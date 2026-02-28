@@ -1,0 +1,14 @@
+{
+  "enabled_categories": [
+    "xcode",
+    "docker",
+    "node",
+    "python",
+    "caches",
+    "logs"
+  ],
+  "skip_paths": [],
+  "log_threshold_mb": 100,
+  "auto_approve": false,
+  "schedule": "weekly"
+}
