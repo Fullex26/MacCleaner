@@ -97,11 +97,14 @@ def get_targets(config):
     targets = []
 
     def add(category, label, path, safe=True, cmd=None):
-        p = Path(path) if not isinstance(path, Path) else path
-        # Expand ~ 
-        if str(path).startswith("~"):
-            p = HOME / str(path)[2:]
-        if any(str(p).startswith(str(s)) for s in skip):
+        if path is None:
+            p = None
+        else:
+            p = Path(path) if not isinstance(path, Path) else path
+            # Expand ~
+            if str(path).startswith("~"):
+                p = HOME / str(path)[2:]
+        if p is not None and any(str(p).startswith(str(s)) for s in skip):
             return
         if category in config["enabled_categories"]:
             targets.append({
