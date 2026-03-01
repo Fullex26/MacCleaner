@@ -49,12 +49,22 @@ case "$choice" in
     *) echo "  Skipped — run '$INSTALL_DIR/scheduler.sh weekly' anytime" ;;
 esac
 
-# 6. Build menu bar app instructions
+# 6. Install menu bar app
+APP_BUNDLE="$SCRIPT_DIR/MacCleaner.app"
+APP_DEST="$HOME/Applications/MacCleaner.app"
+if [ -d "$APP_BUNDLE" ]; then
+    mkdir -p "$HOME/Applications"
+    rm -rf "$APP_DEST"
+    cp -r "$APP_BUNDLE" "$APP_DEST" 2>/dev/null || \
+    cp -r "$APP_BUNDLE" "/Applications/MacCleaner.app" 2>/dev/null || true
+    echo "→ Copied MacCleaner.app to ~/Applications/"
+fi
+
 echo ""
 echo "🖥️  Menu Bar App"
 echo "  To run the menu bar app:"
-echo "  1. Open: $SCRIPT_DIR/MacCleaner.app"
-echo "     (or: open '$SCRIPT_DIR/MacCleaner.app')"
+echo "  1. Open: ~/Applications/MacCleaner.app"
+echo "     (or: open ~/Applications/MacCleaner.app)"
 echo "  2. Look for 🧹 in your menu bar"
 echo ""
 echo "✅ Installation complete!"

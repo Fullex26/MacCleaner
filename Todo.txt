@@ -1,0 +1,3 @@
+# Roadmap
+- How do people just download this as a dmg and it just works?
+- I have no idea how to actually run a full opensource project and what this means, how to people add new features etc. do I have to like check everything?

@@ -1,3 +1,13 @@
-MacCleaner.app/
+# Build artifacts (bare binary, not the .app bundle)
 MacCleaner
+
+# Debug logs
 firebase-debug.log
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

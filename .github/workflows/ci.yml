@@ -1,0 +1,39 @@
+# Runs on every push and pull request to main.
+# Validates Python syntax and smoke-tests the CLI on a real macOS runner.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-smoke-test:
+    name: Python Syntax + Smoke Test
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Python 3 is available
+        run: python3 --version
+
+      - name: Check Python syntax
+        run: python3 -m py_compile cleaner.py
+
+      - name: Smoke test — JSON output mode
+        run: python3 cleaner.py --json
+        # Exercises: load_config(), get_targets(), measure_targets(), run_json_output().
+        # Paths that don't exist on the runner return size=0, not a crash.
+
+      - name: Validate JSON is parseable
+        run: python3 cleaner.py --json | python3 -m json.tool > /dev/null
+
+      - name: Smoke test — preview mode
+        run: python3 cleaner.py --preview
+
+      - name: Smoke test — help
+        run: python3 cleaner.py --help
