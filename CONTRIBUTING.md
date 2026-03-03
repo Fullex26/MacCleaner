@@ -23,7 +23,7 @@ Check the [Roadmap](ROADMAP.md) — Phase 1 lists targets we know we want. Open 
 No special setup needed. The project has no build step for the CLI.
 
 ```bash
-git clone https://github.com/jordanfuller/maccleaner
+git clone https://github.com/Fullex26/MacCleaner
 cd maccleaner
 
 # Test the CLI directly

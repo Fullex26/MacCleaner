@@ -2,7 +2,7 @@
 
 > macOS developer storage cleanup tool — CLI + menu bar app.
 
-[![CI](https://github.com/jordanfuller/maccleaner/actions/workflows/ci.yml/badge.svg)](https://github.com/jordanfuller/maccleaner/actions/workflows/ci.yml)
+[![CI](https://github.com/Fullex26/MacCleaner/actions/workflows/ci.yml/badge.svg)](https://github.com/Fullex26/MacCleaner/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](https://www.apple.com/macos/)
 [![Requires: Python 3](https://img.shields.io/badge/requires-Python%203-yellow.svg)](https://www.python.org/)
