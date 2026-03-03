@@ -1,3 +1,6 @@
+# Claude Code local config (personal — skills, memory, session data)
+.claude/
+
 # Build artifacts (bare binary, not the .app bundle)
 MacCleaner
 
