@@ -5,7 +5,14 @@
     "node",
     "python",
     "caches",
-    "logs"
+    "logs",
+    "homebrew",
+    "go",
+    "rust",
+    "ruby",
+    "cocoapods",
+    "gradle",
+    "maven"
   ],
   "skip_paths": [],
   "log_threshold_mb": 100,

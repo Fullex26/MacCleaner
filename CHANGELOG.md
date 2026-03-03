@@ -11,6 +11,21 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [1.1.0] — 2026-03-03
+
+### Added
+- **Homebrew cache** — `brew cleanup --prune=all` (often 1–5 GB, cmd-based)
+- **Go module cache** — `~/go/pkg/mod`
+- **Go build cache** — `~/go/pkg/cache`
+- **Cargo registry** — `~/.cargo/registry`
+- **Cargo git cache** — `~/.cargo/git`
+- **Ruby gem cleanup** — `gem cleanup` for stale gem versions (cmd-based)
+- **CocoaPods cache** — `~/Library/Caches/CocoaPods`
+- **Gradle caches** — `~/.gradle/caches`
+- **Maven local repo** — `~/.m2/repository` (marked Review — forces full re-download on delete)
+
+---
+
 ## [1.0.0] — 2026-03-01
 
 ### Added

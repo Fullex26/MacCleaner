@@ -38,7 +38,8 @@ LOG_PATH = Path(__file__).parent / "report.log"
 # ── Default config ─────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
     "enabled_categories": [
-        "xcode", "docker", "node", "python", "caches", "logs"
+        "xcode", "docker", "node", "python", "caches", "logs",
+        "homebrew", "go", "rust", "ruby", "cocoapods", "gradle", "maven"
     ],
     "skip_paths": [],
     "log_threshold_mb": 100,
@@ -146,6 +147,31 @@ def get_targets(config):
     add("caches", "Chrome cache",            "~/Library/Application Support/Google/Chrome/Default/Cache")
     add("caches", "Spotify cache",           "~/Library/Application Support/Spotify/Data")
     add("caches", "General app caches",      "~/Library/Caches", safe=False)
+
+    # Homebrew
+    add("homebrew", "Homebrew cache", None,
+        cmd="brew cleanup --prune=all 2>/dev/null || true")
+
+    # Go
+    add("go", "Go module cache",   "~/go/pkg/mod")
+    add("go", "Go build cache",    "~/go/pkg/cache")
+
+    # Rust / Cargo
+    add("rust", "Cargo registry",  "~/.cargo/registry")
+    add("rust", "Cargo git cache", "~/.cargo/git")
+
+    # Ruby
+    add("ruby", "Ruby gem cleanup", None,
+        cmd="gem cleanup 2>/dev/null || true")
+
+    # CocoaPods
+    add("cocoapods", "CocoaPods cache", "~/Library/Caches/CocoaPods")
+
+    # Gradle / Android
+    add("gradle", "Gradle caches", "~/.gradle/caches")
+
+    # Maven
+    add("maven", "Maven local repo", "~/.m2/repository", safe=False)
 
     # Logs
     threshold = config.get("log_threshold_mb", 100) * 1024 * 1024

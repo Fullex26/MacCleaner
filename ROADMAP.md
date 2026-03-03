@@ -20,13 +20,13 @@ This document tracks planned features and long-term direction. Community input w
 
 > Low effort, high impact. Targets any developer is likely to have.
 
-- [ ] **Homebrew cache** — `brew cleanup --prune=all` (often 1–5 GB)
-- [ ] **Go module cache** — `~/go/pkg/mod` and `~/go/pkg/cache`
-- [ ] **Cargo / Rust** — `~/.cargo/registry` and `~/.cargo/git`
-- [ ] **Ruby gems** — `gem cleanup` for stale gem versions
-- [ ] **CocoaPods cache** — `~/Library/Caches/CocoaPods`
-- [ ] **Gradle / Android** — `~/.gradle/caches`
-- [ ] **Maven** — `~/.m2/repository` for unused snapshots
+- [x] **Homebrew cache** — `brew cleanup --prune=all` (often 1–5 GB)
+- [x] **Go module cache** — `~/go/pkg/mod` and `~/go/pkg/cache`
+- [x] **Cargo / Rust** — `~/.cargo/registry` and `~/.cargo/git`
+- [x] **Ruby gems** — `gem cleanup` for stale gem versions
+- [x] **CocoaPods cache** — `~/Library/Caches/CocoaPods`
+- [x] **Gradle / Android** — `~/.gradle/caches`
+- [x] **Maven** — `~/.m2/repository` for unused snapshots
 - [ ] **iOS Simulator runtimes** — remove unused simulator versions via `xcrun simctl`)
 - [ ] **Xcode device symbols** — `~/Library/Developer/Xcode/iOS DeviceSupport` (often 10–30 GB)
 
