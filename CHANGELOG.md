@@ -9,8 +9,21 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+---
+
+## [1.2.0] — 2026-03-05
+
 ### Added
-- **Simulator runtimes** — `~/Library/Developer/CoreSimulator/Volumes` (Review; shows size of installed iOS/watchOS runtime disk images)
+- **`--version`** — prints `MacCleaner 1.2.0` and exits
+- **`--category CATEGORY`** — filter any mode (`--preview`, `--clean`, `--json`) to a single category (e.g. `--preview --category xcode`)
+- **`--config-show`** — prints current `config.json` as formatted JSON
+- **`--config-enable CATEGORY` / `--config-disable CATEGORY`** — toggle categories in `config.json` from the CLI
+- **Interactive TUI checklist** — `--clean` now opens an arrow-key/space-bar checklist (curses); falls back to y/N prompts when not a real TTY (pipe, cron, CI)
+- **Size estimates for cmd-based targets** — Homebrew cache and Docker now show real reclaimable sizes before cleaning (using dry-run commands); pnpm shows `~unknown` if not installed
+- **`brew autoremove`** — new Homebrew target removes unused dependencies
+
+### Changed
+- Targets with no path and no estimate command now show `cmd-based`; targets with an estimate command that returned nothing show `~unknown`
 
 ---
 

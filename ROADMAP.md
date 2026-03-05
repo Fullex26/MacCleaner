@@ -4,12 +4,14 @@ This document tracks planned features and long-term direction. Community input w
 
 ---
 
-## Current State — v1.0 ✅
+## Current State — v1.2 ✅
 
-- Python CLI with rich terminal output
-- Cleans: Xcode DerivedData/Previews/DeviceSupport, Docker, Node (npm/pnpm/yarn), Python pip, app caches, oversized logs
+- Python CLI with rich terminal output and interactive curses TUI
+- Cleans: Xcode, Docker, Node, Python, Homebrew, Go, Rust, Ruby, CocoaPods, Gradle, Maven, app caches, oversized logs
 - Safe vs. Review distinction — auto-clean only touches safe items
 - `--preview`, `--clean`, `--clean --yes`, `--report`, `--json` modes
+- `--version`, `--category`, `--config-show/enable/disable` for ergonomic CLI use
+- Size estimates for Homebrew and Docker before cleaning
 - Cron scheduling via `scheduler.sh`
 - Menu bar app (Swift, arm64) showing reclaimable space
 - `install.sh` — one-command install to `~/mac-cleaner/`
@@ -32,7 +34,20 @@ This document tracks planned features and long-term direction. Community input w
 
 ---
 
-## Phase 2 — Smarter Menu Bar App
+## Phase 2 — CLI Polish ✅
+
+> CLI-first, zero external dependencies beyond Python stdlib.
+
+- [x] **`--version`** — `MacCleaner 1.2.0`
+- [x] **`--category` filter** — scope any mode to one category
+- [x] **Config CLI** — `--config-show/enable/disable` without editing JSON by hand
+- [x] **Interactive TUI** — curses checklist with arrow keys + space toggle; graceful fallback
+- [x] **Size estimates** — Homebrew and Docker show reclaimable bytes before cleaning
+- [x] **`brew autoremove`** — remove unused Homebrew dependencies
+
+---
+
+## Phase 3 — Smarter Menu Bar App
 
 > Makes the menu bar app genuinely useful day-to-day, not just a launcher.
 
@@ -45,7 +60,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ---
 
-## Phase 3 — Distribution & Trust
+## Phase 4 — Distribution & Trust
 
 > Required before sharing with non-developers or putting on GitHub Releases.
 
@@ -57,7 +72,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ---
 
-## Phase 4 — Native Swift Rewrite
+## Phase 5 — Native Swift Rewrite
 
 > Eliminates the Python dependency, making the tool accessible to all Mac users.
 
@@ -69,7 +84,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ---
 
-## Phase 5 — App Store & Beyond
+## Phase 6 — App Store & Beyond
 
 > Long-term, if the project gains traction.
 

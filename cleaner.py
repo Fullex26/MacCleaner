@@ -34,6 +34,7 @@ except ImportError:
 HOME = Path.home()
 CONFIG_PATH = Path(__file__).parent / "config.json"
 LOG_PATH = Path(__file__).parent / "report.log"
+VERSION = "1.2.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
@@ -60,6 +61,7 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
+        f.write("\n")
 
 # ── Size helpers ───────────────────────────────────────────────────────────────
 def get_size(path: Path) -> int:
@@ -92,12 +94,52 @@ def disk_free() -> str:
             return f"Used: {parts[2]} / {parts[1]} ({parts[4]})"
     return "unknown"
 
+# ── Estimate parsers for cmd-based targets ─────────────────────────────────────
+def _parse_brew_estimate(output):
+    import re
+    m = re.search(r'free approximately ([0-9.]+)\s*(KB|MB|GB|TB)', output)
+    if not m:
+        return 0
+    val, unit = float(m.group(1)), m.group(2)
+    return int(val * {"KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}[unit])
+
+def _parse_docker_estimate(output):
+    import re
+    total = 0
+    for line in output.strip().splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 4:
+            m = re.match(r'([0-9.]+)(B|KB|MB|GB|TB)', parts[3])
+            if m:
+                val, unit = float(m.group(1)), m.group(2)
+                total += int(val * {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}[unit])
+    return total
+
+def _parse_du_estimate(output):
+    try:
+        return int(output.split()[0]) * 1024
+    except Exception:
+        return 0
+
+def _run_estimate(estimate_cmd, parser):
+    try:
+        r = subprocess.run(estimate_cmd, shell=True, capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return 0
+        return {
+            "brew_dry_run": _parse_brew_estimate,
+            "docker_df":    _parse_docker_estimate,
+            "du_path":      _parse_du_estimate,
+        }.get(parser, lambda _: 0)(r.stdout)
+    except Exception:
+        return 0
+
 # ── Target definitions ─────────────────────────────────────────────────────────
 def get_targets(config):
     skip = [Path(p) for p in config.get("skip_paths", [])]
     targets = []
 
-    def add(category, label, path, safe=True, cmd=None):
+    def add(category, label, path, safe=True, cmd=None, estimate_cmd=None, estimate_parser=None):
         if path is None:
             p = None
         else:
@@ -113,7 +155,9 @@ def get_targets(config):
                 "label": label,
                 "path": p,
                 "safe": safe,
-                "cmd": cmd,  # Optional shell command instead of rm -rf
+                "cmd": cmd,
+                "estimate_cmd": estimate_cmd,
+                "estimate_parser": estimate_parser,
             })
 
     # Xcode
@@ -127,12 +171,17 @@ def get_targets(config):
     add("xcode", "Simulator runtimes",      "~/Library/Developer/CoreSimulator/Volumes", safe=False)
 
     # Docker
-    add("docker", "Docker unused data",      None,
-        cmd="docker system prune -f --filter 'until=168h' 2>/dev/null || true")
+    add("docker", "Docker unused data", None,
+        cmd="docker system prune -f --filter 'until=168h' 2>/dev/null || true",
+        estimate_cmd="docker system df 2>/dev/null",
+        estimate_parser="docker_df")
 
     # Node
     add("node", "npm cache",                 "~/.npm/_cacache")
-    add("node", "pnpm store",                None, cmd="pnpm store prune 2>/dev/null || true")
+    add("node", "pnpm store",                None,
+        cmd="pnpm store prune 2>/dev/null || true",
+        estimate_cmd="pnpm store path 2>/dev/null | xargs du -sk 2>/dev/null",
+        estimate_parser="du_path")
     add("node", "yarn cache",                "~/.yarn/cache")
 
     # Python
@@ -151,7 +200,11 @@ def get_targets(config):
 
     # Homebrew
     add("homebrew", "Homebrew cache", None,
-        cmd="brew cleanup --prune=all 2>/dev/null || true")
+        cmd="brew cleanup --prune=all 2>/dev/null || true",
+        estimate_cmd="brew cleanup --dry-run 2>/dev/null",
+        estimate_parser="brew_dry_run")
+    add("homebrew", "Homebrew unused deps", None,
+        cmd="brew autoremove 2>/dev/null || true")
 
     # Go
     add("go", "Go module cache",   "~/go/pkg/mod")
@@ -187,6 +240,8 @@ def get_targets(config):
                     "path": item,
                     "safe": True,
                     "cmd": None,
+                    "estimate_cmd": None,
+                    "estimate_parser": None,
                 })
 
     return targets
@@ -197,8 +252,10 @@ def measure_targets(targets):
     for t in targets:
         if t["path"] and t["path"].exists():
             t["size"] = get_size(t["path"])
+        elif t.get("estimate_cmd"):
+            t["size"] = _run_estimate(t["estimate_cmd"], t.get("estimate_parser"))
         else:
-            t["size"] = 0  # cmd-based targets estimated after
+            t["size"] = 0
     return targets
 
 def delete_target(t) -> int:
@@ -216,6 +273,137 @@ def delete_target(t) -> int:
             path.unlink(missing_ok=True)
     return freed
 
+# ── Config commands ─────────────────────────────────────────────────────────────
+def cmd_config_show(cfg):
+    print(json.dumps(cfg, indent=2))
+
+def cmd_config_set(cfg, action, category):
+    valid = set(DEFAULT_CONFIG["enabled_categories"])
+    if category not in valid:
+        print(f"Unknown category '{category}'. Valid: {', '.join(sorted(valid))}")
+        sys.exit(1)
+    cats = cfg["enabled_categories"]
+    if action == "enable" and category not in cats:
+        cats.append(category)
+        save_config(cfg)
+        print(f"Enabled '{category}'.")
+    elif action == "disable" and category in cats:
+        cats.remove(category)
+        save_config(cfg)
+        print(f"Disabled '{category}'.")
+    else:
+        print(f"Category '{category}' already {'enabled' if action == 'enable' else 'disabled'}.")
+
+# ── TUI checklist ───────────────────────────────────────────────────────────────
+def run_tui_clean(targets):
+    """Interactive curses-based checklist. Returns (selected_list, confirmed)."""
+    if not sys.stdout.isatty() or not sys.stdin.isatty():
+        return None, False
+
+    import curses
+
+    # Default: safe items checked, review items unchecked
+    checked = [t["safe"] for t in targets]
+
+    def _tui(stdscr):
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)   # safe + selected
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)  # review
+        curses.init_pair(3, curses.COLOR_CYAN, -1)    # cursor highlight
+        curses.init_pair(4, curses.COLOR_WHITE, -1)   # normal
+
+        cursor = 0
+        confirmed = False
+
+        while True:
+            stdscr.clear()
+            h, w = stdscr.getmaxyx()
+
+            # Header
+            header = " MacCleaner — Space=toggle  a=all  n=none  Enter=confirm  q=cancel"
+            stdscr.addstr(0, 0, header[:w-1], curses.A_BOLD)
+            stdscr.addstr(1, 0, "─" * (w - 1))
+
+            # Items
+            list_start = 2
+            list_end = h - 3
+            visible = list_end - list_start
+            offset = max(0, cursor - visible + 1)
+
+            for i, t in enumerate(targets[offset:offset + visible]):
+                idx = i + offset
+                row = list_start + i
+                if row >= list_end:
+                    break
+
+                mark = "x" if checked[idx] else " "
+                cat = t["category"][:8].ljust(8)
+                label = t["label"][:32].ljust(32)
+                size_str = (fmt_size(t["size"]) if t.get("size")
+                            else "~unknown" if t.get("estimate_cmd")
+                            else "cmd-based")
+                size_str = size_str[:10].rjust(10)
+                review = "  REVIEW" if not t["safe"] else ""
+                line = f" [{mark}] {cat}  {label}  {size_str}{review}"
+
+                if idx == cursor:
+                    attr = curses.color_pair(3) | curses.A_BOLD
+                elif checked[idx] and t["safe"]:
+                    attr = curses.color_pair(1)
+                elif not t["safe"]:
+                    attr = curses.color_pair(2)
+                else:
+                    attr = curses.color_pair(4)
+
+                try:
+                    stdscr.addstr(row, 0, line[:w-1], attr)
+                except curses.error:
+                    pass
+
+            # Footer
+            selected_count = sum(checked)
+            total_bytes = sum(t.get("size", 0) for t, c in zip(targets, checked) if c)
+            footer = f" Selected: {selected_count}/{len(targets)}  Est. to free: {fmt_size(total_bytes)}"
+            try:
+                stdscr.addstr(h - 2, 0, "─" * (w - 1))
+                stdscr.addstr(h - 1, 0, footer[:w-1], curses.A_BOLD)
+            except curses.error:
+                pass
+
+            stdscr.refresh()
+            key = stdscr.getch()
+
+            if key in (curses.KEY_UP, ord('k')):
+                cursor = max(0, cursor - 1)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                cursor = min(len(targets) - 1, cursor + 1)
+            elif key == ord(' '):
+                checked[cursor] = not checked[cursor]
+            elif key == ord('a'):
+                checked[:] = [True] * len(targets)
+            elif key == ord('n'):
+                checked[:] = [False] * len(targets)
+            elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+                confirmed = True
+                break
+            elif key in (ord('q'), 27):  # q or Esc
+                break
+
+        return confirmed
+
+    try:
+        confirmed = curses.wrapper(_tui)
+    except curses.error:
+        return None, False
+
+    if not confirmed:
+        return [], False
+
+    selected = [t for t, c in zip(targets, checked) if c]
+    return selected, True
+
 # ── Output modes ───────────────────────────────────────────────────────────────
 def print_preview(targets):
     targets = measure_targets(targets)
@@ -229,7 +417,9 @@ def print_preview(targets):
         table.add_column("Safe?", justify="center")
 
         for t in sorted(targets, key=lambda x: x["size"], reverse=True):
-            size_str = fmt_size(t["size"]) if t["size"] else "cmd-based"
+            size_str = (fmt_size(t["size"]) if t["size"]
+                        else "~unknown" if t.get("estimate_cmd")
+                        else "cmd-based")
             safe_str = "✅" if t["safe"] else "⚠️"
             table.add_row(t["category"], t["label"], size_str, safe_str)
 
@@ -244,7 +434,9 @@ def print_preview(targets):
         print(f"MacCleaner Preview — {disk_free()}")
         print(f"{'='*60}")
         for t in sorted(targets, key=lambda x: x["size"], reverse=True):
-            size_str = fmt_size(t["size"]) if t["size"] else "cmd"
+            size_str = (fmt_size(t["size"]) if t["size"]
+                        else "~unknown" if t.get("estimate_cmd")
+                        else "cmd")
             safe = "safe" if t["safe"] else "REVIEW"
             print(f"  [{t['category']:8}] {t['label']:<45} {size_str:>10}  {safe}")
         print(f"\n  Total reclaimable: {fmt_size(total)}")
@@ -262,8 +454,38 @@ def run_clean(targets, auto_approve=False):
 
     print(f"\n🧹 MacCleaner — {disk_free()}\n")
 
+    if not auto_approve:
+        selected, confirmed = run_tui_clean(ordered)
+        if selected is None:
+            pass  # TUI unavailable, fall through to y/N loop
+        elif not confirmed:
+            print("Cancelled.")
+            return 0, []
+        else:
+            # Execute TUI selection
+            for t in selected:
+                size_str = fmt_size(t["size"]) if t["size"] else "~unknown"
+                print(f"  ✅ Deleting: {t['label']} ({size_str})")
+                freed = delete_target(t)
+                total_freed += freed
+                results.append({"label": t["label"], "freed": freed, "status": "deleted"})
+            # Mark skipped items
+            selected_labels = {t["label"] for t in selected}
+            for t in ordered:
+                if t["label"] not in selected_labels:
+                    results.append({"label": t["label"], "freed": 0, "status": "skipped"})
+            write_log(total_freed, results)
+            print(f"\n{'='*50}")
+            print(f"  Total freed: {fmt_size(total_freed)}")
+            print(f"  Disk now:    {disk_free()}")
+            print(f"{'='*50}\n")
+            return total_freed, results
+
+    # y/N loop — runs for auto_approve=True or TUI fallback (non-interactive)
     for t in ordered:
-        size_str = fmt_size(t["size"]) if t["size"] else "cmd-based"
+        size_str = (fmt_size(t["size"]) if t["size"]
+                    else "~unknown" if t.get("estimate_cmd")
+                    else "cmd-based")
         safe_label = "" if t["safe"] else " ⚠️  REVIEW BEFORE DELETING"
         prompt_str = f"  Delete [{t['category']}] {t['label']} ({size_str}){safe_label}? [y/N] "
 
@@ -363,12 +585,18 @@ def show_report():
 # ── CLI entry point ────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="MacCleaner — Developer storage cleanup")
-    parser.add_argument("--preview", action="store_true", help="Show what would be deleted")
-    parser.add_argument("--clean",   action="store_true", help="Run interactive cleanup")
-    parser.add_argument("--yes",     action="store_true", help="Auto-approve safe deletions")
-    parser.add_argument("--report",  action="store_true", help="Show cleanup history")
-    parser.add_argument("--json",    action="store_true", help="Output JSON (for menu bar app)")
-    parser.add_argument("--install-deps", action="store_true", help="Install rich for pretty output")
+    parser.add_argument("--version",        action="version", version=f"MacCleaner {VERSION}")
+    parser.add_argument("--preview",        action="store_true", help="Show what would be deleted")
+    parser.add_argument("--clean",          action="store_true", help="Run interactive cleanup")
+    parser.add_argument("--yes",            action="store_true", help="Auto-approve safe deletions")
+    parser.add_argument("--report",         action="store_true", help="Show cleanup history")
+    parser.add_argument("--json",           action="store_true", help="Output JSON (for menu bar app)")
+    parser.add_argument("--install-deps",   action="store_true", help="Install rich for pretty output")
+    parser.add_argument("--category",       metavar="CATEGORY",
+                        help="Only operate on this category (e.g. xcode, docker, node)")
+    parser.add_argument("--config-show",    action="store_true", help="Print current config as JSON")
+    parser.add_argument("--config-enable",  metavar="CATEGORY", help="Enable a category in config")
+    parser.add_argument("--config-disable", metavar="CATEGORY", help="Disable a category in config")
     args = parser.parse_args()
 
     if args.install_deps:
@@ -377,7 +605,25 @@ def main():
         return
 
     config = load_config()
+
+    # Config commands — short-circuit before slow target scan
+    if args.config_show:
+        cmd_config_show(config)
+        return
+    if args.config_enable:
+        cmd_config_set(config, "enable", args.config_enable)
+        return
+    if args.config_disable:
+        cmd_config_set(config, "disable", args.config_disable)
+        return
+
     targets = get_targets(config)
+
+    if args.category:
+        targets = [t for t in targets if t["category"] == args.category.lower()]
+        if not targets:
+            print(f"No targets for '{args.category}'. Available: {', '.join(DEFAULT_CONFIG['enabled_categories'])}")
+            sys.exit(1)
 
     if args.preview:
         print_preview(targets)
