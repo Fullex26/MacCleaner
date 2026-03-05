@@ -2,10 +2,10 @@
 
 > macOS developer storage cleanup tool — CLI + menu bar app.
 
-[![CI](https://github.com/Fullex26/MacCleaner/actions/workflows/ci.yml/badge.svg)](https://github.com/Fullex26/MacCleaner/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](https://www.apple.com/macos/)
-[![Requires: Python 3](https://img.shields.io/badge/requires-Python%203-yellow.svg)](https://www.python.org/)
+[![Build](https://img.shields.io/github/actions/workflow/status/Fullex26/MacCleaner/ci.yml?branch=main&style=for-the-badge&label=BUILD)](https://github.com/Fullex26/MacCleaner/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Fullex26/MacCleaner?style=for-the-badge&label=RELEASE)](https://github.com/Fullex26/MacCleaner/releases/latest)
+[![Stars](https://img.shields.io/github/stars/Fullex26/MacCleaner?style=for-the-badge&label=STARS)](https://github.com/Fullex26/MacCleaner/stargazers)
+[![License](https://img.shields.io/github/license/Fullex26/MacCleaner?style=for-the-badge&label=LICENSE)](LICENSE)
 
 MacCleaner finds and removes developer detritus that accumulates silently — Xcode build caches, Docker layers, Node module stores, pip caches, and more. A single command can reclaim tens of gigabytes.
 
