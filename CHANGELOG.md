@@ -9,6 +9,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+- **Simulator runtimes** — `~/Library/Developer/CoreSimulator/Volumes` (Review; shows size of installed iOS/watchOS runtime disk images)
+
 ---
 
 ## [1.1.0] — 2026-03-03

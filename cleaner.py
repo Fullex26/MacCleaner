@@ -124,6 +124,7 @@ def get_targets(config):
     add("xcode", "Xcode Archives",           "~/Library/Developer/Xcode/Archives", safe=False)
     add("xcode", "Simulator unavailable",    None,
         cmd="xcrun simctl delete unavailable 2>/dev/null || true")
+    add("xcode", "Simulator runtimes",      "~/Library/Developer/CoreSimulator/Volumes", safe=False)
 
     # Docker
     add("docker", "Docker unused data",      None,

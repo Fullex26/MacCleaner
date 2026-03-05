@@ -27,8 +27,8 @@ This document tracks planned features and long-term direction. Community input w
 - [x] **CocoaPods cache** — `~/Library/Caches/CocoaPods`
 - [x] **Gradle / Android** — `~/.gradle/caches`
 - [x] **Maven** — `~/.m2/repository` for unused snapshots
-- [ ] **iOS Simulator runtimes** — remove unused simulator versions via `xcrun simctl`)
-- [ ] **Xcode device symbols** — `~/Library/Developer/Xcode/iOS DeviceSupport` (often 10–30 GB)
+- [x] **iOS Simulator runtimes** — `xcrun simctl delete unavailable` + `~/Library/Developer/CoreSimulator/Volumes` (Review)
+- [x] **Xcode device symbols** — `~/Library/Developer/Xcode/iOS DeviceSupport` (often 10–30 GB)
 
 ---
 
