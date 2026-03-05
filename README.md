@@ -9,14 +9,12 @@
 
 MacCleaner finds and removes developer detritus that accumulates silently — Xcode build caches, Docker layers, Node module stores, pip caches, and more. A single command can reclaim tens of gigabytes.
 
-<!-- Screenshot placeholder — add a terminal recording here -->
-
 ---
 
 ## Install
 
 ```bash
-git clone https://github.com/jordanfuller/maccleaner
+git clone https://github.com/Fullex26/MacCleaner
 cd maccleaner
 bash install.sh
 ```
