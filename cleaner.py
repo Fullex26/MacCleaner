@@ -625,9 +625,7 @@ def main():
             print(f"No targets for '{args.category}'. Available: {', '.join(DEFAULT_CONFIG['enabled_categories'])}")
             sys.exit(1)
 
-    if args.preview:
-        print_preview(targets)
-    elif args.clean:
+    if args.clean:
         auto = args.yes or config.get("auto_approve", False)
         run_clean(targets, auto_approve=auto)
     elif args.report:
@@ -635,7 +633,7 @@ def main():
     elif args.json:
         run_json_output(targets)
     else:
-        parser.print_help()
+        print_preview(targets)  # default: preview
 
 if __name__ == "__main__":
     main()
