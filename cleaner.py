@@ -405,6 +405,27 @@ def run_tui_clean(targets):
     return selected, True
 
 # ── Output modes ───────────────────────────────────────────────────────────────
+def show_welcome():
+    if RICH:
+        console.print(Panel(
+            "[bold]🧹 MacCleaner[/bold] — Free up space on your Mac\n\n"
+            "  [bold cyan]maccleaner preview[/bold cyan]        — see what can be cleaned\n"
+            "  [bold cyan]maccleaner clean[/bold cyan]          — start cleaning (interactive)\n"
+            "  [bold cyan]maccleaner report[/bold cyan]         — show cleanup history\n\n"
+            "  [dim]maccleaner clean --yes   — auto-clean all safe items[/dim]\n"
+            "  [dim]maccleaner --category xcode  — scope to one category[/dim]",
+            title="Welcome",
+            border_style="cyan"
+        ))
+    else:
+        print(f"\n{'='*50}")
+        print("🧹 MacCleaner — Free up space on your Mac")
+        print(f"{'='*50}")
+        print("  maccleaner preview    — see what can be cleaned")
+        print("  maccleaner clean      — start cleaning (interactive)")
+        print("  maccleaner report     — show cleanup history")
+        print(f"{'='*50}\n")
+
 def print_preview(targets):
     targets = measure_targets(targets)
     total = sum(t["size"] for t in targets)
@@ -426,7 +447,8 @@ def print_preview(targets):
         console.print(table)
         console.print(Panel(
             f"[bold green]Total reclaimable: {fmt_size(total)}[/bold green]\n"
-            f"[dim]Current disk: {disk_free()}[/dim]",
+            f"[dim]Current disk: {disk_free()}[/dim]\n\n"
+            f"[bold]→ Run [cyan]maccleaner clean[/cyan] to start cleaning[/bold]",
             title="Summary"
         ))
     else:
@@ -440,6 +462,7 @@ def print_preview(targets):
             safe = "safe" if t["safe"] else "REVIEW"
             print(f"  [{t['category']:8}] {t['label']:<45} {size_str:>10}  {safe}")
         print(f"\n  Total reclaimable: {fmt_size(total)}")
+        print(f"\n  → Run 'maccleaner clean' to start cleaning")
         print(f"{'='*60}\n")
 
 def run_clean(targets, auto_approve=False):
@@ -584,6 +607,19 @@ def show_report():
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
 def main():
+    # Translate natural subcommands → --flags so existing aliases/cron are unaffected
+    _SUBCOMMANDS = {
+        "clean":   "--clean",
+        "preview": "--preview",
+        "scan":    "--preview",
+        "report":  "--report",
+        "history": "--report",
+        "help":    "--help",
+        "version": "--version",
+    }
+    if len(sys.argv) > 1 and sys.argv[1] in _SUBCOMMANDS:
+        sys.argv[1] = _SUBCOMMANDS[sys.argv[1]]
+
     parser = argparse.ArgumentParser(description="MacCleaner — Developer storage cleanup")
     parser.add_argument("--version",        action="version", version=f"MacCleaner {VERSION}")
     parser.add_argument("--preview",        action="store_true", help="Show what would be deleted")
@@ -628,12 +664,14 @@ def main():
     if args.clean:
         auto = args.yes or config.get("auto_approve", False)
         run_clean(targets, auto_approve=auto)
+    elif args.preview:
+        print_preview(targets)
     elif args.report:
         show_report()
     elif args.json:
         run_json_output(targets)
     else:
-        print_preview(targets)  # default: preview
+        show_welcome()
 
 if __name__ == "__main__":
     main()
