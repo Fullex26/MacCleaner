@@ -1,4 +1,4 @@
-# 🧹 MacCleaner
+2# 🧹 MacCleaner
 
 > macOS developer storage cleanup tool — CLI + menu bar app.
 
@@ -15,7 +15,7 @@ MacCleaner finds and removes developer detritus that accumulates silently — Xc
 
 ```bash
 git clone https://github.com/Fullex26/MacCleaner
-cd maccleaner
+cd MacCleaner
 bash install.sh
 ```
 
@@ -28,11 +28,14 @@ Installs to `~/mac-cleaner/`, adds shell aliases, optionally schedules a weekly 
 ## CLI Usage
 
 ```bash
-mpreview          # See what will be deleted + sizes
-mclean            # Interactive cleanup (confirm each item)
-mclean --yes      # Auto-approve all safe items (cron/unattended mode)
-mreport           # Show last 10 cleanup runs
+maccleaner                  # Show help & available commands
+maccleaner preview          # See what can be cleaned + sizes
+maccleaner clean            # Interactive cleanup (TUI checklist)
+maccleaner clean --yes      # Auto-approve all safe items (cron mode)
+maccleaner report           # Show last 10 cleanup runs
 ```
+
+> Short aliases also work: `mclean`, `mpreview`, `mreport`.
 
 Or call directly without installing:
 
@@ -91,6 +94,14 @@ The 🧹 icon appears in your menu bar showing total reclaimable space. Click to
 - Remove entries from `enabled_categories` to skip them entirely
 - Add paths to `skip_paths` to never touch them
 - Set `auto_approve: true` to skip all confirmations (cron mode)
+
+Or manage categories from the CLI without editing the file:
+
+```bash
+maccleaner --config-enable homebrew
+maccleaner --config-disable docker
+maccleaner --config-show
+```
 
 ---
 
