@@ -12,13 +12,24 @@ MacCleaner is a macOS developer storage cleanup tool with two components:
 
 ### CLI (after install)
 ```bash
+python3 cleaner.py               # No args = show welcome/help screen
 python3 cleaner.py --preview     # Dry run: show what would be deleted + sizes
-python3 cleaner.py --clean       # Interactive cleanup
+python3 cleaner.py --clean       # Interactive cleanup (TUI checklist via curses)
 python3 cleaner.py --clean --yes # Auto-approve all safe items (cron mode)
 python3 cleaner.py --report      # Show last 10 cleanup runs from report.log
 python3 cleaner.py --json        # JSON output (consumed by menu bar app)
 python3 cleaner.py --install-deps # Install 'rich' for pretty terminal output
+python3 cleaner.py --category xcode  # Scope run to one category only
 ```
+
+### Config Management
+```bash
+python3 cleaner.py --config-show              # Print current config.json
+python3 cleaner.py --config-enable docker     # Enable a category
+python3 cleaner.py --config-disable ruby      # Disable a category
+```
+
+Available categories: `xcode`, `docker`, `node`, `python`, `caches`, `logs`, `homebrew`, `go`, `rust`, `ruby`, `cocoapods`, `gradle`, `maven`
 
 ### Install & Schedule
 ```bash
@@ -29,7 +40,7 @@ bash install.sh                        # Copies to ~/mac-cleaner/, adds aliases,
 ~/mac-cleaner/scheduler.sh status      # Check current schedule
 ```
 
-After install, shell aliases are added to `~/.zshrc`: `mclean`, `mpreview`, `mreport`.
+After install, shell aliases are added to `~/.zshrc`: `maccleaner`, `mclean`, `mpreview`, `mreport`.
 
 ### Menu Bar App
 Open `AppDelegate.swift` as a new macOS app target in Xcode, build & run. No dock icon (`.accessory` activation policy).
@@ -47,6 +58,7 @@ The JSON schema (`CleanerReport` / `CleanerTarget`) is the contract between the 
 - `get_targets(config)` — builds the list of things to potentially clean (path-based or command-based)
 - `measure_targets(targets)` — uses `du -sk` subprocess to calculate sizes
 - `delete_target(t)` — either `shutil.rmtree` for path targets, or `subprocess.run(shell=True)` for command-based targets (docker prune, pnpm store prune, etc.)
+- `run_tui_clean(targets)` — curses-based checklist UI for `--clean`; automatically falls back to y/N prompt loop if terminal is non-interactive (cron, piped output)
 - `report.log` (sibling to `cleaner.py`) stores the last 50 run entries as JSON
 
 ### Safe vs. Review distinction
