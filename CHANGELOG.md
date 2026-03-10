@@ -11,6 +11,18 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [1.2.1] — 2026-03-10
+
+### Added
+- `SECURITY.md` — private vulnerability reporting via GitHub's advisory flow
+
+### Changed
+- `CLAUDE.md`: corrected no-args default description; added `maccleaner` alias to install list
+- Dependabot already configured for GitHub Actions (weekly, Monday)
+- Branch protection on `main` now requires CI to pass before merging
+
+---
+
 ## [1.2.0] — 2026-03-05
 
 ### Added
