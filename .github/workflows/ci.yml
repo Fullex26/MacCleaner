@@ -1,5 +1,6 @@
 # Runs on every push and pull request to main.
-# Validates Python syntax and smoke-tests the CLI on a real macOS runner.
+# Validates Python syntax, runs the unit test suite, and smoke-tests the CLI
+# (both v2 subcommands and legacy v1 flags) on a real macOS runner.
 
 name: CI
 
@@ -11,7 +12,7 @@ on:
 
 jobs:
   lint-and-smoke-test:
-    name: Python Syntax + Smoke Test
+    name: Tests + Smoke Test
     runs-on: macos-latest
 
     steps:
@@ -24,16 +25,43 @@ jobs:
       - name: Check Python syntax
         run: python3 -m py_compile cleaner.py
 
-      - name: Smoke test — JSON output mode
-        run: python3 cleaner.py --json
-        # Exercises: load_config(), get_targets(), measure_targets(), run_json_output().
-        # Paths that don't exist on the runner return size=0, not a crash.
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
 
-      - name: Validate JSON is parseable
+      - name: Smoke test — scan --json
+        run: python3 cleaner.py scan --json | python3 -m json.tool > /dev/null
+
+      - name: Smoke test — legacy --json contract (menu bar app)
         run: python3 cleaner.py --json | python3 -m json.tool > /dev/null
 
-      - name: Smoke test — preview mode
+      - name: Smoke test — legacy --preview
         run: python3 cleaner.py --preview
+
+      - name: Smoke test — doctor
+        run: python3 cleaner.py doctor
+
+      - name: Smoke test — categories --json
+        run: python3 cleaner.py categories --json | python3 -m json.tool > /dev/null
+
+      - name: Smoke test — projects --json
+        run: python3 cleaner.py projects --json | python3 -m json.tool > /dev/null
 
       - name: Smoke test — help
         run: python3 cleaner.py --help
+
+  build-app:
+    name: Build macOS app
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Build MacCleaner.app from source
+        run: bash app/build.sh
+
+      - name: Verify bundle structure
+        run: |
+          test -x build/MacCleaner.app/Contents/MacOS/MacCleaner
+          test -f build/MacCleaner.app/Contents/Info.plist
+          test -f build/MacCleaner.app/Contents/Resources/cleaner.py
