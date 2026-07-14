@@ -1,7 +1,8 @@
 # Triggers on version tags (e.g. v1.0.0).
 # Produces two release artifacts:
-#   1. MacCleaner-{version}-macos-arm64.zip  — full .app bundle (GUI users)
-#   2. MacCleaner-{version}-cli.tar.gz       — CLI-only files (headless users)
+#   1. MacCleaner-{version}-macos-universal.zip — full .app bundle built from
+#      source (GUI users, Apple Silicon + Intel)
+#   2. MacCleaner-{version}-cli.tar.gz          — CLI-only files (headless users)
 #
 # Note: GITHUB_REF_NAME is the tag name pushed by the repo owner.
 # No user-controlled event input is used in any run: block.
@@ -37,22 +38,28 @@ jobs:
       - name: Verify Python syntax before packaging
         run: python3 -m py_compile cleaner.py
 
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests
+
+      - name: Build app bundle from source
+        run: bash app/build.sh
+
       - name: Package app bundle as zip
         id: package_app
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          APP_ZIP="MacCleaner-${VERSION}-macos-arm64.zip"
+          APP_ZIP="MacCleaner-${VERSION}-macos-universal.zip"
 
-          if [ -d "MacCleaner.app" ]; then
+          if [ -d "build/MacCleaner.app" ]; then
             # ditto preserves macOS extended attributes and code signatures.
             # Never use `zip -r` for .app bundles — it strips these.
-            ditto -c -k --sequesterRsrc --keepParent MacCleaner.app "${APP_ZIP}"
+            ditto -c -k --sequesterRsrc --keepParent build/MacCleaner.app "${APP_ZIP}"
             echo "app_zip=${APP_ZIP}" >> "$GITHUB_OUTPUT"
             echo "app_zip_exists=true" >> "$GITHUB_OUTPUT"
             echo "Packaged: ${APP_ZIP} ($(du -sh ${APP_ZIP} | cut -f1))"
           else
             echo "app_zip_exists=false" >> "$GITHUB_OUTPUT"
-            echo "MacCleaner.app not found — skipping app bundle artifact."
+            echo "build/MacCleaner.app not found — skipping app bundle artifact."
           fi
 
       - name: Package CLI-only tarball
@@ -63,7 +70,7 @@ jobs:
           CLI_TAR="${CLI_DIR}.tar.gz"
 
           mkdir -p "${CLI_DIR}"
-          cp cleaner.py install.sh scheduler.sh config.json README.md "${CLI_DIR}/"
+          cp cleaner.py install.sh scheduler.sh config.json README.md AGENTS.md LICENSE "${CLI_DIR}/"
           echo "${VERSION}" > "${CLI_DIR}/VERSION"
 
           tar -czf "${CLI_TAR}" "${CLI_DIR}/"
@@ -79,7 +86,7 @@ jobs:
             echo "## Installation"
             echo ""
             echo "### Option 1 — Full App (GUI + CLI)"
-            echo "Download \`MacCleaner-${VERSION}-macos-arm64.zip\`, unzip, and run:"
+            echo "Download \`MacCleaner-${VERSION}-macos-universal.zip\`, unzip, and run:"
             echo '```bash'
             echo "bash install.sh"
             echo "open ~/Applications/MacCleaner.app"
@@ -96,9 +103,11 @@ jobs:
             echo '```'
             echo ""
             echo "## Requirements"
-            echo "- macOS 12 Monterey or later"
-            echo "- Python 3 (pre-installed on macOS)"
-            echo "- Apple Silicon (arm64) for the app bundle"
+            echo "- CLI: any macOS with Python 3 (pre-installed)"
+            echo "- App: macOS 13 Ventura or later (universal: Apple Silicon + Intel)"
+            echo ""
+            echo "## For AI agents"
+            echo "Every command supports \`--json\` — see \`AGENTS.md\` for the full machine interface."
           } > release_notes.md
 
       - name: Create GitHub Release and upload assets

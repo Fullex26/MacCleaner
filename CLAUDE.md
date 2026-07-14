@@ -4,71 +4,91 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-MacCleaner is a macOS developer storage cleanup tool with two components:
-1. **`cleaner.py`** — Python CLI (the core engine for all scan/delete logic)
-2. **`AppDelegate.swift`** — Swift menu bar app (a thin wrapper that calls the Python CLI)
+MacCleaner (v2) is a macOS developer storage cleanup tool with two components:
+1. **`cleaner.py`** — Python 3 CLI, single file, stdlib-only (the core engine for all scan/delete logic)
+2. **`app/`** — SwiftUI menu bar + dashboard app (macOS 13+), a thin client over the CLI's JSON interface
 
 ## Commands
 
-### CLI (after install)
+### CLI (subcommands are the primary interface)
 ```bash
-python3 cleaner.py               # No args = show welcome/help screen
-python3 cleaner.py --preview     # Dry run: show what would be deleted + sizes
-python3 cleaner.py --clean       # Interactive cleanup (TUI checklist via curses)
-python3 cleaner.py --clean --yes # Auto-approve all safe items (cron mode)
-python3 cleaner.py --report      # Show last 10 cleanup runs from report.log
-python3 cleaner.py --json        # JSON output (consumed by menu bar app)
-python3 cleaner.py --install-deps # Install 'rich' for pretty terminal output
-python3 cleaner.py --category xcode  # Scope run to one category only
+python3 cleaner.py                    # No args = welcome screen
+python3 cleaner.py scan               # What can be cleaned + sizes (--category, --min-size MB, --all, --json)
+python3 cleaner.py clean              # Interactive cleanup (curses TUI checklist)
+python3 cleaner.py clean --yes        # Auto-approve all safe targets (cron mode)
+python3 cleaner.py clean --targets npm-cache,pip-cache --yes --json   # Agent mode: specific IDs
+python3 cleaner.py clean --trash      # Move to ~/.Trash instead of deleting
+python3 cleaner.py projects           # Stale build artifacts (--roots, --min-age-days, --clean, --yes, --targets, --trash, --json)
+python3 cleaner.py report -n 10       # Cleanup history from report.log (--json)
+python3 cleaner.py doctor             # Environment health check (--json)
+python3 cleaner.py categories         # List categories + targets (--json)
+python3 cleaner.py config show|path|enable C|disable C|set KEY VALUE
+python3 cleaner.py install-deps       # Install 'rich' for pretty output
 ```
 
-### Config Management
-```bash
-python3 cleaner.py --config-show              # Print current config.json
-python3 cleaner.py --config-enable docker     # Enable a category
-python3 cleaner.py --config-disable ruby      # Disable a category
-```
+Every data command supports `--json`. JSON goes to **stdout**, human messages to **stderr**. Exit codes: 0 success, 1 runtime error, 2 usage error. `AGENTS.md` documents the machine contract.
 
-Available categories: `xcode`, `docker`, `node`, `python`, `caches`, `logs`, `homebrew`, `go`, `rust`, `ruby`, `cocoapods`, `gradle`, `maven`
+**Legacy v1 spellings still work** via `translate_legacy()` pre-parse translation: `--preview`, `--clean [--yes]`, `--report`, bare `--json` (maps to `scan --json` — the old menu bar app contract), `--category`, `--config-show/--config-enable/--config-disable`, `--install-deps`; also aliases `preview`→`scan`, `history`→`report`. Existing cron jobs, shell aliases, and the v1 app keep working — don't break these.
+
+Categories (17): `xcode`, `docker`, `node`, `python`, `caches`, `logs`, `homebrew`, `go`, `rust`, `ruby`, `cocoapods`, `gradle`, `maven`, `ai`, `ide`, `browsers`, `system`
+
+### Tests
+```bash
+python3 -m unittest discover -s tests    # 39 tests, stdlib only, no deps
+```
+CI runs tests + smoke tests + the app build on `macos-latest`.
 
 ### Install & Schedule
 ```bash
-bash install.sh                        # Copies to ~/mac-cleaner/, adds aliases, installs rich
-~/mac-cleaner/scheduler.sh weekly      # Cron: every Monday 9am
-~/mac-cleaner/scheduler.sh monthly     # Cron: 1st of month
-~/mac-cleaner/scheduler.sh remove      # Remove cron job
-~/mac-cleaner/scheduler.sh status      # Check current schedule
+bash install.sh                        # Copies to ~/mac-cleaner/, adds aliases, installs the app
+~/mac-cleaner/scheduler.sh weekly|monthly|remove|status
 ```
 
-After install, shell aliases are added to `~/.zshrc`: `maccleaner`, `mclean`, `mpreview`, `mreport`.
+After install, zsh aliases: `maccleaner`, `mclean`, `mpreview`, `mreport`.
 
-### Menu Bar App
-Open `AppDelegate.swift` as a new macOS app target in Xcode, build & run. No dock icon (`.accessory` activation policy).
+### App Build
+```bash
+bash app/build.sh              # swiftc → build/MacCleaner.app (universal arm64+x86_64 when possible, ad-hoc signed)
+bash app/build.sh --install    # …then copy to ~/Applications/
+```
+No Xcode project needed. The build bundles `cleaner.py` into `Contents/Resources/` as a fallback engine.
 
 ## Architecture
 
-### Python ↔ Swift Bridge
-The Swift app has **no cleaning logic** of its own. It communicates with `cleaner.py` in two ways:
-- **Background data**: calls `python3 cleaner.py --json` via `Process()`, decodes stdout into `CleanerReport` (a `Codable` struct) to update the menu bar display
-- **Interactive actions**: opens Terminal via `NSAppleScript` and runs `cleaner.py --preview` or `--clean [--yes]` there
+### Python ↔ Swift Bridge (the JSON contract)
+The Swift app has **no cleaning logic**. `CleanerBridge.swift` runs `cleaner.py` via `Process` and decodes JSON from stdout into `Codable` models (`ScanReport`, `CleanResult`, `ProjectsReport`, `HistoryReport`, `CategoriesReport`).
 
-The JSON schema (`CleanerReport` / `CleanerTarget`) is the contract between the two layers. Changes to the `--json` output format must be mirrored in the Swift structs.
+**Superset rule**: additive JSON changes (new keys) are fine — already-installed apps keep decoding. Removing or renaming keys breaks the app models in `app/Sources/CleanerBridge.swift` AND the documented contract in `AGENTS.md` — update both if you must.
+
+Engine resolution order: `MACCLEANER_ENGINE` env override (dev) → `~/mac-cleaner/cleaner.py` → bundled `Contents/Resources/cleaner.py`.
+
+### App structure (`app/Sources/`)
+- `MacCleanerApp.swift` — `MenuBarExtra` (reclaimable size, Scan, Auto-Clean Safe, Open, Quit; `LSUIElement`, no Dock icon) + window with 4 tabs
+- `DashboardView.swift` — grouped targets with checkboxes, in-app clean via `clean --targets … --yes --json`
+- `ProjectsView.swift`, `HistoryView.swift`, `SettingsView.swift` — Settings persists through `config` subcommands so CLI and app share one config
 
 ### Python cleaner.py internals
-- `get_targets(config)` — builds the list of things to potentially clean (path-based or command-based)
-- `measure_targets(targets)` — uses `du -sk` subprocess to calculate sizes
-- `delete_target(t)` — either `shutil.rmtree` for path targets, or `subprocess.run(shell=True)` for command-based targets (docker prune, pnpm store prune, etc.)
-- `run_tui_clean(targets)` — curses-based checklist UI for `--clean`; automatically falls back to y/N prompt loop if terminal is non-interactive (cron, piped output)
-- `report.log` (sibling to `cleaner.py`) stores the last 50 run entries as JSON
+- `get_targets(config)` — 60+ targets across 17 categories. Each has a **stable kebab-case `id`** (e.g. `xcode-derived-data`, `npm-cache`), `label`, `description`, `safe` bool, and either a `path` (glob patterns with `*` supported), a `cmd` (docker prune, brew cleanup, …), or `empty_only=True` (delete contents, keep dir — used for `~/Library/Caches` and `~/.Trash`)
+- `measure_targets(targets)` — parallel `du -sk` via `ThreadPoolExecutor`; cmd targets use `estimate_cmd` parsers
+- `delete_target(t, mode)` — refuses anything outside `$HOME` (and `$HOME` itself / `/`), never follows symlinks (unlinks them); `mode="trash"` moves to `~/.Trash` instead (the `trash` target always hard-deletes)
+- `scan_projects(config)` — walks `project_roots` to bounded depth for artifact dirs (`node_modules`, `.venv`, `target`, `build`, `Pods`, `.next`, …) requiring a sibling manifest (`package.json`, `Cargo.toml`, `pyproject.toml`, …) and min age (default 30 days); never descends into artifacts
+- `run_doctor(config)` — checks python, rich, config validity, install, cron, app, tool availability, disk
+- `run_tui_clean(targets)` — curses checklist; falls back to y/N prompts when non-interactive
+- `translate_legacy(argv)` — v1 flag → v2 subcommand shim, runs before argparse
+- `report.log` (sibling to `cleaner.py`) stores the last 50 runs as JSON
 
 ### Safe vs. Review distinction
-Each target has a `safe` bool. `--yes` / `auto_approve` only deletes `safe=True` targets. Review targets (`safe=False`) always require confirmation: Xcode Archives, pyenv shims, general `~/Library/Caches`.
+Each target has a `safe` bool. `--yes` / `auto_approve` only cleans `safe=True` targets. Review targets (`safe=False` — Xcode Archives, AI models, iOS backups, Trash, …) need explicit selection (`--targets id --yes` counts as consent) or interactive confirmation.
 
 ### Config
-`config.json` (sibling to `cleaner.py`) controls which categories run, paths to skip, log threshold, and auto-approve default. Installed to `~/mac-cleaner/config.json`. The Python script merges missing keys with `DEFAULT_CONFIG` at load time.
+`config.json` (sibling to `cleaner.py`; installed: `~/mac-cleaner/config.json`) — missing keys merge with `DEFAULT_CONFIG` at load. Keys: `enabled_categories`, `skip_paths`, `log_threshold_mb`, `auto_approve`, `schedule`, `delete_mode` (`"rm"` | `"trash"`), `project_roots`, `project_min_age_days`.
+
+### Env vars
+- `MACCLEANER_CONFIG` / `MACCLEANER_LOG` — override config/log paths (used by tests)
+- `MACCLEANER_ENGINE` — app-side override of the engine path (app development)
 
 ## Install Path vs. Source
-Source lives in this repo; installed copy lives at `~/mac-cleaner/`. The Swift app's `cleanerPath` is hardcoded to `~/mac-cleaner/cleaner.py`. When testing changes during development, either re-run `install.sh` or call `cleaner.py` directly from the repo path.
+Source lives in this repo; installed copy lives at `~/mac-cleaner/`, app at `~/Applications/MacCleaner.app`. When testing changes, either re-run `install.sh` or call `cleaner.py` directly from the repo path (for the app, set `MACCLEANER_ENGINE` to the repo's `cleaner.py`).
 
 ## Optional Dependency
-`rich` is optional — the script detects it at import and falls back to plain text output (`RICH = False`). All output paths have both rich and plain variants.
+`rich` is optional — detected at import, falls back to plain text (`RICH = False`). All output paths have both rich and plain variants.

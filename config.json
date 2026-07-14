@@ -12,10 +12,23 @@
     "ruby",
     "cocoapods",
     "gradle",
-    "maven"
+    "maven",
+    "ai",
+    "ide",
+    "browsers",
+    "system"
   ],
   "skip_paths": [],
   "log_threshold_mb": 100,
   "auto_approve": false,
-  "schedule": "weekly"
+  "schedule": "weekly",
+  "delete_mode": "rm",
+  "project_roots": [
+    "~/Documents",
+    "~/Developer",
+    "~/Projects",
+    "~/Code",
+    "~/dev"
+  ],
+  "project_min_age_days": 30
 }

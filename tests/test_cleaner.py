@@ -248,6 +248,30 @@ class TestDeleteSafety(unittest.TestCase):
         self.assertFalse((base / "p2" / "cache2").exists())
         self.assertTrue((base / "p1").exists())
 
+    def test_glob_respects_skip_paths(self):
+        base = self.fake_home / "profiles"
+        for name in ["keep", "clean"]:
+            (base / name / "cache2").mkdir(parents=True)
+        t = self.target(None, glob=str(base / "*" / "cache2"),
+                        skip=[str(base / "keep")])
+        freed, err = cleaner.delete_target(t)
+        self.assertIsNone(err)
+        self.assertTrue((base / "keep" / "cache2").exists(), "skip_paths must protect glob matches")
+        self.assertFalse((base / "clean" / "cache2").exists())
+
+    def test_trash_name_collisions_never_nest(self):
+        for i in range(3):
+            victim = self.fake_home / "cache"
+            victim.mkdir()
+            (victim / f"round{i}").write_text("x")
+            freed, err = cleaner.delete_target(self.target(victim), mode="trash")
+            self.assertIsNone(err)
+        trashed = sorted((self.fake_home / ".Trash").iterdir())
+        self.assertEqual(len(trashed), 3, f"each trashed copy must be a sibling, got {trashed}")
+        for d in trashed:
+            children = [c.name for c in d.iterdir()]
+            self.assertEqual(len(children), 1, "trashed dirs must not nest into each other")
+
 
 class TestProjectsScanner(unittest.TestCase):
     def setUp(self):

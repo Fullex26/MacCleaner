@@ -225,6 +225,7 @@ def get_targets(config, all_categories=False):
             "description": desc,
             "path": p,
             "glob": pattern,
+            "skip": [str(s) for s in skip] if pattern else [],
             "safe": safe,
             "cmd": cmd,
             "estimate_cmd": estimate_cmd,
@@ -424,9 +425,14 @@ def get_targets(config, all_categories=False):
 
 
 def _target_paths(t):
-    """Concrete filesystem paths for a target (glob patterns expanded)."""
+    """Concrete filesystem paths for a target (glob patterns expanded).
+
+    Glob matches are filtered against skip_paths here because the prefix
+    check in add() can only see the pattern, not its expansions."""
     if t.get("glob"):
-        return [Path(p) for p in sorted(globmod.glob(t["glob"]))]
+        skip = t.get("skip", [])
+        return [Path(p) for p in sorted(globmod.glob(t["glob"]))
+                if not any(p.startswith(s) for s in skip)]
     if t.get("path"):
         return [t["path"]]
     return []
@@ -481,9 +487,12 @@ def _move_to_trash(path: Path):
     trash = HOME / ".Trash"
     trash.mkdir(exist_ok=True)
     dest = trash / path.name
-    if dest.exists() or dest.is_symlink():
+    counter = 0
+    # Must be unique: shutil.move into an existing dir would nest inside it
+    while dest.exists() or dest.is_symlink():
+        counter += 1
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        dest = trash / f"{path.name}-maccleaner-{stamp}"
+        dest = trash / f"{path.name}-maccleaner-{stamp}-{counter}"
     shutil.move(str(path), str(dest))
 
 
