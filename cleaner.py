@@ -59,6 +59,7 @@ ALL_CATEGORIES = [
     "xcode", "docker", "node", "python", "caches", "logs", "homebrew",
     "go", "rust", "ruby", "cocoapods", "gradle", "maven",
     "ai", "ide", "browsers", "system",
+    "flutter", "php", "vms",
 ]
 
 CATEGORY_DESCRIPTIONS = {
@@ -79,6 +80,9 @@ CATEGORY_DESCRIPTIONS = {
     "ide":       "Editor caches (VS Code, JetBrains)",
     "browsers":  "Browser caches (Arc, Brave, Edge, Firefox)",
     "system":    "Trash and iOS device backups — review carefully",
+    "flutter":   "Dart & Flutter pub package cache",
+    "php":       "Composer package cache",
+    "vms":       "VM disks and container runtimes (Colima, Vagrant, minikube) — review carefully",
 }
 
 DEFAULT_CONFIG = {
@@ -186,6 +190,16 @@ def _parse_du_estimate(output):
         return 0
 
 
+def _parse_conda_estimate(output):
+    """Sum the '(N.N GB)' sizes in `conda clean --all --dry-run` output."""
+    total = 0
+    for m in re.finditer(r'\(([0-9.]+)\s*(B|KB|MB|GB|TB)\)', output):
+        val, unit = float(m.group(1)), m.group(2)
+        total += int(val * {"B": 1, "KB": 1024, "MB": 1024**2,
+                            "GB": 1024**3, "TB": 1024**4}[unit])
+    return total
+
+
 def _run_estimate(estimate_cmd, parser):
     try:
         r = subprocess.run(estimate_cmd, shell=True, capture_output=True, text=True, timeout=15)
@@ -195,6 +209,7 @@ def _run_estimate(estimate_cmd, parser):
             "brew_dry_run": _parse_brew_estimate,
             "docker_df":    _parse_docker_estimate,
             "du_path":      _parse_du_estimate,
+            "conda_dry_run": _parse_conda_estimate,
         }.get(parser, lambda _: 0)(r.stdout)
     except Exception:
         return 0
@@ -258,6 +273,10 @@ def get_targets(config, all_categories=False):
     add("xcode", "carthage-cache", "Carthage cache", "~/Library/Caches/org.carthage.CarthageKit",
         desc="Carthage dependency builds")
 
+    # Xcode (v2.1 addition — place with the other xcode adds)
+    add("xcode", "xcode-doc-cache", "Xcode documentation cache", "~/Library/Developer/Xcode/DocumentationCache",
+        desc="Downloaded documentation indexes; re-fetched on demand")
+
     # Docker
     add("docker", "docker-prune", "Docker unused data", None,
         cmd="docker system prune -f --filter 'until=168h' 2>/dev/null || true",
@@ -284,6 +303,12 @@ def get_targets(config, all_categories=False):
     add("node", "node-gyp-cache", "node-gyp cache", "~/Library/Caches/node-gyp",
         desc="Node.js headers downloaded for native module builds")
 
+    # Node (v2.1 additions)
+    add("node", "yarn-global-cache", "Yarn classic global cache", "~/Library/Caches/Yarn",
+        desc="Yarn v1 global package cache (separate from ~/.yarn/cache)")
+    add("node", "npm-logs", "npm logs", "~/.npm/_logs",
+        desc="npm debug log files")
+
     # Python
     add("python", "pip-cache", "pip cache", "~/Library/Caches/pip",
         desc="pip download/wheel cache")
@@ -296,6 +321,13 @@ def get_targets(config, all_categories=False):
     add("python", "pyenv-shims", "pyenv shims cache", "~/.pyenv/shims", safe=False,
         desc="pyenv shim binaries — regenerate with 'pyenv rehash' after deleting")
 
+    # Python (v2.1 additions)
+    add("python", "conda-clean", "Conda caches", None,
+        cmd="conda clean --all --yes 2>/dev/null || true",
+        estimate_cmd="conda clean --all --dry-run 2>/dev/null",
+        estimate_parser="conda_dry_run",
+        desc="Unused conda packages, tarballs, and index caches (conda clean --all)")
+
     # AI models
     add("ai", "huggingface-hub", "Hugging Face hub cache", "~/.cache/huggingface", safe=False,
         desc="Downloaded models/datasets — can be very large; re-downloaded on demand")
@@ -303,6 +335,12 @@ def get_targets(config, all_categories=False):
         desc="Downloaded PyTorch models and weights")
     add("ai", "ollama-models", "Ollama models", "~/.ollama/models", safe=False,
         desc="Local Ollama models — re-pull with 'ollama pull' if needed")
+
+    # AI models (v2.1 additions)
+    add("ai", "lm-studio-models", "LM Studio models", "~/.lmstudio/models", safe=False,
+        desc="Downloaded LM Studio models — re-download from the app if needed")
+    add("ai", "whisper-models", "Whisper models", "~/.cache/whisper", safe=False,
+        desc="Downloaded OpenAI Whisper models")
 
     # IDE / editors
     add("ide", "vscode-cache", "VS Code cache", "~/Library/Application Support/Code/Cache",
@@ -349,6 +387,19 @@ def get_targets(config, all_categories=False):
         desc="Playwright browser binaries — re-download with 'npx playwright install'")
     add("caches", "puppeteer-cache", "Puppeteer cache", "~/.cache/puppeteer", safe=False,
         desc="Puppeteer downloaded Chromium builds")
+
+    # App caches (v2.1 additions — place with the other caches adds)
+    add("caches", "cypress-cache", "Cypress binary cache", "~/Library/Caches/Cypress", safe=False,
+        desc="Cypress browser/runner binaries — re-download with 'cypress install'")
+    add("caches", "teams-cache", "Microsoft Teams cache", "~/Library/Caches/com.microsoft.teams2",
+        desc="Microsoft Teams (new) app cache")
+    add("caches", "zoom-updater", "Zoom installer cache", "~/Library/Application Support/zoom.us/AutoUpdater",
+        desc="Downloaded Zoom update installers")
+    add("caches", "terraform-plugin-cache", "Terraform plugin cache", "~/.terraform.d/plugin-cache",
+        desc="Cached provider plugins; re-downloaded on 'terraform init'")
+    add("caches", "expo-cache", "Expo cache", "~/.expo/cache",
+        desc="Expo CLI download cache")
+
     add("caches", "general-caches", "General app caches", "~/Library/Caches", safe=False, empty_only=True,
         desc="Everything in ~/Library/Caches — broad; review before deleting")
 
@@ -376,6 +427,10 @@ def get_targets(config, all_categories=False):
     add("rust", "cargo-git", "Cargo git cache", "~/.cargo/git",
         desc="Cargo git dependency checkouts")
 
+    # Rust (v2.1 addition — place with the other rust adds)
+    add("rust", "sccache-cache", "sccache cache", "~/Library/Caches/Mozilla.sccache",
+        desc="Shared compilation cache; rebuilt on demand")
+
     # Ruby
     add("ruby", "gem-cleanup", "Ruby gem cleanup", None,
         cmd="gem cleanup 2>/dev/null || true",
@@ -398,6 +453,22 @@ def get_targets(config, all_categories=False):
         desc="Permanently delete everything in the Trash")
     add("system", "ios-backups", "iOS device backups", "~/Library/Application Support/MobileSync/Backup", safe=False,
         desc="Local iPhone/iPad backups — only delete if backed up to iCloud or elsewhere")
+
+    # Flutter / Dart
+    add("flutter", "dart-pub-cache", "Dart pub cache", "~/.pub-cache",
+        desc="Dart & Flutter packages; repopulated by 'dart pub get' / 'flutter pub get'")
+
+    # PHP
+    add("php", "composer-cache", "Composer cache", "~/Library/Caches/composer",
+        desc="Composer package download cache")
+
+    # VMs / container runtimes
+    add("vms", "colima-vm", "Colima VM", "~/.colima", safe=False,
+        desc="Colima VM disks — deleting removes the VM including its containers and images")
+    add("vms", "vagrant-boxes", "Vagrant boxes", "~/.vagrant.d/boxes", safe=False,
+        desc="Downloaded Vagrant base boxes — large re-downloads")
+    add("vms", "minikube-cache", "minikube cache", "~/.minikube/cache",
+        desc="Cached minikube images and binaries; re-fetched on demand")
 
     # Logs (dynamic)
     threshold = config.get("log_threshold_mb", 100) * 1024 * 1024
@@ -1046,7 +1117,8 @@ def run_doctor(config, json_mode=False):
     check("Menu bar app", "installed" if any(p.exists() for p in app_paths) else "not installed")
 
     for tool in ["brew", "docker", "xcrun", "node", "npm", "pnpm", "yarn", "bun", "deno",
-                 "go", "cargo", "gem", "pod", "gradle", "mvn", "uv", "ollama"]:
+                 "go", "cargo", "gem", "pod", "gradle", "mvn", "uv", "ollama",
+                 "conda", "dart", "composer", "terraform", "colima", "vagrant", "minikube"]:
         present = shutil.which(tool) is not None
         check(f"tool: {tool}", "found" if present else "not found (its targets will be skipped)")
 

@@ -431,5 +431,50 @@ class TestCLIIntegration(unittest.TestCase):
         self.assertIn("runs", data)
 
 
+class TestNewTargetsV21(unittest.TestCase):
+    """Engine v2.1: new categories and targets."""
+
+    def setUp(self):
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        self.targets = {t["id"]: t
+                        for t in cleaner.get_targets(self.cfg, all_categories=True)}
+
+    def test_new_categories_registered(self):
+        for cat in ["flutter", "php", "vms"]:
+            self.assertIn(cat, cleaner.ALL_CATEGORIES)
+            self.assertIn(cat, cleaner.CATEGORY_DESCRIPTIONS)
+
+    def test_new_target_ids_present(self):
+        for tid in ["dart-pub-cache", "composer-cache", "colima-vm", "vagrant-boxes",
+                    "minikube-cache", "yarn-global-cache", "npm-logs", "conda-clean",
+                    "sccache-cache", "lm-studio-models", "whisper-models",
+                    "xcode-doc-cache", "cypress-cache", "teams-cache", "zoom-updater",
+                    "terraform-plugin-cache", "expo-cache"]:
+            self.assertIn(tid, self.targets, f"missing target {tid}")
+
+    def test_new_review_flags(self):
+        for tid in ["colima-vm", "vagrant-boxes", "lm-studio-models",
+                    "whisper-models", "cypress-cache"]:
+            self.assertFalse(self.targets[tid]["safe"], f"{tid} must be review-level")
+        for tid in ["dart-pub-cache", "composer-cache", "minikube-cache",
+                    "conda-clean", "teams-cache", "yarn-global-cache", "npm-logs",
+                    "sccache-cache", "xcode-doc-cache", "zoom-updater",
+                    "terraform-plugin-cache", "expo-cache"]:
+            self.assertTrue(self.targets[tid]["safe"], f"{tid} should be safe")
+
+    def test_conda_is_cmd_target(self):
+        t = self.targets["conda-clean"]
+        self.assertIsNone(t["path"])
+        self.assertIn("conda clean", t["cmd"])
+        self.assertIn("--dry-run", t["estimate_cmd"])
+
+    def test_conda_estimate_parser(self):
+        out = ("Will remove 132 (1.5 GB) tarball(s).\n"
+               "Will remove 10 index cache(s).\n"
+               "Will remove 200 (512.0 MB) package(s).\n")
+        self.assertEqual(cleaner._parse_conda_estimate(out),
+                         int(1.5 * 1024**3) + int(512.0 * 1024**2))
+
+
 if __name__ == "__main__":
     unittest.main()
