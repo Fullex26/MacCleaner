@@ -52,6 +52,8 @@ except ImportError:
 HOME = Path.home()
 CONFIG_PATH = Path(os.environ.get("MACCLEANER_CONFIG", Path(__file__).parent / "config.json"))
 LOG_PATH = Path(os.environ.get("MACCLEANER_LOG", Path(__file__).parent / "report.log"))
+SNAPSHOTS_PATH = Path(os.environ.get("MACCLEANER_SNAPSHOTS", Path(__file__).parent / "snapshots.log"))
+SNAPSHOT_CAP = 365
 VERSION = "2.0.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
@@ -851,7 +853,8 @@ def scan_json(targets, extra=None):
     print(json.dumps(output, indent=2))
 
 
-def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=False):
+def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=False,
+              snapshot_scope="partial"):
     """Clean targets. explicit=True means the selection was made via --targets."""
     say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
 
@@ -930,6 +933,13 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
                     say(f"    → Skipped")
 
     write_log(total_freed, results)
+
+    if snapshot_scope == "full":
+        cleaned = {r["id"] for r in results if r["status"] in ("deleted", "trashed")}
+        remaining = [t for t in targets if t["id"] not in cleaned]
+        record_snapshot(*snapshot_fields(remaining))
+    else:
+        record_snapshot()
 
     if json_mode:
         print(json.dumps({
@@ -1215,18 +1225,120 @@ def write_log(total_freed: int, results: list):
         json.dump(logs, f, indent=2)
 
 
+# ── Disk snapshots ──────────────────────────────────────────────────────────────
+def load_snapshots():
+    if not SNAPSHOTS_PATH.exists():
+        return []
+    try:
+        with open(SNAPSHOTS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def record_snapshot(reclaimable_bytes=None, categories=None):
+    """Append a disk snapshot; a snapshot in the same clock hour replaces the last.
+
+    None reclaimable/categories = the run only measured part of the target set,
+    so only the disk numbers are trustworthy."""
+    ds = disk_stats()
+    entry = {
+        "ts": datetime.datetime.now().isoformat(),
+        "disk_total_bytes": ds["total_bytes"],
+        "disk_free_bytes": ds["free_bytes"],
+        "reclaimable_bytes": reclaimable_bytes,
+        "categories": categories,
+    }
+    try:
+        snaps = load_snapshots()
+        if snaps and snaps[-1].get("ts", "")[:13] == entry["ts"][:13]:
+            snaps[-1] = entry
+        else:
+            snaps.append(entry)
+        snaps = snaps[-SNAPSHOT_CAP:]
+        with open(SNAPSHOTS_PATH, "w") as f:
+            json.dump(snaps, f, indent=2)
+    except Exception as e:
+        print(f"Warning: could not write snapshot: {e}", file=sys.stderr)
+
+
+def snapshot_fields(measured_targets):
+    """(reclaimable_bytes, categories) sums from a fully measured target list."""
+    total, cats = 0, {}
+    for t in measured_targets:
+        size = t.get("size") or 0
+        total += size
+        cats[t["category"]] = cats.get(t["category"], 0) + size
+    return total, cats
+
+
+def _nearest_snapshot(snaps, days_ago):
+    goal = datetime.datetime.now() - datetime.timedelta(days=days_ago)
+    best, best_delta = None, None
+    for s in snaps:
+        try:
+            ts = datetime.datetime.fromisoformat(s["ts"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        delta = abs((ts - goal).total_seconds())
+        if best_delta is None or delta < best_delta:
+            best, best_delta = s, delta
+    return best
+
+
+def format_disk_trend(snaps):
+    """Lines comparing current free space with ~7d/~30d-ago snapshots, or None."""
+    if len(snaps) < 2:
+        return None
+    now = datetime.datetime.now()
+    now_free = disk_stats()["free_bytes"]
+    lines = [f"Free now: {fmt_size(now_free)}"]
+    seen = set()
+    for days in (7, 30):
+        s = _nearest_snapshot(snaps, days)
+        if not s or s["ts"] in seen:
+            continue
+        seen.add(s["ts"])
+        try:
+            age = max(0, (now - datetime.datetime.fromisoformat(s["ts"])).days)
+        except (TypeError, ValueError):
+            continue
+        delta = now_free - s["disk_free_bytes"]
+        sign = "+" if delta >= 0 else "-"
+        lines.append(f"{age}d ago: {fmt_size(s['disk_free_bytes'])} free "
+                     f"({sign}{fmt_size(abs(delta))} free since)")
+    return lines if len(lines) > 1 else None
+
+
+def _print_disk_trend(snaps):
+    lines = format_disk_trend(snaps)
+    if not lines:
+        return
+    if RICH:
+        console.print(Panel("\n".join(lines), title="💾 Disk trend", border_style="cyan"))
+    else:
+        print("  Disk trend:")
+        for line in lines:
+            print(f"    {line}")
+        print()
+
+
 def show_report(limit=10, json_mode=False):
+    disk_history = {"current": disk_stats(), "snapshots": load_snapshots()}
     if not LOG_PATH.exists():
         if json_mode:
-            print(json.dumps({"version": VERSION, "runs": []}))
+            print(json.dumps({"version": VERSION, "runs": [], "disk_history": disk_history}))
         else:
             print("No cleanup history found. Run 'maccleaner clean' first.")
+            _print_disk_trend(disk_history["snapshots"])
         return
     with open(LOG_PATH) as f:
         logs = json.load(f)
 
     if json_mode:
-        print(json.dumps({"version": VERSION, "runs": logs[-limit:]}, indent=2))
+        print(json.dumps({"version": VERSION, "runs": logs[-limit:],
+                          "disk_history": disk_history}, indent=2))
     elif RICH:
         table = Table(title="📊 Cleanup History", show_lines=True)
         table.add_column("Date", style="cyan")
@@ -1236,6 +1348,7 @@ def show_report(limit=10, json_mode=False):
             ts = entry["timestamp"][:16].replace("T", " ")
             table.add_row(ts, entry["total_freed_human"], entry["disk_after"])
         console.print(table)
+        _print_disk_trend(disk_history["snapshots"])
     else:
         print(f"\n{'='*60}")
         print(f"Cleanup History (last {limit} runs)")
@@ -1244,6 +1357,7 @@ def show_report(limit=10, json_mode=False):
             ts = entry["timestamp"][:16].replace("T", " ")
             print(f"  {ts}  Freed: {entry['total_freed_human']:>10}  {entry['disk_after']}")
         print(f"{'='*60}\n")
+        _print_disk_trend(disk_history["snapshots"])
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
@@ -1444,6 +1558,11 @@ def main():
     if args.command == "scan":
         if args.min_size is not None:
             targets = filter_targets(targets, min_size_mb=args.min_size)
+        targets = measure_targets(targets)
+        if categories or args.min_size is not None:
+            record_snapshot()  # partial selection: disk numbers only
+        else:
+            record_snapshot(*snapshot_fields(targets))
         if args.json:
             scan_json(targets)
         else:
@@ -1465,7 +1584,9 @@ def main():
             targets = filter_targets(targets, min_size_mb=args.min_size)
         auto = args.yes or config.get("auto_approve", False)
         mode = "trash" if args.trash else config.get("delete_mode", "rm")
-        run_clean(targets, auto_approve=auto, mode=mode, json_mode=args.json, explicit=explicit)
+        full = not explicit and not categories and args.min_size is None
+        run_clean(targets, auto_approve=auto, mode=mode, json_mode=args.json,
+                  explicit=explicit, snapshot_scope="full" if full else "partial")
         return
 
 

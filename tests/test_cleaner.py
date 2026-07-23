@@ -4,6 +4,7 @@
 Run:  python3 -m unittest discover -s tests -v
 """
 
+import datetime
 import json
 import os
 import shutil
@@ -358,7 +359,8 @@ class TestCLIIntegration(unittest.TestCase):
         cls.env = {**os.environ,
                    "HOME": str(cls.home),
                    "MACCLEANER_CONFIG": str(cls.cfg_path),
-                   "MACCLEANER_LOG": str(cls.tmp / "report.log")}
+                   "MACCLEANER_LOG": str(cls.tmp / "report.log"),
+                   "MACCLEANER_SNAPSHOTS": str(cls.tmp / "snapshots.log")}
 
     @classmethod
     def tearDownClass(cls):
@@ -430,6 +432,21 @@ class TestCLIIntegration(unittest.TestCase):
         data = json.loads(r.stdout)
         self.assertIn("runs", data)
 
+    def test_scan_records_snapshot(self):
+        r = self.run_cli("scan", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(Path(self.env["MACCLEANER_SNAPSHOTS"]).exists())
+
+    def test_report_json_has_disk_history(self):
+        self.run_cli("scan", "--json")
+        r = self.run_cli("report", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertIn("disk_history", data)
+        self.assertIn("current", data["disk_history"])
+        self.assertIn("snapshots", data["disk_history"])
+        self.assertIn("runs", data)  # existing key untouched
+
 
 class TestNewTargetsV21(unittest.TestCase):
     """Engine v2.1: new categories and targets."""
@@ -474,6 +491,83 @@ class TestNewTargetsV21(unittest.TestCase):
                "Will remove 200 (512.0 MB) package(s).\n")
         self.assertEqual(cleaner._parse_conda_estimate(out),
                          int(1.5 * 1024**3) + int(512.0 * 1024**2))
+
+
+class TestSnapshots(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.orig = cleaner.SNAPSHOTS_PATH
+        cleaner.SNAPSHOTS_PATH = self.tmp / "snapshots.log"
+
+    def tearDown(self):
+        cleaner.SNAPSHOTS_PATH = self.orig
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_record_creates_file_with_fields(self):
+        cleaner.record_snapshot(1234, {"node": 1234})
+        snaps = cleaner.load_snapshots()
+        self.assertEqual(len(snaps), 1)
+        for key in ["ts", "disk_total_bytes", "disk_free_bytes",
+                    "reclaimable_bytes", "categories"]:
+            self.assertIn(key, snaps[0])
+        self.assertEqual(snaps[0]["reclaimable_bytes"], 1234)
+
+    def test_partial_records_null_fields(self):
+        cleaner.record_snapshot()
+        s = cleaner.load_snapshots()[0]
+        self.assertIsNone(s["reclaimable_bytes"])
+        self.assertIsNone(s["categories"])
+        self.assertGreater(s["disk_free_bytes"], 0)
+
+    def test_same_hour_replaces(self):
+        cleaner.record_snapshot(100, {})
+        cleaner.record_snapshot(200, {})
+        snaps = cleaner.load_snapshots()
+        self.assertEqual(len(snaps), 1, "same-hour snapshots must replace, not append")
+        self.assertEqual(snaps[0]["reclaimable_bytes"], 200)
+
+    def test_cap_365(self):
+        base = datetime.datetime(2025, 1, 1)
+        snaps = [{"ts": (base + datetime.timedelta(hours=i)).isoformat(),
+                  "disk_total_bytes": 1, "disk_free_bytes": 1,
+                  "reclaimable_bytes": i, "categories": {}} for i in range(365)]
+        cleaner.SNAPSHOTS_PATH.write_text(json.dumps(snaps))
+        cleaner.record_snapshot(999, {})
+        out = cleaner.load_snapshots()
+        self.assertEqual(len(out), 365)
+        self.assertEqual(out[-1]["reclaimable_bytes"], 999)
+        self.assertEqual(out[0]["reclaimable_bytes"], 1, "oldest entry must drop")
+
+    def test_corrupt_file_recovers(self):
+        cleaner.SNAPSHOTS_PATH.write_text("{not json")
+        cleaner.record_snapshot(42, {})
+        snaps = cleaner.load_snapshots()
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0]["reclaimable_bytes"], 42)
+
+    def test_snapshot_fields_sums(self):
+        targets = [{"category": "node", "size": 100}, {"category": "node", "size": 50},
+                   {"category": "xcode", "size": 25}]
+        total, cats = cleaner.snapshot_fields(targets)
+        self.assertEqual(total, 175)
+        self.assertEqual(cats, {"node": 150, "xcode": 25})
+
+    def test_format_disk_trend_needs_two(self):
+        self.assertIsNone(cleaner.format_disk_trend([]))
+        cleaner.record_snapshot(1, {})
+        self.assertIsNone(cleaner.format_disk_trend(cleaner.load_snapshots()))
+
+    def test_format_disk_trend_lines(self):
+        now = datetime.datetime.now()
+        snaps = [{"ts": (now - datetime.timedelta(days=8)).isoformat(),
+                  "disk_total_bytes": 100, "disk_free_bytes": 50,
+                  "reclaimable_bytes": None, "categories": None},
+                 {"ts": (now - datetime.timedelta(days=1)).isoformat(),
+                  "disk_total_bytes": 100, "disk_free_bytes": 60,
+                  "reclaimable_bytes": None, "categories": None}]
+        lines = cleaner.format_disk_trend(snaps)
+        self.assertTrue(lines[0].startswith("Free now:"))
+        self.assertTrue(any("8d ago" in ln for ln in lines))
 
 
 if __name__ == "__main__":
