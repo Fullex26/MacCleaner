@@ -580,5 +580,101 @@ class TestSnapshots(unittest.TestCase):
         self.assertTrue(any("8d ago" in ln for ln in lines))
 
 
+class TestGitAwareProjects(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "Code"
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        self.old = 1_000_000_000
+        # Isolate from the user's global git config (gpgsign, hooks, etc.)
+        self.git_env = {**os.environ,
+                        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+                        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _git(self, cwd, *args):
+        subprocess.run(["git", "-C", str(cwd), *args],
+                       capture_output=True, check=True, env=self.git_env)
+
+    def make_project(self, name):
+        proj = self.root / name
+        (proj / "node_modules" / "x").mkdir(parents=True)
+        (proj / "package.json").write_text("{}")
+        os.utime(proj / "node_modules", (self.old, self.old))
+        return proj
+
+    def make_repo(self, name, dirty=False, pushed=True):
+        proj = self.make_project(name)
+        (proj / ".gitignore").write_text("node_modules/\n")
+        self._git(proj, "init", "-q")
+        self._git(proj, "add", ".gitignore", "package.json")
+        self._git(proj, "commit", "-qm", "init")
+        if pushed:
+            remote = self.tmp / f"{name}-remote.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(remote)],
+                           capture_output=True, check=True, env=self.git_env)
+            self._git(proj, "remote", "add", "origin", str(remote))
+            self._git(proj, "push", "-q", "origin", "HEAD")
+        if dirty:
+            (proj / "wip.txt").write_text("uncommitted")
+        return proj
+
+    def test_git_states_detected(self):
+        self.make_repo("cleanproj", dirty=False, pushed=True)
+        self.make_repo("dirtyproj", dirty=True, pushed=True)
+        self.make_repo("unpushedproj", dirty=False, pushed=False)
+        self.make_project("norepo")
+        hits, _, _ = cleaner.scan_projects(self.cfg, roots=[str(self.root)])
+        by_name = {Path(h["project"]).name: h for h in hits}
+        self.assertEqual(by_name["cleanproj"]["git"], {"dirty": False, "unpushed": False})
+        self.assertEqual(by_name["dirtyproj"]["git"], {"dirty": True, "unpushed": False})
+        self.assertEqual(by_name["unpushedproj"]["git"], {"dirty": False, "unpushed": True})
+        self.assertIsNone(by_name["norepo"]["git"])
+
+    def test_git_check_disabled_by_config(self):
+        self.make_repo("dirtyproj", dirty=True)
+        self.cfg["project_git_check"] = False
+        hits, _, _ = cleaner.scan_projects(self.cfg, roots=[str(self.root)])
+        self.assertTrue(all(h["git"] is None for h in hits))
+
+    def test_flagged_targets_get_badges_and_flag(self):
+        self.make_repo("dirtyproj", dirty=True, pushed=True)
+        hits, _, _ = cleaner.scan_projects(self.cfg, roots=[str(self.root)])
+        t = cleaner.projects_to_targets(hits)[0]
+        self.assertIn("[dirty]", t["label"])
+        self.assertTrue(cleaner._git_flagged(t))
+        self.assertEqual(t["git"], {"dirty": True, "unpushed": False})
+
+    def test_clean_repo_not_flagged(self):
+        self.make_repo("cleanproj", dirty=False, pushed=True)
+        hits, _, _ = cleaner.scan_projects(self.cfg, roots=[str(self.root)])
+        t = cleaner.projects_to_targets(hits)[0]
+        self.assertNotIn("[", t["label"])
+        self.assertFalse(cleaner._git_flagged(t))
+
+    def test_yes_never_sweeps_flagged(self):
+        self.make_repo("dirtyproj", dirty=True, pushed=True)
+        self.make_repo("cleanproj", dirty=False, pushed=True)
+        cfg_path = self.tmp / "config.json"
+        cfg_path.write_text(json.dumps({"project_roots": [str(self.root)],
+                                        "project_min_age_days": 0}))
+        env = {**os.environ, "HOME": str(self.tmp),
+               "MACCLEANER_CONFIG": str(cfg_path),
+               "MACCLEANER_LOG": str(self.tmp / "report.log"),
+               "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log")}
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "projects", "--clean", "--yes", "--json"],
+                           capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue((self.root / "dirtyproj" / "node_modules").exists(),
+                        "dirty project must survive --yes")
+        self.assertFalse((self.root / "cleanproj" / "node_modules").exists(),
+                         "clean project should be swept by --yes")
+        self.assertIn("dirtyproj", r.stderr, "skip note should name the project")
+
+
 if __name__ == "__main__":
     unittest.main()

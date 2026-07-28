@@ -96,6 +96,7 @@ DEFAULT_CONFIG = {
     "delete_mode": "rm",  # "rm" = delete immediately, "trash" = move to ~/.Trash
     "project_roots": ["~/Documents", "~/Developer", "~/Projects", "~/Code", "~/dev"],
     "project_min_age_days": 30,
+    "project_git_check": True,
 }
 
 
@@ -979,6 +980,32 @@ ARTIFACT_MANIFESTS = {
 PROJECT_SCAN_MAX_DEPTH = 5
 
 
+def _git_info(project_dir):
+    """Git activity signals for a project dir, or None when unknowable.
+
+    Returns {"dirty": bool, "unpushed": bool}. A repo with no remotes counts
+    as unpushed — its commits exist nowhere else. Any git failure (not a repo,
+    git missing, timeout) degrades to None rather than blocking the scan."""
+    def run(*args):
+        return subprocess.run(["git", "-C", str(project_dir), *args],
+                              capture_output=True, text=True, timeout=2)
+    try:
+        r = run("rev-parse", "--is-inside-work-tree")
+        if r.returncode != 0 or r.stdout.strip() != "true":
+            return None
+        dirty = bool(run("status", "--porcelain").stdout.strip())
+        count = run("rev-list", "--count", "--branches", "--not", "--remotes").stdout.strip()
+        return {"dirty": dirty, "unpushed": count not in ("", "0")}
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+
+def _git_flagged(t):
+    """True when a project target has uncommitted or unpushed work."""
+    git = t.get("git")
+    return bool(git and (git.get("dirty") or git.get("unpushed")))
+
+
 def scan_projects(config, roots=None, min_age_days=None):
     """Find stale build-artifact directories under the configured project roots."""
     root_strs = roots if roots else config.get("project_roots", [])
@@ -1035,6 +1062,14 @@ def scan_projects(config, roots=None, min_age_days=None):
         sizes = list(pool.map(lambda h: get_size(Path(h["path"])), hits))
     for h, s in zip(hits, sizes):
         h["size_bytes"] = s
+    if config.get("project_git_check", True):
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            infos = list(pool.map(lambda h: _git_info(h["project"]), hits))
+        for h, info in zip(hits, infos):
+            h["git"] = info
+    else:
+        for h in hits:
+            h["git"] = None
     hits.sort(key=lambda h: h["size_bytes"], reverse=True)
     return hits, [str(r) for r in roots], min_age
 
@@ -1042,12 +1077,17 @@ def scan_projects(config, roots=None, min_age_days=None):
 def projects_to_targets(hits):
     targets = []
     for h in hits:
+        git = h.get("git")
+        flags = [name for name, on in (("dirty", git and git.get("dirty")),
+                                       ("unpushed", git and git.get("unpushed"))) if on]
+        badge = "".join(f" [{f}]" for f in flags)
         rel = os.path.relpath(h["path"], str(HOME))
         targets.append({
             "id": f"project-{slugify(rel)}",
             "category": "projects",
-            "label": f"{h['kind']} — {os.path.relpath(h['project'], str(HOME))}",
-            "description": f"Stale {h['kind']} ({h['age_days']} days old)",
+            "label": f"{h['kind']} — {os.path.relpath(h['project'], str(HOME))}{badge}",
+            "description": f"Stale {h['kind']} ({h['age_days']} days old)"
+                           + (f" — git: {', '.join(flags)}" if flags else ""),
             "path": Path(h["path"]),
             "glob": None,
             "safe": False,
@@ -1057,8 +1097,18 @@ def projects_to_targets(hits):
             "empty_only": False,
             "size": h["size_bytes"],
             "exists": True,
+            "git": git,
         })
     return targets
+
+
+def _git_label(h):
+    git = h.get("git")
+    if not git:
+        return "—"
+    flags = [f for f, on in (("dirty", git.get("dirty")),
+                             ("unpushed", git.get("unpushed"))) if on]
+    return ", ".join(flags) if flags else "clean"
 
 
 def print_projects(hits, roots, min_age):
@@ -1068,10 +1118,11 @@ def print_projects(hits, roots, min_age):
         table.add_column("Artifact", style="cyan")
         table.add_column("Project", style="white")
         table.add_column("Age", justify="right")
+        table.add_column("Git", style="magenta")
         table.add_column("Size", style="yellow", justify="right")
         for h in hits:
             table.add_row(h["kind"], os.path.relpath(h["project"], str(HOME)),
-                          f"{h['age_days']}d", fmt_size(h["size_bytes"]))
+                          f"{h['age_days']}d", _git_label(h), fmt_size(h["size_bytes"]))
         console.print(table)
         console.print(Panel(
             f"[bold green]Total: {fmt_size(total)}[/bold green] across {len(hits)} artifacts\n"
@@ -1085,7 +1136,7 @@ def print_projects(hits, roots, min_age):
         print(f"{'='*72}")
         for h in hits:
             proj = os.path.relpath(h["project"], str(HOME))
-            print(f"  {h['kind']:<14} {proj:<40} {h['age_days']:>4}d {fmt_size(h['size_bytes']):>10}")
+            print(f"  {h['kind']:<14} {proj:<36} {h['age_days']:>4}d {_git_label(h):>10} {fmt_size(h['size_bytes']):>10}")
         print(f"\n  Total: {fmt_size(total)} across {len(hits)} artifacts")
         print(f"  Roots scanned: {', '.join(roots)}")
         print(f"\n  → Run 'maccleaner projects --clean' to remove them")
@@ -1523,6 +1574,15 @@ def main():
                 if missing:
                     print(f"Unknown artifact IDs: {', '.join(sorted(missing))}", file=sys.stderr)
                     sys.exit(1)
+            if args.yes and not args.targets:
+                flagged = [t for t in targets if _git_flagged(t)]
+                if flagged:
+                    print("Skipping projects with uncommitted or unpushed work "
+                          "(select explicitly with --targets to clean them):",
+                          file=sys.stderr)
+                    for t in flagged:
+                        print(f"  {t['id']}  {t['label']}", file=sys.stderr)
+                    targets = [t for t in targets if not _git_flagged(t)]
             mode = "trash" if args.trash else config.get("delete_mode", "rm")
             run_clean(targets, auto_approve=args.yes, mode=mode,
                       json_mode=args.json, explicit=bool(args.targets) or args.yes)
