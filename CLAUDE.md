@@ -18,7 +18,8 @@ python3 cleaner.py clean              # Interactive cleanup (curses TUI checklis
 python3 cleaner.py clean --yes        # Auto-approve all safe targets (cron mode)
 python3 cleaner.py clean --targets npm-cache,pip-cache --yes --json   # Agent mode: specific IDs
 python3 cleaner.py clean --trash      # Move to ~/.Trash instead of deleting
-python3 cleaner.py projects           # Stale build artifacts (--roots, --min-age-days, --clean, --yes, --targets, --trash, --json)
+python3 cleaner.py clean --dry-run --json   # Preview exact paths/sizes a clean would touch, zero side effects
+python3 cleaner.py projects           # Stale build artifacts (--roots, --min-age-days, --clean, --yes, --targets, --trash, --dry-run, --json)
 python3 cleaner.py report -n 10       # Cleanup history from report.log (--json)
 python3 cleaner.py doctor             # Environment health check (--json)
 python3 cleaner.py categories         # List categories + targets (--json)
@@ -30,11 +31,11 @@ Every data command supports `--json`. JSON goes to **stdout**, human messages to
 
 **Legacy v1 spellings still work** via `translate_legacy()` pre-parse translation: `--preview`, `--clean [--yes]`, `--report`, bare `--json` (maps to `scan --json` — the old menu bar app contract), `--category`, `--config-show/--config-enable/--config-disable`, `--install-deps`; also aliases `preview`→`scan`, `history`→`report`. Existing cron jobs, shell aliases, and the v1 app keep working — don't break these.
 
-Categories (17): `xcode`, `docker`, `node`, `python`, `caches`, `logs`, `homebrew`, `go`, `rust`, `ruby`, `cocoapods`, `gradle`, `maven`, `ai`, `ide`, `browsers`, `system`
+Categories (20): `xcode`, `docker`, `node`, `python`, `caches`, `logs`, `homebrew`, `go`, `rust`, `ruby`, `cocoapods`, `gradle`, `maven`, `ai`, `ide`, `browsers`, `system`, `flutter`, `php`, `vms`
 
 ### Tests
 ```bash
-python3 -m unittest discover -s tests    # 39 tests, stdlib only, no deps
+python3 -m unittest discover -s tests    # 69 tests, stdlib only, no deps
 ```
 CI runs tests + smoke tests + the app build on `macos-latest`.
 
@@ -68,23 +69,25 @@ Engine resolution order: `MACCLEANER_ENGINE` env override (dev) → `~/mac-clean
 - `ProjectsView.swift`, `HistoryView.swift`, `SettingsView.swift` — Settings persists through `config` subcommands so CLI and app share one config
 
 ### Python cleaner.py internals
-- `get_targets(config)` — 60+ targets across 17 categories. Each has a **stable kebab-case `id`** (e.g. `xcode-derived-data`, `npm-cache`), `label`, `description`, `safe` bool, and either a `path` (glob patterns with `*` supported), a `cmd` (docker prune, brew cleanup, …), or `empty_only=True` (delete contents, keep dir — used for `~/Library/Caches` and `~/.Trash`)
+- `get_targets(config)` — 70+ targets across 20 categories. Each has a **stable kebab-case `id`** (e.g. `xcode-derived-data`, `npm-cache`), `label`, `description`, `safe` bool, and either a `path` (glob patterns with `*` supported), a `cmd` (docker prune, brew cleanup, …), or `empty_only=True` (delete contents, keep dir — used for `~/Library/Caches` and `~/.Trash`)
 - `measure_targets(targets)` — parallel `du -sk` via `ThreadPoolExecutor`; cmd targets use `estimate_cmd` parsers
 - `delete_target(t, mode)` — refuses anything outside `$HOME` (and `$HOME` itself / `/`), never follows symlinks (unlinks them); `mode="trash"` moves to `~/.Trash` instead (the `trash` target always hard-deletes)
-- `scan_projects(config)` — walks `project_roots` to bounded depth for artifact dirs (`node_modules`, `.venv`, `target`, `build`, `Pods`, `.next`, …) requiring a sibling manifest (`package.json`, `Cargo.toml`, `pyproject.toml`, …) and min age (default 30 days); never descends into artifacts
+- `run_dry_run(targets, mode, json_mode)` — resolves exactly what a real `clean` would delete (concrete paths + sizes, or the command that would run) without deleting anything or writing to `report.log`/`snapshots.log`; used by `clean --dry-run` and `projects --dry-run`
+- `scan_projects(config)` — walks `project_roots` to bounded depth for artifact dirs (`node_modules`, `.venv`, `target`, `build`, `Pods`, `.next`, …) requiring a sibling manifest (`package.json`, `Cargo.toml`, `pyproject.toml`, …) and min age (default 30 days); never descends into artifacts. When `project_git_check` is on (default), each hit's project dir is also checked with `git` for uncommitted/unpushed work (`_git_info`); dirty/unpushed projects are excluded from `projects --clean --yes` unless named via `--targets`
 - `run_doctor(config)` — checks python, rich, config validity, install, cron, app, tool availability, disk
 - `run_tui_clean(targets)` — curses checklist; falls back to y/N prompts when non-interactive
 - `translate_legacy(argv)` — v1 flag → v2 subcommand shim, runs before argparse
 - `report.log` (sibling to `cleaner.py`) stores the last 50 runs as JSON
+- `snapshots.log` (sibling to `cleaner.py`; env override `MACCLEANER_SNAPSHOTS`) — every `scan` and real `clean`/`projects --clean` run (not `--dry-run`) appends a disk-usage snapshot, capped at the last 365 entries; a snapshot in the same clock hour as the previous one replaces it instead of appending. `report` prints a disk trend and `report --json` gains a `disk_history` key
 
 ### Safe vs. Review distinction
 Each target has a `safe` bool. `--yes` / `auto_approve` only cleans `safe=True` targets. Review targets (`safe=False` — Xcode Archives, AI models, iOS backups, Trash, …) need explicit selection (`--targets id --yes` counts as consent) or interactive confirmation.
 
 ### Config
-`config.json` (sibling to `cleaner.py`; installed: `~/mac-cleaner/config.json`) — missing keys merge with `DEFAULT_CONFIG` at load. Keys: `enabled_categories`, `skip_paths`, `log_threshold_mb`, `auto_approve`, `schedule`, `delete_mode` (`"rm"` | `"trash"`), `project_roots`, `project_min_age_days`.
+`config.json` (sibling to `cleaner.py`; installed: `~/mac-cleaner/config.json`) — missing keys merge with `DEFAULT_CONFIG` at load. Keys: `enabled_categories`, `skip_paths`, `log_threshold_mb`, `auto_approve`, `schedule`, `delete_mode` (`"rm"` | `"trash"`), `project_roots`, `project_min_age_days`, `project_git_check` (default `true`; disables the git dirty/unpushed check in `projects` when set `false`).
 
 ### Env vars
-- `MACCLEANER_CONFIG` / `MACCLEANER_LOG` — override config/log paths (used by tests)
+- `MACCLEANER_CONFIG` / `MACCLEANER_LOG` / `MACCLEANER_SNAPSHOTS` — override config/log/snapshots paths (used by tests)
 - `MACCLEANER_ENGINE` — app-side override of the engine path (app development)
 
 ## Install Path vs. Source

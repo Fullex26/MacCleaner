@@ -54,7 +54,7 @@ CONFIG_PATH = Path(os.environ.get("MACCLEANER_CONFIG", Path(__file__).parent / "
 LOG_PATH = Path(os.environ.get("MACCLEANER_LOG", Path(__file__).parent / "report.log"))
 SNAPSHOTS_PATH = Path(os.environ.get("MACCLEANER_SNAPSHOTS", Path(__file__).parent / "snapshots.log"))
 SNAPSHOT_CAP = 365
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
