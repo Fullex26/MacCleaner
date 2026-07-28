@@ -735,5 +735,61 @@ class TestGitAwareProjects(unittest.TestCase):
                          "explicitly named flagged project must still be cleaned by --targets")
 
 
+class TestDryRun(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        (self.home / ".npm" / "_cacache").mkdir(parents=True)
+        (self.home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        cfg_path = self.tmp / "config.json"
+        cfg_path.write_text(json.dumps({"enabled_categories": ["node"]}))
+        self.log_path = self.tmp / "report.log"
+        self.snap_path = self.tmp / "snapshots.log"
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(cfg_path),
+                    "MACCLEANER_LOG": str(self.log_path),
+                    "MACCLEANER_SNAPSHOTS": str(self.snap_path)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_dry_run_deletes_nothing_and_reports(self):
+        r = self.run_cli("clean", "--dry-run", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["dry_run"])
+        self.assertTrue((self.home / ".npm" / "_cacache").exists(),
+                        "dry run must not delete")
+        npm = next(i for i in data["items"] if i["id"] == "npm-cache")
+        self.assertEqual(npm["status"], "would-delete")
+        self.assertTrue(npm["paths"])
+        self.assertIn("_cacache", npm["paths"][0]["path"])
+        self.assertGreater(npm["paths"][0]["size_bytes"], 0)
+        self.assertGreater(data["freed_bytes"], 0)
+
+    def test_dry_run_writes_no_logs(self):
+        r = self.run_cli("clean", "--dry-run", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(self.log_path.exists(), "dry run must not write report.log")
+        self.assertFalse(self.snap_path.exists(), "dry run must not record snapshots")
+
+    def test_dry_run_respects_targets(self):
+        r = self.run_cli("clean", "--dry-run", "--targets", "npm-cache", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertEqual([i["id"] for i in data["items"]], ["npm-cache"])
+
+    def test_dry_run_human_output(self):
+        r = self.run_cli("clean", "--dry-run")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("Dry run", r.stdout)
+        self.assertIn("Would free", r.stdout)
+        self.assertTrue((self.home / ".npm" / "_cacache").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

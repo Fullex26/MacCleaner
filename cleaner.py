@@ -961,6 +961,58 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
     return total_freed, results
 
 
+def run_dry_run(targets, mode="rm", json_mode=False):
+    """Resolve exactly what a real clean of `targets` would delete. Deletes
+    nothing, writes no report.log entry, records no snapshot."""
+    say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
+    targets = measure_targets(targets)
+    targets = [t for t in targets if t.get("exists") or t.get("cmd")]
+    items, total = [], 0
+
+    for t in sorted(targets, key=lambda x: x.get("size") or 0, reverse=True):
+        if t.get("cmd"):
+            size = t.get("size") or 0
+            items.append({"id": t["id"], "label": t["label"], "freed": size,
+                          "status": "would-run", "cmd": t["cmd"], "paths": []})
+            total += size
+            continue
+        paths = []
+        for p in _target_paths(t):
+            if not p.exists() and not p.is_symlink():
+                continue
+            if t.get("empty_only"):
+                paths.extend(c for c in sorted(p.iterdir()) if _safe_to_delete(c))
+            elif _safe_to_delete(p):
+                paths.append(p)
+        entries = [{"path": str(p), "size_bytes": get_size(p)} for p in paths]
+        size = sum(e["size_bytes"] for e in entries)
+        total += size
+        items.append({"id": t["id"], "label": t["label"], "freed": size,
+                      "status": "would-delete", "paths": entries})
+
+    if json_mode:
+        print(json.dumps({
+            "version": VERSION,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "dry_run": True,
+            "delete_mode": mode,
+            "freed_bytes": total,
+            "freed_human": fmt_size(total),
+            "disk_after": disk_free(),
+            "items": items,
+        }, indent=2))
+    else:
+        say("\n🧪 Dry run — nothing will be deleted\n")
+        for it in items:
+            say(f"  {it['label']} ({fmt_size(it['freed'])})")
+            if it.get("cmd"):
+                say(f"      would run: {it['cmd']}")
+            for e in it["paths"]:
+                say(f"      would delete: {e['path']} ({fmt_size(e['size_bytes'])})")
+        say(f"\n  Would free: {fmt_size(total)}\n")
+    return total, items
+
+
 # ── Stale project artifacts ─────────────────────────────────────────────────────
 ARTIFACT_MANIFESTS = {
     "node_modules":  ["package.json"],
@@ -1493,6 +1545,8 @@ def build_parser():
     p_clean.add_argument("--min-size", type=float, metavar="MB", help="Skip targets smaller than this")
     p_clean.add_argument("--trash", action="store_true", help="Move to Trash instead of deleting")
     p_clean.add_argument("--json", action="store_true", help="Machine-readable results")
+    p_clean.add_argument("--dry-run", action="store_true",
+                         help="Show exactly what would be deleted, delete nothing")
 
     p_proj = sub.add_parser("projects", help="Find stale build artifacts (node_modules, .venv, target, ...)")
     p_proj.add_argument("--roots", action="append", metavar="DIR", help="Roots to scan (default: config project_roots)")
@@ -1502,6 +1556,8 @@ def build_parser():
     p_proj.add_argument("--targets", metavar="ID,ID", help="With --clean: only these artifact IDs")
     p_proj.add_argument("--trash", action="store_true", help="Move to Trash instead of deleting")
     p_proj.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_proj.add_argument("--dry-run", action="store_true",
+                        help="Show what --clean would delete, delete nothing (implies --clean)")
 
     p_report = sub.add_parser("report", help="Show cleanup history")
     p_report.add_argument("-n", "--limit", type=int, default=10, help="Number of runs to show")
@@ -1571,7 +1627,7 @@ def main():
 
     if args.command == "projects":
         hits, roots, min_age = scan_projects(config, roots=args.roots, min_age_days=args.min_age_days)
-        if args.clean:
+        if args.clean or args.dry_run:
             targets = projects_to_targets(hits)
             if args.targets:
                 wanted = {t.strip() for t in args.targets.split(",") if t.strip()}
@@ -1590,6 +1646,10 @@ def main():
                         print(f"  {t['id']}  {t['label']}", file=sys.stderr)
                     targets = [t for t in targets if not _git_flagged(t)]
             mode = "trash" if args.trash else config.get("delete_mode", "rm")
+            if args.dry_run:
+                selected = targets if args.targets else [t for t in targets if not _git_flagged(t)]
+                run_dry_run(selected, mode=mode, json_mode=args.json)
+                return
             run_clean(targets, auto_approve=args.yes, mode=mode,
                       json_mode=args.json, explicit=bool(args.targets) or args.yes)
         elif args.json:
@@ -1651,6 +1711,10 @@ def main():
             targets = filter_targets(targets, min_size_mb=args.min_size)
         auto = args.yes or config.get("auto_approve", False)
         mode = "trash" if args.trash else config.get("delete_mode", "rm")
+        if args.dry_run:
+            selected = [t for t in targets if t["safe"] or explicit]
+            run_dry_run(selected, mode=mode, json_mode=args.json)
+            return
         full = not explicit and not categories and args.min_size is None
         run_clean(targets, auto_approve=auto, mode=mode, json_mode=args.json,
                   explicit=explicit, snapshot_scope="full" if full else "partial")
