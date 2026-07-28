@@ -993,8 +993,14 @@ def _git_info(project_dir):
         r = run("rev-parse", "--is-inside-work-tree")
         if r.returncode != 0 or r.stdout.strip() != "true":
             return None
-        dirty = bool(run("status", "--porcelain").stdout.strip())
-        count = run("rev-list", "--count", "--branches", "--not", "--remotes").stdout.strip()
+        status = run("status", "--porcelain")
+        if status.returncode != 0:
+            return None
+        rev_list = run("rev-list", "--count", "--branches", "--not", "--remotes")
+        if rev_list.returncode != 0:
+            return None
+        dirty = bool(status.stdout.strip())
+        count = rev_list.stdout.strip()
         return {"dirty": dirty, "unpushed": count not in ("", "0")}
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None

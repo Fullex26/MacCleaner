@@ -675,6 +675,65 @@ class TestGitAwareProjects(unittest.TestCase):
                          "clean project should be swept by --yes")
         self.assertIn("dirtyproj", r.stderr, "skip note should name the project")
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                      "root bypasses file permission checks")
+    def test_git_info_degrades_to_none_on_partial_failure(self):
+        # rev-parse only checks whether the dir is a work tree; it doesn't
+        # touch the index. Revoking read access to .git/index leaves
+        # rev-parse succeeding while `git status` fails outright (nonzero
+        # exit, empty stdout) — exactly the "readable enough to pass
+        # rev-parse but fails later" scenario the fix must catch.
+        proj = self.make_repo("corruptproj", dirty=False, pushed=True)
+        index_path = proj / ".git" / "index"
+        self.assertTrue(index_path.exists())
+        os.chmod(index_path, 0o000)
+        try:
+            sanity = subprocess.run(
+                ["git", "-C", str(proj), "rev-parse", "--is-inside-work-tree"],
+                capture_output=True, text=True, env=self.git_env)
+            self.assertEqual(sanity.returncode, 0)
+            self.assertEqual(sanity.stdout.strip(), "true")
+
+            broken = subprocess.run(
+                ["git", "-C", str(proj), "status", "--porcelain"],
+                capture_output=True, text=True, env=self.git_env)
+            self.assertNotEqual(broken.returncode, 0)
+            self.assertEqual(broken.stdout.strip(), "")
+
+            self.assertIsNone(cleaner._git_info(proj),
+                               "a git failure after rev-parse must degrade to None, "
+                               "never report a false clean/pushed state")
+        finally:
+            os.chmod(index_path, 0o644)
+
+    def test_targets_override_cleans_flagged_project(self):
+        self.make_repo("dirtyproj", dirty=True, pushed=True)
+        cfg_path = self.tmp / "config.json"
+        cfg_path.write_text(json.dumps({"project_roots": [str(self.root)],
+                                        "project_min_age_days": 0}))
+        env = {**os.environ, "HOME": str(self.tmp),
+               "MACCLEANER_CONFIG": str(cfg_path),
+               "MACCLEANER_LOG": str(self.tmp / "report.log"),
+               "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log")}
+
+        # Resolve the generated target id from the same sandboxed env (HOME
+        # is the tempdir here, so ids computed elsewhere wouldn't match).
+        scan = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                               "projects", "--json"],
+                              capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(scan.returncode, 0)
+        artifacts = json.loads(scan.stdout)["artifacts"]
+        self.assertEqual(len(artifacts), 1)
+        target_id = artifacts[0]["id"]
+
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "projects", "--clean", "--yes",
+                            "--targets", target_id, "--json"],
+                           capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse((self.root / "dirtyproj" / "node_modules").exists(),
+                         "explicitly named flagged project must still be cleaned by --targets")
+
 
 if __name__ == "__main__":
     unittest.main()
