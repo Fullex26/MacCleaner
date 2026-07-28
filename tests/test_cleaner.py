@@ -735,6 +735,106 @@ class TestGitAwareProjects(unittest.TestCase):
                          "explicitly named flagged project must still be cleaned by --targets")
 
 
+class TestProjectsDryRun(unittest.TestCase):
+    """projects --dry-run must mirror exactly what `projects --clean --yes`
+    would sweep: git-flagged projects excluded unless named via --targets,
+    and (like every dry run) nothing deleted, no report.log/snapshots.log."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "Code"
+        # Isolate from the user's global git config (gpgsign, hooks, etc.)
+        self.git_env = {**os.environ,
+                        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+                        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        cfg_path = self.tmp / "config.json"
+        cfg_path.write_text(json.dumps({"project_roots": [str(self.root)],
+                                        "project_min_age_days": 0}))
+        self.log_path = self.tmp / "report.log"
+        self.snap_path = self.tmp / "snapshots.log"
+        self.env = {**os.environ, "HOME": str(self.tmp),
+                    "MACCLEANER_CONFIG": str(cfg_path),
+                    "MACCLEANER_LOG": str(self.log_path),
+                    "MACCLEANER_SNAPSHOTS": str(self.snap_path)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _git(self, cwd, *args):
+        subprocess.run(["git", "-C", str(cwd), *args],
+                       capture_output=True, check=True, env=self.git_env)
+
+    def make_project(self, name):
+        proj = self.root / name
+        (proj / "node_modules" / "x").mkdir(parents=True)
+        (proj / "package.json").write_text("{}")
+        old = 1_000_000_000
+        os.utime(proj / "node_modules", (old, old))
+        return proj
+
+    def make_repo(self, name, dirty=False, pushed=True):
+        proj = self.make_project(name)
+        (proj / ".gitignore").write_text("node_modules/\n")
+        self._git(proj, "init", "-q")
+        self._git(proj, "add", ".gitignore", "package.json")
+        self._git(proj, "commit", "-qm", "init")
+        if pushed:
+            remote = self.tmp / f"{name}-remote.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(remote)],
+                           capture_output=True, check=True, env=self.git_env)
+            self._git(proj, "remote", "add", "origin", str(remote))
+            self._git(proj, "push", "-q", "origin", "HEAD")
+        if dirty:
+            (proj / "wip.txt").write_text("uncommitted")
+        return proj
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_dry_run_excludes_git_flagged_projects(self):
+        self.make_repo("dirtyproj", dirty=True, pushed=True)
+        self.make_repo("cleanproj", dirty=False, pushed=True)
+
+        r = self.run_cli("projects", "--dry-run", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        ids = [i["id"] for i in data["items"]]
+        self.assertEqual(len(ids), 1, ids)
+        self.assertIn("cleanproj", ids[0])
+        self.assertTrue(all("dirtyproj" not in i for i in ids),
+                        "git-flagged project must be excluded from the preview")
+
+        # a dry run never deletes, regardless of a target's flagged status
+        self.assertTrue((self.root / "dirtyproj" / "node_modules").exists())
+        self.assertTrue((self.root / "cleanproj" / "node_modules").exists())
+        self.assertFalse(self.log_path.exists(), "dry run must not write report.log")
+        self.assertFalse(self.snap_path.exists(), "dry run must not record snapshots")
+
+    def test_dry_run_targets_override_includes_flagged(self):
+        self.make_repo("dirtyproj", dirty=True, pushed=True)
+
+        # Resolve the generated target id from the same sandboxed env (HOME
+        # is the tempdir here, so ids computed elsewhere wouldn't match).
+        scan = self.run_cli("projects", "--json")
+        self.assertEqual(scan.returncode, 0, scan.stderr)
+        artifacts = json.loads(scan.stdout)["artifacts"]
+        self.assertEqual(len(artifacts), 1)
+        target_id = artifacts[0]["id"]
+
+        r = self.run_cli("projects", "--dry-run", "--targets", target_id, "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual([i["id"] for i in data["items"]], [target_id],
+                          "explicitly named flagged project must appear in the preview")
+
+        self.assertTrue((self.root / "dirtyproj" / "node_modules").exists(),
+                        "dry run must not delete, even for an explicitly named flagged project")
+        self.assertFalse(self.log_path.exists(), "dry run must not write report.log")
+        self.assertFalse(self.snap_path.exists(), "dry run must not record snapshots")
+
+
 class TestDryRun(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
