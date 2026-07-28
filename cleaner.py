@@ -1234,6 +1234,7 @@ def load_snapshots():
             data = json.load(f)
         return data if isinstance(data, list) else []
     except Exception:
+        print(f"Warning: corrupt or unparseable {SNAPSHOTS_PATH}, restarting", file=sys.stderr)
         return []
 
 
@@ -1242,15 +1243,15 @@ def record_snapshot(reclaimable_bytes=None, categories=None):
 
     None reclaimable/categories = the run only measured part of the target set,
     so only the disk numbers are trustworthy."""
-    ds = disk_stats()
-    entry = {
-        "ts": datetime.datetime.now().isoformat(),
-        "disk_total_bytes": ds["total_bytes"],
-        "disk_free_bytes": ds["free_bytes"],
-        "reclaimable_bytes": reclaimable_bytes,
-        "categories": categories,
-    }
     try:
+        ds = disk_stats()
+        entry = {
+            "ts": datetime.datetime.now().isoformat(),
+            "disk_total_bytes": ds["total_bytes"],
+            "disk_free_bytes": ds["free_bytes"],
+            "reclaimable_bytes": reclaimable_bytes,
+            "categories": categories,
+        }
         snaps = load_snapshots()
         if snaps and snaps[-1].get("ts", "")[:13] == entry["ts"][:13]:
             snaps[-1] = entry

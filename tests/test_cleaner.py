@@ -4,7 +4,9 @@
 Run:  python3 -m unittest discover -s tests -v
 """
 
+import contextlib
 import datetime
+import io
 import json
 import os
 import shutil
@@ -540,10 +542,18 @@ class TestSnapshots(unittest.TestCase):
 
     def test_corrupt_file_recovers(self):
         cleaner.SNAPSHOTS_PATH.write_text("{not json")
-        cleaner.record_snapshot(42, {})
+        # Capture stderr to verify warning is emitted
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stderr(stderr_capture):
+            cleaner.record_snapshot(42, {})
+        stderr_output = stderr_capture.getvalue()
+        # Verify the recovery worked
         snaps = cleaner.load_snapshots()
         self.assertEqual(len(snaps), 1)
         self.assertEqual(snaps[0]["reclaimable_bytes"], 42)
+        # Verify warning was emitted exactly once (in load_snapshots during recovery)
+        self.assertIn("Warning: corrupt or unparseable", stderr_output)
+        self.assertIn(str(cleaner.SNAPSHOTS_PATH), stderr_output)
 
     def test_snapshot_fields_sums(self):
         targets = [{"category": "node", "size": 100}, {"category": "node", "size": 50},
