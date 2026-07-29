@@ -295,7 +295,7 @@ Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 5
 | Variable | Effect |
 |---|---|
 | `MACCLEANER_CONFIG` | Path to config JSON (default: `config.json` next to `cleaner.py`) |
-| `MACCLEANER_LOG` | Path to the run-history log (default: `report.log` next to `cleaner.py`, falling back to `~/Library/Application Support/MacCleaner/report.log` when that directory isn't writable — e.g. running from a signed `.app` bundle's `Contents/Resources/cleaner.py`) |
+| `MACCLEANER_LOG` | Path to the run-history log (default: `report.log` next to `cleaner.py`, falling back to `~/Library/Application Support/MacCleaner/report.log` when that directory isn't writable, or when it's inside a `.app` bundle regardless of writability — e.g. running from a signed `.app` bundle's `Contents/Resources/cleaner.py`) |
 | `MACCLEANER_SNAPSHOTS` | Path to the disk-snapshots log (default: `snapshots.log` next to `cleaner.py`, with the same Application Support fallback as `MACCLEANER_LOG`) — new in 2.1.0 |
 
 `MACCLEANER_ENGINE` is read by the macOS app only (points it at a development `cleaner.py`); the engine itself ignores it.

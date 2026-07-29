@@ -1174,6 +1174,40 @@ class TestStatePathFallback(unittest.TestCase):
                                            script_dir=writable_dir)
         self.assertEqual(path, writable_dir / "report.log")
 
+    def test_falls_back_when_inside_app_bundle_even_if_writable(self):
+        # A user-owned .app's Contents/Resources is drwxr-xr-x (writable),
+        # but state files must never land inside the bundle.
+        bundle_resources = self.tmp / "MacCleaner.app" / "Contents" / "Resources"
+        bundle_resources.mkdir(parents=True)
+        self.assertTrue(os.access(bundle_resources, os.W_OK))
+        path = cleaner._resolve_state_path("MACCLEANER_LOG_TEST_UNSET", "report.log",
+                                           script_dir=bundle_resources)
+        expected = self.fake_home / "Library/Application Support/MacCleaner/report.log"
+        self.assertEqual(path, expected)
+        self.assertTrue(expected.parent.is_dir(), "fallback dir must be created")
+
+    def test_env_override_wins_even_when_inside_app_bundle(self):
+        bundle_resources = self.tmp / "MacCleaner.app" / "Contents" / "Resources"
+        bundle_resources.mkdir(parents=True)
+        override = str(self.tmp / "custom-report.log")
+        os.environ["MACCLEANER_LOG_TEST_OVERRIDE"] = override
+        try:
+            path = cleaner._resolve_state_path("MACCLEANER_LOG_TEST_OVERRIDE", "report.log",
+                                               script_dir=bundle_resources)
+            self.assertEqual(path, Path(override))
+        finally:
+            os.environ.pop("MACCLEANER_LOG_TEST_OVERRIDE", None)
+
+    def test_is_inside_app_bundle_detection(self):
+        self.assertTrue(cleaner._is_inside_app_bundle(
+            Path("/Applications/MacCleaner.app/Contents/Resources")))
+        self.assertTrue(cleaner._is_inside_app_bundle(
+            Path.home() / "Downloads/MacCleaner.app/Contents/Resources"))
+        self.assertFalse(cleaner._is_inside_app_bundle(
+            Path.home() / "mac-cleaner"))
+        self.assertFalse(cleaner._is_inside_app_bundle(
+            Path("/Users/dev/Code/MacCleaner")))
+
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
                       "root bypasses directory write-permission checks")
     def test_env_override_wins_even_when_script_dir_not_writable(self):

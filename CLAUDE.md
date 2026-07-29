@@ -77,7 +77,7 @@ Engine resolution order: `MACCLEANER_ENGINE` env override (dev) → `~/mac-clean
 - `run_doctor(config)` — checks python, rich, config validity, install, cron, app, tool availability, disk
 - `run_tui_clean(targets)` — curses checklist; falls back to y/N prompts when non-interactive
 - `translate_legacy(argv)` — v1 flag → v2 subcommand shim, runs before argparse
-- `report.log` (sibling to `cleaner.py`, falling back to `~/Library/Application Support/MacCleaner/` when that directory isn't writable — e.g. the app's bundled fallback engine running from inside its signed `.app`) stores the last 50 runs as JSON
+- `report.log` (sibling to `cleaner.py`, falling back to `~/Library/Application Support/MacCleaner/` when that directory isn't writable, or when it's inside a `.app` bundle regardless of writability — e.g. the app's bundled fallback engine running from inside its signed `.app`) stores the last 50 runs as JSON
 - `snapshots.log` (same location rule as `report.log`; env override `MACCLEANER_SNAPSHOTS`) — every `scan` and real `clean`/`projects --clean` run (not `--dry-run`) appends a disk-usage snapshot, capped at the last 365 entries; a snapshot on the same calendar day as the previous one replaces it instead of appending, so 365 entries covers roughly a year. `report` prints a disk trend and `report --json` gains a `disk_history` key
 - Both `report.log` and `snapshots.log` writes are atomic (dump to a temp file, then `os.replace()`) so two concurrent runs (e.g. a cron `clean --yes` overlapping a menu bar app scan) can't corrupt either file
 

@@ -54,22 +54,42 @@ HOME = Path.home()
 CONFIG_PATH = Path(os.environ.get("MACCLEANER_CONFIG", Path(__file__).parent / "config.json"))
 
 
+def _is_inside_app_bundle(path: Path) -> bool:
+    """True if any component of `path` ends in `.app` — a macOS app bundle.
+
+    Structural check, not a writability probe: a normal user-owned `.app`'s
+    Contents/Resources is `drwxr-xr-x`, so `os.access(..., os.W_OK)` alone
+    never catches "this directory lives inside a bundle"."""
+    return any(part.endswith(".app") for part in path.parts)
+
+
 def _resolve_state_path(env_var: str, filename: str, script_dir: Path = None) -> Path:
     """Resolve the path for a mutable state file (report.log / snapshots.log).
 
     `env_var` (MACCLEANER_LOG / MACCLEANER_SNAPSHOTS) always wins when set.
     Otherwise prefer the directory beside cleaner.py — the normal installed
-    case, `~/mac-cleaner/`. If that directory isn't writable (e.g. cleaner.py
-    is running from inside a signed .app bundle's sealed Contents/Resources —
-    the fallback engine path for someone who downloaded the release without
-    running install.sh), fall back to `~/Library/Application Support/MacCleaner/`,
-    creating it if needed, so disk trends still work for app-only users.
+    case, `~/mac-cleaner/`. Fall back to
+    `~/Library/Application Support/MacCleaner/` (creating it if needed) when
+    either:
+      - that directory isn't writable, or
+      - it's inside a `.app` bundle (e.g. cleaner.py running from a signed
+        .app bundle's Contents/Resources — the fallback engine path for
+        someone who downloaded the release without running install.sh).
+        Bundle directories are user-owned and writable, so this case is
+        detected structurally rather than via os.access; without it, history
+        would be written inside the bundle (invalidating its ad-hoc
+        signature, and wiped on the next app update) — and under App
+        Translocation the writability probe alone would fire only until the
+        user drags the app out of ~/Downloads, silently flipping the write
+        location afterward.
+    This keeps disk trends working for app-only users who never ran
+    install.sh.
     """
     override = os.environ.get(env_var)
     if override:
         return Path(override)
     script_dir = Path(script_dir) if script_dir is not None else Path(__file__).parent
-    if os.access(script_dir, os.W_OK):
+    if not _is_inside_app_bundle(script_dir) and os.access(script_dir, os.W_OK):
         return script_dir / filename
     fallback_dir = HOME / "Library/Application Support/MacCleaner"
     try:
