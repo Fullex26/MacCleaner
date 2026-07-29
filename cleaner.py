@@ -32,6 +32,7 @@ import json
 import glob as globmod
 import time
 import shutil
+import tempfile
 import argparse
 import subprocess
 import datetime
@@ -51,8 +52,35 @@ except ImportError:
 
 HOME = Path.home()
 CONFIG_PATH = Path(os.environ.get("MACCLEANER_CONFIG", Path(__file__).parent / "config.json"))
-LOG_PATH = Path(os.environ.get("MACCLEANER_LOG", Path(__file__).parent / "report.log"))
-SNAPSHOTS_PATH = Path(os.environ.get("MACCLEANER_SNAPSHOTS", Path(__file__).parent / "snapshots.log"))
+
+
+def _resolve_state_path(env_var: str, filename: str, script_dir: Path = None) -> Path:
+    """Resolve the path for a mutable state file (report.log / snapshots.log).
+
+    `env_var` (MACCLEANER_LOG / MACCLEANER_SNAPSHOTS) always wins when set.
+    Otherwise prefer the directory beside cleaner.py — the normal installed
+    case, `~/mac-cleaner/`. If that directory isn't writable (e.g. cleaner.py
+    is running from inside a signed .app bundle's sealed Contents/Resources —
+    the fallback engine path for someone who downloaded the release without
+    running install.sh), fall back to `~/Library/Application Support/MacCleaner/`,
+    creating it if needed, so disk trends still work for app-only users.
+    """
+    override = os.environ.get(env_var)
+    if override:
+        return Path(override)
+    script_dir = Path(script_dir) if script_dir is not None else Path(__file__).parent
+    if os.access(script_dir, os.W_OK):
+        return script_dir / filename
+    fallback_dir = HOME / "Library/Application Support/MacCleaner"
+    try:
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return fallback_dir / filename
+
+
+LOG_PATH = _resolve_state_path("MACCLEANER_LOG", "report.log")
+SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 SNAPSHOT_CAP = 365
 VERSION = "2.1.0"
 
@@ -462,7 +490,7 @@ def get_targets(config, all_categories=False):
         desc="Dart & Flutter packages; repopulated by 'dart pub get' / 'flutter pub get'")
 
     # PHP
-    add("php", "composer-cache", "Composer cache", "~/Library/Caches/composer",
+    add("php", "composer-cache", "Composer cache", "~/.composer/cache",
         desc="Composer package download cache")
 
     # VMs / container runtimes
@@ -981,7 +1009,14 @@ def run_dry_run(targets, mode="rm", json_mode=False):
             if not p.exists() and not p.is_symlink():
                 continue
             if t.get("empty_only"):
-                paths.extend(c for c in sorted(p.iterdir()) if _safe_to_delete(c))
+                # Guarded the same way delete_target guards the equivalent loop:
+                # a PermissionError previewing one target's children must not
+                # abort the whole preview when the real delete would tolerate it.
+                try:
+                    children = list(p.iterdir())
+                except (PermissionError, FileNotFoundError, OSError):
+                    continue
+                paths.extend(c for c in sorted(children) if _safe_to_delete(c))
             elif _safe_to_delete(p):
                 paths.append(p)
         entries = [{"path": str(p), "size_bytes": get_size(p)} for p in paths]
@@ -1039,8 +1074,14 @@ def _git_info(project_dir):
     as unpushed — its commits exist nowhere else. Any git failure (not a repo,
     git missing, timeout) degrades to None rather than blocking the scan."""
     def run(*args):
-        return subprocess.run(["git", "-C", str(project_dir), *args],
-                              capture_output=True, text=True, timeout=2)
+        # --no-optional-locks: don't take .git/index.lock or touch index mtimes —
+        # a concurrent `git add`/`git commit` by the user must not fail because
+        # a read-only scan is holding the lock (this is what editors do too).
+        # -c core.fsmonitor=: a hostile checked-out repo can't use a repo-local
+        # fsmonitor hook to execute code during this read-only scan.
+        return subprocess.run(
+            ["git", "-C", str(project_dir), "--no-optional-locks", "-c", "core.fsmonitor=", *args],
+            capture_output=True, text=True, timeout=2)
     try:
         r = run("rev-parse", "--is-inside-work-tree")
         if r.returncode != 0 or r.stdout.strip() != "true":
@@ -1062,6 +1103,23 @@ def _git_flagged(t):
     """True when a project target has uncommitted or unpushed work."""
     git = t.get("git")
     return bool(git and (git.get("dirty") or git.get("unpushed")))
+
+
+def _filter_git_flagged(targets, bypass):
+    """Exclude git-flagged (dirty/unpushed) project targets, unless `bypass`
+    (an explicit --targets selection, which counts as consent). Shared by the
+    `--yes` clean path and the `--dry-run` preview so they can never drift —
+    both print the same stderr note naming each skipped project."""
+    if bypass:
+        return targets
+    flagged = [t for t in targets if _git_flagged(t)]
+    if flagged:
+        print("Skipping projects with uncommitted or unpushed work "
+              "(select explicitly with --targets to clean them):",
+              file=sys.stderr)
+        for t in flagged:
+            print(f"  {t['id']}  {t['label']}", file=sys.stderr)
+    return [t for t in targets if not _git_flagged(t)]
 
 
 def scan_projects(config, roots=None, min_age_days=None):
@@ -1312,6 +1370,26 @@ def show_categories(config, json_mode=False):
         print(f"{'='*72}\n")
 
 
+def _atomic_write_json(path: Path, data):
+    """Dump JSON to a temp file beside `path`, then os.replace() it into place.
+
+    os.replace() is atomic within a filesystem, so a concurrent reader (e.g. a
+    cron `clean --yes` overlapping a menu bar app scan) always sees either the
+    old complete file or the new complete file, never a partial write. On any
+    failure the temp file is removed so it's never mistaken for real data."""
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_name, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 # ── Report log ──────────────────────────────────────────────────────────────────
 def write_log(total_freed: int, results: list):
     entry = {
@@ -1330,8 +1408,10 @@ def write_log(total_freed: int, results: list):
             logs = []
     logs.append(entry)
     logs = logs[-50:]  # Keep last 50 runs
-    with open(LOG_PATH, "w") as f:
-        json.dump(logs, f, indent=2)
+    try:
+        _atomic_write_json(LOG_PATH, logs)
+    except Exception as e:
+        print(f"Warning: could not write log: {e}", file=sys.stderr)
 
 
 # ── Disk snapshots ──────────────────────────────────────────────────────────────
@@ -1341,14 +1421,22 @@ def load_snapshots():
     try:
         with open(SNAPSHOTS_PATH) as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        # A non-dict element would otherwise raise inside record_snapshot's
+        # snaps[-1].get(...) dedupe check on every future run, forever (only
+        # caught by the broad except there, with just a per-run warning).
+        # Dropping non-dict entries here lets a partially malformed file
+        # self-heal the same way a fully unparseable one does.
+        return [e for e in data if isinstance(e, dict)]
     except Exception:
         print(f"Warning: corrupt or unparseable {SNAPSHOTS_PATH}, restarting", file=sys.stderr)
         return []
 
 
 def record_snapshot(reclaimable_bytes=None, categories=None):
-    """Append a disk snapshot; a snapshot in the same clock hour replaces the last.
+    """Append a disk snapshot; a snapshot recorded the same calendar day
+    replaces the last one instead of adding a new entry.
 
     None reclaimable/categories = the run only measured part of the target set,
     so only the disk numbers are trustworthy."""
@@ -1362,13 +1450,12 @@ def record_snapshot(reclaimable_bytes=None, categories=None):
             "categories": categories,
         }
         snaps = load_snapshots()
-        if snaps and snaps[-1].get("ts", "")[:13] == entry["ts"][:13]:
+        if snaps and snaps[-1].get("ts", "")[:10] == entry["ts"][:10]:
             snaps[-1] = entry
         else:
             snaps.append(entry)
         snaps = snaps[-SNAPSHOT_CAP:]
-        with open(SNAPSHOTS_PATH, "w") as f:
-            json.dump(snaps, f, indent=2)
+        _atomic_write_json(SNAPSHOTS_PATH, snaps)
     except Exception as e:
         print(f"Warning: could not write snapshot: {e}", file=sys.stderr)
 
@@ -1636,20 +1723,13 @@ def main():
                 if missing:
                     print(f"Unknown artifact IDs: {', '.join(sorted(missing))}", file=sys.stderr)
                     sys.exit(1)
-            if args.yes and not args.targets:
-                flagged = [t for t in targets if _git_flagged(t)]
-                if flagged:
-                    print("Skipping projects with uncommitted or unpushed work "
-                          "(select explicitly with --targets to clean them):",
-                          file=sys.stderr)
-                    for t in flagged:
-                        print(f"  {t['id']}  {t['label']}", file=sys.stderr)
-                    targets = [t for t in targets if not _git_flagged(t)]
             mode = "trash" if args.trash else config.get("delete_mode", "rm")
             if args.dry_run:
-                selected = targets if args.targets else [t for t in targets if not _git_flagged(t)]
+                selected = _filter_git_flagged(targets, bypass=bool(args.targets))
                 run_dry_run(selected, mode=mode, json_mode=args.json)
                 return
+            if args.yes:
+                targets = _filter_git_flagged(targets, bypass=bool(args.targets))
             run_clean(targets, auto_approve=args.yes, mode=mode,
                       json_mode=args.json, explicit=bool(args.targets) or args.yes)
         elif args.json:
