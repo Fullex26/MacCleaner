@@ -35,7 +35,7 @@ Categories (20): `xcode`, `docker`, `node`, `python`, `caches`, `logs`, `homebre
 
 ### Tests
 ```bash
-python3 -m unittest discover -s tests    # 69 tests, stdlib only, no deps
+python3 -m unittest discover -s tests    # 84 tests, stdlib only, no deps
 ```
 CI runs tests + smoke tests + the app build on `macos-latest`.
 
@@ -77,8 +77,9 @@ Engine resolution order: `MACCLEANER_ENGINE` env override (dev) → `~/mac-clean
 - `run_doctor(config)` — checks python, rich, config validity, install, cron, app, tool availability, disk
 - `run_tui_clean(targets)` — curses checklist; falls back to y/N prompts when non-interactive
 - `translate_legacy(argv)` — v1 flag → v2 subcommand shim, runs before argparse
-- `report.log` (sibling to `cleaner.py`) stores the last 50 runs as JSON
-- `snapshots.log` (sibling to `cleaner.py`; env override `MACCLEANER_SNAPSHOTS`) — every `scan` and real `clean`/`projects --clean` run (not `--dry-run`) appends a disk-usage snapshot, capped at the last 365 entries; a snapshot in the same clock hour as the previous one replaces it instead of appending. `report` prints a disk trend and `report --json` gains a `disk_history` key
+- `report.log` (sibling to `cleaner.py`, falling back to `~/Library/Application Support/MacCleaner/` when that directory isn't writable — e.g. the app's bundled fallback engine running from inside its signed `.app`) stores the last 50 runs as JSON
+- `snapshots.log` (same location rule as `report.log`; env override `MACCLEANER_SNAPSHOTS`) — every `scan` and real `clean`/`projects --clean` run (not `--dry-run`) appends a disk-usage snapshot, capped at the last 365 entries; a snapshot on the same calendar day as the previous one replaces it instead of appending, so 365 entries covers roughly a year. `report` prints a disk trend and `report --json` gains a `disk_history` key
+- Both `report.log` and `snapshots.log` writes are atomic (dump to a temp file, then `os.replace()`) so two concurrent runs (e.g. a cron `clean --yes` overlapping a menu bar app scan) can't corrupt either file
 
 ### Safe vs. Review distinction
 Each target has a `safe` bool. `--yes` / `auto_approve` only cleans `safe=True` targets. Review targets (`safe=False` — Xcode Archives, AI models, iOS backups, Trash, …) need explicit selection (`--targets id --yes` counts as consent) or interactive confirmation.
@@ -87,7 +88,7 @@ Each target has a `safe` bool. `--yes` / `auto_approve` only cleans `safe=True` 
 `config.json` (sibling to `cleaner.py`; installed: `~/mac-cleaner/config.json`) — missing keys merge with `DEFAULT_CONFIG` at load. Keys: `enabled_categories`, `skip_paths`, `log_threshold_mb`, `auto_approve`, `schedule`, `delete_mode` (`"rm"` | `"trash"`), `project_roots`, `project_min_age_days`, `project_git_check` (default `true`; disables the git dirty/unpushed check in `projects` when set `false`).
 
 ### Env vars
-- `MACCLEANER_CONFIG` / `MACCLEANER_LOG` / `MACCLEANER_SNAPSHOTS` — override config/log/snapshots paths (used by tests)
+- `MACCLEANER_CONFIG` / `MACCLEANER_LOG` / `MACCLEANER_SNAPSHOTS` — override config/log/snapshots paths (used by tests); these always win over the beside-`cleaner.py`-or-Application-Support default resolution
 - `MACCLEANER_ENGINE` — app-side override of the engine path (app development)
 
 ## Install Path vs. Source
