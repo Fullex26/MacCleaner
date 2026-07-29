@@ -521,16 +521,20 @@ class TestSnapshots(unittest.TestCase):
         self.assertIsNone(s["categories"])
         self.assertGreater(s["disk_free_bytes"], 0)
 
-    def test_same_hour_replaces(self):
+    def test_same_day_replaces(self):
         cleaner.record_snapshot(100, {})
         cleaner.record_snapshot(200, {})
         snaps = cleaner.load_snapshots()
-        self.assertEqual(len(snaps), 1, "same-hour snapshots must replace, not append")
+        self.assertEqual(len(snaps), 1, "same-day snapshots must replace, not append")
         self.assertEqual(snaps[0]["reclaimable_bytes"], 200)
 
     def test_cap_365(self):
+        # Spaced a day apart (not an hour) so each entry is distinct under the
+        # daily dedupe key — otherwise this wouldn't actually test a cap of
+        # 365 *distinct* days, just 365 pre-written rows that happen to survive
+        # because record_snapshot only ever compares against the last one.
         base = datetime.datetime(2025, 1, 1)
-        snaps = [{"ts": (base + datetime.timedelta(hours=i)).isoformat(),
+        snaps = [{"ts": (base + datetime.timedelta(days=i)).isoformat(),
                   "disk_total_bytes": 1, "disk_free_bytes": 1,
                   "reclaimable_bytes": i, "categories": {}} for i in range(365)]
         cleaner.SNAPSHOTS_PATH.write_text(json.dumps(snaps))
@@ -554,6 +558,24 @@ class TestSnapshots(unittest.TestCase):
         # Verify warning was emitted exactly once (in load_snapshots during recovery)
         self.assertIn("Warning: corrupt or unparseable", stderr_output)
         self.assertIn(str(cleaner.SNAPSHOTS_PATH), stderr_output)
+
+    def test_partially_malformed_list_recovers(self):
+        """A list containing a non-dict element must not get load_snapshots
+        (and therefore record_snapshot) permanently stuck: snaps[-1].get(...)
+        on a non-dict would raise every future run otherwise."""
+        cleaner.SNAPSHOTS_PATH.write_text(json.dumps([
+            {"ts": "2025-01-01T00:00:00", "disk_total_bytes": 1, "disk_free_bytes": 1,
+             "reclaimable_bytes": 1, "categories": {}},
+            "not-a-dict-entry",
+            42,
+            None,
+        ]))
+        cleaner.record_snapshot(42, {"node": 42})
+        snaps = cleaner.load_snapshots()
+        self.assertTrue(all(isinstance(s, dict) for s in snaps),
+                        "non-dict entries must be dropped, not crash the reader")
+        self.assertEqual(snaps[-1]["reclaimable_bytes"], 42)
+        self.assertEqual(len(snaps), 2, "the one valid pre-existing entry plus the new one")
 
     def test_snapshot_fields_sums(self):
         targets = [{"category": "node", "size": 100}, {"category": "node", "size": 50},
@@ -606,7 +628,7 @@ class TestGitAwareProjects(unittest.TestCase):
         os.utime(proj / "node_modules", (self.old, self.old))
         return proj
 
-    def make_repo(self, name, dirty=False, pushed=True):
+    def make_repo(self, name, dirty=False, pushed=True, unpushed_commit=False):
         proj = self.make_project(name)
         (proj / ".gitignore").write_text("node_modules/\n")
         self._git(proj, "init", "-q")
@@ -618,9 +640,26 @@ class TestGitAwareProjects(unittest.TestCase):
                            capture_output=True, check=True, env=self.git_env)
             self._git(proj, "remote", "add", "origin", str(remote))
             self._git(proj, "push", "-q", "origin", "HEAD")
+        if unpushed_commit:
+            (proj / "more.txt").write_text("more work, never pushed")
+            self._git(proj, "add", "more.txt")
+            self._git(proj, "commit", "-qm", "more")
         if dirty:
             (proj / "wip.txt").write_text("uncommitted")
         return proj
+
+    def test_unpushed_detected_with_real_remote_present(self):
+        """make_repo(pushed=False) never creates a remote at all, so the
+        no-remote branch of `unpushed` is the only one that scenario exercises.
+        This covers the actual rev-list predicate against a repo that HAS a
+        remote and has pushed to it, plus one local commit made afterward —
+        a miswritten revision range would still slip past the no-remote case."""
+        self.make_repo("aheadproj", dirty=False, pushed=True, unpushed_commit=True)
+        self.make_repo("fullypushedproj", dirty=False, pushed=True)
+        hits, _, _ = cleaner.scan_projects(self.cfg, roots=[str(self.root)])
+        by_name = {Path(h["project"]).name: h for h in hits}
+        self.assertEqual(by_name["aheadproj"]["git"], {"dirty": False, "unpushed": True})
+        self.assertEqual(by_name["fullypushedproj"]["git"], {"dirty": False, "unpushed": False})
 
     def test_git_states_detected(self):
         self.make_repo("cleanproj", dirty=False, pushed=True)
@@ -889,6 +928,302 @@ class TestDryRun(unittest.TestCase):
         self.assertIn("Dry run", r.stdout)
         self.assertIn("Would free", r.stdout)
         self.assertTrue((self.home / ".npm" / "_cacache").exists())
+
+
+class TestDryRunSafeOnlyFilter(unittest.TestCase):
+    """TestDryRun only enables 'node', where every path target is safe=True,
+    so a regression leaking review targets into a bare `clean --dry-run`
+    preview would pass unnoticed. Use 'xcode', which has both safe and
+    review-level targets, to actually exercise the filter."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        derived = self.home / "Library/Developer/Xcode/DerivedData/App-abc123"
+        derived.mkdir(parents=True)
+        (derived / "blob").write_text("x" * 4096)
+        archive_dir = self.home / "Library/Developer/Xcode/Archives"
+        archive = archive_dir / "2026-01-01" / "App.xcarchive"
+        archive.mkdir(parents=True)
+        (archive / "blob").write_text("y" * 4096)
+        cfg_path = self.tmp / "config.json"
+        cfg_path.write_text(json.dumps({"enabled_categories": ["xcode"]}))
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log")}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_bare_dry_run_previews_safe_only(self):
+        r = self.run_cli("clean", "--dry-run", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        ids = {i["id"] for i in data["items"]}
+        self.assertIn("xcode-derived-data", ids)
+        self.assertNotIn("xcode-archives", ids,
+                         "review targets must not leak into a bare dry-run preview")
+
+    def test_targets_dry_run_previews_named_review_target(self):
+        r = self.run_cli("clean", "--dry-run", "--targets", "xcode-archives", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual([i["id"] for i in data["items"]], ["xcode-archives"],
+                         "naming a review target via --targets must preview it")
+
+
+class TestDryRunExpansion(unittest.TestCase):
+    """AGENTS.md promises empty_only targets list their top-level children,
+    and cmd targets report would-run with the command, never executing it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        caches = self.home / "Library/Caches"
+        (caches / "child_a").mkdir(parents=True)
+        (caches / "child_a" / "f").write_text("x" * 4096)
+        (caches / "child_b").mkdir(parents=True)
+        (caches / "child_b" / "f").write_text("y" * 4096)
+        cfg_path = self.tmp / "config.json"
+        cfg_path.write_text(json.dumps({"enabled_categories": ["caches", "docker"]}))
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log")}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_empty_only_lists_top_level_children(self):
+        r = self.run_cli("clean", "--dry-run", "--targets", "general-caches", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        item = next(i for i in data["items"] if i["id"] == "general-caches")
+        names = {Path(p["path"]).name for p in item["paths"]}
+        self.assertEqual(names, {"child_a", "child_b"})
+        self.assertTrue((self.home / "Library/Caches").exists(),
+                        "dry run must not actually delete anything")
+
+    def test_cmd_target_reports_would_run_without_executing(self):
+        r = self.run_cli("clean", "--dry-run", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        item = next(i for i in data["items"] if i["id"] == "docker-prune")
+        self.assertEqual(item["status"], "would-run")
+        self.assertIn("docker system prune", item["cmd"])
+        self.assertEqual(item["paths"], [])
+
+
+class TestSnapshotScope(unittest.TestCase):
+    """run_clean's snapshot_scope='full' remaining-targets computation must
+    exclude what was cleaned and retain what wasn't."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.fake_home = self.tmp / "home"
+        self.fake_home.mkdir()
+        self.orig_home = cleaner.HOME
+        self.orig_log = cleaner.LOG_PATH
+        self.orig_snap = cleaner.SNAPSHOTS_PATH
+        cleaner.HOME = self.fake_home
+        cleaner.LOG_PATH = self.tmp / "report.log"
+        cleaner.SNAPSHOTS_PATH = self.tmp / "snapshots.log"
+
+    def tearDown(self):
+        cleaner.HOME = self.orig_home
+        cleaner.LOG_PATH = self.orig_log
+        cleaner.SNAPSHOTS_PATH = self.orig_snap
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def target(self, tid, category, path, safe=True):
+        return {"id": tid, "category": category, "label": tid, "description": "",
+                "path": Path(path), "glob": None, "safe": safe, "cmd": None,
+                "estimate_cmd": None, "estimate_parser": None, "empty_only": False}
+
+    def test_full_scope_non_null_and_excludes_cleaned_retains_uncleaned(self):
+        a = self.fake_home / "a"
+        a.mkdir()
+        (a / "f").write_text("x" * 4096)
+        b = self.fake_home / "b"
+        b.mkdir()
+        (b / "f").write_text("y" * 4096)
+        targets = [self.target("clean-me", "node", a, safe=True),
+                   self.target("keep-me", "python", b, safe=False)]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cleaner.run_clean(targets, auto_approve=True, json_mode=True, explicit=False,
+                              snapshot_scope="full")
+        snaps = cleaner.load_snapshots()
+        self.assertEqual(len(snaps), 1)
+        self.assertIsNotNone(snaps[0]["reclaimable_bytes"])
+        self.assertIsNotNone(snaps[0]["categories"])
+        self.assertNotIn("node", snaps[0]["categories"],
+                         "the cleaned (safe) target's category must be excluded")
+        self.assertIn("python", snaps[0]["categories"],
+                      "the skipped (review) target's category must be retained")
+        self.assertFalse(a.exists())
+        self.assertTrue(b.exists())
+
+    def test_partial_scope_records_null(self):
+        a = self.fake_home / "a"
+        a.mkdir()
+        (a / "f").write_text("x" * 4096)
+        targets = [self.target("clean-me", "node", a, safe=True)]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cleaner.run_clean(targets, auto_approve=True, json_mode=True, explicit=False,
+                              snapshot_scope="partial")
+        snaps = cleaner.load_snapshots()
+        self.assertEqual(len(snaps), 1)
+        self.assertIsNone(snaps[0]["reclaimable_bytes"])
+        self.assertIsNone(snaps[0]["categories"])
+
+
+class TestScanSnapshotScope(unittest.TestCase):
+    """Nothing previously asserted that an unscoped `scan` records non-null
+    reclaimable_bytes/categories while a scoped one nulls them out."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        (self.home / ".npm" / "_cacache").mkdir(parents=True)
+        (self.home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        cfg_path = self.tmp / "config.json"
+        cfg_path.write_text(json.dumps({"enabled_categories": ["node"]}))
+        self.snap_path = self.tmp / "snapshots.log"
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.snap_path)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_unscoped_scan_records_non_null(self):
+        r = self.run_cli("scan", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        snaps = json.loads(self.snap_path.read_text())
+        self.assertEqual(len(snaps), 1)
+        self.assertIsNotNone(snaps[0]["reclaimable_bytes"])
+        self.assertIsNotNone(snaps[0]["categories"])
+
+    def test_category_scoped_scan_records_null(self):
+        r = self.run_cli("scan", "--category", "node", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        snaps = json.loads(self.snap_path.read_text())
+        self.assertEqual(len(snaps), 1)
+        self.assertIsNone(snaps[0]["reclaimable_bytes"])
+        self.assertIsNone(snaps[0]["categories"])
+
+    def test_min_size_scoped_scan_records_null(self):
+        r = self.run_cli("scan", "--min-size", "0", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        snaps = json.loads(self.snap_path.read_text())
+        self.assertEqual(len(snaps), 1)
+        self.assertIsNone(snaps[0]["reclaimable_bytes"])
+        self.assertIsNone(snaps[0]["categories"])
+
+
+class TestStatePathFallback(unittest.TestCase):
+    """SNAPSHOTS_PATH/LOG_PATH must fall back to
+    ~/Library/Application Support/MacCleaner when the directory beside
+    cleaner.py isn't writable (the bundled-engine-in-a-signed-.app case),
+    while the env override always wins regardless."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.fake_home = self.tmp / "home"
+        self.fake_home.mkdir()
+        self.orig_home = cleaner.HOME
+        cleaner.HOME = self.fake_home
+
+    def tearDown(self):
+        cleaner.HOME = self.orig_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                      "root bypasses directory write-permission checks")
+    def test_falls_back_when_script_dir_not_writable(self):
+        readonly_dir = self.tmp / "bundle_resources"
+        readonly_dir.mkdir()
+        os.chmod(readonly_dir, 0o555)
+        try:
+            path = cleaner._resolve_state_path("MACCLEANER_LOG_TEST_UNSET", "report.log",
+                                               script_dir=readonly_dir)
+            expected = self.fake_home / "Library/Application Support/MacCleaner/report.log"
+            self.assertEqual(path, expected)
+            self.assertTrue(expected.parent.is_dir(), "fallback dir must be created")
+        finally:
+            os.chmod(readonly_dir, 0o755)
+
+    def test_uses_script_dir_when_writable(self):
+        writable_dir = self.tmp / "mac-cleaner"
+        writable_dir.mkdir()
+        path = cleaner._resolve_state_path("MACCLEANER_LOG_TEST_UNSET", "report.log",
+                                           script_dir=writable_dir)
+        self.assertEqual(path, writable_dir / "report.log")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                      "root bypasses directory write-permission checks")
+    def test_env_override_wins_even_when_script_dir_not_writable(self):
+        readonly_dir = self.tmp / "bundle_resources2"
+        readonly_dir.mkdir()
+        os.chmod(readonly_dir, 0o555)
+        override = str(self.tmp / "custom-report.log")
+        os.environ["MACCLEANER_LOG_TEST_OVERRIDE"] = override
+        try:
+            path = cleaner._resolve_state_path("MACCLEANER_LOG_TEST_OVERRIDE", "report.log",
+                                               script_dir=readonly_dir)
+            self.assertEqual(path, Path(override))
+        finally:
+            os.environ.pop("MACCLEANER_LOG_TEST_OVERRIDE", None)
+            os.chmod(readonly_dir, 0o755)
+
+
+class TestDryRunPermissionGuard(unittest.TestCase):
+    """run_dry_run's empty_only expansion must guard p.iterdir() the same way
+    delete_target guards the equivalent loop — a PermissionError previewing
+    one target must not abort the whole preview with a traceback."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.fake_home = self.tmp / "home"
+        self.fake_home.mkdir()
+        self.orig_home = cleaner.HOME
+        cleaner.HOME = self.fake_home
+
+    def tearDown(self):
+        cleaner.HOME = self.orig_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                      "root bypasses directory permission checks")
+    def test_empty_only_permission_error_does_not_abort_preview(self):
+        d = self.fake_home / "Caches"
+        d.mkdir()
+        (d / "readable").mkdir()
+        os.chmod(d, 0o000)  # no read/execute -> p.iterdir() raises PermissionError
+        try:
+            t = {"id": "t", "category": "test", "label": "t", "description": "",
+                 "path": d, "glob": None, "safe": True, "cmd": None,
+                 "estimate_cmd": None, "estimate_parser": None, "empty_only": True}
+            with contextlib.redirect_stdout(io.StringIO()):
+                total, items = cleaner.run_dry_run([t])
+            self.assertEqual(total, 0)
+            self.assertEqual(items[0]["paths"], [])
+        finally:
+            os.chmod(d, 0o755)
 
 
 if __name__ == "__main__":
