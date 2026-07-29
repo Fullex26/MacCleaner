@@ -1448,7 +1448,13 @@ def load_snapshots():
         # caught by the broad except there, with just a per-run warning).
         # Dropping non-dict entries here lets a partially malformed file
         # self-heal the same way a fully unparseable one does.
-        return [e for e in data if isinstance(e, dict)]
+        cleaned = [e for e in data if isinstance(e, dict)]
+        dropped = len(data) - len(cleaned)
+        if dropped:
+            noun = "entry" if dropped == 1 else "entries"
+            print(f"Warning: discarded {dropped} malformed snapshot {noun} from {SNAPSHOTS_PATH}",
+                  file=sys.stderr)
+        return cleaned
     except Exception:
         print(f"Warning: corrupt or unparseable {SNAPSHOTS_PATH}, restarting", file=sys.stderr)
         return []

@@ -577,6 +577,32 @@ class TestSnapshots(unittest.TestCase):
         self.assertEqual(snaps[-1]["reclaimable_bytes"], 42)
         self.assertEqual(len(snaps), 2, "the one valid pre-existing entry plus the new one")
 
+    def test_partially_malformed_list_warns_with_count(self):
+        """Dropping malformed entries silently would permanently lose trend
+        history (90% garbage in -> 90% gone forever on the next write) with
+        no visible trace. load_snapshots must warn how many were discarded."""
+        cleaner.SNAPSHOTS_PATH.write_text(json.dumps([
+            {"ts": "2025-01-01T00:00:00", "disk_total_bytes": 1, "disk_free_bytes": 1,
+             "reclaimable_bytes": 1, "categories": {}},
+            "not-a-dict-entry",
+            42,
+            None,
+        ]))
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stderr(stderr_capture):
+            snaps = cleaner.load_snapshots()
+        self.assertEqual(len(snaps), 1)
+        stderr_output = stderr_capture.getvalue()
+        self.assertIn("Warning: discarded 3 malformed snapshot entries", stderr_output)
+        self.assertIn(str(cleaner.SNAPSHOTS_PATH), stderr_output)
+
+    def test_fully_valid_list_does_not_warn(self):
+        cleaner.record_snapshot(1, {})
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stderr(stderr_capture):
+            cleaner.load_snapshots()
+        self.assertEqual(stderr_capture.getvalue(), "")
+
     def test_snapshot_fields_sums(self):
         targets = [{"category": "node", "size": 100}, {"category": "node", "size": 50},
                    {"category": "xcode", "size": 25}]
