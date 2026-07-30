@@ -7,7 +7,13 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
-## [Unreleased]
+## [2.1.0] — Unreleased
+
+### Added
+- 17 new cleanup targets across 3 new categories — `flutter` (Dart pub cache), `php` (Composer), `vms` (Colima, Vagrant, minikube) — plus yarn classic cache, npm logs, conda clean, sccache, LM Studio & Whisper models, Xcode DocumentationCache, Cypress, MS Teams, Zoom updater, Terraform plugins, and Expo caches
+- Disk snapshots: every scan/clean records free space + reclaimable to `snapshots.log` (365 daily-deduped entries, roughly a year of history); `report` shows a disk trend and `report --json` gains `disk_history`
+- Git-aware `projects`: dirty or unpushed repos are badged and excluded from `--yes` sweeps (config `project_git_check`)
+- `clean --dry-run` / `projects --dry-run`: exact resolved paths + sizes, zero side effects
 
 ---
 

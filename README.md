@@ -9,10 +9,11 @@
 
 MacCleaner finds and removes the developer detritus that accumulates silently — Xcode DerivedData, Docker layers, package manager caches, downloaded AI models, stale `node_modules` in projects you abandoned months ago. A single command can reclaim tens of gigabytes.
 
-- **CLI** — `scan`, `clean`, `projects`, `report`, `doctor`, `config`. 60+ cleanup targets across 17 categories. Interactive checklist or fully unattended.
+- **CLI** — `scan`, `clean`, `projects`, `report`, `doctor`, `config`. 70+ cleanup targets across 20 categories. Interactive checklist or fully unattended.
 - **macOS app** — SwiftUI menu bar app (macOS 13+) with a dashboard: see everything, tick what goes, clean in-app.
 - **Agent-ready** — every command speaks `--json`, every target has a stable ID, exit codes are documented. Point your AI agent at [AGENTS.md](AGENTS.md) and it can operate the whole tool.
 - **Safe by design** — deletes only inside your home directory, never follows symlinks, and can move things to the Trash instead of deleting.
+- **Know before you act** — `--dry-run` previews the exact paths and sizes a clean would touch with zero side effects, `report` tracks disk-space trends over time, and `projects` automatically skips repos with uncommitted or unpushed work.
 
 ---
 
@@ -55,9 +56,9 @@ A scan looks like this:
   → Run 'maccleaner clean' to start cleaning
 ```
 
-`projects` is the one people miss: it walks your project roots (`~/Documents`, `~/Developer`, `~/Projects`, `~/Code`, `~/dev` by default) looking for `node_modules`, `.venv`, `target`, `Pods`, `.next`, and friends that haven't been touched in 30+ days — and only counts a directory when a sibling manifest (`package.json`, `Cargo.toml`, `pyproject.toml`, …) proves what it is. Add `--clean` to remove them.
+`projects` is the one people miss: it walks your project roots (`~/Documents`, `~/Developer`, `~/Projects`, `~/Code`, `~/dev` by default) looking for `node_modules`, `.venv`, `target`, `Pods`, `.next`, and friends that haven't been touched in 30+ days — and only counts a directory when a sibling manifest (`package.json`, `Cargo.toml`, `pyproject.toml`, …) proves what it is. Add `--clean` to remove them. Projects with uncommitted changes or commits that haven't been pushed anywhere are flagged and left out of `--clean --yes` automatically — name them explicitly with `--targets` if you really want them gone.
 
-Useful extras: `--category xcode` to scope a run, `--min-size 500` to ignore small stuff, `--trash` to move to Trash instead of deleting, `report` for history. The full flag reference lives in [AGENTS.md](AGENTS.md).
+Useful extras: `--category xcode` to scope a run, `--min-size 500` to ignore small stuff, `--trash` to move to Trash instead of deleting, `--dry-run` to see exactly what would be deleted first, `report` for history and disk-space trends. The full flag reference lives in [AGENTS.md](AGENTS.md).
 
 ---
 
@@ -95,7 +96,7 @@ python3 ~/mac-cleaner/cleaner.py clean --targets npm-cache,pip-cache,xcode-deriv
 
 ## What It Cleans
 
-17 categories, 60+ targets. Enable or disable any category via `maccleaner config enable|disable <category>`; run `maccleaner categories` to list every target and its ID.
+20 categories, 70+ targets. Enable or disable any category via `maccleaner config enable|disable <category>`; run `maccleaner categories` to list every target and its ID.
 
 | Category | What's in it |
 |----------|--------------|
@@ -116,6 +117,9 @@ python3 ~/mac-cleaner/cleaner.py clean --targets npm-cache,pip-cache,xcode-deriv
 | **ide** | VS Code and JetBrains caches |
 | **browsers** | Arc, Brave, Edge, Firefox caches |
 | **system** | Empty Trash, iOS device backups — review carefully |
+| **flutter** | Dart & Flutter pub package cache |
+| **php** | Composer package cache |
+| **vms** | VM disks and container runtimes — Colima, Vagrant, minikube (review carefully) |
 
 ---
 

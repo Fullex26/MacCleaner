@@ -16,6 +16,7 @@ This document tracks planned features and long-term direction. Community input w
 - Buildable from source in one command — `bash app/build.sh` (swiftc, universal arm64 + x86_64, bundles `cleaner.py` as a fallback engine)
 - 39 stdlib-only unit tests; CI runs tests, smoke tests, and the app build on `macos-latest`
 - Still here from v1: safe vs. review distinction, cron scheduling via `scheduler.sh`, `install.sh`, optional `rich` output
+- **v2.1 additions** — 17 more targets across 3 new categories (`flutter`, `php`, `vms`), now 70+ targets across 20 categories; disk-usage snapshots with a `report` trend view (`disk_history` in `report --json`); git-aware `projects` (dirty/unpushed repos excluded from `--yes` sweeps, config `project_git_check`); `--dry-run` on `clean`/`projects` for exact-path previews with zero side effects. 69 tests total
 
 ---
 
@@ -28,7 +29,7 @@ This document tracks planned features and long-term direction. Community input w
 - [ ] **Sparkle auto-updater** — installed apps update themselves when new versions ship
 - [ ] **Homebrew Cask** — `brew install --cask maccleaner` without cloning the repo
 - [ ] **launchd instead of cron** — the native macOS scheduler; catches up on missed runs after sleep, no crontab editing
-- [ ] **More targets** — always room for more; open an issue with the `cleanup-target` label
+- [x] **More targets** — 17 added in v2.1: 3 new categories (`flutter`, `php`, `vms` — Dart/Composer/Colima/Vagrant/minikube) plus sccache, conda clean, Yarn classic cache, npm logs, LM Studio, Whisper, Xcode docs cache, Cypress, Teams, Zoom, Terraform, and Expo caches. Always room for more; open an issue with the `cleanup-target` label
 
 ---
 
