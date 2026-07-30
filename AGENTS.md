@@ -216,7 +216,7 @@ Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets`
 }
 ```
 
-`ok` is false only for genuine problems (currently: invalid config JSON). Missing optional tools are informational (`ok: true`).
+`ok` is false only for genuine problems: invalid config JSON, or (see Schedule below) a launchd plist present but not actually loaded. Missing optional tools are informational (`ok: true`). This is `doctor`'s own summary field, not a process exit code — `main` doesn't propagate `run_doctor`'s return value, so `doctor`'s exit code stays governed by the usual 0/1/2 contract regardless of this `ok` value.
 
 The `Schedule` check (new in 2.2.0) queries `launchctl list <label>` for each `com.fullex.maccleaner.*.plist` found in `~/Library/LaunchAgents` — a plist's mere presence on disk isn't proof launchd actually has it loaded. When at least one agent is genuinely loaded, it reports `"launchd: com.fullex.maccleaner.clean, com.fullex.maccleaner.diskwatch"` (`ok: true`), appending a note for any plist present but not loaded and for a lingering legacy cron entry. When a plist exists but launchd has nothing loaded, it reports that distinctly (`ok: false` — this is the one case the check flags as a problem, since it means scheduling silently isn't running). With no plists but a legacy cron line, it reports the cron entry and suggests migrating (`ok: true`). With neither, it reports `"not scheduled"` (`ok: true` — an unscheduled tool isn't a failure).
 

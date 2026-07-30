@@ -37,7 +37,7 @@ Categories (20): `xcode`, `docker`, `node`, `python`, `caches`, `logs`, `homebre
 
 ### Tests
 ```bash
-python3 -m unittest discover -s tests    # 136 tests, stdlib only, no deps
+python3 -m unittest discover -s tests    # 150 tests, stdlib only, no deps
 ```
 CI runs tests + smoke tests + the app build on `macos-latest`.
 
