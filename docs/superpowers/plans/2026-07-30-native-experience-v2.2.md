@@ -1429,19 +1429,28 @@ Expected: version 2.2.0; `disk-check` exits 0 and reports real numbers (`notifie
 
 - [ ] **Step 4: App build** — `bash app/build.sh` compiles, and `grep -c '2.2.0' build/MacCleaner.app/Contents/Info.plist` returns 2.
 
-- [ ] **Step 5: Scheduler dry check (do NOT install into the real LaunchAgents).** Run against a temp directory so the real agents are untouched:
+- [ ] **Step 5: Scheduler dry check — fully sandboxed.**
+
+**`MACCLEANER_LAUNCH_AGENTS_DIR` alone is not a sandbox.** It redirects only where plists are written; the crontab and `launchctl` calls are still real. `weekly`/`monthly` auto-migrate a legacy cron line, so running either with just that variable set would strip the user's real cron entry and bootstrap agents from a directory that is about to be deleted. **This machine has a live MacCleaner cron line.** Stub `crontab` and `launchctl` on `PATH` as well:
 
 ```bash
-MACCLEANER_LAUNCH_AGENTS_DIR=$(mktemp -d) bash scheduler.sh status
+d=$(mktemp -d); b="$d/bin"; mkdir -p "$b" "$d/agents"
+printf '#!/bin/sh\nexit 0\n' > "$b/launchctl"; printf '#!/bin/sh\nexit 0\n' > "$b/crontab"
+chmod +x "$b/launchctl" "$b/crontab"
+PATH="$b:$PATH" MACCLEANER_LAUNCH_AGENTS_DIR="$d/agents" bash scheduler.sh weekly
+plutil -lint "$d"/agents/*.plist
 ```
 
-Expected: reports "Not scheduled" for the empty temp dir and exits 0. Then confirm the generated plists lint, still in a temp dir:
+Expected: `weekly` reports the schedule and exits 0; both plists report OK. `status` is read-only and safe to run with only the agents-dir override, but keep the stubs anyway — there is no reason to point a real `launchctl` at a temp-dir plist.
+
+Then confirm the real environment was untouched:
 
 ```bash
-d=$(mktemp -d); MACCLEANER_LAUNCH_AGENTS_DIR="$d" bash scheduler.sh weekly >/dev/null 2>&1; plutil -lint "$d"/*.plist
+crontab -l 2>/dev/null | grep -c cleaner.py
+ls ~/Library/LaunchAgents/com.fullex.maccleaner.* 2>/dev/null || echo "no real agents installed"
 ```
 
-Expected: both plists report OK. (`launchctl` may warn on a temp-dir plist; the plists themselves must lint.)
+Expected: the cron count is whatever it was before this step (do not "fix" it here — migrating the maintainer's real schedule is their call, not a verification side effect), and no real agents were installed.
 
 - [ ] **Step 6: Check for stray runtime files** — `git status --porcelain` shows no untracked runtime artifacts. If `alerts.json` appears at the repo root (created by the smoke runs above), add it to `.gitignore` beside `report.log` and `snapshots.log`, along with its atomic-write temp pattern `.alerts.json.*.tmp`, and commit.
 
