@@ -162,6 +162,11 @@ final class CleanerBridge: ObservableObject {
     private var fullTimer: Timer?
     private var lastFullScan: Date?
     private var wakeObserver: NSObjectProtocol?
+    /// Memoized so settings load exactly once per app run no matter how many
+    /// call sites race to trigger it (menu bar `.task`, main window `.task`,
+    /// a notification-gated action) — awaiting it elsewhere just joins the
+    /// in-flight (or already-finished) load instead of starting a new one.
+    private var settingsLoadTask: Task<Void, Never>?
 
     /// Engine resolution: MACCLEANER_ENGINE env override (development) →
     /// user-installed copy (shares config with the CLI) → bundled fallback.
@@ -246,6 +251,11 @@ final class CleanerBridge: ObservableObject {
         lightTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.lightRefresh() }
         }
+        // A tolerance-less 60s repeating timer defeats timer coalescing and
+        // App Nap, so an idle menu bar app wakes the process on the dot
+        // 1440x/day. 10% tolerance lets the system batch this with other
+        // wake-ups (finding M7).
+        lightTimer?.tolerance = 6
         scheduleFullTimer()
         if wakeObserver == nil {
             wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -266,6 +276,7 @@ final class CleanerBridge: ObservableObject {
         fullTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.fullRefreshIfStale() }
         }
+        fullTimer?.tolerance = interval * 0.1
     }
 
     /// Cheap: free space and last-cleaned only. Never runs during a clean.
@@ -309,6 +320,9 @@ final class CleanerBridge: ObservableObject {
             args.append("--json")
             lastClean = try await run(CleanResult.self, args)
             statusMessage = nil
+            // Settings must be loaded before this check even in a menu-bar-only
+            // session (finding I4) — see ensureSettingsLoaded().
+            await ensureSettingsLoaded().value
             if notificationsEnabled, let result = lastClean {
                 NotificationManager.shared.post(
                     title: "MacCleaner freed \(result.freed_human)",
@@ -319,6 +333,9 @@ final class CleanerBridge: ObservableObject {
         }
         await scan()
         await loadHistory()
+        // One refresh covers both "Free disk" and "Last cleaned" in the menu
+        // bar, instead of leaving them up to 60s stale (finding M12).
+        await lightRefresh()
     }
 
     func autoCleanSafe() async {
@@ -327,6 +344,9 @@ final class CleanerBridge: ObservableObject {
         do {
             lastClean = try await run(CleanResult.self, ["clean", "--yes", "--json"])
             statusMessage = nil
+            // Settings must be loaded before this check even in a menu-bar-only
+            // session (finding I4) — see ensureSettingsLoaded().
+            await ensureSettingsLoaded().value
             if notificationsEnabled, let result = lastClean {
                 NotificationManager.shared.post(
                     title: "MacCleaner freed \(result.freed_human)",
@@ -337,6 +357,9 @@ final class CleanerBridge: ObservableObject {
         }
         await scan()
         await loadHistory()
+        // One refresh covers both "Free disk" and "Last cleaned" in the menu
+        // bar, instead of leaving them up to 60s stale (finding M12).
+        await lightRefresh()
     }
 
     func scanProjects() async {
@@ -373,6 +396,21 @@ final class CleanerBridge: ObservableObject {
         } catch {
             history = []
         }
+    }
+
+    /// Kicks off `loadSettings()` at most once per app run and returns the
+    /// shared task, so a caller can either fire-and-forget it (the menu bar's
+    /// `.task`, which must not block on a subprocess at launch) or `await
+    /// .value` to guarantee settings are current before acting on them (the
+    /// notification checks in `clean`/`autoCleanSafe`) — without reloading
+    /// settings again just because the menu happened to open first
+    /// (finding I4).
+    @discardableResult
+    func ensureSettingsLoaded() -> Task<Void, Never> {
+        if let existing = settingsLoadTask { return existing }
+        let task = Task { await loadSettings() }
+        settingsLoadTask = task
+        return task
     }
 
     func loadSettings() async {

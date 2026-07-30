@@ -21,6 +21,12 @@ struct MacCleanerApp: App {
             MenuBarContent()
                 .environmentObject(bridge)
                 .task {
+                    // Fire-and-forget: a menu-bar-only session (the user never
+                    // opens the main window) must still have real settings —
+                    // e.g. a disabled `notifications` — before Auto-Clean Safe
+                    // can post a banner (finding I4). Memoized, so this is a
+                    // no-op on every later menu open.
+                    bridge.ensureSettingsLoaded()
                     await bridge.lightRefresh()
                     await bridge.fullRefreshIfStale()
                 }
@@ -107,8 +113,9 @@ struct MainView: View {
             bridge.startAutoRefresh()
             // Load config (incl. full_refresh_hours) in the background so launch
             // never waits on a subprocess; fullRefreshHours' didSet reschedules
-            // the periodic timer once the real value comes back.
-            Task { await bridge.loadSettings() }
+            // the periodic timer once the real value comes back. Memoized —
+            // joins the menu bar's load if that already kicked one off.
+            bridge.ensureSettingsLoaded()
             if bridge.report == nil {
                 await bridge.scan()
             }
