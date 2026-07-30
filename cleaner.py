@@ -65,9 +65,11 @@ def _is_inside_app_bundle(path: Path) -> bool:
 
 
 def _resolve_state_path(env_var: str, filename: str, script_dir: Path = None) -> Path:
-    """Resolve the path for a mutable state file (report.log / snapshots.log).
+    """Resolve the path for a mutable state file (report.log / snapshots.log /
+    alerts.json).
 
-    `env_var` (MACCLEANER_LOG / MACCLEANER_SNAPSHOTS) always wins when set.
+    `env_var` (MACCLEANER_LOG / MACCLEANER_SNAPSHOTS / MACCLEANER_ALERTS)
+    always wins when set.
     Otherwise prefer the directory beside cleaner.py — the normal installed
     case, `~/mac-cleaner/`. Fall back to
     `~/Library/Application Support/MacCleaner/` (creating it if needed) when
@@ -1325,6 +1327,18 @@ def print_projects(hits, roots, min_age):
 
 
 # ── Doctor ──────────────────────────────────────────────────────────────────────
+def _launchd_is_loaded(label: str) -> bool:
+    """True only if launchd currently has `label` loaded — a plist file on
+    disk merely means it was written, not that bootstrap/load succeeded or
+    that it's still loaded (finding I1)."""
+    try:
+        r = subprocess.run(["launchctl", "list", label],
+                           capture_output=True, text=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def run_doctor(config, json_mode=False):
     checks = []
 
@@ -1352,13 +1366,24 @@ def run_doctor(config, json_mode=False):
         agents = HOME / "Library/LaunchAgents"
         labels = [p.stem for p in sorted(agents.glob("com.fullex.maccleaner.*.plist"))] \
             if agents.exists() else []
+        loaded = [l for l in labels if _launchd_is_loaded(l)]
+        not_loaded = [l for l in labels if l not in loaded]
         cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
-        has_cron = cron.returncode == 0 and "cleaner.py" in cron.stdout
-        if labels:
-            note = f"launchd: {', '.join(labels)}"
+        has_cron = cron.returncode == 0 and "mac-cleaner/cleaner.py" in cron.stdout
+        if loaded:
+            note = f"launchd: {', '.join(loaded)}"
+            if not_loaded:
+                note += (f" (plist present but not loaded: {', '.join(not_loaded)}"
+                         " — run scheduler.sh weekly to reload)")
             if has_cron:
                 note += " (plus a legacy cron entry — run scheduler.sh weekly to clean up)"
             check("Schedule", note)
+        elif not_loaded:
+            # The plist exists but launchd doesn't have it loaded — distinct
+            # from "never installed at all" (finding I1).
+            check("Schedule",
+                  f"plist present but not loaded: {', '.join(not_loaded)}"
+                  " — run scheduler.sh weekly to reload", ok=False)
         elif has_cron:
             check("Schedule", "legacy cron entry (run scheduler.sh weekly to migrate to launchd)")
         else:
@@ -1662,6 +1687,8 @@ def run_disk_check(config, json_mode=False):
         threshold_gb = float(raw_threshold)
         if not math.isfinite(threshold_gb):
             raise ValueError(f"non-finite threshold_gb {threshold_gb!r}")
+        if threshold_gb < 0:
+            raise ValueError(f"negative threshold_gb {threshold_gb!r}")
         threshold = int(threshold_gb * 1024**3)
     except (TypeError, ValueError, OverflowError):
         print(f"Warning: invalid low_disk_threshold_gb {raw_threshold!r}, "
@@ -1674,12 +1701,21 @@ def run_disk_check(config, json_mode=False):
     alerts = load_alerts()
     should_notify, state = _low_disk_decision(alerts, datetime.datetime.now(), free, threshold)
     notified = False
+    # A decision that doesn't depend on posting a notification (still-above, or
+    # still-below-but-throttled) is accurate regardless of what happens below.
+    persist_state = not should_notify
     if enabled and should_notify:
         notified = _notify(
             f"Low disk space: {fmt_size(free)} free",
             f"Below your {fmt_size(threshold)} threshold — "
             f"open MacCleaner to reclaim space.")
-    if enabled:
+        # Only stamp the throttle when the banner actually posted — otherwise
+        # a failed notification would suppress retries for the next 24h even
+        # though the user never saw anything (finding M5).
+        persist_state = notified
+    if enabled and persist_state and alerts.get("low_disk") != state:
+        # Skip the write entirely when nothing changed, so an hourly agent
+        # isn't rewriting alerts.json every run for no reason (finding M3).
         alerts["low_disk"] = state
         save_alerts(alerts)
 
