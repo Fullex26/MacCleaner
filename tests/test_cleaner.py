@@ -1587,6 +1587,41 @@ class TestDiskCheck(unittest.TestCase):
         self.assertEqual(data["threshold_bytes"], int(15 * 1024**3))
         self.assertNotIn("low_disk_threshold_gb", r.stderr)
 
+    def test_nan_threshold_falls_back_and_warns(self):
+        """json permits the NaN literal, and `config set low_disk_threshold_gb NaN`
+        writes a real float('nan') that round-trips through load_config(). float(nan)
+        doesn't raise, so this must be caught before int(nan * 1024**3), which raises
+        ValueError: cannot convert float NaN to integer."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=float("nan"))
+        self.assertEqual(r.returncode, 0, "disk-check must always exit 0")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertEqual(data["free_human"], cleaner.fmt_size(data["free_bytes"]),
+                          "numbers must still be usable, not just present")
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("nan", r.stderr.lower())
+
+    def test_infinity_threshold_falls_back_and_warns(self):
+        """float(inf) doesn't raise either, but int(inf * 1024**3) raises
+        OverflowError: cannot convert float infinity to integer — a third
+        exception type that must also be caught."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=float("inf"))
+        self.assertEqual(r.returncode, 0, "disk-check must always exit 0")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertEqual(data["free_human"], cleaner.fmt_size(data["free_bytes"]))
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("inf", r.stderr.lower())
+
+    def test_negative_infinity_threshold_falls_back_and_warns(self):
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=float("-inf"))
+        self.assertEqual(r.returncode, 0, "disk-check must always exit 0")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertEqual(data["free_human"], cleaner.fmt_size(data["free_bytes"]))
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("inf", r.stderr.lower())
+
     def test_no_side_effect_files(self):
         r = self.run_cli("disk-check", "--json")
         self.assertEqual(r.returncode, 0)

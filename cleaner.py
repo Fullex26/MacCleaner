@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import json
+import math
 import glob as globmod
 import time
 import shutil
@@ -1648,11 +1649,14 @@ def run_disk_check(config, json_mode=False):
     raw_threshold = config.get("low_disk_threshold_gb", 10)
     try:
         threshold_gb = float(raw_threshold)
-    except (TypeError, ValueError):
+        if not math.isfinite(threshold_gb):
+            raise ValueError(f"non-finite threshold_gb {threshold_gb!r}")
+        threshold = int(threshold_gb * 1024**3)
+    except (TypeError, ValueError, OverflowError):
         print(f"Warning: invalid low_disk_threshold_gb {raw_threshold!r}, "
               f"falling back to the default of 10 GB", file=sys.stderr)
         threshold_gb = 10
-    threshold = int(threshold_gb * 1024**3)
+        threshold = int(threshold_gb * 1024**3)
     free = ds["free_bytes"]
     enabled = config.get("low_disk_alerts", True)
 
