@@ -13,8 +13,11 @@ firebase-debug.log
 # MacCleaner runtime data (created next to cleaner.py when run from the repo)
 report.log
 snapshots.log
+alerts.json
 .report.log.*.tmp
 .snapshots.log.*.tmp
+.alerts.json.*.tmp
+cron.log
 
 # macOS
 .DS_Store
