@@ -15,8 +15,9 @@ This document tracks planned features and long-term direction. Community input w
 - SwiftUI app (macOS 13+) — menu bar extra plus a real dashboard window (Dashboard / Projects / History / Settings), cleaning in-app through the CLI's JSON interface instead of hopping to Terminal
 - Buildable from source in one command — `bash app/build.sh` (swiftc, universal arm64 + x86_64, bundles `cleaner.py` as a fallback engine)
 - 39 stdlib-only unit tests; CI runs tests, smoke tests, and the app build on `macos-latest`
-- Still here from v1: safe vs. review distinction, cron scheduling via `scheduler.sh`, `install.sh`, optional `rich` output
+- Still here from v1: safe vs. review distinction, scheduling via `scheduler.sh` (launchd as of v2.2, cron before it), `install.sh`, optional `rich` output
 - **v2.1 additions** — 17 more targets across 3 new categories (`flutter`, `php`, `vms`), now 70+ targets across 20 categories; disk-usage snapshots with a `report` trend view (`disk_history` in `report --json`); git-aware `projects` (dirty/unpushed repos excluded from `--yes` sweeps, config `project_git_check`); `--dry-run` on `clean`/`projects` for exact-path previews with zero side effects. 69 tests total
+- **v2.2 additions** — launchd scheduling replaces cron (catches up on missed runs after sleep; existing cron schedules migrate automatically); notifications when a scheduled clean finishes (`clean --notify`) and after in-app cleans; `disk-check`, a cheap hourly low-disk watch (config `low_disk_alerts`, `low_disk_threshold_gb`, default 10 GB, throttled to once a day); a live menu bar with split-cadence refresh (60s light tick, longer full rescan, config `full_refresh_hours`) and a "Last cleaned" readout. 136 tests total
 
 ---
 
@@ -25,10 +26,10 @@ This document tracks planned features and long-term direction. Community input w
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
 - [ ] **Shell completions** — zsh/bash completion for subcommands, categories, and target IDs
-- [ ] **Notifications** — macOS notification when a scheduled clean finishes, plus low-disk alerts when free space drops below a configurable threshold
+- [x] **Notifications** — macOS notification when a scheduled clean finishes (`clean --notify`) or an in-app clean completes, plus low-disk alerts (`disk-check`) when free space drops below a configurable threshold (default 10 GB, throttled to once a day)
 - [ ] **Sparkle auto-updater** — installed apps update themselves when new versions ship
 - [ ] **Homebrew Cask** — `brew install --cask maccleaner` without cloning the repo
-- [ ] **launchd instead of cron** — the native macOS scheduler; catches up on missed runs after sleep, no crontab editing
+- [x] **launchd instead of cron** — the native macOS scheduler; catches up on missed runs after sleep, no crontab editing. Existing cron schedules migrate automatically
 - [x] **More targets** — 17 added in v2.1: 3 new categories (`flutter`, `php`, `vms` — Dart/Composer/Colima/Vagrant/minikube) plus sccache, conda clean, Yarn classic cache, npm logs, LM Studio, Whisper, Xcode docs cache, Cypress, Teams, Zoom, Terraform, and Expo caches. Always room for more; open an issue with the `cleanup-target` label
 
 ---
@@ -62,15 +63,15 @@ This document tracks planned features and long-term direction. Community input w
 
 ---
 
-## Phase 3 — Smarter Menu Bar App
+## Phase 3 — Smarter Menu Bar App ✅
 
-> Makes the menu bar app genuinely useful day-to-day, not just a launcher. Largely landed in the v2.0 SwiftUI app.
+> Makes the menu bar app genuinely useful day-to-day, not just a launcher. Largely landed in the v2.0 SwiftUI app; completed in v2.2.
 
 - [x] **Live free disk space** — shown in the menu and the Dashboard header (the bar title still shows reclaimable)
-- [ ] **Low disk alerts** — macOS notification when free space drops below a configurable threshold (e.g. 10 GB)
-- [ ] **Auto-refresh** — poll every N minutes; the v2.0 app scans on launch and on demand only
+- [x] **Low disk alerts** — macOS notification when free space drops below a configurable threshold (default 10 GB), via the hourly `disk-check` launchd agent
+- [x] **Auto-refresh** — split-cadence refresh: a light 60-second tick (`report --json`) plus a full rescan on a longer interval (`full_refresh_hours`, default 6), on wake, and when the menu opens
 - [x] **Preferences panel** — Settings tab toggles categories and delete mode, shared with the CLI's `config.json`; schedule is still configured via `scheduler.sh`
-- [ ] **Last cleaned timestamp** — the History tab shows full run history, but the menu itself doesn't say "Last cleaned: 3 days ago" yet
+- [x] **Last cleaned timestamp** — the menu bar now shows "Last cleaned: 3 days ago" alongside reclaimable size
 - [x] **Per-category breakdown** — Dashboard groups targets by category with per-category size totals
 
 ---

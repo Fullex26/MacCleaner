@@ -14,6 +14,7 @@ MacCleaner finds and removes the developer detritus that accumulates silently �
 - **Agent-ready** — every command speaks `--json`, every target has a stable ID, exit codes are documented. Point your AI agent at [AGENTS.md](AGENTS.md) and it can operate the whole tool.
 - **Safe by design** — deletes only inside your home directory, never follows symlinks, and can move things to the Trash instead of deleting.
 - **Know before you act** — `--dry-run` previews the exact paths and sizes a clean would touch with zero side effects, `report` tracks disk-space trends over time, and `projects` automatically skips repos with uncommitted or unpushed work.
+- **Stay in the loop** — a notification when a scheduled clean finishes, a low-disk warning if free space drops below a configurable threshold (10 GB by default), and a menu bar that shows free space and "last cleaned" without opening the app.
 
 ---
 
@@ -23,7 +24,7 @@ MacCleaner finds and removes the developer detritus that accumulates silently �
 git clone https://github.com/Fullex26/MacCleaner && cd MacCleaner && bash install.sh
 ```
 
-Installs to `~/mac-cleaner/`, adds shell aliases (`maccleaner`, `mclean`, `mpreview`, `mreport`), optionally sets up a cron schedule, and installs the menu bar app.
+Installs to `~/mac-cleaner/`, adds shell aliases (`maccleaner`, `mclean`, `mpreview`, `mreport`), optionally sets up a launchd schedule, and installs the menu bar app. Already scheduling via cron? It's migrated to launchd automatically the next time you run `scheduler.sh`.
 
 **Zero required dependencies** — the engine is a single Python 3 file using only the standard library, and Python 3 ships on every Mac. [`rich`](https://github.com/Textualize/rich) is optional (prettier tables); `install.sh` offers to install it, and everything works without it.
 
@@ -36,7 +37,7 @@ Upgrading from v1? Everything still works — old flags (`--preview`, `--clean -
 ```bash
 maccleaner scan             # what's reclaimable, and how much
 maccleaner clean            # interactive checklist — pick what goes
-maccleaner clean --yes      # auto-clean everything marked safe (cron mode)
+maccleaner clean --yes      # auto-clean everything marked safe (unattended mode)
 maccleaner projects         # find stale build artifacts in old projects
 maccleaner doctor           # health-check your environment and install
 ```
@@ -66,7 +67,7 @@ Useful extras: `--category xcode` to scope a run, `--min-size 500` to ignore sma
 
 A SwiftUI app (macOS 13+) that's a thin client over the CLI — same engine, same config, no separate logic.
 
-- **Menu bar**: total reclaimable space at a glance, plus Scan, Auto-Clean Safe, Open Dashboard, Quit. No Dock icon.
+- **Menu bar**: total reclaimable space and "last cleaned" at a glance, plus Scan, Auto-Clean Safe, Open Dashboard, Quit. No Dock icon. Refreshes lightly every minute, with a full rescan on a longer interval, on wake, and whenever you open the menu.
 - **Dashboard window**: four tabs — **Dashboard** (targets grouped by category with checkboxes, clean in-app), **Projects** (stale artifact finder), **History** (past runs), **Settings** (category toggles and delete mode, shared with the CLI's `config.json`).
 
 `install.sh` installs a pre-built copy, or build from source — no Xcode project needed:
@@ -144,7 +145,10 @@ python3 ~/mac-cleaner/cleaner.py clean --targets npm-cache,pip-cache,xcode-deriv
   "auto_approve": false,
   "delete_mode": "rm",
   "project_roots": ["~/Documents", "~/Developer", "~/Projects", "~/Code", "~/dev"],
-  "project_min_age_days": 30
+  "project_min_age_days": 30,
+  "notifications": true,
+  "low_disk_alerts": true,
+  "low_disk_threshold_gb": 10
 }
 ```
 
@@ -168,7 +172,9 @@ maccleaner config set delete_mode trash
 ~/mac-cleaner/scheduler.sh remove    # Remove schedule
 ```
 
-Scheduled runs use `clean --yes`, so only *safe* targets are ever touched unattended.
+Scheduled runs use `clean --yes --notify`, so only *safe* targets are ever touched unattended, and you get a notification once it's done. An hourly low-disk check runs alongside it, warning (at most once a day) if free space drops below `low_disk_threshold_gb`.
+
+Scheduling uses launchd, not cron — it catches up on a run that was due while your Mac was asleep instead of silently skipping it. If you already had a cron schedule from an earlier version, it's migrated to launchd automatically the next time you run `scheduler.sh weekly`/`monthly`.
 
 ---
 
