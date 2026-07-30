@@ -1349,11 +1349,22 @@ def run_doctor(config, json_mode=False):
           else "not installed to ~/mac-cleaner (running from source?)")
 
     try:
-        r = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
-        scheduled = r.returncode == 0 and "cleaner.py" in r.stdout
-        check("Schedule", "cron job active" if scheduled else "no cron schedule (run scheduler.sh weekly)")
+        agents = HOME / "Library/LaunchAgents"
+        labels = [p.stem for p in sorted(agents.glob("com.fullex.maccleaner.*.plist"))] \
+            if agents.exists() else []
+        cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
+        has_cron = cron.returncode == 0 and "cleaner.py" in cron.stdout
+        if labels:
+            note = f"launchd: {', '.join(labels)}"
+            if has_cron:
+                note += " (plus a legacy cron entry — run scheduler.sh weekly to clean up)"
+            check("Schedule", note)
+        elif has_cron:
+            check("Schedule", "legacy cron entry (run scheduler.sh weekly to migrate to launchd)")
+        else:
+            check("Schedule", "not scheduled (run scheduler.sh weekly)")
     except Exception:
-        check("Schedule", "could not read crontab")
+        check("Schedule", "could not determine schedule")
 
     app_paths = [HOME / "Applications/MacCleaner.app", Path("/Applications/MacCleaner.app")]
     check("Menu bar app", "installed" if any(p.exists() for p in app_paths) else "not installed")

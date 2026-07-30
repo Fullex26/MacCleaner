@@ -1641,5 +1641,141 @@ class TestDiskCheck(unittest.TestCase):
         self.assertIn("free", r.stdout.lower())
 
 
+class TestScheduler(unittest.TestCase):
+    """scheduler.sh against a sandboxed LaunchAgents dir with stub
+    launchctl/crontab on PATH — never touches the real agents or crontab."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.agents = self.tmp / "LaunchAgents"
+        self.agents.mkdir()
+        self.bindir = self.tmp / "bin"
+        self.bindir.mkdir()
+        self.calls = self.tmp / "calls.txt"
+        self.crontab_file = self.tmp / "crontab.txt"
+        self.crontab_file.write_text("")
+        for name in ("launchctl", "crontab"):
+            stub = self.bindir / name
+            stub.write_text(
+                '#!/bin/sh\n'
+                f'printf "{name} %s\\n" "$*" >> "$CALLS_FILE"\n'
+                'if [ "$1" = "-l" ]; then cat "$CRONTAB_FILE"; exit 0; fi\n'
+                'if [ "$1" = "list" ]; then grep -o "maccleaner[a-z.]*" "$CALLS_FILE" 2>/dev/null | head -1; exit 0; fi\n'
+                'if [ -z "$1" ] || [ "$1" = "-" ]; then cat > "$CRONTAB_FILE"; fi\n'
+                'exit 0\n')
+            stub.chmod(0o755)
+        self.env = {**os.environ,
+                    "PATH": f"{self.bindir}:{os.environ['PATH']}",
+                    "HOME": str(self.tmp),
+                    "MACCLEANER_LAUNCH_AGENTS_DIR": str(self.agents),
+                    "CALLS_FILE": str(self.calls),
+                    "CRONTAB_FILE": str(self.crontab_file)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def sched(self, *args):
+        return subprocess.run(["bash", str(REPO / "scheduler.sh"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=60)
+
+    def plist(self, label):
+        return self.agents / f"com.fullex.maccleaner.{label}.plist"
+
+    def test_weekly_installs_both_agents(self):
+        r = self.sched("weekly")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.plist("clean").exists(), "clean agent missing")
+        self.assertTrue(self.plist("diskwatch").exists(), "diskwatch agent missing")
+
+    def test_plists_are_valid(self):
+        self.sched("weekly")
+        for label in ("clean", "diskwatch"):
+            lint = subprocess.run(["plutil", "-lint", str(self.plist(label))],
+                                  capture_output=True, text=True)
+            self.assertEqual(lint.returncode, 0, f"{label}: {lint.stdout}{lint.stderr}")
+
+    def test_clean_agent_content(self):
+        self.sched("weekly")
+        body = self.plist("clean").read_text()
+        self.assertIn("com.fullex.maccleaner.clean", body)
+        self.assertIn("cleaner.py", body)
+        self.assertIn("--notify", body)
+        self.assertIn("StartCalendarInterval", body)
+        self.assertIn("<key>Weekday</key>", body)
+
+    def test_monthly_uses_day_not_weekday(self):
+        self.sched("monthly")
+        body = self.plist("clean").read_text()
+        self.assertIn("<key>Day</key>", body)
+        self.assertNotIn("<key>Weekday</key>", body)
+
+    def test_diskwatch_agent_content(self):
+        self.sched("weekly")
+        body = self.plist("diskwatch").read_text()
+        self.assertIn("disk-check", body)
+        self.assertIn("StartInterval", body)
+        self.assertIn("3600", body)
+
+    def test_remove_deletes_both(self):
+        self.sched("weekly")
+        r = self.sched("remove")
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(self.plist("clean").exists())
+        self.assertFalse(self.plist("diskwatch").exists())
+
+    def test_reinstall_replaces_not_stacks(self):
+        self.sched("weekly")
+        self.sched("monthly")
+        body = self.plist("clean").read_text()
+        self.assertIn("<key>Day</key>", body)
+        self.assertEqual(len(list(self.agents.glob("*.plist"))), 2)
+
+    def test_migrates_cron_weekly(self):
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        r = self.sched("status")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("migrat", (r.stdout + r.stderr).lower())
+        self.assertTrue(self.plist("clean").exists())
+        self.assertIn("<key>Weekday</key>", self.plist("clean").read_text())
+        self.assertNotIn("cleaner.py", self.crontab_file.read_text(),
+                         "the cron line must be removed after migration")
+
+    def test_migration_preserves_monthly(self):
+        self.crontab_file.write_text(
+            "0 9 1 * * /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        self.sched("status")
+        self.assertIn("<key>Day</key>", self.plist("clean").read_text())
+
+    def test_migration_keeps_unrelated_cron_lines(self):
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n"
+            "*/5 * * * * /usr/local/bin/other-job\n")
+        self.sched("status")
+        remaining = self.crontab_file.read_text()
+        self.assertIn("other-job", remaining, "unrelated cron jobs must survive")
+        self.assertNotIn("cleaner.py", remaining)
+
+    def test_migration_is_idempotent(self):
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        self.sched("status")
+        second = self.sched("status")
+        self.assertEqual(second.returncode, 0)
+        self.assertNotIn("migrat", second.stdout.lower(),
+                         "second run has nothing to migrate")
+
+    def test_status_reports_installed(self):
+        self.sched("weekly")
+        r = self.sched("status")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("maccleaner", r.stdout.lower())
+
+    def test_usage_when_no_command(self):
+        r = self.sched()
+        self.assertIn("weekly", r.stdout)
+        self.assertIn("monthly", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
