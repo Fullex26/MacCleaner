@@ -1373,18 +1373,28 @@ class TestNotify(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_alerts_path_resolution(self):
-        """The override wins; otherwise alerts.json sits beside cleaner.py."""
-        installed = Path.home() / "mac-cleaner"
-        self.assertEqual(
-            cleaner._resolve_state_path("MACCLEANER_ALERTS", "alerts.json", installed),
-            installed / "alerts.json")
-        os.environ["MACCLEANER_ALERTS"] = "/tmp/alerts-override-test.json"
+        """The override wins; otherwise alerts.json sits beside cleaner.py.
+
+        The "installed" directory is a real tempdir rather than ~/mac-cleaner:
+        the sibling-directory branch requires the directory to exist and be
+        writable, so pointing at a path that happens to exist on a developer's
+        machine but not on a fresh CI runner would fall through to the
+        Application Support fallback and fail there only."""
+        tmp = Path(tempfile.mkdtemp())
+        override = tmp / "override.json"
         try:
             self.assertEqual(
-                cleaner._resolve_state_path("MACCLEANER_ALERTS", "alerts.json", installed),
-                Path("/tmp/alerts-override-test.json"))
+                cleaner._resolve_state_path("MACCLEANER_ALERTS", "alerts.json", tmp),
+                tmp / "alerts.json")
+            os.environ["MACCLEANER_ALERTS"] = str(override)
+            try:
+                self.assertEqual(
+                    cleaner._resolve_state_path("MACCLEANER_ALERTS", "alerts.json", tmp),
+                    override)
+            finally:
+                del os.environ["MACCLEANER_ALERTS"]
         finally:
-            del os.environ["MACCLEANER_ALERTS"]
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_escape_applescript(self):
         self.assertEqual(cleaner._escape_applescript('say "hi"'), 'say \\"hi\\"')
