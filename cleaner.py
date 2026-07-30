@@ -941,7 +941,7 @@ def scan_json(targets, extra=None):
 
 
 def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=False,
-              snapshot_scope="partial"):
+              snapshot_scope="partial", notify=False):
     """Clean targets. explicit=True means the selection was made via --targets."""
     say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
 
@@ -1027,6 +1027,12 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
         record_snapshot(*snapshot_fields(remaining))
     else:
         record_snapshot()
+
+    if notify and load_config().get("notifications", True):
+        cleaned = sum(1 for r in results if r["status"] in ("deleted", "trashed"))
+        _notify(f"MacCleaner freed {fmt_size(total_freed)}",
+                f"{cleaned} item{'s' if cleaned != 1 else ''} cleaned · "
+                f"{fmt_size(disk_stats()['free_bytes'])} free")
 
     if json_mode:
         print(json.dumps({
@@ -1698,6 +1704,8 @@ def build_parser():
     p_clean.add_argument("--json", action="store_true", help="Machine-readable results")
     p_clean.add_argument("--dry-run", action="store_true",
                          help="Show exactly what would be deleted, delete nothing")
+    p_clean.add_argument("--notify", action="store_true",
+                         help="Post a macOS notification when the clean finishes")
 
     p_proj = sub.add_parser("projects", help="Find stale build artifacts (node_modules, .venv, target, ...)")
     p_proj.add_argument("--roots", action="append", metavar="DIR", help="Roots to scan (default: config project_roots)")
@@ -1861,7 +1869,8 @@ def main():
             return
         full = not explicit and not categories and args.min_size is None
         run_clean(targets, auto_approve=auto, mode=mode, json_mode=args.json,
-                  explicit=explicit, snapshot_scope="full" if full else "partial")
+                  explicit=explicit, snapshot_scope="full" if full else "partial",
+                  notify=args.notify)
         return
 
 

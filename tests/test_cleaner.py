@@ -1348,5 +1348,81 @@ class TestNotify(unittest.TestCase):
             cleaner._notify_argv = orig
 
 
+class TestCleanNotify(unittest.TestCase):
+    """--notify must be observable without posting a real notification: the
+    tests capture the argv _notify would have used by swapping the primitive."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        (self.home / ".npm" / "_cacache").mkdir(parents=True)
+        (self.home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        self.cfg_path = self.tmp / "config.json"
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_ALERTS": str(self.tmp / "alerts.json")}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write_cfg(self, **extra):
+        cfg = {"enabled_categories": ["node"]}
+        cfg.update(extra)
+        self.cfg_path.write_text(json.dumps(cfg))
+
+    def run_cli(self, *args, fake_osascript=True):
+        """Run the CLI with a stub `osascript` early on PATH that records its
+        argv to a file, so we can assert on the notification without posting."""
+        env = dict(self.env)
+        if fake_osascript:
+            bindir = self.tmp / "bin"
+            bindir.mkdir(exist_ok=True)
+            recorded = self.tmp / "notified.txt"
+            stub = bindir / "osascript"
+            stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$RECORD_FILE"\n')
+            stub.chmod(0o755)
+            env["PATH"] = f"{bindir}:{env['PATH']}"
+            env["RECORD_FILE"] = str(recorded)
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=env, timeout=120)
+
+    def notified_text(self):
+        f = self.tmp / "notified.txt"
+        return f.read_text() if f.exists() else ""
+
+    def test_notify_posts_after_clean(self):
+        self.write_cfg()
+        r = self.run_cli("clean", "--yes", "--notify", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertGreater(data["freed_bytes"], 0)
+        self.assertIn("display notification", self.notified_text())
+        self.assertIn("MacCleaner", self.notified_text())
+
+    def test_notifications_disabled_suppresses(self):
+        self.write_cfg(notifications=False)
+        r = self.run_cli("clean", "--yes", "--notify", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(self.notified_text(), "",
+                         "notifications:false must suppress the notification")
+        self.assertFalse((self.home / ".npm" / "_cacache").exists(),
+                         "the clean itself must still happen")
+
+    def test_no_flag_no_notification(self):
+        self.write_cfg()
+        r = self.run_cli("clean", "--yes", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(self.notified_text(), "")
+
+    def test_dry_run_never_notifies(self):
+        self.write_cfg()
+        r = self.run_cli("clean", "--dry-run", "--notify", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(self.notified_text(), "")
+        self.assertTrue((self.home / ".npm" / "_cacache").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
