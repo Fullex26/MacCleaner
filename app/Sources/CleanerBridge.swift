@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 // ── JSON models (contract with cleaner.py --json, see AGENTS.md) ───────────────
 
@@ -69,8 +70,18 @@ struct HistoryRun: Codable, Identifiable {
     var id: String { timestamp }
 }
 
+struct DiskCurrent: Codable {
+    let free_bytes: Int
+    let total_bytes: Int
+}
+
+struct DiskHistory: Codable {
+    let current: DiskCurrent
+}
+
 struct HistoryReport: Codable {
     let runs: [HistoryRun]
+    let disk_history: DiskHistory?
 }
 
 struct CategoryInfo: Codable, Identifiable {
@@ -135,6 +146,13 @@ final class CleanerBridge: ObservableObject {
     @Published var isCleaning = false
     @Published var statusMessage: String?
     @Published var lastClean: CleanResult?
+    @Published var lastCleanedAt: Date?
+    @Published var freeBytes: Int?
+
+    private var lightTimer: Timer?
+    private var fullTimer: Timer?
+    private var lastFullScan: Date?
+    private var wakeObserver: NSObjectProtocol?
 
     /// Engine resolution: MACCLEANER_ENGINE env override (development) →
     /// user-installed copy (shares config with the CLI) → bundled fallback.
@@ -205,6 +223,72 @@ final class CleanerBridge: ObservableObject {
         } catch {
             statusMessage = "Scan failed: \(error.localizedDescription)"
         }
+        lastFullScan = Date()
+    }
+
+    // ── Auto-refresh ───────────────────────────────────────────────────────────
+    //
+    // Two cadences on purpose: `report --json` is a couple of file reads and one
+    // stat, so it can run every minute; a full `scan` shells out to `du` for
+    // 70+ targets and must not.
+
+    func startAutoRefresh() {
+        lightTimer?.invalidate()
+        lightTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.lightRefresh() }
+        }
+        scheduleFullTimer()
+        if wakeObserver == nil {
+            wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    await self?.lightRefresh()
+                    await self?.fullRefreshIfStale()
+                }
+            }
+        }
+        Task { await lightRefresh() }
+    }
+
+    private func scheduleFullTimer() {
+        fullTimer?.invalidate()
+        let interval = max(3600, fullRefreshHours * 3600)
+        fullTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.fullRefreshIfStale() }
+        }
+    }
+
+    /// Cheap: free space and last-cleaned only. Never runs during a clean.
+    func lightRefresh() async {
+        guard !isCleaning else { return }
+        guard let report = try? await run(HistoryReport.self, ["report", "--json", "-n", "1"])
+        else { return }
+        freeBytes = report.disk_history?.current.free_bytes
+        lastCleanedAt = report.runs.last.flatMap { Self.parseTimestamp($0.timestamp) }
+    }
+
+    /// Full scan, debounced so a wake plus a menu-open doesn't launch two.
+    func fullRefreshIfStale() async {
+        guard !isCleaning, !isBusy else { return }
+        let interval = max(3600, fullRefreshHours * 3600)
+        if let last = lastFullScan, Date().timeIntervalSince(last) < interval { return }
+        lastFullScan = Date()
+        await scan()
+    }
+
+    nonisolated static func parseTimestamp(_ raw: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = formatter.date(from: raw) { return d }
+        formatter.formatOptions = [.withInternetDateTime]
+        if let d = formatter.date(from: raw) { return d }
+        // The engine writes datetime.isoformat(), which has no timezone suffix.
+        let fallback = DateFormatter()
+        fallback.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
+        if let d = fallback.date(from: raw) { return d }
+        fallback.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return fallback.date(from: raw)
     }
 
     func clean(ids: [String]) async {
