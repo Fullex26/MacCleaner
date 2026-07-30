@@ -1645,7 +1645,14 @@ def run_disk_check(config, json_mode=False):
     """Cheap enough to run hourly: one disk_usage call, no measurement, no
     snapshot. Always exits 0 — it is a monitor, not a check that fails."""
     ds = disk_stats()
-    threshold = int(float(config.get("low_disk_threshold_gb", 10)) * 1024**3)
+    raw_threshold = config.get("low_disk_threshold_gb", 10)
+    try:
+        threshold_gb = float(raw_threshold)
+    except (TypeError, ValueError):
+        print(f"Warning: invalid low_disk_threshold_gb {raw_threshold!r}, "
+              f"falling back to the default of 10 GB", file=sys.stderr)
+        threshold_gb = 10
+    threshold = int(threshold_gb * 1024**3)
     free = ds["free_bytes"]
     enabled = config.get("low_disk_alerts", True)
 

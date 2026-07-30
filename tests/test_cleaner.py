@@ -1473,6 +1473,25 @@ class TestLowDiskThrottle(unittest.TestCase):
         notify, _ = self.decide(alerts, 5 * 1024**3)
         self.assertTrue(notify)
 
+    def test_below_state_missing_stamp_notifies(self):
+        """A hand-edited or partially written alerts.json can have `state`
+        present but no `last_notified` at all — distinct from a corrupt
+        (non-empty but unparseable) stamp. Must still notify."""
+        alerts = {"low_disk": {"state": "below", "last_notified": None}}
+        notify, state = self.decide(alerts, 5 * 1024**3)
+        self.assertTrue(notify)
+        self.assertEqual(state["last_notified"], self.now.isoformat())
+
+    def test_still_below_at_exact_renotify_boundary_renotifies(self):
+        """elapsed >= LOW_DISK_RENOTIFY_HOURS uses >=, so exactly 24h must
+        renotify, not just times strictly greater than it."""
+        alerts = {"low_disk": {"state": "below",
+                               "last_notified": (self.now - datetime.timedelta(
+                                   hours=cleaner.LOW_DISK_RENOTIFY_HOURS)).isoformat()}}
+        notify, state = self.decide(alerts, 5 * 1024**3)
+        self.assertTrue(notify, "exactly the renotify window must still renotify")
+        self.assertEqual(state["last_notified"], self.now.isoformat())
+
 
 class TestDiskCheck(unittest.TestCase):
     def setUp(self):
@@ -1533,6 +1552,40 @@ class TestDiskCheck(unittest.TestCase):
         self.assertTrue(data["below_threshold"], "numbers still reported")
         self.assertFalse(data["notified"])
         self.assertEqual(self.notified(), "")
+        self.assertFalse(self.alerts.exists(),
+                          "disabled alerts must not persist a stamp, so re-enabling "
+                          "later doesn't inherit a stale 'already warned' state")
+
+    def test_malformed_threshold_falls_back_and_warns(self):
+        """A non-numeric low_disk_threshold_gb (e.g. hand-edited via `config set`
+        with no type validation) must degrade to the documented 10 GB default
+        instead of crashing the hourly monitor."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb="high")
+        self.assertEqual(r.returncode, 0, "disk-check must always exit 0")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertEqual(data["free_human"], cleaner.fmt_size(data["free_bytes"]),
+                          "numbers must still be usable, not just present")
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("high", r.stderr)
+
+    def test_structurally_wrong_threshold_falls_back_and_warns(self):
+        """A list or null (TypeError from float()) must also degrade cleanly,
+        not just a non-numeric string (ValueError)."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=None)
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+
+    def test_numeric_string_threshold_still_works(self):
+        """Happy path must be unchanged: a numeric string like "15" still
+        parses via float() with no warning."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb="15")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], int(15 * 1024**3))
+        self.assertNotIn("low_disk_threshold_gb", r.stderr)
 
     def test_no_side_effect_files(self):
         r = self.run_cli("disk-check", "--json")
