@@ -24,7 +24,7 @@ MacCleaner finds and removes the developer detritus that accumulates silently â€
 git clone https://github.com/Fullex26/MacCleaner && cd MacCleaner && bash install.sh
 ```
 
-Installs to `~/mac-cleaner/`, adds shell aliases (`maccleaner`, `mclean`, `mpreview`, `mreport`), optionally sets up a launchd schedule, and installs the menu bar app. Already scheduling via cron? It's migrated to launchd automatically the next time you run `scheduler.sh`.
+Installs to `~/mac-cleaner/`, adds shell aliases (`maccleaner`, `mclean`, `mpreview`, `mreport`), optionally sets up a launchd schedule, and installs the menu bar app. Already scheduling via cron? It's migrated to launchd automatically the next time you run `scheduler.sh weekly` or `scheduler.sh monthly`.
 
 **Zero required dependencies** â€” the engine is a single Python 3 file using only the standard library, and Python 3 ships on every Mac. [`rich`](https://github.com/Textualize/rich) is optional (prettier tables); `install.sh` offers to install it, and everything works without it.
 
