@@ -1591,6 +1591,92 @@ def _print_disk_trend(snaps):
         print()
 
 
+# ── Low-disk alerts ────────────────────────────────────────────────────────────
+LOW_DISK_RENOTIFY_HOURS = 24
+
+
+def load_alerts():
+    """Alert throttle state. A corrupt file self-heals, like snapshots.log."""
+    if not ALERTS_PATH.exists():
+        return {}
+    try:
+        with open(ALERTS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        print(f"Warning: corrupt or unparseable {ALERTS_PATH}, restarting", file=sys.stderr)
+        return {}
+
+
+def save_alerts(alerts):
+    try:
+        _atomic_write_json(ALERTS_PATH, alerts)
+    except Exception as e:
+        print(f"Warning: could not write alert state: {e}", file=sys.stderr)
+
+
+def _low_disk_decision(alerts, now, free_bytes, threshold_bytes):
+    """(should_notify, new_low_disk_state) — pure, so the throttle is testable
+    without touching the clock or the filesystem.
+
+    Notify on an above->below transition, then at most once per
+    LOW_DISK_RENOTIFY_HOURS while still below. Recovering to `above` clears the
+    stamp so the next dip warns immediately."""
+    prev = alerts.get("low_disk") or {}
+    if free_bytes >= threshold_bytes:
+        return False, {"state": "above", "last_notified": prev.get("last_notified")}
+
+    stamp = {"state": "below", "last_notified": now.isoformat()}
+    if prev.get("state") != "below":
+        return True, stamp
+    last = prev.get("last_notified")
+    if not last:
+        return True, stamp
+    try:
+        elapsed = now - datetime.datetime.fromisoformat(last)
+    except (TypeError, ValueError):
+        return True, stamp
+    if elapsed >= datetime.timedelta(hours=LOW_DISK_RENOTIFY_HOURS):
+        return True, stamp
+    return False, {"state": "below", "last_notified": last}
+
+
+def run_disk_check(config, json_mode=False):
+    """Cheap enough to run hourly: one disk_usage call, no measurement, no
+    snapshot. Always exits 0 — it is a monitor, not a check that fails."""
+    ds = disk_stats()
+    threshold = int(float(config.get("low_disk_threshold_gb", 10)) * 1024**3)
+    free = ds["free_bytes"]
+    enabled = config.get("low_disk_alerts", True)
+
+    alerts = load_alerts()
+    should_notify, state = _low_disk_decision(alerts, datetime.datetime.now(), free, threshold)
+    notified = False
+    if enabled and should_notify:
+        notified = _notify(
+            f"Low disk space: {fmt_size(free)} free",
+            f"Below your {fmt_size(threshold)} threshold — "
+            f"open MacCleaner to reclaim space.")
+    if enabled:
+        alerts["low_disk"] = state
+        save_alerts(alerts)
+
+    result = {
+        "free_bytes": free,
+        "free_human": fmt_size(free),
+        "threshold_bytes": threshold,
+        "below_threshold": free < threshold,
+        "notified": notified,
+    }
+    if json_mode:
+        print(json.dumps({"version": VERSION, **result}, indent=2))
+    else:
+        status = "BELOW threshold" if result["below_threshold"] else "ok"
+        print(f"Free: {result['free_human']} · threshold "
+              f"{fmt_size(threshold)} · {status}")
+    return result
+
+
 def show_report(limit=10, json_mode=False):
     disk_history = {"current": disk_stats(), "snapshots": load_snapshots()}
     if not LOG_PATH.exists():
@@ -1740,6 +1826,10 @@ def build_parser():
     p_cats = sub.add_parser("categories", help="List categories and their targets")
     p_cats.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    p_disk = sub.add_parser("disk-check",
+                            help="Warn when free space is below the configured threshold (cheap; for launchd)")
+    p_disk.add_argument("--json", action="store_true", help="Machine-readable output")
+
     sub.add_parser("install-deps", help="Install 'rich' for pretty terminal output")
 
     return parser
@@ -1778,6 +1868,10 @@ def main():
 
     if args.command == "doctor":
         run_doctor(config, json_mode=args.json)
+        return
+
+    if args.command == "disk-check":
+        run_disk_check(config, json_mode=args.json)
         return
 
     if args.command == "report":

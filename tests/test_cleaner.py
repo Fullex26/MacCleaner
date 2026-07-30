@@ -1424,5 +1424,134 @@ class TestCleanNotify(unittest.TestCase):
         self.assertTrue((self.home / ".npm" / "_cacache").exists())
 
 
+class TestLowDiskThrottle(unittest.TestCase):
+    """_low_disk_decision is pure: (alerts, now, free, threshold) -> (notify?, state)."""
+
+    def setUp(self):
+        self.now = datetime.datetime(2026, 7, 30, 12, 0, 0)
+        self.threshold = 10 * 1024**3
+
+    def decide(self, alerts, free, now=None):
+        return cleaner._low_disk_decision(alerts, now or self.now, free, self.threshold)
+
+    def test_first_dip_notifies(self):
+        notify, state = self.decide({}, 5 * 1024**3)
+        self.assertTrue(notify)
+        self.assertEqual(state["state"], "below")
+        self.assertEqual(state["last_notified"], self.now.isoformat())
+
+    def test_above_threshold_never_notifies(self):
+        notify, state = self.decide({}, 500 * 1024**3)
+        self.assertFalse(notify)
+        self.assertEqual(state["state"], "above")
+
+    def test_still_below_within_24h_stays_quiet(self):
+        alerts = {"low_disk": {"state": "below",
+                               "last_notified": (self.now - datetime.timedelta(hours=3)).isoformat()}}
+        notify, state = self.decide(alerts, 5 * 1024**3)
+        self.assertFalse(notify, "must not re-notify hourly")
+        self.assertEqual(state["state"], "below")
+
+    def test_still_below_after_24h_renotifies(self):
+        alerts = {"low_disk": {"state": "below",
+                               "last_notified": (self.now - datetime.timedelta(hours=25)).isoformat()}}
+        notify, state = self.decide(alerts, 5 * 1024**3)
+        self.assertTrue(notify)
+        self.assertEqual(state["last_notified"], self.now.isoformat())
+
+    def test_recovery_then_new_dip_notifies_immediately(self):
+        recovered = {"low_disk": {"state": "below",
+                                  "last_notified": (self.now - datetime.timedelta(hours=1)).isoformat()}}
+        notify, state = self.decide(recovered, 500 * 1024**3)
+        self.assertFalse(notify)
+        self.assertEqual(state["state"], "above")
+        notify2, _ = self.decide({"low_disk": state}, 5 * 1024**3)
+        self.assertTrue(notify2, "a fresh dip after recovery must notify at once")
+
+    def test_corrupt_last_notified_notifies(self):
+        alerts = {"low_disk": {"state": "below", "last_notified": "not-a-timestamp"}}
+        notify, _ = self.decide(alerts, 5 * 1024**3)
+        self.assertTrue(notify)
+
+
+class TestDiskCheck(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.alerts = self.tmp / "alerts.json"
+        self.log = self.tmp / "report.log"
+        self.snaps = self.tmp / "snapshots.log"
+        self.cfg_path = self.tmp / "config.json"
+        self.env = {**os.environ, "HOME": str(self.tmp),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.log),
+                    "MACCLEANER_SNAPSHOTS": str(self.snaps),
+                    "MACCLEANER_ALERTS": str(self.alerts)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args, **cfg):
+        self.cfg_path.write_text(json.dumps(cfg) if cfg else "{}")
+        bindir = self.tmp / "bin"
+        bindir.mkdir(exist_ok=True)
+        stub = bindir / "osascript"
+        stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$RECORD_FILE"\n')
+        stub.chmod(0o755)
+        env = {**self.env, "PATH": f"{bindir}:{os.environ['PATH']}",
+               "RECORD_FILE": str(self.tmp / "notified.txt")}
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=env, timeout=60)
+
+    def notified(self):
+        f = self.tmp / "notified.txt"
+        return f.read_text() if f.exists() else ""
+
+    def test_json_shape_and_exit_zero(self):
+        r = self.run_cli("disk-check", "--json")
+        self.assertEqual(r.returncode, 0, "disk-check is a monitor: always exit 0")
+        data = json.loads(r.stdout)
+        for key in ["free_bytes", "free_human", "threshold_bytes",
+                    "below_threshold", "notified"]:
+            self.assertIn(key, data)
+        self.assertIsInstance(data["below_threshold"], bool)
+
+    def test_huge_threshold_triggers_notification(self):
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["below_threshold"])
+        self.assertTrue(data["notified"])
+        self.assertIn("display notification", self.notified())
+        self.assertTrue(self.alerts.exists())
+        state = json.loads(self.alerts.read_text())["low_disk"]
+        self.assertEqual(state["state"], "below")
+
+    def test_alerts_disabled_reports_but_stays_quiet(self):
+        r = self.run_cli("disk-check", "--json",
+                         low_disk_threshold_gb=10_000_000, low_disk_alerts=False)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["below_threshold"], "numbers still reported")
+        self.assertFalse(data["notified"])
+        self.assertEqual(self.notified(), "")
+
+    def test_no_side_effect_files(self):
+        r = self.run_cli("disk-check", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(self.log.exists(), "disk-check must not write report.log")
+        self.assertFalse(self.snaps.exists(), "disk-check must not record a snapshot")
+
+    def test_corrupt_alerts_file_self_heals(self):
+        self.alerts.write_text("{not json")
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(json.loads(r.stdout)["notified"])
+        self.assertIn("low_disk", json.loads(self.alerts.read_text()))
+
+    def test_human_output(self):
+        r = self.run_cli("disk-check")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("free", r.stdout.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
