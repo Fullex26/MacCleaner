@@ -5,6 +5,10 @@ import AppKit
 struct MacCleanerApp: App {
     @StateObject private var bridge = CleanerBridge()
 
+    init() {
+        NotificationManager.shared.requestAuthorization()
+    }
+
     var body: some Scene {
         Window("MacCleaner", id: "main") {
             MainView()

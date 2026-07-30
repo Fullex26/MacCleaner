@@ -86,6 +86,10 @@ struct CategoriesReport: Codable {
 
 struct EngineConfig: Codable {
     var delete_mode: String?
+    var notifications: Bool?
+    var low_disk_alerts: Bool?
+    var low_disk_threshold_gb: Double?
+    var full_refresh_hours: Double?
 }
 
 enum BridgeError: LocalizedError {
@@ -123,6 +127,10 @@ final class CleanerBridge: ObservableObject {
     @Published var history: [HistoryRun] = []
     @Published var categories: [CategoryInfo] = []
     @Published var deleteMode: String = "rm"
+    @Published var notificationsEnabled = true
+    @Published var lowDiskAlertsEnabled = true
+    @Published var lowDiskThresholdGB: Double = 10
+    @Published var fullRefreshHours: Double = 6
     @Published var isBusy = false
     @Published var isCleaning = false
     @Published var statusMessage: String?
@@ -209,6 +217,11 @@ final class CleanerBridge: ObservableObject {
             args.append("--json")
             lastClean = try await run(CleanResult.self, args)
             statusMessage = nil
+            if notificationsEnabled, let result = lastClean {
+                NotificationManager.shared.post(
+                    title: "MacCleaner freed \(result.freed_human)",
+                    body: "\(result.items.filter { $0.status != "skipped" }.count) items cleaned")
+            }
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
         }
@@ -222,6 +235,11 @@ final class CleanerBridge: ObservableObject {
         do {
             lastClean = try await run(CleanResult.self, ["clean", "--yes", "--json"])
             statusMessage = nil
+            if notificationsEnabled, let result = lastClean {
+                NotificationManager.shared.post(
+                    title: "MacCleaner freed \(result.freed_human)",
+                    body: "\(result.items.filter { $0.status != "skipped" }.count) items cleaned")
+            }
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
         }
@@ -270,6 +288,10 @@ final class CleanerBridge: ObservableObject {
             categories = try await run(CategoriesReport.self, ["categories", "--json"]).categories
             let cfg = try await run(EngineConfig.self, ["config", "show"])
             deleteMode = cfg.delete_mode ?? "rm"
+            notificationsEnabled = cfg.notifications ?? true
+            lowDiskAlertsEnabled = cfg.low_disk_alerts ?? true
+            lowDiskThresholdGB = cfg.low_disk_threshold_gb ?? 10
+            fullRefreshHours = cfg.full_refresh_hours ?? 6
         } catch {
             statusMessage = "Could not load settings: \(error.localizedDescription)"
         }
@@ -288,6 +310,34 @@ final class CleanerBridge: ObservableObject {
         do {
             try await runPlain(["config", "set", "delete_mode", mode])
             deleteMode = mode
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    func setNotifications(_ on: Bool) async {
+        do {
+            try await runPlain(["config", "set", "notifications", on ? "true" : "false"])
+            notificationsEnabled = on
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    func setLowDiskAlerts(_ on: Bool) async {
+        do {
+            try await runPlain(["config", "set", "low_disk_alerts", on ? "true" : "false"])
+            lowDiskAlertsEnabled = on
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    func setLowDiskThreshold(_ gb: Double) async {
+        do {
+            try await runPlain(["config", "set", "low_disk_threshold_gb",
+                                String(format: "%g", gb)])
+            lowDiskThresholdGB = gb
         } catch {
             statusMessage = "Config change failed: \(error.localizedDescription)"
         }
