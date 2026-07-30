@@ -58,12 +58,22 @@ else
     echo "→ Non-interactive install — schedule later with '$INSTALL_DIR/scheduler.sh weekly'"
 fi
 
-# 6. Menu bar app: use the pre-built bundle, or build from source if possible
+# 6. Menu bar app: build fresh from source whenever possible, so the app
+# installed from a `git clone && bash install.sh` can never be older than the
+# checkout — falling back to the committed bundle only when swiftc isn't
+# available (the committed bundle is rebuilt each release, but a clone
+# between releases would otherwise ship whatever was last committed).
 APP_BUNDLE="$SCRIPT_DIR/MacCleaner.app"
 APP_DEST="$HOME/Applications/MacCleaner.app"
-if [ ! -d "$APP_BUNDLE" ] && command -v swiftc >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/app/build.sh" ]; then
-    echo "→ No pre-built app found — building from source..."
-    bash "$SCRIPT_DIR/app/build.sh" && APP_BUNDLE="$SCRIPT_DIR/build/MacCleaner.app"
+if command -v swiftc >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/app/build.sh" ]; then
+    echo "→ Building MacCleaner.app from source..."
+    if bash "$SCRIPT_DIR/app/build.sh"; then
+        APP_BUNDLE="$SCRIPT_DIR/build/MacCleaner.app"
+    elif [ -d "$APP_BUNDLE" ]; then
+        echo "→ Build failed — falling back to the committed app bundle"
+    fi
+elif [ -d "$APP_BUNDLE" ]; then
+    echo "→ swiftc not found — using the committed app bundle (may be older than this checkout)"
 fi
 if [ -d "$APP_BUNDLE" ]; then
     mkdir -p "$HOME/Applications"
@@ -71,6 +81,9 @@ if [ -d "$APP_BUNDLE" ]; then
     cp -R "$APP_BUNDLE" "$APP_DEST" 2>/dev/null || \
     cp -R "$APP_BUNDLE" "/Applications/MacCleaner.app" 2>/dev/null || true
     echo "→ Installed MacCleaner.app to ~/Applications/"
+else
+    echo "→ No Swift toolchain and no committed app bundle found — skipping menu bar app install"
+    echo "  Install Xcode Command Line Tools and re-run, or run 'bash app/build.sh --install' later"
 fi
 
 echo ""
