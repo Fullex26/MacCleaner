@@ -70,7 +70,7 @@ A SwiftUI app (macOS 13+) that's a thin client over the CLI — same engine, sam
 - **Menu bar**: total reclaimable space and "last cleaned" at a glance, plus Scan, Auto-Clean Safe, Open Dashboard, Quit. No Dock icon. Refreshes lightly every minute, with a full rescan on a longer interval, on wake, and whenever you open the menu.
 - **Dashboard window**: four tabs — **Dashboard** (targets grouped by category with checkboxes, clean in-app), **Projects** (stale artifact finder), **History** (past runs), **Settings** (category toggles and delete mode, shared with the CLI's `config.json`).
 
-`install.sh` installs a pre-built copy, or build from source — no Xcode project needed:
+`install.sh` builds the app from source whenever Swift's toolchain (`swiftc`, from Xcode or the Command Line Tools) is available, so the installed app is never older than your checkout; it falls back to the committed pre-built copy only when `swiftc` isn't found. No Xcode project needed either way:
 
 ```bash
 bash app/build.sh            # swiftc → build/MacCleaner.app (universal, ad-hoc signed)
