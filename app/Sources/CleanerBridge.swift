@@ -282,6 +282,18 @@ final class CleanerBridge: ObservableObject {
     /// Cheap: free space and last-cleaned only. Never runs during a clean.
     func lightRefresh() async {
         guard !isCleaning else { return }
+        await performLightRefresh()
+    }
+
+    /// The unguarded body of `lightRefresh()`. `clean(ids:)`/`autoCleanSafe()`
+    /// call this directly for their post-clean refresh instead of going
+    /// through `lightRefresh()`: at that point `isCleaning` is still `true`
+    /// (it isn't cleared until the function's `defer` fires on return), so
+    /// the guarded entry point would just no-op. Calling the unguarded body
+    /// still guarantees no *concurrent* refresh — a timer-driven
+    /// `lightRefresh()` call — can interleave with a clean in flight, since
+    /// everything here runs sequentially on the main actor.
+    private func performLightRefresh() async {
         guard let report = try? await run(HistoryReport.self, ["report", "--json", "-n", "1"])
         else { return }
         freeBytes = report.disk_history?.current.free_bytes
@@ -334,8 +346,11 @@ final class CleanerBridge: ObservableObject {
         await scan()
         await loadHistory()
         // One refresh covers both "Free disk" and "Last cleaned" in the menu
-        // bar, instead of leaving them up to 60s stale (finding M12).
-        await lightRefresh()
+        // bar, instead of leaving them up to 60s stale (finding M12). Goes
+        // through the unguarded body, not lightRefresh() — isCleaning is
+        // still true here (the `defer` above only clears it once this
+        // function returns), so lightRefresh()'s own guard would swallow it.
+        await performLightRefresh()
     }
 
     func autoCleanSafe() async {
@@ -358,8 +373,11 @@ final class CleanerBridge: ObservableObject {
         await scan()
         await loadHistory()
         // One refresh covers both "Free disk" and "Last cleaned" in the menu
-        // bar, instead of leaving them up to 60s stale (finding M12).
-        await lightRefresh()
+        // bar, instead of leaving them up to 60s stale (finding M12). Goes
+        // through the unguarded body, not lightRefresh() — isCleaning is
+        // still true here (the `defer` above only clears it once this
+        // function returns), so lightRefresh()'s own guard would swallow it.
+        await performLightRefresh()
     }
 
     func scanProjects() async {
