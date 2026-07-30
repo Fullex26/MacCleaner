@@ -1286,5 +1286,67 @@ class TestDryRunPermissionGuard(unittest.TestCase):
             os.chmod(d, 0o755)
 
 
+class TestNotify(unittest.TestCase):
+    def test_new_config_defaults(self):
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        self.assertTrue(cfg["notifications"])
+        self.assertTrue(cfg["low_disk_alerts"])
+        self.assertEqual(cfg["low_disk_threshold_gb"], 10)
+        self.assertEqual(cfg["full_refresh_hours"], 6)
+
+    def test_new_keys_merge_into_old_config(self):
+        tmp = Path(tempfile.mkdtemp())
+        orig = cleaner.CONFIG_PATH
+        cleaner.CONFIG_PATH = tmp / "config.json"
+        try:
+            cleaner.CONFIG_PATH.write_text('{"enabled_categories": ["node"]}')
+            cfg = cleaner.load_config()
+            self.assertEqual(cfg["enabled_categories"], ["node"])
+            self.assertTrue(cfg["low_disk_alerts"])
+            self.assertEqual(cfg["low_disk_threshold_gb"], 10)
+        finally:
+            cleaner.CONFIG_PATH = orig
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_alerts_path_resolution(self):
+        """The override wins; otherwise alerts.json sits beside cleaner.py."""
+        installed = Path.home() / "mac-cleaner"
+        self.assertEqual(
+            cleaner._resolve_state_path("MACCLEANER_ALERTS", "alerts.json", installed),
+            installed / "alerts.json")
+        os.environ["MACCLEANER_ALERTS"] = "/tmp/alerts-override-test.json"
+        try:
+            self.assertEqual(
+                cleaner._resolve_state_path("MACCLEANER_ALERTS", "alerts.json", installed),
+                Path("/tmp/alerts-override-test.json"))
+        finally:
+            del os.environ["MACCLEANER_ALERTS"]
+
+    def test_escape_applescript(self):
+        self.assertEqual(cleaner._escape_applescript('say "hi"'), 'say \\"hi\\"')
+        self.assertEqual(cleaner._escape_applescript(r"back\slash"), r"back\\slash")
+        self.assertEqual(cleaner._escape_applescript("plain"), "plain")
+
+    def test_notify_argv_shape(self):
+        argv = cleaner._notify_argv("MacCleaner freed 1.0 GB", 'a "quoted" note')
+        self.assertEqual(argv[0], "osascript")
+        self.assertEqual(argv[1], "-e")
+        self.assertIn('display notification "a \\"quoted\\" note"', argv[2])
+        self.assertIn('with title "MacCleaner freed 1.0 GB"', argv[2])
+        self.assertEqual(len(argv), 3)
+
+    def test_notify_survives_missing_binary(self):
+        """A notification failure must never raise into the caller."""
+        orig = cleaner._notify_argv
+        cleaner._notify_argv = lambda t, m: ["definitely-not-a-real-binary-xyz"]
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                result = cleaner._notify("t", "m")
+            self.assertFalse(result)
+            self.assertIn("notif", err.getvalue().lower())
+        finally:
+            cleaner._notify_argv = orig
+
+
 if __name__ == "__main__":
     unittest.main()

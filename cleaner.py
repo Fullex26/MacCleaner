@@ -101,6 +101,7 @@ def _resolve_state_path(env_var: str, filename: str, script_dir: Path = None) ->
 
 LOG_PATH = _resolve_state_path("MACCLEANER_LOG", "report.log")
 SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
+ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 SNAPSHOT_CAP = 365
 VERSION = "2.1.0"
 
@@ -145,6 +146,10 @@ DEFAULT_CONFIG = {
     "project_roots": ["~/Documents", "~/Developer", "~/Projects", "~/Code", "~/dev"],
     "project_min_age_days": 30,
     "project_git_check": True,
+    "notifications": True,           # notify when a scheduled clean finishes
+    "low_disk_alerts": True,         # warn when free space drops below the threshold
+    "low_disk_threshold_gb": 10,     # the low-disk warning threshold
+    "full_refresh_hours": 6,         # how often the app runs a full scan (app-side)
 }
 
 
@@ -188,6 +193,39 @@ def fmt_size(bytes_val: int) -> str:
             return f"{bytes_val:.1f} {unit}"
         bytes_val /= 1024
     return f"{bytes_val:.1f} TB"
+
+
+# ── Notifications ──────────────────────────────────────────────────────────────
+def _escape_applescript(text: str) -> str:
+    """Escape a Python string for embedding in an AppleScript string literal."""
+    return str(text).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _notify_argv(title: str, message: str) -> list:
+    """The osascript argv for a notification. Separate from _notify so tests can
+    assert the constructed command as data instead of posting a real alert."""
+    script = (f'display notification "{_escape_applescript(message)}" '
+              f'with title "{_escape_applescript(title)}"')
+    return ["osascript", "-e", script]
+
+
+def _notify(title: str, message: str) -> bool:
+    """Post a macOS notification. Returns True if it was posted.
+
+    Never raises: a missing or failing osascript warns on stderr and leaves the
+    caller's exit code alone — a notification failure must not turn a
+    successful clean into a failed one. Attribution is generic until the app is
+    signed; the SwiftUI app posts properly attributed notifications itself."""
+    try:
+        r = subprocess.run(_notify_argv(title, message),
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            print(f"Warning: notification failed: {r.stderr.strip()}", file=sys.stderr)
+            return False
+        return True
+    except Exception as e:
+        print(f"Warning: could not post notification: {e}", file=sys.stderr)
+        return False
 
 
 def disk_free() -> str:
