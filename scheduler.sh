@@ -20,6 +20,12 @@ AGENTS_DIR="${MACCLEANER_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 CLEAN_LABEL="com.fullex.maccleaner.clean"
 WATCH_LABEL="com.fullex.maccleaner.diskwatch"
 
+# Homebrew tools (brew, docker, ...) aren't on launchd's minimal default PATH
+# (/usr/bin:/bin:/usr/sbin:/sbin) — same list CleanerBridge.runEngine uses on
+# the app side, so a cmd-based target behaves the same whether it's run from
+# the app or from a scheduled agent (finding I3).
+AGENT_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 write_plist() {
     # $1 = label, $2 = XML for program args, $3 = XML for the trigger
     local label="$1" args_xml="$2" trigger_xml="$3"
@@ -35,6 +41,11 @@ write_plist() {
     <array>
 $args_xml
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$AGENT_PATH</string>
+    </dict>
 $trigger_xml
     <key>StandardOutPath</key>
     <string>$LOG</string>
@@ -136,36 +147,58 @@ install_schedule() {
     echo "   Log: $LOG"
 }
 
-# Migrate a legacy cron line, if any, to launchd. Idempotent.
+# A cron line belongs to MacCleaner only if it references the canonical
+# install path, `mac-cleaner/cleaner.py` — an unanchored match on "cleaner.py"
+# would also catch a user's own `db-cleaner.py` or `log_cleaner.py` job
+# (finding I6). This intentionally does not match a dev checkout run straight
+# from a repo clone (which isn't named `mac-cleaner`); those are never what
+# migrate_cron or remove are trying to clean up.
+CRON_MARKER="mac-cleaner/cleaner.py"
+
+# Strip any legacy MacCleaner cron line and report what was found. Does not
+# install anything — the caller (the `weekly`/`monthly` case below) always
+# installs the cadence the user actually asked for. The cron line's own
+# cadence is reported for visibility only; it does not drive the install,
+# so a mismatch (e.g. a monthly cron line, migrated via `weekly`) can't
+# produce two contradictory installs (finding I2). Idempotent: a no-op when
+# there's nothing to migrate.
 migrate_cron() {
-    local existing
+    local existing removed
     existing="$(crontab -l 2>/dev/null)" || return 0
     case "$existing" in
-        *cleaner.py*) ;;
+        *"$CRON_MARKER"*) ;;
         *) return 0 ;;
     esac
-    local kind="weekly"
+    removed="$(echo "$existing" | grep "$CRON_MARKER")"
+    local detected="weekly"
     # A monthly cron line pins day-of-month (field 3); weekly pins weekday (field 5).
-    if echo "$existing" | grep "cleaner.py" | awk '{print $3}' | grep -qv '^\*$'; then
-        kind="monthly"
+    if echo "$removed" | awk '{print $3}' | grep -qv '^\*$'; then
+        detected="monthly"
     fi
-    echo "→ Migrating your cron schedule to launchd ($kind)…"
-    echo "$existing" | grep -v "cleaner.py" | crontab -
-    install_schedule "$kind"
-    echo "   Removed the old cron entry."
+    echo "→ Found a legacy cron schedule (looked $detected) — migrating to launchd and removing it:"
+    echo "    $removed"
+    echo "$existing" | grep -v "$CRON_MARKER" | crontab -
+}
+
+is_loaded() {
+    launchctl list "$1" >/dev/null 2>&1
 }
 
 status() {
     echo "── MacCleaner Scheduler Status ──"
-    local found=0
+    local any_plist=0
     for label in "$CLEAN_LABEL" "$WATCH_LABEL"; do
         if [ -f "$AGENTS_DIR/$label.plist" ]; then
-            echo "✅ $label (launchd)"
-            found=1
+            any_plist=1
+            if is_loaded "$label"; then
+                echo "✅ $label (launchd)"
+            else
+                echo "⚠️  $label — plist present but not loaded (run ./scheduler.sh weekly or monthly to reload)"
+            fi
         fi
     done
-    [ "$found" = 0 ] && echo "❌ Not scheduled (run ./scheduler.sh weekly)"
-    if crontab -l 2>/dev/null | grep -q "cleaner.py"; then
+    [ "$any_plist" = 0 ] && echo "❌ Not scheduled (run ./scheduler.sh weekly)"
+    if crontab -l 2>/dev/null | grep -q "$CRON_MARKER"; then
         echo "⚠️  A legacy cron entry is still present — run ./scheduler.sh weekly to migrate."
     fi
 }
@@ -180,9 +213,12 @@ case "${1:-}" in
     remove)
         existing="$(crontab -l 2>/dev/null)" || existing=""
         case "$existing" in
-            *cleaner.py*)
-                echo "$existing" | grep -v "cleaner.py" | crontab -
-                echo "   Also removed a legacy cron entry."
+            *"$CRON_MARKER"*)
+                removed="$(echo "$existing" | grep "$CRON_MARKER")"
+                echo "   Removing legacy cron entry:"
+                echo "     $removed"
+                echo "$existing" | grep -v "$CRON_MARKER" | crontab -
+                echo "   Also removed the legacy cron entry."
                 ;;
         esac
         unload_agent "$CLEAN_LABEL"
