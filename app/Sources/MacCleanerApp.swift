@@ -105,6 +105,10 @@ struct MainView: View {
         }
         .task {
             bridge.startAutoRefresh()
+            // Load config (incl. full_refresh_hours) in the background so launch
+            // never waits on a subprocess; fullRefreshHours' didSet reschedules
+            // the periodic timer once the real value comes back.
+            Task { await bridge.loadSettings() }
             if bridge.report == nil {
                 await bridge.scan()
             }

@@ -141,7 +141,16 @@ final class CleanerBridge: ObservableObject {
     @Published var notificationsEnabled = true
     @Published var lowDiskAlertsEnabled = true
     @Published var lowDiskThresholdGB: Double = 10
-    @Published var fullRefreshHours: Double = 6
+    @Published var fullRefreshHours: Double = 6 {
+        didSet {
+            // Reschedule the periodic timer when the configured cadence actually
+            // changes (initial config load, or a later edit) — but only once
+            // auto-refresh has actually started (fullTimer != nil), and never on
+            // a settings reload that leaves the value unchanged.
+            guard fullRefreshHours != oldValue, fullTimer != nil else { return }
+            scheduleFullTimer()
+        }
+    }
     @Published var isBusy = false
     @Published var isCleaning = false
     @Published var statusMessage: String?
@@ -220,10 +229,10 @@ final class CleanerBridge: ObservableObject {
         do {
             report = try await run(ScanReport.self, ["scan", "--json"])
             statusMessage = nil
+            lastFullScan = Date()
         } catch {
             statusMessage = "Scan failed: \(error.localizedDescription)"
         }
-        lastFullScan = Date()
     }
 
     // ── Auto-refresh ───────────────────────────────────────────────────────────
@@ -273,7 +282,6 @@ final class CleanerBridge: ObservableObject {
         guard !isCleaning, !isBusy else { return }
         let interval = max(3600, fullRefreshHours * 3600)
         if let last = lastFullScan, Date().timeIntervalSince(last) < interval { return }
-        lastFullScan = Date()
         await scan()
     }
 
