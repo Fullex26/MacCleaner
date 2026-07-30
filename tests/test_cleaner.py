@@ -1733,8 +1733,8 @@ class TestScheduler(unittest.TestCase):
     def test_migrates_cron_weekly(self):
         self.crontab_file.write_text(
             "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
-        r = self.sched("status")
-        self.assertEqual(r.returncode, 0)
+        r = self.sched("weekly")
+        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("migrat", (r.stdout + r.stderr).lower())
         self.assertTrue(self.plist("clean").exists())
         self.assertIn("<key>Weekday</key>", self.plist("clean").read_text())
@@ -1744,14 +1744,15 @@ class TestScheduler(unittest.TestCase):
     def test_migration_preserves_monthly(self):
         self.crontab_file.write_text(
             "0 9 1 * * /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
-        self.sched("status")
+        r = self.sched("monthly")
+        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("<key>Day</key>", self.plist("clean").read_text())
 
     def test_migration_keeps_unrelated_cron_lines(self):
         self.crontab_file.write_text(
             "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n"
             "*/5 * * * * /usr/local/bin/other-job\n")
-        self.sched("status")
+        self.sched("weekly")
         remaining = self.crontab_file.read_text()
         self.assertIn("other-job", remaining, "unrelated cron jobs must survive")
         self.assertNotIn("cleaner.py", remaining)
@@ -1759,11 +1760,52 @@ class TestScheduler(unittest.TestCase):
     def test_migration_is_idempotent(self):
         self.crontab_file.write_text(
             "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
-        self.sched("status")
-        second = self.sched("status")
-        self.assertEqual(second.returncode, 0)
+        self.sched("weekly")
+        second = self.sched("weekly")
+        self.assertEqual(second.returncode, 0, second.stderr)
         self.assertNotIn("migrat", second.stdout.lower(),
                          "second run has nothing to migrate")
+
+    def test_status_is_read_only_with_legacy_cron(self):
+        """status must only report a legacy cron line, never touch it or
+        install anything — even when one is present (finding 1)."""
+        cron_line = ("0 9 * * 1 /usr/bin/python3 "
+                     "/Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        self.crontab_file.write_text(cron_line)
+        r = self.sched("status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Migrating your cron schedule", r.stdout + r.stderr,
+                         "status must not perform migration")
+        self.assertNotIn("Removed the old cron entry", r.stdout + r.stderr,
+                         "status must not perform migration")
+        self.assertIn("run ./scheduler.sh weekly to migrate",
+                      (r.stdout + r.stderr))
+        self.assertEqual(self.crontab_file.read_text(), cron_line,
+                         "status must not touch the crontab")
+        self.assertEqual(list(self.agents.glob("*.plist")), [],
+                         "status must not create any launchd agents")
+
+    def test_remove_strips_legacy_cron_without_migrating(self):
+        """remove must not install anything, but should strip a legacy
+        cron line since the user's intent is to stop scheduling entirely."""
+        cron_line = ("0 9 * * 1 /usr/bin/python3 "
+                     "/Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        self.crontab_file.write_text(cron_line)
+        r = self.sched("remove")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("migrat", (r.stdout + r.stderr).lower())
+        self.assertNotIn("cleaner.py", self.crontab_file.read_text(),
+                         "remove should strip the legacy cron line")
+        self.assertEqual(list(self.agents.glob("*.plist")), [],
+                         "remove must not install any launchd agents")
+
+    def test_bare_invocation_does_not_migrate(self):
+        cron_line = ("0 9 * * 1 /usr/bin/python3 "
+                     "/Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        self.crontab_file.write_text(cron_line)
+        r = self.sched()
+        self.assertEqual(self.crontab_file.read_text(), cron_line)
+        self.assertEqual(list(self.agents.glob("*.plist")), [])
 
     def test_status_reports_installed(self):
         self.sched("weekly")
@@ -1775,6 +1817,35 @@ class TestScheduler(unittest.TestCase):
         r = self.sched()
         self.assertIn("weekly", r.stdout)
         self.assertIn("monthly", r.stdout)
+
+    def test_launchctl_failure_surfaces_message_and_propagates(self):
+        """A launchctl that fails to load an agent must surface its real
+        stderr diagnostic and make scheduler.sh exit non-zero, instead of
+        printing a generic warning immediately followed by a success
+        banner (finding 2)."""
+        failing = self.bindir / "launchctl"
+        failing.write_text(
+            '#!/bin/sh\n'
+            f'printf "launchctl %s\\n" "$*" >> "$CALLS_FILE"\n'
+            'case "$1" in\n'
+            '  bootstrap|load)\n'
+            '    echo "Load failed: 5: Input/output error" >&2\n'
+            '    exit 1\n'
+            '    ;;\n'
+            'esac\n'
+            'exit 0\n')
+        failing.chmod(0o755)
+
+        r = self.sched("weekly")
+
+        self.assertNotEqual(r.returncode, 0,
+                            "a failed launchctl load must not exit 0")
+        self.assertIn("Load failed: 5: Input/output error", r.stderr,
+                     "the real launchctl diagnostic must be surfaced")
+        self.assertNotIn("✅ Scheduled", r.stdout,
+                         "must not print a success banner after a load failure")
+        # The plist is still written so the user can load it manually.
+        self.assertTrue(self.plist("clean").exists())
 
 
 if __name__ == "__main__":

@@ -47,17 +47,20 @@ PLIST
 
 bootstrap() {
     local label="$1" plist="$AGENTS_DIR/$1.plist"
+    local err
     launchctl bootout "gui/$UID/$label" 2>/dev/null
-    if ! launchctl bootstrap "gui/$UID" "$plist" 2>/dev/null; then
-        # Older macOS, or a launchd that dislikes bootstrap for this domain
-        launchctl unload "$plist" 2>/dev/null
-        if ! launchctl load "$plist" 2>/dev/null; then
-            echo "⚠️  Could not load $label with launchctl." >&2
-            echo "    The plist is written to $plist — load it manually with:" >&2
-            echo "    launchctl bootstrap gui/$UID \"$plist\"" >&2
-            return 1
-        fi
+    if err="$(launchctl bootstrap "gui/$UID" "$plist" 2>&1 >/dev/null)"; then
+        return 0
     fi
+    # Older macOS, or a launchd that dislikes bootstrap for this domain
+    launchctl unload "$plist" 2>/dev/null
+    if err="$(launchctl load "$plist" 2>&1 >/dev/null)"; then
+        return 0
+    fi
+    echo "⚠️  Could not load $label with launchctl.${err:+ ($err)}" >&2
+    echo "    The plist is written to $plist — load it manually with:" >&2
+    echo "    launchctl bootstrap gui/$UID \"$plist\"" >&2
+    return 1
 }
 
 unload_agent() {
@@ -111,9 +114,20 @@ install_clean() {
 }
 
 install_schedule() {
-    install_clean "$1"
-    install_diskwatch
-    if [ "$1" = "monthly" ]; then
+    local kind="$1" failed=0
+    if ! install_clean "$kind"; then
+        echo "⚠️  $CLEAN_LABEL did not load — fix the issue above, then run ./scheduler.sh $kind again (or load the plist manually)." >&2
+        failed=1
+    fi
+    if ! install_diskwatch; then
+        echo "⚠️  $WATCH_LABEL did not load — fix the issue above, then run ./scheduler.sh $kind again (or load the plist manually)." >&2
+        failed=1
+    fi
+    if [ "$failed" = 1 ]; then
+        echo "❌ Scheduling incomplete — see the warning(s) above." >&2
+        return 1
+    fi
+    if [ "$kind" = "monthly" ]; then
         echo "✅ Scheduled: 1st of every month at 9am (launchd)"
     else
         echo "✅ Scheduled: every Monday at 9am (launchd)"
@@ -156,12 +170,21 @@ status() {
     fi
 }
 
-migrate_cron
+# Auto-migration only runs for the install commands (weekly/monthly) below —
+# `status`, `remove`, and a bare invocation must never mutate the crontab or
+# the agents directory.
 
 case "${1:-}" in
-    weekly)   install_schedule weekly ;;
-    monthly)  install_schedule monthly ;;
+    weekly)   migrate_cron; install_schedule weekly ;;
+    monthly)  migrate_cron; install_schedule monthly ;;
     remove)
+        existing="$(crontab -l 2>/dev/null)" || existing=""
+        case "$existing" in
+            *cleaner.py*)
+                echo "$existing" | grep -v "cleaner.py" | crontab -
+                echo "   Also removed a legacy cron entry."
+                ;;
+        esac
         unload_agent "$CLEAN_LABEL"
         unload_agent "$WATCH_LABEL"
         echo "✅ Removed MacCleaner launchd agents"
