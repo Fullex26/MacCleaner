@@ -218,7 +218,6 @@ case "${1:-}" in
                 echo "   Removing legacy cron entry:"
                 echo "     $removed"
                 echo "$existing" | grep -v "$CRON_MARKER" | crontab -
-                echo "   Also removed the legacy cron entry."
                 ;;
         esac
         unload_agent "$CLEAN_LABEL"
