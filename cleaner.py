@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import json
+import math
 import glob as globmod
 import time
 import shutil
@@ -64,9 +65,11 @@ def _is_inside_app_bundle(path: Path) -> bool:
 
 
 def _resolve_state_path(env_var: str, filename: str, script_dir: Path = None) -> Path:
-    """Resolve the path for a mutable state file (report.log / snapshots.log).
+    """Resolve the path for a mutable state file (report.log / snapshots.log /
+    alerts.json).
 
-    `env_var` (MACCLEANER_LOG / MACCLEANER_SNAPSHOTS) always wins when set.
+    `env_var` (MACCLEANER_LOG / MACCLEANER_SNAPSHOTS / MACCLEANER_ALERTS)
+    always wins when set.
     Otherwise prefer the directory beside cleaner.py — the normal installed
     case, `~/mac-cleaner/`. Fall back to
     `~/Library/Application Support/MacCleaner/` (creating it if needed) when
@@ -101,8 +104,9 @@ def _resolve_state_path(env_var: str, filename: str, script_dir: Path = None) ->
 
 LOG_PATH = _resolve_state_path("MACCLEANER_LOG", "report.log")
 SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
+ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 SNAPSHOT_CAP = 365
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -145,6 +149,10 @@ DEFAULT_CONFIG = {
     "project_roots": ["~/Documents", "~/Developer", "~/Projects", "~/Code", "~/dev"],
     "project_min_age_days": 30,
     "project_git_check": True,
+    "notifications": True,           # notify when a scheduled clean finishes
+    "low_disk_alerts": True,         # warn when free space drops below the threshold
+    "low_disk_threshold_gb": 10,     # the low-disk warning threshold
+    "full_refresh_hours": 6,         # how often the app runs a full scan (app-side)
 }
 
 
@@ -188,6 +196,39 @@ def fmt_size(bytes_val: int) -> str:
             return f"{bytes_val:.1f} {unit}"
         bytes_val /= 1024
     return f"{bytes_val:.1f} TB"
+
+
+# ── Notifications ──────────────────────────────────────────────────────────────
+def _escape_applescript(text: str) -> str:
+    """Escape a Python string for embedding in an AppleScript string literal."""
+    return str(text).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _notify_argv(title: str, message: str) -> list:
+    """The osascript argv for a notification. Separate from _notify so tests can
+    assert the constructed command as data instead of posting a real alert."""
+    script = (f'display notification "{_escape_applescript(message)}" '
+              f'with title "{_escape_applescript(title)}"')
+    return ["osascript", "-e", script]
+
+
+def _notify(title: str, message: str) -> bool:
+    """Post a macOS notification. Returns True if it was posted.
+
+    Never raises: a missing or failing osascript warns on stderr and leaves the
+    caller's exit code alone — a notification failure must not turn a
+    successful clean into a failed one. Attribution is generic until the app is
+    signed; the SwiftUI app posts properly attributed notifications itself."""
+    try:
+        r = subprocess.run(_notify_argv(title, message),
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            print(f"Warning: notification failed: {r.stderr.strip()}", file=sys.stderr)
+            return False
+        return True
+    except Exception as e:
+        print(f"Warning: could not post notification: {e}", file=sys.stderr)
+        return False
 
 
 def disk_free() -> str:
@@ -903,7 +944,7 @@ def scan_json(targets, extra=None):
 
 
 def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=False,
-              snapshot_scope="partial"):
+              snapshot_scope="partial", notify=False):
     """Clean targets. explicit=True means the selection was made via --targets."""
     say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
 
@@ -989,6 +1030,12 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
         record_snapshot(*snapshot_fields(remaining))
     else:
         record_snapshot()
+
+    if notify and load_config().get("notifications", True):
+        cleaned = sum(1 for r in results if r["status"] in ("deleted", "trashed"))
+        _notify(f"MacCleaner freed {fmt_size(total_freed)}",
+                f"{cleaned} item{'s' if cleaned != 1 else ''} cleaned · "
+                f"{fmt_size(disk_stats()['free_bytes'])} free")
 
     if json_mode:
         print(json.dumps({
@@ -1280,6 +1327,18 @@ def print_projects(hits, roots, min_age):
 
 
 # ── Doctor ──────────────────────────────────────────────────────────────────────
+def _launchd_is_loaded(label: str) -> bool:
+    """True only if launchd currently has `label` loaded — a plist file on
+    disk merely means it was written, not that bootstrap/load succeeded or
+    that it's still loaded (finding I1)."""
+    try:
+        r = subprocess.run(["launchctl", "list", label],
+                           capture_output=True, text=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def run_doctor(config, json_mode=False):
     checks = []
 
@@ -1304,11 +1363,33 @@ def run_doctor(config, json_mode=False):
           else "not installed to ~/mac-cleaner (running from source?)")
 
     try:
-        r = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
-        scheduled = r.returncode == 0 and "cleaner.py" in r.stdout
-        check("Schedule", "cron job active" if scheduled else "no cron schedule (run scheduler.sh weekly)")
+        agents = HOME / "Library/LaunchAgents"
+        labels = [p.stem for p in sorted(agents.glob("com.fullex.maccleaner.*.plist"))] \
+            if agents.exists() else []
+        loaded = [l for l in labels if _launchd_is_loaded(l)]
+        not_loaded = [l for l in labels if l not in loaded]
+        cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
+        has_cron = cron.returncode == 0 and "mac-cleaner/cleaner.py" in cron.stdout
+        if loaded:
+            note = f"launchd: {', '.join(loaded)}"
+            if not_loaded:
+                note += (f" (plist present but not loaded: {', '.join(not_loaded)}"
+                         " — run scheduler.sh weekly to reload)")
+            if has_cron:
+                note += " (plus a legacy cron entry — run scheduler.sh weekly to clean up)"
+            check("Schedule", note)
+        elif not_loaded:
+            # The plist exists but launchd doesn't have it loaded — distinct
+            # from "never installed at all" (finding I1).
+            check("Schedule",
+                  f"plist present but not loaded: {', '.join(not_loaded)}"
+                  " — run scheduler.sh weekly to reload", ok=False)
+        elif has_cron:
+            check("Schedule", "legacy cron entry (run scheduler.sh weekly to migrate to launchd)")
+        else:
+            check("Schedule", "not scheduled (run scheduler.sh weekly)")
     except Exception:
-        check("Schedule", "could not read crontab")
+        check("Schedule", "could not determine schedule")
 
     app_paths = [HOME / "Applications/MacCleaner.app", Path("/Applications/MacCleaner.app")]
     check("Menu bar app", "installed" if any(p.exists() for p in app_paths) else "not installed")
@@ -1547,6 +1628,113 @@ def _print_disk_trend(snaps):
         print()
 
 
+# ── Low-disk alerts ────────────────────────────────────────────────────────────
+LOW_DISK_RENOTIFY_HOURS = 24
+
+
+def load_alerts():
+    """Alert throttle state. A corrupt file self-heals, like snapshots.log."""
+    if not ALERTS_PATH.exists():
+        return {}
+    try:
+        with open(ALERTS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        print(f"Warning: corrupt or unparseable {ALERTS_PATH}, restarting", file=sys.stderr)
+        return {}
+
+
+def save_alerts(alerts):
+    try:
+        _atomic_write_json(ALERTS_PATH, alerts)
+    except Exception as e:
+        print(f"Warning: could not write alert state: {e}", file=sys.stderr)
+
+
+def _low_disk_decision(alerts, now, free_bytes, threshold_bytes):
+    """(should_notify, new_low_disk_state) — pure, so the throttle is testable
+    without touching the clock or the filesystem.
+
+    Notify on an above->below transition, then at most once per
+    LOW_DISK_RENOTIFY_HOURS while still below. Recovering to `above` clears the
+    stamp so the next dip warns immediately."""
+    prev = alerts.get("low_disk") or {}
+    if free_bytes >= threshold_bytes:
+        return False, {"state": "above", "last_notified": prev.get("last_notified")}
+
+    stamp = {"state": "below", "last_notified": now.isoformat()}
+    if prev.get("state") != "below":
+        return True, stamp
+    last = prev.get("last_notified")
+    if not last:
+        return True, stamp
+    try:
+        elapsed = now - datetime.datetime.fromisoformat(last)
+    except (TypeError, ValueError):
+        return True, stamp
+    if elapsed >= datetime.timedelta(hours=LOW_DISK_RENOTIFY_HOURS):
+        return True, stamp
+    return False, {"state": "below", "last_notified": last}
+
+
+def run_disk_check(config, json_mode=False):
+    """Cheap enough to run hourly: one disk_usage call, no measurement, no
+    snapshot. Always exits 0 — it is a monitor, not a check that fails."""
+    ds = disk_stats()
+    raw_threshold = config.get("low_disk_threshold_gb", 10)
+    try:
+        threshold_gb = float(raw_threshold)
+        if not math.isfinite(threshold_gb):
+            raise ValueError(f"non-finite threshold_gb {threshold_gb!r}")
+        if threshold_gb < 0:
+            raise ValueError(f"negative threshold_gb {threshold_gb!r}")
+        threshold = int(threshold_gb * 1024**3)
+    except (TypeError, ValueError, OverflowError):
+        print(f"Warning: invalid low_disk_threshold_gb {raw_threshold!r}, "
+              f"falling back to the default of 10 GB", file=sys.stderr)
+        threshold_gb = 10
+        threshold = int(threshold_gb * 1024**3)
+    free = ds["free_bytes"]
+    enabled = config.get("low_disk_alerts", True)
+
+    alerts = load_alerts()
+    should_notify, state = _low_disk_decision(alerts, datetime.datetime.now(), free, threshold)
+    notified = False
+    # A decision that doesn't depend on posting a notification (still-above, or
+    # still-below-but-throttled) is accurate regardless of what happens below.
+    persist_state = not should_notify
+    if enabled and should_notify:
+        notified = _notify(
+            f"Low disk space: {fmt_size(free)} free",
+            f"Below your {fmt_size(threshold)} threshold — "
+            f"open MacCleaner to reclaim space.")
+        # Only stamp the throttle when the banner actually posted — otherwise
+        # a failed notification would suppress retries for the next 24h even
+        # though the user never saw anything (finding M5).
+        persist_state = notified
+    if enabled and persist_state and alerts.get("low_disk") != state:
+        # Skip the write entirely when nothing changed, so an hourly agent
+        # isn't rewriting alerts.json every run for no reason (finding M3).
+        alerts["low_disk"] = state
+        save_alerts(alerts)
+
+    result = {
+        "free_bytes": free,
+        "free_human": fmt_size(free),
+        "threshold_bytes": threshold,
+        "below_threshold": free < threshold,
+        "notified": notified,
+    }
+    if json_mode:
+        print(json.dumps({"version": VERSION, **result}, indent=2))
+    else:
+        status = "BELOW threshold" if result["below_threshold"] else "ok"
+        print(f"Free: {result['free_human']} · threshold "
+              f"{fmt_size(threshold)} · {status}")
+    return result
+
+
 def show_report(limit=10, json_mode=False):
     disk_history = {"current": disk_stats(), "snapshots": load_snapshots()}
     if not LOG_PATH.exists():
@@ -1660,6 +1848,8 @@ def build_parser():
     p_clean.add_argument("--json", action="store_true", help="Machine-readable results")
     p_clean.add_argument("--dry-run", action="store_true",
                          help="Show exactly what would be deleted, delete nothing")
+    p_clean.add_argument("--notify", action="store_true",
+                         help="Post a macOS notification when the clean finishes")
 
     p_proj = sub.add_parser("projects", help="Find stale build artifacts (node_modules, .venv, target, ...)")
     p_proj.add_argument("--roots", action="append", metavar="DIR", help="Roots to scan (default: config project_roots)")
@@ -1693,6 +1883,10 @@ def build_parser():
 
     p_cats = sub.add_parser("categories", help="List categories and their targets")
     p_cats.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_disk = sub.add_parser("disk-check",
+                            help="Warn when free space is below the configured threshold (cheap; for launchd)")
+    p_disk.add_argument("--json", action="store_true", help="Machine-readable output")
 
     sub.add_parser("install-deps", help="Install 'rich' for pretty terminal output")
 
@@ -1732,6 +1926,10 @@ def main():
 
     if args.command == "doctor":
         run_doctor(config, json_mode=args.json)
+        return
+
+    if args.command == "disk-check":
+        run_disk_check(config, json_mode=args.json)
         return
 
     if args.command == "report":
@@ -1823,7 +2021,8 @@ def main():
             return
         full = not explicit and not categories and args.min_size is None
         run_clean(targets, auto_approve=auto, mode=mode, json_mode=args.json,
-                  explicit=explicit, snapshot_scope="full" if full else "partial")
+                  explicit=explicit, snapshot_scope="full" if full else "partial",
+                  notify=args.notify)
         return
 
 

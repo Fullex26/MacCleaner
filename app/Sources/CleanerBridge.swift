@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 // ── JSON models (contract with cleaner.py --json, see AGENTS.md) ───────────────
 
@@ -69,8 +70,18 @@ struct HistoryRun: Codable, Identifiable {
     var id: String { timestamp }
 }
 
+struct DiskCurrent: Codable {
+    let free_bytes: Int
+    let total_bytes: Int
+}
+
+struct DiskHistory: Codable {
+    let current: DiskCurrent
+}
+
 struct HistoryReport: Codable {
     let runs: [HistoryRun]
+    let disk_history: DiskHistory?
 }
 
 struct CategoryInfo: Codable, Identifiable {
@@ -86,6 +97,10 @@ struct CategoriesReport: Codable {
 
 struct EngineConfig: Codable {
     var delete_mode: String?
+    var notifications: Bool?
+    var low_disk_alerts: Bool?
+    var low_disk_threshold_gb: Double?
+    var full_refresh_hours: Double?
 }
 
 enum BridgeError: LocalizedError {
@@ -123,10 +138,35 @@ final class CleanerBridge: ObservableObject {
     @Published var history: [HistoryRun] = []
     @Published var categories: [CategoryInfo] = []
     @Published var deleteMode: String = "rm"
+    @Published var notificationsEnabled = true
+    @Published var lowDiskAlertsEnabled = true
+    @Published var lowDiskThresholdGB: Double = 10
+    @Published var fullRefreshHours: Double = 6 {
+        didSet {
+            // Reschedule the periodic timer when the configured cadence actually
+            // changes (initial config load, or a later edit) — but only once
+            // auto-refresh has actually started (fullTimer != nil), and never on
+            // a settings reload that leaves the value unchanged.
+            guard fullRefreshHours != oldValue, fullTimer != nil else { return }
+            scheduleFullTimer()
+        }
+    }
     @Published var isBusy = false
     @Published var isCleaning = false
     @Published var statusMessage: String?
     @Published var lastClean: CleanResult?
+    @Published var lastCleanedAt: Date?
+    @Published var freeBytes: Int?
+
+    private var lightTimer: Timer?
+    private var fullTimer: Timer?
+    private var lastFullScan: Date?
+    private var wakeObserver: NSObjectProtocol?
+    /// Memoized so settings load exactly once per app run no matter how many
+    /// call sites race to trigger it (menu bar `.task`, main window `.task`,
+    /// a notification-gated action) — awaiting it elsewhere just joins the
+    /// in-flight (or already-finished) load instead of starting a new one.
+    private var settingsLoadTask: Task<Void, Never>?
 
     /// Engine resolution: MACCLEANER_ENGINE env override (development) →
     /// user-installed copy (shares config with the CLI) → bundled fallback.
@@ -194,9 +234,92 @@ final class CleanerBridge: ObservableObject {
         do {
             report = try await run(ScanReport.self, ["scan", "--json"])
             statusMessage = nil
+            lastFullScan = Date()
         } catch {
             statusMessage = "Scan failed: \(error.localizedDescription)"
         }
+    }
+
+    // ── Auto-refresh ───────────────────────────────────────────────────────────
+    //
+    // Two cadences on purpose: `report --json` is a couple of file reads and one
+    // stat, so it can run every minute; a full `scan` shells out to `du` for
+    // 70+ targets and must not.
+
+    func startAutoRefresh() {
+        lightTimer?.invalidate()
+        lightTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.lightRefresh() }
+        }
+        // A tolerance-less 60s repeating timer defeats timer coalescing and
+        // App Nap, so an idle menu bar app wakes the process on the dot
+        // 1440x/day. 10% tolerance lets the system batch this with other
+        // wake-ups (finding M7).
+        lightTimer?.tolerance = 6
+        scheduleFullTimer()
+        if wakeObserver == nil {
+            wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    await self?.lightRefresh()
+                    await self?.fullRefreshIfStale()
+                }
+            }
+        }
+        Task { await lightRefresh() }
+    }
+
+    private func scheduleFullTimer() {
+        fullTimer?.invalidate()
+        let interval = max(3600, fullRefreshHours * 3600)
+        fullTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.fullRefreshIfStale() }
+        }
+        fullTimer?.tolerance = interval * 0.1
+    }
+
+    /// Cheap: free space and last-cleaned only. Never runs during a clean.
+    func lightRefresh() async {
+        guard !isCleaning else { return }
+        await performLightRefresh()
+    }
+
+    /// The unguarded body of `lightRefresh()`. `clean(ids:)`/`autoCleanSafe()`
+    /// call this directly for their post-clean refresh instead of going
+    /// through `lightRefresh()`: at that point `isCleaning` is still `true`
+    /// (it isn't cleared until the function's `defer` fires on return), so
+    /// the guarded entry point would just no-op. Calling the unguarded body
+    /// still guarantees no *concurrent* refresh — a timer-driven
+    /// `lightRefresh()` call — can interleave with a clean in flight, since
+    /// everything here runs sequentially on the main actor.
+    private func performLightRefresh() async {
+        guard let report = try? await run(HistoryReport.self, ["report", "--json", "-n", "1"])
+        else { return }
+        freeBytes = report.disk_history?.current.free_bytes
+        lastCleanedAt = report.runs.last.flatMap { Self.parseTimestamp($0.timestamp) }
+    }
+
+    /// Full scan, debounced so a wake plus a menu-open doesn't launch two.
+    func fullRefreshIfStale() async {
+        guard !isCleaning, !isBusy else { return }
+        let interval = max(3600, fullRefreshHours * 3600)
+        if let last = lastFullScan, Date().timeIntervalSince(last) < interval { return }
+        await scan()
+    }
+
+    nonisolated static func parseTimestamp(_ raw: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = formatter.date(from: raw) { return d }
+        formatter.formatOptions = [.withInternetDateTime]
+        if let d = formatter.date(from: raw) { return d }
+        // The engine writes datetime.isoformat(), which has no timezone suffix.
+        let fallback = DateFormatter()
+        fallback.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
+        if let d = fallback.date(from: raw) { return d }
+        fallback.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return fallback.date(from: raw)
     }
 
     func clean(ids: [String]) async {
@@ -209,11 +332,25 @@ final class CleanerBridge: ObservableObject {
             args.append("--json")
             lastClean = try await run(CleanResult.self, args)
             statusMessage = nil
+            // Settings must be loaded before this check even in a menu-bar-only
+            // session (finding I4) — see ensureSettingsLoaded().
+            await ensureSettingsLoaded().value
+            if notificationsEnabled, let result = lastClean {
+                NotificationManager.shared.post(
+                    title: "MacCleaner freed \(result.freed_human)",
+                    body: "\(result.items.filter { $0.status != "skipped" }.count) items cleaned")
+            }
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
         }
         await scan()
         await loadHistory()
+        // One refresh covers both "Free disk" and "Last cleaned" in the menu
+        // bar, instead of leaving them up to 60s stale (finding M12). Goes
+        // through the unguarded body, not lightRefresh() — isCleaning is
+        // still true here (the `defer` above only clears it once this
+        // function returns), so lightRefresh()'s own guard would swallow it.
+        await performLightRefresh()
     }
 
     func autoCleanSafe() async {
@@ -222,11 +359,25 @@ final class CleanerBridge: ObservableObject {
         do {
             lastClean = try await run(CleanResult.self, ["clean", "--yes", "--json"])
             statusMessage = nil
+            // Settings must be loaded before this check even in a menu-bar-only
+            // session (finding I4) — see ensureSettingsLoaded().
+            await ensureSettingsLoaded().value
+            if notificationsEnabled, let result = lastClean {
+                NotificationManager.shared.post(
+                    title: "MacCleaner freed \(result.freed_human)",
+                    body: "\(result.items.filter { $0.status != "skipped" }.count) items cleaned")
+            }
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
         }
         await scan()
         await loadHistory()
+        // One refresh covers both "Free disk" and "Last cleaned" in the menu
+        // bar, instead of leaving them up to 60s stale (finding M12). Goes
+        // through the unguarded body, not lightRefresh() — isCleaning is
+        // still true here (the `defer` above only clears it once this
+        // function returns), so lightRefresh()'s own guard would swallow it.
+        await performLightRefresh()
     }
 
     func scanProjects() async {
@@ -265,11 +416,30 @@ final class CleanerBridge: ObservableObject {
         }
     }
 
+    /// Kicks off `loadSettings()` at most once per app run and returns the
+    /// shared task, so a caller can either fire-and-forget it (the menu bar's
+    /// `.task`, which must not block on a subprocess at launch) or `await
+    /// .value` to guarantee settings are current before acting on them (the
+    /// notification checks in `clean`/`autoCleanSafe`) — without reloading
+    /// settings again just because the menu happened to open first
+    /// (finding I4).
+    @discardableResult
+    func ensureSettingsLoaded() -> Task<Void, Never> {
+        if let existing = settingsLoadTask { return existing }
+        let task = Task { await loadSettings() }
+        settingsLoadTask = task
+        return task
+    }
+
     func loadSettings() async {
         do {
             categories = try await run(CategoriesReport.self, ["categories", "--json"]).categories
             let cfg = try await run(EngineConfig.self, ["config", "show"])
             deleteMode = cfg.delete_mode ?? "rm"
+            notificationsEnabled = cfg.notifications ?? true
+            lowDiskAlertsEnabled = cfg.low_disk_alerts ?? true
+            lowDiskThresholdGB = cfg.low_disk_threshold_gb ?? 10
+            fullRefreshHours = cfg.full_refresh_hours ?? 6
         } catch {
             statusMessage = "Could not load settings: \(error.localizedDescription)"
         }
@@ -288,6 +458,34 @@ final class CleanerBridge: ObservableObject {
         do {
             try await runPlain(["config", "set", "delete_mode", mode])
             deleteMode = mode
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    func setNotifications(_ on: Bool) async {
+        do {
+            try await runPlain(["config", "set", "notifications", on ? "true" : "false"])
+            notificationsEnabled = on
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    func setLowDiskAlerts(_ on: Bool) async {
+        do {
+            try await runPlain(["config", "set", "low_disk_alerts", on ? "true" : "false"])
+            lowDiskAlertsEnabled = on
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    func setLowDiskThreshold(_ gb: Double) async {
+        do {
+            try await runPlain(["config", "set", "low_disk_threshold_gb",
+                                String(format: "%g", gb)])
+            lowDiskThresholdGB = gb
         } catch {
             statusMessage = "Config change failed: \(error.localizedDescription)"
         }

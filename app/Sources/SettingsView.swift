@@ -45,6 +45,40 @@ struct SettingsView: View {
             }
 
             Section {
+                Toggle(isOn: Binding(
+                    get: { bridge.notificationsEnabled },
+                    set: { on in Task { await bridge.setNotifications(on) } }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Notify when a clean finishes")
+                        Text("Includes scheduled cleans run in the background")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Toggle(isOn: Binding(
+                    get: { bridge.lowDiskAlertsEnabled },
+                    set: { on in Task { await bridge.setLowDiskAlerts(on) } }
+                )) {
+                    Text("Warn when disk space is low")
+                }
+
+                if bridge.lowDiskAlertsEnabled {
+                    LabeledContent("Warn below") {
+                        Stepper("\(Int(bridge.lowDiskThresholdGB)) GB",
+                                value: Binding(
+                                    get: { bridge.lowDiskThresholdGB },
+                                    set: { gb in Task { await bridge.setLowDiskThreshold(gb) } }
+                                ),
+                                in: 1...500, step: 1)
+                    }
+                }
+            } header: {
+                Text("Notifications")
+            }
+
+            Section {
                 LabeledContent("Engine", value: (CleanerBridge.enginePath() as NSString).abbreviatingWithTildeInPath)
                 LabeledContent("Interface docs", value: "AGENTS.md in the repo")
             } header: {

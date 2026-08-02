@@ -450,6 +450,70 @@ class TestCLIIntegration(unittest.TestCase):
         self.assertIn("runs", data)  # existing key untouched
 
 
+class TestDoctorSchedule(unittest.TestCase):
+    """`doctor`'s Schedule check used to glob the LaunchAgents directory and
+    report ✅ purely from a plist's existence, even if launchd never
+    successfully loaded it (finding I1). It must ask launchd directly."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.agents = self.home / "Library" / "LaunchAgents"
+        self.agents.mkdir(parents=True)
+        self.cfg_path = self.tmp / "config.json"
+        self.cfg_path.write_text("{}")
+        self.bindir = self.tmp / "bin"
+        self.bindir.mkdir()
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "PATH": f"{self.bindir}:{os.environ['PATH']}"}
+        # A real crontab may exist on the dev machine; use a stub so this
+        # test's outcome depends only on the fabricated LaunchAgents/launchctl.
+        stub_crontab = self.bindir / "crontab"
+        stub_crontab.write_text('#!/bin/sh\nexit 1\n')
+        stub_crontab.chmod(0o755)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write_launchctl(self, body):
+        stub = self.bindir / "launchctl"
+        stub.write_text(body)
+        stub.chmod(0o755)
+
+    def run_doctor(self):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), "doctor", "--json"],
+                              capture_output=True, text=True, env=self.env, timeout=60)
+
+    def test_plist_present_but_not_loaded_is_not_ok(self):
+        (self.agents / "com.fullex.maccleaner.clean.plist").write_text("<plist/>")
+        self.write_launchctl('#!/bin/sh\nexit 1\n')  # `launchctl list <label>` always fails
+        r = self.run_doctor()
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        sched = next(c for c in data["checks"] if c["name"] == "Schedule")
+        self.assertFalse(sched["ok"], "a plist launchd hasn't loaded must not read as healthy")
+        self.assertIn("not loaded", sched["status"].lower())
+
+    def test_plist_loaded_is_ok(self):
+        (self.agents / "com.fullex.maccleaner.clean.plist").write_text("<plist/>")
+        self.write_launchctl('#!/bin/sh\nexit 0\n')  # `launchctl list <label>` always succeeds
+        r = self.run_doctor()
+        data = json.loads(r.stdout)
+        sched = next(c for c in data["checks"] if c["name"] == "Schedule")
+        self.assertTrue(sched["ok"])
+        self.assertIn("launchd:", sched["status"])
+
+    def test_no_plist_at_all_reports_not_scheduled(self):
+        r = self.run_doctor()
+        data = json.loads(r.stdout)
+        sched = next(c for c in data["checks"] if c["name"] == "Schedule")
+        self.assertTrue(sched["ok"])
+        self.assertIn("not scheduled", sched["status"].lower())
+
+
 class TestNewTargetsV21(unittest.TestCase):
     """Engine v2.1: new categories and targets."""
 
@@ -1284,6 +1348,778 @@ class TestDryRunPermissionGuard(unittest.TestCase):
             self.assertEqual(items[0]["paths"], [])
         finally:
             os.chmod(d, 0o755)
+
+
+class TestNotify(unittest.TestCase):
+    def test_new_config_defaults(self):
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        self.assertTrue(cfg["notifications"])
+        self.assertTrue(cfg["low_disk_alerts"])
+        self.assertEqual(cfg["low_disk_threshold_gb"], 10)
+        self.assertEqual(cfg["full_refresh_hours"], 6)
+
+    def test_new_keys_merge_into_old_config(self):
+        tmp = Path(tempfile.mkdtemp())
+        orig = cleaner.CONFIG_PATH
+        cleaner.CONFIG_PATH = tmp / "config.json"
+        try:
+            cleaner.CONFIG_PATH.write_text('{"enabled_categories": ["node"]}')
+            cfg = cleaner.load_config()
+            self.assertEqual(cfg["enabled_categories"], ["node"])
+            self.assertTrue(cfg["low_disk_alerts"])
+            self.assertEqual(cfg["low_disk_threshold_gb"], 10)
+        finally:
+            cleaner.CONFIG_PATH = orig
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_alerts_path_resolution(self):
+        """The override wins; otherwise alerts.json sits beside cleaner.py.
+
+        The "installed" directory is a real tempdir rather than ~/mac-cleaner:
+        the sibling-directory branch requires the directory to exist and be
+        writable, so pointing at a path that happens to exist on a developer's
+        machine but not on a fresh CI runner would fall through to the
+        Application Support fallback and fail there only."""
+        tmp = Path(tempfile.mkdtemp())
+        override = tmp / "override.json"
+        try:
+            self.assertEqual(
+                cleaner._resolve_state_path("MACCLEANER_ALERTS", "alerts.json", tmp),
+                tmp / "alerts.json")
+            os.environ["MACCLEANER_ALERTS"] = str(override)
+            try:
+                self.assertEqual(
+                    cleaner._resolve_state_path("MACCLEANER_ALERTS", "alerts.json", tmp),
+                    override)
+            finally:
+                del os.environ["MACCLEANER_ALERTS"]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_escape_applescript(self):
+        self.assertEqual(cleaner._escape_applescript('say "hi"'), 'say \\"hi\\"')
+        self.assertEqual(cleaner._escape_applescript(r"back\slash"), r"back\\slash")
+        self.assertEqual(cleaner._escape_applescript("plain"), "plain")
+
+    def test_notify_argv_shape(self):
+        argv = cleaner._notify_argv("MacCleaner freed 1.0 GB", 'a "quoted" note')
+        self.assertEqual(argv[0], "osascript")
+        self.assertEqual(argv[1], "-e")
+        self.assertIn('display notification "a \\"quoted\\" note"', argv[2])
+        self.assertIn('with title "MacCleaner freed 1.0 GB"', argv[2])
+        self.assertEqual(len(argv), 3)
+
+    def test_notify_survives_missing_binary(self):
+        """A notification failure must never raise into the caller."""
+        orig = cleaner._notify_argv
+        cleaner._notify_argv = lambda t, m: ["definitely-not-a-real-binary-xyz"]
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                result = cleaner._notify("t", "m")
+            self.assertFalse(result)
+            self.assertIn("notif", err.getvalue().lower())
+        finally:
+            cleaner._notify_argv = orig
+
+
+class TestCleanNotify(unittest.TestCase):
+    """--notify must be observable without posting a real notification: the
+    tests capture the argv _notify would have used by swapping the primitive."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        (self.home / ".npm" / "_cacache").mkdir(parents=True)
+        (self.home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        self.cfg_path = self.tmp / "config.json"
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_ALERTS": str(self.tmp / "alerts.json")}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write_cfg(self, **extra):
+        cfg = {"enabled_categories": ["node"]}
+        cfg.update(extra)
+        self.cfg_path.write_text(json.dumps(cfg))
+
+    def run_cli(self, *args, fake_osascript=True):
+        """Run the CLI with a stub `osascript` early on PATH that records its
+        argv to a file, so we can assert on the notification without posting."""
+        env = dict(self.env)
+        if fake_osascript:
+            bindir = self.tmp / "bin"
+            bindir.mkdir(exist_ok=True)
+            recorded = self.tmp / "notified.txt"
+            stub = bindir / "osascript"
+            stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$RECORD_FILE"\n')
+            stub.chmod(0o755)
+            env["PATH"] = f"{bindir}:{env['PATH']}"
+            env["RECORD_FILE"] = str(recorded)
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=env, timeout=120)
+
+    def notified_text(self):
+        f = self.tmp / "notified.txt"
+        return f.read_text() if f.exists() else ""
+
+    def test_notify_posts_after_clean(self):
+        self.write_cfg()
+        r = self.run_cli("clean", "--yes", "--notify", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertGreater(data["freed_bytes"], 0)
+        self.assertIn("display notification", self.notified_text())
+        self.assertIn("MacCleaner", self.notified_text())
+
+    def test_notifications_disabled_suppresses(self):
+        self.write_cfg(notifications=False)
+        r = self.run_cli("clean", "--yes", "--notify", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(self.notified_text(), "",
+                         "notifications:false must suppress the notification")
+        self.assertFalse((self.home / ".npm" / "_cacache").exists(),
+                         "the clean itself must still happen")
+
+    def test_no_flag_no_notification(self):
+        self.write_cfg()
+        r = self.run_cli("clean", "--yes", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(self.notified_text(), "")
+
+    def test_dry_run_never_notifies(self):
+        self.write_cfg()
+        r = self.run_cli("clean", "--dry-run", "--notify", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(self.notified_text(), "")
+        self.assertTrue((self.home / ".npm" / "_cacache").exists())
+
+
+class TestLowDiskThrottle(unittest.TestCase):
+    """_low_disk_decision is pure: (alerts, now, free, threshold) -> (notify?, state)."""
+
+    def setUp(self):
+        self.now = datetime.datetime(2026, 7, 30, 12, 0, 0)
+        self.threshold = 10 * 1024**3
+
+    def decide(self, alerts, free, now=None):
+        return cleaner._low_disk_decision(alerts, now or self.now, free, self.threshold)
+
+    def test_first_dip_notifies(self):
+        notify, state = self.decide({}, 5 * 1024**3)
+        self.assertTrue(notify)
+        self.assertEqual(state["state"], "below")
+        self.assertEqual(state["last_notified"], self.now.isoformat())
+
+    def test_above_threshold_never_notifies(self):
+        notify, state = self.decide({}, 500 * 1024**3)
+        self.assertFalse(notify)
+        self.assertEqual(state["state"], "above")
+
+    def test_still_below_within_24h_stays_quiet(self):
+        alerts = {"low_disk": {"state": "below",
+                               "last_notified": (self.now - datetime.timedelta(hours=3)).isoformat()}}
+        notify, state = self.decide(alerts, 5 * 1024**3)
+        self.assertFalse(notify, "must not re-notify hourly")
+        self.assertEqual(state["state"], "below")
+
+    def test_still_below_after_24h_renotifies(self):
+        alerts = {"low_disk": {"state": "below",
+                               "last_notified": (self.now - datetime.timedelta(hours=25)).isoformat()}}
+        notify, state = self.decide(alerts, 5 * 1024**3)
+        self.assertTrue(notify)
+        self.assertEqual(state["last_notified"], self.now.isoformat())
+
+    def test_recovery_then_new_dip_notifies_immediately(self):
+        recovered = {"low_disk": {"state": "below",
+                                  "last_notified": (self.now - datetime.timedelta(hours=1)).isoformat()}}
+        notify, state = self.decide(recovered, 500 * 1024**3)
+        self.assertFalse(notify)
+        self.assertEqual(state["state"], "above")
+        notify2, _ = self.decide({"low_disk": state}, 5 * 1024**3)
+        self.assertTrue(notify2, "a fresh dip after recovery must notify at once")
+
+    def test_corrupt_last_notified_notifies(self):
+        alerts = {"low_disk": {"state": "below", "last_notified": "not-a-timestamp"}}
+        notify, _ = self.decide(alerts, 5 * 1024**3)
+        self.assertTrue(notify)
+
+    def test_below_state_missing_stamp_notifies(self):
+        """A hand-edited or partially written alerts.json can have `state`
+        present but no `last_notified` at all — distinct from a corrupt
+        (non-empty but unparseable) stamp. Must still notify."""
+        alerts = {"low_disk": {"state": "below", "last_notified": None}}
+        notify, state = self.decide(alerts, 5 * 1024**3)
+        self.assertTrue(notify)
+        self.assertEqual(state["last_notified"], self.now.isoformat())
+
+    def test_still_below_at_exact_renotify_boundary_renotifies(self):
+        """elapsed >= LOW_DISK_RENOTIFY_HOURS uses >=, so exactly 24h must
+        renotify, not just times strictly greater than it."""
+        alerts = {"low_disk": {"state": "below",
+                               "last_notified": (self.now - datetime.timedelta(
+                                   hours=cleaner.LOW_DISK_RENOTIFY_HOURS)).isoformat()}}
+        notify, state = self.decide(alerts, 5 * 1024**3)
+        self.assertTrue(notify, "exactly the renotify window must still renotify")
+        self.assertEqual(state["last_notified"], self.now.isoformat())
+
+
+class TestRunDiskCheckPersistence(unittest.TestCase):
+    """run_disk_check's own persistence decisions (M3, M5) — direct calls
+    against a swapped ALERTS_PATH, not a subprocess, so _notify can be
+    monkeypatched to simulate a failure."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.orig_alerts_path = cleaner.ALERTS_PATH
+        cleaner.ALERTS_PATH = self.tmp / "alerts.json"
+
+    def tearDown(self):
+        cleaner.ALERTS_PATH = self.orig_alerts_path
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_failed_notification_does_not_stamp_throttle(self):
+        """A failed notification used to stamp last_notified anyway,
+        suppressing retries for 24h after a banner the user never saw
+        (finding M5). It must be retried on the very next run instead."""
+        orig_notify = cleaner._notify
+        cleaner._notify = lambda title, message: False
+        try:
+            cfg = {"low_disk_alerts": True, "low_disk_threshold_gb": 10_000_000}
+            with contextlib.redirect_stdout(io.StringIO()):
+                r1 = cleaner.run_disk_check(cfg, json_mode=True)
+            self.assertTrue(r1["below_threshold"])
+            self.assertFalse(r1["notified"])
+            self.assertFalse(cleaner.ALERTS_PATH.exists(),
+                             "a failed notification must not persist a stamp")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                r2 = cleaner.run_disk_check(cfg, json_mode=True)
+            self.assertFalse(r2["notified"], "the stub keeps failing")
+            self.assertFalse(cleaner.ALERTS_PATH.exists(),
+                             "still no stamp — the next run (with a working "
+                             "notifier) will retry immediately")
+        finally:
+            cleaner._notify = orig_notify
+
+
+class TestDiskCheck(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.alerts = self.tmp / "alerts.json"
+        self.log = self.tmp / "report.log"
+        self.snaps = self.tmp / "snapshots.log"
+        self.cfg_path = self.tmp / "config.json"
+        self.env = {**os.environ, "HOME": str(self.tmp),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.log),
+                    "MACCLEANER_SNAPSHOTS": str(self.snaps),
+                    "MACCLEANER_ALERTS": str(self.alerts)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args, **cfg):
+        self.cfg_path.write_text(json.dumps(cfg) if cfg else "{}")
+        bindir = self.tmp / "bin"
+        bindir.mkdir(exist_ok=True)
+        stub = bindir / "osascript"
+        stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$RECORD_FILE"\n')
+        stub.chmod(0o755)
+        env = {**self.env, "PATH": f"{bindir}:{os.environ['PATH']}",
+               "RECORD_FILE": str(self.tmp / "notified.txt")}
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=env, timeout=60)
+
+    def notified(self):
+        f = self.tmp / "notified.txt"
+        return f.read_text() if f.exists() else ""
+
+    def test_json_shape_and_exit_zero(self):
+        r = self.run_cli("disk-check", "--json")
+        self.assertEqual(r.returncode, 0, "disk-check is a monitor: always exit 0")
+        data = json.loads(r.stdout)
+        for key in ["free_bytes", "free_human", "threshold_bytes",
+                    "below_threshold", "notified"]:
+            self.assertIn(key, data)
+        self.assertIsInstance(data["below_threshold"], bool)
+
+    def test_huge_threshold_triggers_notification(self):
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["below_threshold"])
+        self.assertTrue(data["notified"])
+        self.assertIn("display notification", self.notified())
+        self.assertTrue(self.alerts.exists())
+        state = json.loads(self.alerts.read_text())["low_disk"]
+        self.assertEqual(state["state"], "below")
+
+    def test_alerts_disabled_reports_but_stays_quiet(self):
+        r = self.run_cli("disk-check", "--json",
+                         low_disk_threshold_gb=10_000_000, low_disk_alerts=False)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["below_threshold"], "numbers still reported")
+        self.assertFalse(data["notified"])
+        self.assertEqual(self.notified(), "")
+        self.assertFalse(self.alerts.exists(),
+                          "disabled alerts must not persist a stamp, so re-enabling "
+                          "later doesn't inherit a stale 'already warned' state")
+
+    def test_malformed_threshold_falls_back_and_warns(self):
+        """A non-numeric low_disk_threshold_gb (e.g. hand-edited via `config set`
+        with no type validation) must degrade to the documented 10 GB default
+        instead of crashing the hourly monitor."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb="high")
+        self.assertEqual(r.returncode, 0, "disk-check must always exit 0")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertEqual(data["free_human"], cleaner.fmt_size(data["free_bytes"]),
+                          "numbers must still be usable, not just present")
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("high", r.stderr)
+
+    def test_structurally_wrong_threshold_falls_back_and_warns(self):
+        """A list or null (TypeError from float()) must also degrade cleanly,
+        not just a non-numeric string (ValueError)."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=None)
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+
+    def test_numeric_string_threshold_still_works(self):
+        """Happy path must be unchanged: a numeric string like "15" still
+        parses via float() with no warning."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb="15")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], int(15 * 1024**3))
+        self.assertNotIn("low_disk_threshold_gb", r.stderr)
+
+    def test_nan_threshold_falls_back_and_warns(self):
+        """json permits the NaN literal, and `config set low_disk_threshold_gb NaN`
+        writes a real float('nan') that round-trips through load_config(). float(nan)
+        doesn't raise, so this must be caught before int(nan * 1024**3), which raises
+        ValueError: cannot convert float NaN to integer."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=float("nan"))
+        self.assertEqual(r.returncode, 0, "disk-check must always exit 0")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertEqual(data["free_human"], cleaner.fmt_size(data["free_bytes"]),
+                          "numbers must still be usable, not just present")
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("nan", r.stderr.lower())
+
+    def test_infinity_threshold_falls_back_and_warns(self):
+        """float(inf) doesn't raise either, but int(inf * 1024**3) raises
+        OverflowError: cannot convert float infinity to integer — a third
+        exception type that must also be caught."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=float("inf"))
+        self.assertEqual(r.returncode, 0, "disk-check must always exit 0")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertEqual(data["free_human"], cleaner.fmt_size(data["free_bytes"]))
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("inf", r.stderr.lower())
+
+    def test_negative_infinity_threshold_falls_back_and_warns(self):
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=float("-inf"))
+        self.assertEqual(r.returncode, 0, "disk-check must always exit 0")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertEqual(data["free_human"], cleaner.fmt_size(data["free_bytes"]))
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("inf", r.stderr.lower())
+
+    def test_no_side_effect_files(self):
+        r = self.run_cli("disk-check", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(self.log.exists(), "disk-check must not write report.log")
+        self.assertFalse(self.snaps.exists(), "disk-check must not record a snapshot")
+
+    def test_corrupt_alerts_file_self_heals(self):
+        self.alerts.write_text("{not json")
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(json.loads(r.stdout)["notified"])
+        self.assertIn("low_disk", json.loads(self.alerts.read_text()))
+
+    def test_human_output(self):
+        r = self.run_cli("disk-check")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("free", r.stdout.lower())
+
+    def test_second_run_stays_quiet_immediately_after_first(self):
+        """_low_disk_decision is exhaustively covered as a pure function, but
+        nothing previously invoked disk-check twice in a row, so the wiring in
+        run_disk_check (load_alerts -> decision -> save_alerts under
+        "low_disk" -> the enabled-and-should_notify gate) was only half
+        verified (finding I5)."""
+        r1 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        self.assertTrue(json.loads(r1.stdout)["notified"])
+        notified_path = self.tmp / "notified.txt"
+        if notified_path.exists():
+            notified_path.unlink()
+
+        r2 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        data2 = json.loads(r2.stdout)
+        self.assertTrue(data2["below_threshold"])
+        self.assertFalse(data2["notified"],
+                         "an immediate second run must stay quiet (throttled)")
+        self.assertEqual(self.notified(), "",
+                         "no new notification must be posted while throttled")
+
+    def test_backdated_last_notified_renotifies(self):
+        r1 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        self.assertTrue(json.loads(r1.stdout)["notified"])
+
+        alerts = json.loads(self.alerts.read_text())
+        stale = datetime.datetime.now() - datetime.timedelta(
+            hours=cleaner.LOW_DISK_RENOTIFY_HOURS + 1)
+        alerts["low_disk"]["last_notified"] = stale.isoformat()
+        self.alerts.write_text(json.dumps(alerts))
+        notified_path = self.tmp / "notified.txt"
+        if notified_path.exists():
+            notified_path.unlink()
+
+        r2 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        data2 = json.loads(r2.stdout)
+        self.assertTrue(data2["notified"],
+                        "a back-dated last_notified past the renotify window must renotify")
+        self.assertIn("display notification", self.notified())
+
+    def test_negative_threshold_falls_back_and_warns(self):
+        """math.isfinite(-5) is True, so the NaN/infinity guard alone lets a
+        negative low_disk_threshold_gb (e.g. `config set low_disk_threshold_gb
+        -5`) through, making below_threshold permanently False (finding M8)."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=-5)
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("-5", r.stderr)
+
+    def test_unchanged_state_does_not_rewrite_alerts_file(self):
+        """The `above` branch used to stamp alerts.json unconditionally, so an
+        hourly agent rewrote the file every run even when nothing changed
+        (finding M3)."""
+        r1 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=0.0000001)
+        self.assertFalse(json.loads(r1.stdout)["below_threshold"])
+        self.assertTrue(self.alerts.exists())
+        first_mtime = self.alerts.stat().st_mtime_ns
+
+        r2 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=0.0000001)
+        self.assertFalse(json.loads(r2.stdout)["below_threshold"])
+        second_mtime = self.alerts.stat().st_mtime_ns
+        self.assertEqual(first_mtime, second_mtime,
+                         "an unchanged low-disk state must not rewrite alerts.json")
+
+
+class TestScheduler(unittest.TestCase):
+    """scheduler.sh against a sandboxed LaunchAgents dir with stub
+    launchctl/crontab on PATH — never touches the real agents or crontab."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.agents = self.tmp / "LaunchAgents"
+        self.agents.mkdir()
+        self.bindir = self.tmp / "bin"
+        self.bindir.mkdir()
+        self.calls = self.tmp / "calls.txt"
+        self.crontab_file = self.tmp / "crontab.txt"
+        self.crontab_file.write_text("")
+        for name in ("launchctl", "crontab"):
+            stub = self.bindir / name
+            stub.write_text(
+                '#!/bin/sh\n'
+                f'printf "{name} %s\\n" "$*" >> "$CALLS_FILE"\n'
+                'if [ "$1" = "-l" ]; then cat "$CRONTAB_FILE"; exit 0; fi\n'
+                'if [ "$1" = "list" ]; then grep -o "maccleaner[a-z.]*" "$CALLS_FILE" 2>/dev/null | head -1; exit 0; fi\n'
+                'if [ -z "$1" ] || [ "$1" = "-" ]; then cat > "$CRONTAB_FILE"; fi\n'
+                'exit 0\n')
+            stub.chmod(0o755)
+        self.env = {**os.environ,
+                    "PATH": f"{self.bindir}:{os.environ['PATH']}",
+                    "HOME": str(self.tmp),
+                    "MACCLEANER_LAUNCH_AGENTS_DIR": str(self.agents),
+                    "CALLS_FILE": str(self.calls),
+                    "CRONTAB_FILE": str(self.crontab_file)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def sched(self, *args):
+        return subprocess.run(["bash", str(REPO / "scheduler.sh"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=60)
+
+    def plist(self, label):
+        return self.agents / f"com.fullex.maccleaner.{label}.plist"
+
+    def test_weekly_installs_both_agents(self):
+        r = self.sched("weekly")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.plist("clean").exists(), "clean agent missing")
+        self.assertTrue(self.plist("diskwatch").exists(), "diskwatch agent missing")
+
+    def test_plists_are_valid(self):
+        self.sched("weekly")
+        for label in ("clean", "diskwatch"):
+            lint = subprocess.run(["plutil", "-lint", str(self.plist(label))],
+                                  capture_output=True, text=True)
+            self.assertEqual(lint.returncode, 0, f"{label}: {lint.stdout}{lint.stderr}")
+
+    def test_clean_agent_content(self):
+        self.sched("weekly")
+        body = self.plist("clean").read_text()
+        self.assertIn("com.fullex.maccleaner.clean", body)
+        self.assertIn("cleaner.py", body)
+        self.assertIn("--notify", body)
+        self.assertIn("StartCalendarInterval", body)
+        self.assertIn("<key>Weekday</key>", body)
+
+    def test_monthly_uses_day_not_weekday(self):
+        self.sched("monthly")
+        body = self.plist("clean").read_text()
+        self.assertIn("<key>Day</key>", body)
+        self.assertNotIn("<key>Weekday</key>", body)
+
+    def test_diskwatch_agent_content(self):
+        self.sched("weekly")
+        body = self.plist("diskwatch").read_text()
+        self.assertIn("disk-check", body)
+        self.assertIn("StartInterval", body)
+        self.assertIn("3600", body)
+
+    def test_agents_carry_tool_path(self):
+        """Both agents must set EnvironmentVariables/PATH to the same list the
+        app's CleanerBridge.runEngine uses, or cmd-based targets (brew, docker,
+        pnpm, gem, conda, xcrun simctl, ...) silently no-op under a scheduled
+        run because launchd's default PATH is just /usr/bin:/bin:/usr/sbin:/sbin
+        (finding I3)."""
+        self.sched("weekly")
+        for label in ("clean", "diskwatch"):
+            body = self.plist(label).read_text()
+            self.assertIn("EnvironmentVariables", body)
+            self.assertIn("/opt/homebrew/bin", body)
+            self.assertIn("/usr/local/bin", body)
+
+    def test_remove_deletes_both(self):
+        self.sched("weekly")
+        r = self.sched("remove")
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(self.plist("clean").exists())
+        self.assertFalse(self.plist("diskwatch").exists())
+
+    def test_reinstall_replaces_not_stacks(self):
+        self.sched("weekly")
+        self.sched("monthly")
+        body = self.plist("clean").read_text()
+        self.assertIn("<key>Day</key>", body)
+        self.assertEqual(len(list(self.agents.glob("*.plist"))), 2)
+
+    def test_migrates_cron_weekly(self):
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        r = self.sched("weekly")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("migrat", (r.stdout + r.stderr).lower())
+        self.assertTrue(self.plist("clean").exists())
+        self.assertIn("<key>Weekday</key>", self.plist("clean").read_text())
+        self.assertNotIn("cleaner.py", self.crontab_file.read_text(),
+                         "the cron line must be removed after migration")
+
+    def test_migration_preserves_monthly(self):
+        """When the requested cadence matches what the old cron line implies,
+        migration must install exactly once (finding I2 — migrate_cron used to
+        call install_schedule itself with its *detected* cadence, and the
+        outer case statement called install_schedule again with the
+        *argument*, printing two, possibly contradictory, schedule lines and
+        bootstrapping each agent twice)."""
+        self.crontab_file.write_text(
+            "0 9 1 * * /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        r = self.sched("monthly")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        output = r.stdout + r.stderr
+        self.assertEqual(output.count("✅ Scheduled"), 1,
+                         "migration must install exactly once")
+        self.assertIn("<key>Day</key>", self.plist("clean").read_text())
+
+    def test_migration_reports_detected_cadence_but_argument_wins(self):
+        """A monthly-shaped cron line migrated via `weekly` must not install
+        monthly behind the scenes — the explicit command always wins, and the
+        cron line's own cadence is only ever reported, never installed
+        (finding I2)."""
+        self.crontab_file.write_text(
+            "0 9 1 * * /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        r = self.sched("weekly")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        output = r.stdout + r.stderr
+        self.assertEqual(output.count("✅ Scheduled"), 1,
+                         "migration must install exactly once, even on a cadence mismatch")
+        self.assertIn("monthly", output.lower(),
+                     "the detected cadence should still be reported for visibility")
+        body = self.plist("clean").read_text()
+        self.assertIn("<key>Weekday</key>", body,
+                     "the requested cadence (weekly) must win, not the detected one (monthly)")
+        self.assertNotIn("<key>Day</key>", body)
+
+    def test_migration_keeps_unrelated_cron_lines(self):
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n"
+            "*/5 * * * * /usr/local/bin/other-job\n")
+        self.sched("weekly")
+        remaining = self.crontab_file.read_text()
+        self.assertIn("other-job", remaining, "unrelated cron jobs must survive")
+        self.assertNotIn("cleaner.py", remaining)
+
+    def test_migration_is_idempotent(self):
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        self.sched("weekly")
+        second = self.sched("weekly")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotIn("migrat", second.stdout.lower(),
+                         "second run has nothing to migrate")
+
+    def test_status_is_read_only_with_legacy_cron(self):
+        """status must only report a legacy cron line, never touch it or
+        install anything — even when one is present (finding 1)."""
+        cron_line = ("0 9 * * 1 /usr/bin/python3 "
+                     "/Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        self.crontab_file.write_text(cron_line)
+        r = self.sched("status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Migrating your cron schedule", r.stdout + r.stderr,
+                         "status must not perform migration")
+        self.assertNotIn("Removed the old cron entry", r.stdout + r.stderr,
+                         "status must not perform migration")
+        self.assertIn("run ./scheduler.sh weekly to migrate",
+                      (r.stdout + r.stderr))
+        self.assertEqual(self.crontab_file.read_text(), cron_line,
+                         "status must not touch the crontab")
+        self.assertEqual(list(self.agents.glob("*.plist")), [],
+                         "status must not create any launchd agents")
+
+    def test_remove_strips_legacy_cron_without_migrating(self):
+        """remove must not install anything, but should strip a legacy
+        cron line since the user's intent is to stop scheduling entirely."""
+        cron_line = ("0 9 * * 1 /usr/bin/python3 "
+                     "/Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        self.crontab_file.write_text(cron_line)
+        r = self.sched("remove")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("migrat", (r.stdout + r.stderr).lower())
+        self.assertNotIn("cleaner.py", self.crontab_file.read_text(),
+                         "remove should strip the legacy cron line")
+        self.assertEqual(list(self.agents.glob("*.plist")), [],
+                         "remove must not install any launchd agents")
+
+    def test_bare_invocation_does_not_migrate(self):
+        cron_line = ("0 9 * * 1 /usr/bin/python3 "
+                     "/Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        self.crontab_file.write_text(cron_line)
+        r = self.sched()
+        self.assertEqual(self.crontab_file.read_text(), cron_line)
+        self.assertEqual(list(self.agents.glob("*.plist")), [])
+
+    def test_status_reports_installed(self):
+        self.sched("weekly")
+        r = self.sched("status")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("maccleaner", r.stdout.lower())
+
+    def test_usage_when_no_command(self):
+        r = self.sched()
+        self.assertIn("weekly", r.stdout)
+        self.assertIn("monthly", r.stdout)
+
+    def test_launchctl_failure_surfaces_message_and_propagates(self):
+        """A launchctl that fails to load an agent must surface its real
+        stderr diagnostic and make scheduler.sh exit non-zero, instead of
+        printing a generic warning immediately followed by a success
+        banner (finding 2)."""
+        failing = self.bindir / "launchctl"
+        failing.write_text(
+            '#!/bin/sh\n'
+            f'printf "launchctl %s\\n" "$*" >> "$CALLS_FILE"\n'
+            'case "$1" in\n'
+            '  bootstrap|load)\n'
+            '    echo "Load failed: 5: Input/output error" >&2\n'
+            '    exit 1\n'
+            '    ;;\n'
+            'esac\n'
+            'exit 0\n')
+        failing.chmod(0o755)
+
+        r = self.sched("weekly")
+
+        self.assertNotEqual(r.returncode, 0,
+                            "a failed launchctl load must not exit 0")
+        self.assertIn("Load failed: 5: Input/output error", r.stderr,
+                     "the real launchctl diagnostic must be surfaced")
+        self.assertNotIn("✅ Scheduled", r.stdout,
+                         "must not print a success banner after a load failure")
+        # The plist is still written so the user can load it manually.
+        self.assertTrue(self.plist("clean").exists())
+
+    def test_status_does_not_checkmark_a_plist_launchd_has_not_loaded(self):
+        """A plist can exist on disk (bootstrap once succeeded, or it was
+        written but never loaded) without launchd actually having the job
+        loaded right now. status used to check only `-f plist`, so it kept
+        showing ✅ seconds after scheduler.sh itself printed a load failure.
+        It must instead ask launchd directly (finding I1)."""
+        self.sched("weekly")
+        not_loaded = self.bindir / "launchctl"
+        not_loaded.write_text(
+            '#!/bin/sh\n'
+            f'printf "launchctl %s\\n" "$*" >> "$CALLS_FILE"\n'
+            'if [ "$1" = "list" ]; then exit 1; fi\n'
+            'exit 0\n')
+        not_loaded.chmod(0o755)
+
+        r = self.sched("status")
+
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("✅", r.stdout,
+                         "must not show a checkmark when launchctl list fails")
+        self.assertIn("not loaded", (r.stdout + r.stderr).lower())
+        # Still distinguishable from "nothing installed at all".
+        self.assertNotIn("Not scheduled", r.stdout)
+
+    def test_third_party_cron_line_survives_migration(self):
+        """An unanchored `grep -v cleaner.py` would also strip a user's own
+        `db-cleaner.py` cron job. Only MacCleaner's own line may be touched
+        (finding I6)."""
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n"
+            "0 3 * * * /Users/x/bin/db-cleaner.py\n")
+        r = self.sched("weekly")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        remaining = self.crontab_file.read_text()
+        self.assertIn("db-cleaner.py", remaining,
+                     "a third-party cron job must survive migration")
+        self.assertNotIn("mac-cleaner/cleaner.py", remaining)
+
+    def test_third_party_cron_line_survives_remove(self):
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n"
+            "0 3 * * * /Users/x/bin/db-cleaner.py\n")
+        r = self.sched("remove")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        remaining = self.crontab_file.read_text()
+        self.assertIn("db-cleaner.py", remaining,
+                     "a third-party cron job must survive remove")
+        self.assertNotIn("mac-cleaner/cleaner.py", remaining)
+
+    def test_status_ignores_third_party_cleaner_script(self):
+        self.crontab_file.write_text("0 3 * * * /Users/x/bin/db-cleaner.py\n")
+        r = self.sched("status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("legacy cron entry", (r.stdout + r.stderr).lower())
 
 
 if __name__ == "__main__":

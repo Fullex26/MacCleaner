@@ -5,6 +5,10 @@ import AppKit
 struct MacCleanerApp: App {
     @StateObject private var bridge = CleanerBridge()
 
+    init() {
+        NotificationManager.shared.requestAuthorization()
+    }
+
     var body: some Scene {
         Window("MacCleaner", id: "main") {
             MainView()
@@ -16,6 +20,16 @@ struct MacCleanerApp: App {
         MenuBarExtra {
             MenuBarContent()
                 .environmentObject(bridge)
+                .task {
+                    // Fire-and-forget: a menu-bar-only session (the user never
+                    // opens the main window) must still have real settings —
+                    // e.g. a disabled `notifications` — before Auto-Clean Safe
+                    // can post a banner (finding I4). Memoized, so this is a
+                    // no-op on every later menu open.
+                    bridge.ensureSettingsLoaded()
+                    await bridge.lightRefresh()
+                    await bridge.fullRefreshIfStale()
+                }
         } label: {
             if let report = bridge.report {
                 Text("🧹 \(report.total_reclaimable_human)")
@@ -33,11 +47,14 @@ struct MenuBarContent: View {
     var body: some View {
         if let report = bridge.report {
             Text("Reclaimable: \(report.total_reclaimable_human)")
-            if let stats = report.disk_stats {
-                Text("Free disk: \(ByteCountFormatter.string(fromByteCount: Int64(stats.free_bytes), countStyle: .file))")
-            }
-            Divider()
         }
+        if let free = bridge.freeBytes {
+            Text("Free disk: \(ByteCountFormatter.string(fromByteCount: Int64(free), countStyle: .file))")
+        } else if let stats = bridge.report?.disk_stats {
+            Text("Free disk: \(ByteCountFormatter.string(fromByteCount: Int64(stats.free_bytes), countStyle: .file))")
+        }
+        Text("Last cleaned: \(Self.lastCleanedText(bridge.lastCleanedAt))")
+        Divider()
         Button(bridge.isBusy ? "Scanning…" : "Scan Now") {
             Task { await bridge.scan() }
         }
@@ -69,6 +86,13 @@ struct MenuBarContent: View {
             NSApp.terminate(nil)
         }
     }
+
+    static func lastCleanedText(_ date: Date?) -> String {
+        guard let date else { return "Never" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
 }
 
 struct MainView: View {
@@ -86,6 +110,12 @@ struct MainView: View {
                 .tabItem { Label("Settings", systemImage: "gearshape") }
         }
         .task {
+            bridge.startAutoRefresh()
+            // Load config (incl. full_refresh_hours) in the background so launch
+            // never waits on a subprocess; fullRefreshHours' didSet reschedules
+            // the periodic timer once the real value comes back. Memoized —
+            // joins the menu bar's load if that already kicked one off.
+            bridge.ensureSettingsLoaded()
             if bridge.report == nil {
                 await bridge.scan()
             }

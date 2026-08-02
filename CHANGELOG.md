@@ -7,6 +7,20 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.2.0] — Unreleased
+
+### Added
+- launchd scheduling replaces cron — a clean whose scheduled time passed while the Mac was asleep now runs on wake instead of being skipped. An existing cron schedule is removed automatically the next time you run `scheduler.sh weekly` or `scheduler.sh monthly` (not a bare `scheduler.sh` invocation, which never touches the crontab)
+- Notifications when a scheduled clean finishes (`clean --notify`, used by the launchd agent), and in-app notifications after a clean
+- `disk-check` — a cheap hourly low-disk watch installed alongside any schedule; warns below `low_disk_threshold_gb` (default 10 GB), throttled to at most one warning per day
+- Live menu bar — free disk and "last cleaned" refresh every minute; the full reclaimable scan runs on a long interval (`full_refresh_hours`, default 6) plus on wake and when the menu opens
+- Settings toggles for notifications, low-disk alerts, and the threshold
+
+### Changed
+- `doctor`'s Schedule check reports launchd agents, and flags a legacy cron entry
+
+---
+
 ## [2.1.0] — Unreleased
 
 ### Added

@@ -29,9 +29,11 @@ import os
 import re
 import sys
 import json
+import math
 import glob as globmod
 import time
 import shutil
+import tempfile
 import argparse
 import subprocess
 import datetime
@@ -51,14 +53,67 @@ except ImportError:
 
 HOME = Path.home()
 CONFIG_PATH = Path(os.environ.get("MACCLEANER_CONFIG", Path(__file__).parent / "config.json"))
-LOG_PATH = Path(os.environ.get("MACCLEANER_LOG", Path(__file__).parent / "report.log"))
-VERSION = "2.0.0"
+
+
+def _is_inside_app_bundle(path: Path) -> bool:
+    """True if any component of `path` ends in `.app` — a macOS app bundle.
+
+    Structural check, not a writability probe: a normal user-owned `.app`'s
+    Contents/Resources is `drwxr-xr-x`, so `os.access(..., os.W_OK)` alone
+    never catches "this directory lives inside a bundle"."""
+    return any(part.endswith(".app") for part in path.parts)
+
+
+def _resolve_state_path(env_var: str, filename: str, script_dir: Path = None) -> Path:
+    """Resolve the path for a mutable state file (report.log / snapshots.log /
+    alerts.json).
+
+    `env_var` (MACCLEANER_LOG / MACCLEANER_SNAPSHOTS / MACCLEANER_ALERTS)
+    always wins when set.
+    Otherwise prefer the directory beside cleaner.py — the normal installed
+    case, `~/mac-cleaner/`. Fall back to
+    `~/Library/Application Support/MacCleaner/` (creating it if needed) when
+    either:
+      - that directory isn't writable, or
+      - it's inside a `.app` bundle (e.g. cleaner.py running from a signed
+        .app bundle's Contents/Resources — the fallback engine path for
+        someone who downloaded the release without running install.sh).
+        Bundle directories are user-owned and writable, so this case is
+        detected structurally rather than via os.access; without it, history
+        would be written inside the bundle (invalidating its ad-hoc
+        signature, and wiped on the next app update) — and under App
+        Translocation the writability probe alone would fire only until the
+        user drags the app out of ~/Downloads, silently flipping the write
+        location afterward.
+    This keeps disk trends working for app-only users who never ran
+    install.sh.
+    """
+    override = os.environ.get(env_var)
+    if override:
+        return Path(override)
+    script_dir = Path(script_dir) if script_dir is not None else Path(__file__).parent
+    if not _is_inside_app_bundle(script_dir) and os.access(script_dir, os.W_OK):
+        return script_dir / filename
+    fallback_dir = HOME / "Library/Application Support/MacCleaner"
+    try:
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return fallback_dir / filename
+
+
+LOG_PATH = _resolve_state_path("MACCLEANER_LOG", "report.log")
+SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
+ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
+SNAPSHOT_CAP = 365
+VERSION = "2.2.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
     "xcode", "docker", "node", "python", "caches", "logs", "homebrew",
     "go", "rust", "ruby", "cocoapods", "gradle", "maven",
     "ai", "ide", "browsers", "system",
+    "flutter", "php", "vms",
 ]
 
 CATEGORY_DESCRIPTIONS = {
@@ -79,6 +134,9 @@ CATEGORY_DESCRIPTIONS = {
     "ide":       "Editor caches (VS Code, JetBrains)",
     "browsers":  "Browser caches (Arc, Brave, Edge, Firefox)",
     "system":    "Trash and iOS device backups — review carefully",
+    "flutter":   "Dart & Flutter pub package cache",
+    "php":       "Composer package cache",
+    "vms":       "VM disks and container runtimes (Colima, Vagrant, minikube) — review carefully",
 }
 
 DEFAULT_CONFIG = {
@@ -90,6 +148,11 @@ DEFAULT_CONFIG = {
     "delete_mode": "rm",  # "rm" = delete immediately, "trash" = move to ~/.Trash
     "project_roots": ["~/Documents", "~/Developer", "~/Projects", "~/Code", "~/dev"],
     "project_min_age_days": 30,
+    "project_git_check": True,
+    "notifications": True,           # notify when a scheduled clean finishes
+    "low_disk_alerts": True,         # warn when free space drops below the threshold
+    "low_disk_threshold_gb": 10,     # the low-disk warning threshold
+    "full_refresh_hours": 6,         # how often the app runs a full scan (app-side)
 }
 
 
@@ -133,6 +196,39 @@ def fmt_size(bytes_val: int) -> str:
             return f"{bytes_val:.1f} {unit}"
         bytes_val /= 1024
     return f"{bytes_val:.1f} TB"
+
+
+# ── Notifications ──────────────────────────────────────────────────────────────
+def _escape_applescript(text: str) -> str:
+    """Escape a Python string for embedding in an AppleScript string literal."""
+    return str(text).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _notify_argv(title: str, message: str) -> list:
+    """The osascript argv for a notification. Separate from _notify so tests can
+    assert the constructed command as data instead of posting a real alert."""
+    script = (f'display notification "{_escape_applescript(message)}" '
+              f'with title "{_escape_applescript(title)}"')
+    return ["osascript", "-e", script]
+
+
+def _notify(title: str, message: str) -> bool:
+    """Post a macOS notification. Returns True if it was posted.
+
+    Never raises: a missing or failing osascript warns on stderr and leaves the
+    caller's exit code alone — a notification failure must not turn a
+    successful clean into a failed one. Attribution is generic until the app is
+    signed; the SwiftUI app posts properly attributed notifications itself."""
+    try:
+        r = subprocess.run(_notify_argv(title, message),
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            print(f"Warning: notification failed: {r.stderr.strip()}", file=sys.stderr)
+            return False
+        return True
+    except Exception as e:
+        print(f"Warning: could not post notification: {e}", file=sys.stderr)
+        return False
 
 
 def disk_free() -> str:
@@ -186,6 +282,16 @@ def _parse_du_estimate(output):
         return 0
 
 
+def _parse_conda_estimate(output):
+    """Sum the '(N.N GB)' sizes in `conda clean --all --dry-run` output."""
+    total = 0
+    for m in re.finditer(r'\(([0-9.]+)\s*(B|KB|MB|GB|TB)\)', output):
+        val, unit = float(m.group(1)), m.group(2)
+        total += int(val * {"B": 1, "KB": 1024, "MB": 1024**2,
+                            "GB": 1024**3, "TB": 1024**4}[unit])
+    return total
+
+
 def _run_estimate(estimate_cmd, parser):
     try:
         r = subprocess.run(estimate_cmd, shell=True, capture_output=True, text=True, timeout=15)
@@ -195,6 +301,7 @@ def _run_estimate(estimate_cmd, parser):
             "brew_dry_run": _parse_brew_estimate,
             "docker_df":    _parse_docker_estimate,
             "du_path":      _parse_du_estimate,
+            "conda_dry_run": _parse_conda_estimate,
         }.get(parser, lambda _: 0)(r.stdout)
     except Exception:
         return 0
@@ -258,6 +365,10 @@ def get_targets(config, all_categories=False):
     add("xcode", "carthage-cache", "Carthage cache", "~/Library/Caches/org.carthage.CarthageKit",
         desc="Carthage dependency builds")
 
+    # Xcode (v2.1 addition — place with the other xcode adds)
+    add("xcode", "xcode-doc-cache", "Xcode documentation cache", "~/Library/Developer/Xcode/DocumentationCache",
+        desc="Downloaded documentation indexes; re-fetched on demand")
+
     # Docker
     add("docker", "docker-prune", "Docker unused data", None,
         cmd="docker system prune -f --filter 'until=168h' 2>/dev/null || true",
@@ -284,6 +395,12 @@ def get_targets(config, all_categories=False):
     add("node", "node-gyp-cache", "node-gyp cache", "~/Library/Caches/node-gyp",
         desc="Node.js headers downloaded for native module builds")
 
+    # Node (v2.1 additions)
+    add("node", "yarn-global-cache", "Yarn classic global cache", "~/Library/Caches/Yarn",
+        desc="Yarn v1 global package cache (separate from ~/.yarn/cache)")
+    add("node", "npm-logs", "npm logs", "~/.npm/_logs",
+        desc="npm debug log files")
+
     # Python
     add("python", "pip-cache", "pip cache", "~/Library/Caches/pip",
         desc="pip download/wheel cache")
@@ -296,6 +413,13 @@ def get_targets(config, all_categories=False):
     add("python", "pyenv-shims", "pyenv shims cache", "~/.pyenv/shims", safe=False,
         desc="pyenv shim binaries — regenerate with 'pyenv rehash' after deleting")
 
+    # Python (v2.1 additions)
+    add("python", "conda-clean", "Conda caches", None,
+        cmd="conda clean --all --yes 2>/dev/null || true",
+        estimate_cmd="conda clean --all --dry-run 2>/dev/null",
+        estimate_parser="conda_dry_run",
+        desc="Unused conda packages, tarballs, and index caches (conda clean --all)")
+
     # AI models
     add("ai", "huggingface-hub", "Hugging Face hub cache", "~/.cache/huggingface", safe=False,
         desc="Downloaded models/datasets — can be very large; re-downloaded on demand")
@@ -303,6 +427,12 @@ def get_targets(config, all_categories=False):
         desc="Downloaded PyTorch models and weights")
     add("ai", "ollama-models", "Ollama models", "~/.ollama/models", safe=False,
         desc="Local Ollama models — re-pull with 'ollama pull' if needed")
+
+    # AI models (v2.1 additions)
+    add("ai", "lm-studio-models", "LM Studio models", "~/.lmstudio/models", safe=False,
+        desc="Downloaded LM Studio models — re-download from the app if needed")
+    add("ai", "whisper-models", "Whisper models", "~/.cache/whisper", safe=False,
+        desc="Downloaded OpenAI Whisper models")
 
     # IDE / editors
     add("ide", "vscode-cache", "VS Code cache", "~/Library/Application Support/Code/Cache",
@@ -349,6 +479,19 @@ def get_targets(config, all_categories=False):
         desc="Playwright browser binaries — re-download with 'npx playwright install'")
     add("caches", "puppeteer-cache", "Puppeteer cache", "~/.cache/puppeteer", safe=False,
         desc="Puppeteer downloaded Chromium builds")
+
+    # App caches (v2.1 additions — place with the other caches adds)
+    add("caches", "cypress-cache", "Cypress binary cache", "~/Library/Caches/Cypress", safe=False,
+        desc="Cypress browser/runner binaries — re-download with 'cypress install'")
+    add("caches", "teams-cache", "Microsoft Teams cache", "~/Library/Caches/com.microsoft.teams2",
+        desc="Microsoft Teams (new) app cache")
+    add("caches", "zoom-updater", "Zoom installer cache", "~/Library/Application Support/zoom.us/AutoUpdater",
+        desc="Downloaded Zoom update installers")
+    add("caches", "terraform-plugin-cache", "Terraform plugin cache", "~/.terraform.d/plugin-cache",
+        desc="Cached provider plugins; re-downloaded on 'terraform init'")
+    add("caches", "expo-cache", "Expo cache", "~/.expo/cache",
+        desc="Expo CLI download cache")
+
     add("caches", "general-caches", "General app caches", "~/Library/Caches", safe=False, empty_only=True,
         desc="Everything in ~/Library/Caches — broad; review before deleting")
 
@@ -376,6 +519,10 @@ def get_targets(config, all_categories=False):
     add("rust", "cargo-git", "Cargo git cache", "~/.cargo/git",
         desc="Cargo git dependency checkouts")
 
+    # Rust (v2.1 addition — place with the other rust adds)
+    add("rust", "sccache-cache", "sccache cache", "~/Library/Caches/Mozilla.sccache",
+        desc="Shared compilation cache; rebuilt on demand")
+
     # Ruby
     add("ruby", "gem-cleanup", "Ruby gem cleanup", None,
         cmd="gem cleanup 2>/dev/null || true",
@@ -398,6 +545,22 @@ def get_targets(config, all_categories=False):
         desc="Permanently delete everything in the Trash")
     add("system", "ios-backups", "iOS device backups", "~/Library/Application Support/MobileSync/Backup", safe=False,
         desc="Local iPhone/iPad backups — only delete if backed up to iCloud or elsewhere")
+
+    # Flutter / Dart
+    add("flutter", "dart-pub-cache", "Dart pub cache", "~/.pub-cache",
+        desc="Dart & Flutter packages; repopulated by 'dart pub get' / 'flutter pub get'")
+
+    # PHP
+    add("php", "composer-cache", "Composer cache", "~/.composer/cache",
+        desc="Composer package download cache")
+
+    # VMs / container runtimes
+    add("vms", "colima-vm", "Colima VM", "~/.colima", safe=False,
+        desc="Colima VM disks — deleting removes the VM including its containers and images")
+    add("vms", "vagrant-boxes", "Vagrant boxes", "~/.vagrant.d/boxes", safe=False,
+        desc="Downloaded Vagrant base boxes — large re-downloads")
+    add("vms", "minikube-cache", "minikube cache", "~/.minikube/cache",
+        desc="Cached minikube images and binaries; re-fetched on demand")
 
     # Logs (dynamic)
     threshold = config.get("log_threshold_mb", 100) * 1024 * 1024
@@ -780,7 +943,8 @@ def scan_json(targets, extra=None):
     print(json.dumps(output, indent=2))
 
 
-def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=False):
+def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=False,
+              snapshot_scope="partial", notify=False):
     """Clean targets. explicit=True means the selection was made via --targets."""
     say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
 
@@ -860,6 +1024,19 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
 
     write_log(total_freed, results)
 
+    if snapshot_scope == "full":
+        cleaned = {r["id"] for r in results if r["status"] in ("deleted", "trashed")}
+        remaining = [t for t in targets if t["id"] not in cleaned]
+        record_snapshot(*snapshot_fields(remaining))
+    else:
+        record_snapshot()
+
+    if notify and load_config().get("notifications", True):
+        cleaned = sum(1 for r in results if r["status"] in ("deleted", "trashed"))
+        _notify(f"MacCleaner freed {fmt_size(total_freed)}",
+                f"{cleaned} item{'s' if cleaned != 1 else ''} cleaned · "
+                f"{fmt_size(disk_stats()['free_bytes'])} free")
+
     if json_mode:
         print(json.dumps({
             "version": VERSION,
@@ -879,6 +1056,65 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
     return total_freed, results
 
 
+def run_dry_run(targets, mode="rm", json_mode=False):
+    """Resolve exactly what a real clean of `targets` would delete. Deletes
+    nothing, writes no report.log entry, records no snapshot."""
+    say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
+    targets = measure_targets(targets)
+    targets = [t for t in targets if t.get("exists") or t.get("cmd")]
+    items, total = [], 0
+
+    for t in sorted(targets, key=lambda x: x.get("size") or 0, reverse=True):
+        if t.get("cmd"):
+            size = t.get("size") or 0
+            items.append({"id": t["id"], "label": t["label"], "freed": size,
+                          "status": "would-run", "cmd": t["cmd"], "paths": []})
+            total += size
+            continue
+        paths = []
+        for p in _target_paths(t):
+            if not p.exists() and not p.is_symlink():
+                continue
+            if t.get("empty_only"):
+                # Guarded the same way delete_target guards the equivalent loop:
+                # a PermissionError previewing one target's children must not
+                # abort the whole preview when the real delete would tolerate it.
+                try:
+                    children = list(p.iterdir())
+                except (PermissionError, FileNotFoundError, OSError):
+                    continue
+                paths.extend(c for c in sorted(children) if _safe_to_delete(c))
+            elif _safe_to_delete(p):
+                paths.append(p)
+        entries = [{"path": str(p), "size_bytes": get_size(p)} for p in paths]
+        size = sum(e["size_bytes"] for e in entries)
+        total += size
+        items.append({"id": t["id"], "label": t["label"], "freed": size,
+                      "status": "would-delete", "paths": entries})
+
+    if json_mode:
+        print(json.dumps({
+            "version": VERSION,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "dry_run": True,
+            "delete_mode": mode,
+            "freed_bytes": total,
+            "freed_human": fmt_size(total),
+            "disk_after": disk_free(),
+            "items": items,
+        }, indent=2))
+    else:
+        say("\n🧪 Dry run — nothing will be deleted\n")
+        for it in items:
+            say(f"  {it['label']} ({fmt_size(it['freed'])})")
+            if it.get("cmd"):
+                say(f"      would run: {it['cmd']}")
+            for e in it["paths"]:
+                say(f"      would delete: {e['path']} ({fmt_size(e['size_bytes'])})")
+        say(f"\n  Would free: {fmt_size(total)}\n")
+    return total, items
+
+
 # ── Stale project artifacts ─────────────────────────────────────────────────────
 ARTIFACT_MANIFESTS = {
     "node_modules":  ["package.json"],
@@ -896,6 +1132,61 @@ ARTIFACT_MANIFESTS = {
     ".ruff_cache":   [],
 }
 PROJECT_SCAN_MAX_DEPTH = 5
+
+
+def _git_info(project_dir):
+    """Git activity signals for a project dir, or None when unknowable.
+
+    Returns {"dirty": bool, "unpushed": bool}. A repo with no remotes counts
+    as unpushed — its commits exist nowhere else. Any git failure (not a repo,
+    git missing, timeout) degrades to None rather than blocking the scan."""
+    def run(*args):
+        # --no-optional-locks: don't take .git/index.lock or touch index mtimes —
+        # a concurrent `git add`/`git commit` by the user must not fail because
+        # a read-only scan is holding the lock (this is what editors do too).
+        # -c core.fsmonitor=: a hostile checked-out repo can't use a repo-local
+        # fsmonitor hook to execute code during this read-only scan.
+        return subprocess.run(
+            ["git", "-C", str(project_dir), "--no-optional-locks", "-c", "core.fsmonitor=", *args],
+            capture_output=True, text=True, timeout=2)
+    try:
+        r = run("rev-parse", "--is-inside-work-tree")
+        if r.returncode != 0 or r.stdout.strip() != "true":
+            return None
+        status = run("status", "--porcelain")
+        if status.returncode != 0:
+            return None
+        rev_list = run("rev-list", "--count", "--branches", "--not", "--remotes")
+        if rev_list.returncode != 0:
+            return None
+        dirty = bool(status.stdout.strip())
+        count = rev_list.stdout.strip()
+        return {"dirty": dirty, "unpushed": count not in ("", "0")}
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+
+def _git_flagged(t):
+    """True when a project target has uncommitted or unpushed work."""
+    git = t.get("git")
+    return bool(git and (git.get("dirty") or git.get("unpushed")))
+
+
+def _filter_git_flagged(targets, bypass):
+    """Exclude git-flagged (dirty/unpushed) project targets, unless `bypass`
+    (an explicit --targets selection, which counts as consent). Shared by the
+    `--yes` clean path and the `--dry-run` preview so they can never drift —
+    both print the same stderr note naming each skipped project."""
+    if bypass:
+        return targets
+    flagged = [t for t in targets if _git_flagged(t)]
+    if flagged:
+        print("Skipping projects with uncommitted or unpushed work "
+              "(select explicitly with --targets to clean them):",
+              file=sys.stderr)
+        for t in flagged:
+            print(f"  {t['id']}  {t['label']}", file=sys.stderr)
+    return [t for t in targets if not _git_flagged(t)]
 
 
 def scan_projects(config, roots=None, min_age_days=None):
@@ -954,6 +1245,14 @@ def scan_projects(config, roots=None, min_age_days=None):
         sizes = list(pool.map(lambda h: get_size(Path(h["path"])), hits))
     for h, s in zip(hits, sizes):
         h["size_bytes"] = s
+    if config.get("project_git_check", True):
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            infos = list(pool.map(lambda h: _git_info(h["project"]), hits))
+        for h, info in zip(hits, infos):
+            h["git"] = info
+    else:
+        for h in hits:
+            h["git"] = None
     hits.sort(key=lambda h: h["size_bytes"], reverse=True)
     return hits, [str(r) for r in roots], min_age
 
@@ -961,12 +1260,17 @@ def scan_projects(config, roots=None, min_age_days=None):
 def projects_to_targets(hits):
     targets = []
     for h in hits:
+        git = h.get("git")
+        flags = [name for name, on in (("dirty", git and git.get("dirty")),
+                                       ("unpushed", git and git.get("unpushed"))) if on]
+        badge = "".join(f" [{f}]" for f in flags)
         rel = os.path.relpath(h["path"], str(HOME))
         targets.append({
             "id": f"project-{slugify(rel)}",
             "category": "projects",
-            "label": f"{h['kind']} — {os.path.relpath(h['project'], str(HOME))}",
-            "description": f"Stale {h['kind']} ({h['age_days']} days old)",
+            "label": f"{h['kind']} — {os.path.relpath(h['project'], str(HOME))}{badge}",
+            "description": f"Stale {h['kind']} ({h['age_days']} days old)"
+                           + (f" — git: {', '.join(flags)}" if flags else ""),
             "path": Path(h["path"]),
             "glob": None,
             "safe": False,
@@ -976,8 +1280,18 @@ def projects_to_targets(hits):
             "empty_only": False,
             "size": h["size_bytes"],
             "exists": True,
+            "git": git,
         })
     return targets
+
+
+def _git_label(h):
+    git = h.get("git")
+    if not git:
+        return "—"
+    flags = [f for f, on in (("dirty", git.get("dirty")),
+                             ("unpushed", git.get("unpushed"))) if on]
+    return ", ".join(flags) if flags else "clean"
 
 
 def print_projects(hits, roots, min_age):
@@ -987,10 +1301,11 @@ def print_projects(hits, roots, min_age):
         table.add_column("Artifact", style="cyan")
         table.add_column("Project", style="white")
         table.add_column("Age", justify="right")
+        table.add_column("Git", style="magenta")
         table.add_column("Size", style="yellow", justify="right")
         for h in hits:
             table.add_row(h["kind"], os.path.relpath(h["project"], str(HOME)),
-                          f"{h['age_days']}d", fmt_size(h["size_bytes"]))
+                          f"{h['age_days']}d", _git_label(h), fmt_size(h["size_bytes"]))
         console.print(table)
         console.print(Panel(
             f"[bold green]Total: {fmt_size(total)}[/bold green] across {len(hits)} artifacts\n"
@@ -1004,7 +1319,7 @@ def print_projects(hits, roots, min_age):
         print(f"{'='*72}")
         for h in hits:
             proj = os.path.relpath(h["project"], str(HOME))
-            print(f"  {h['kind']:<14} {proj:<40} {h['age_days']:>4}d {fmt_size(h['size_bytes']):>10}")
+            print(f"  {h['kind']:<14} {proj:<36} {h['age_days']:>4}d {_git_label(h):>10} {fmt_size(h['size_bytes']):>10}")
         print(f"\n  Total: {fmt_size(total)} across {len(hits)} artifacts")
         print(f"  Roots scanned: {', '.join(roots)}")
         print(f"\n  → Run 'maccleaner projects --clean' to remove them")
@@ -1012,6 +1327,18 @@ def print_projects(hits, roots, min_age):
 
 
 # ── Doctor ──────────────────────────────────────────────────────────────────────
+def _launchd_is_loaded(label: str) -> bool:
+    """True only if launchd currently has `label` loaded — a plist file on
+    disk merely means it was written, not that bootstrap/load succeeded or
+    that it's still loaded (finding I1)."""
+    try:
+        r = subprocess.run(["launchctl", "list", label],
+                           capture_output=True, text=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def run_doctor(config, json_mode=False):
     checks = []
 
@@ -1036,17 +1363,40 @@ def run_doctor(config, json_mode=False):
           else "not installed to ~/mac-cleaner (running from source?)")
 
     try:
-        r = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
-        scheduled = r.returncode == 0 and "cleaner.py" in r.stdout
-        check("Schedule", "cron job active" if scheduled else "no cron schedule (run scheduler.sh weekly)")
+        agents = HOME / "Library/LaunchAgents"
+        labels = [p.stem for p in sorted(agents.glob("com.fullex.maccleaner.*.plist"))] \
+            if agents.exists() else []
+        loaded = [l for l in labels if _launchd_is_loaded(l)]
+        not_loaded = [l for l in labels if l not in loaded]
+        cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
+        has_cron = cron.returncode == 0 and "mac-cleaner/cleaner.py" in cron.stdout
+        if loaded:
+            note = f"launchd: {', '.join(loaded)}"
+            if not_loaded:
+                note += (f" (plist present but not loaded: {', '.join(not_loaded)}"
+                         " — run scheduler.sh weekly to reload)")
+            if has_cron:
+                note += " (plus a legacy cron entry — run scheduler.sh weekly to clean up)"
+            check("Schedule", note)
+        elif not_loaded:
+            # The plist exists but launchd doesn't have it loaded — distinct
+            # from "never installed at all" (finding I1).
+            check("Schedule",
+                  f"plist present but not loaded: {', '.join(not_loaded)}"
+                  " — run scheduler.sh weekly to reload", ok=False)
+        elif has_cron:
+            check("Schedule", "legacy cron entry (run scheduler.sh weekly to migrate to launchd)")
+        else:
+            check("Schedule", "not scheduled (run scheduler.sh weekly)")
     except Exception:
-        check("Schedule", "could not read crontab")
+        check("Schedule", "could not determine schedule")
 
     app_paths = [HOME / "Applications/MacCleaner.app", Path("/Applications/MacCleaner.app")]
     check("Menu bar app", "installed" if any(p.exists() for p in app_paths) else "not installed")
 
     for tool in ["brew", "docker", "xcrun", "node", "npm", "pnpm", "yarn", "bun", "deno",
-                 "go", "cargo", "gem", "pod", "gradle", "mvn", "uv", "ollama"]:
+                 "go", "cargo", "gem", "pod", "gradle", "mvn", "uv", "ollama",
+                 "conda", "dart", "composer", "terraform", "colima", "vagrant", "minikube"]:
         present = shutil.which(tool) is not None
         check(f"tool: {tool}", "found" if present else "not found (its targets will be skipped)")
 
@@ -1121,6 +1471,26 @@ def show_categories(config, json_mode=False):
         print(f"{'='*72}\n")
 
 
+def _atomic_write_json(path: Path, data):
+    """Dump JSON to a temp file beside `path`, then os.replace() it into place.
+
+    os.replace() is atomic within a filesystem, so a concurrent reader (e.g. a
+    cron `clean --yes` overlapping a menu bar app scan) always sees either the
+    old complete file or the new complete file, never a partial write. On any
+    failure the temp file is removed so it's never mistaken for real data."""
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_name, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 # ── Report log ──────────────────────────────────────────────────────────────────
 def write_log(total_freed: int, results: list):
     entry = {
@@ -1139,22 +1509,247 @@ def write_log(total_freed: int, results: list):
             logs = []
     logs.append(entry)
     logs = logs[-50:]  # Keep last 50 runs
-    with open(LOG_PATH, "w") as f:
-        json.dump(logs, f, indent=2)
+    try:
+        _atomic_write_json(LOG_PATH, logs)
+    except Exception as e:
+        print(f"Warning: could not write log: {e}", file=sys.stderr)
+
+
+# ── Disk snapshots ──────────────────────────────────────────────────────────────
+def load_snapshots():
+    if not SNAPSHOTS_PATH.exists():
+        return []
+    try:
+        with open(SNAPSHOTS_PATH) as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return []
+        # A non-dict element would otherwise raise inside record_snapshot's
+        # snaps[-1].get(...) dedupe check on every future run, forever (only
+        # caught by the broad except there, with just a per-run warning).
+        # Dropping non-dict entries here lets a partially malformed file
+        # self-heal the same way a fully unparseable one does.
+        cleaned = [e for e in data if isinstance(e, dict)]
+        dropped = len(data) - len(cleaned)
+        if dropped:
+            noun = "entry" if dropped == 1 else "entries"
+            print(f"Warning: discarded {dropped} malformed snapshot {noun} from {SNAPSHOTS_PATH}",
+                  file=sys.stderr)
+        return cleaned
+    except Exception:
+        print(f"Warning: corrupt or unparseable {SNAPSHOTS_PATH}, restarting", file=sys.stderr)
+        return []
+
+
+def record_snapshot(reclaimable_bytes=None, categories=None):
+    """Append a disk snapshot; a snapshot recorded the same calendar day
+    replaces the last one instead of adding a new entry.
+
+    None reclaimable/categories = the run only measured part of the target set,
+    so only the disk numbers are trustworthy."""
+    try:
+        ds = disk_stats()
+        entry = {
+            "ts": datetime.datetime.now().isoformat(),
+            "disk_total_bytes": ds["total_bytes"],
+            "disk_free_bytes": ds["free_bytes"],
+            "reclaimable_bytes": reclaimable_bytes,
+            "categories": categories,
+        }
+        snaps = load_snapshots()
+        if snaps and snaps[-1].get("ts", "")[:10] == entry["ts"][:10]:
+            snaps[-1] = entry
+        else:
+            snaps.append(entry)
+        snaps = snaps[-SNAPSHOT_CAP:]
+        _atomic_write_json(SNAPSHOTS_PATH, snaps)
+    except Exception as e:
+        print(f"Warning: could not write snapshot: {e}", file=sys.stderr)
+
+
+def snapshot_fields(measured_targets):
+    """(reclaimable_bytes, categories) sums from a fully measured target list."""
+    total, cats = 0, {}
+    for t in measured_targets:
+        size = t.get("size") or 0
+        total += size
+        cats[t["category"]] = cats.get(t["category"], 0) + size
+    return total, cats
+
+
+def _nearest_snapshot(snaps, days_ago):
+    goal = datetime.datetime.now() - datetime.timedelta(days=days_ago)
+    best, best_delta = None, None
+    for s in snaps:
+        try:
+            ts = datetime.datetime.fromisoformat(s["ts"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        delta = abs((ts - goal).total_seconds())
+        if best_delta is None or delta < best_delta:
+            best, best_delta = s, delta
+    return best
+
+
+def format_disk_trend(snaps):
+    """Lines comparing current free space with ~7d/~30d-ago snapshots, or None."""
+    if len(snaps) < 2:
+        return None
+    now = datetime.datetime.now()
+    now_free = disk_stats()["free_bytes"]
+    lines = [f"Free now: {fmt_size(now_free)}"]
+    seen = set()
+    for days in (7, 30):
+        s = _nearest_snapshot(snaps, days)
+        if not s or s["ts"] in seen:
+            continue
+        seen.add(s["ts"])
+        try:
+            age = max(0, (now - datetime.datetime.fromisoformat(s["ts"])).days)
+        except (TypeError, ValueError):
+            continue
+        delta = now_free - s["disk_free_bytes"]
+        sign = "+" if delta >= 0 else "-"
+        lines.append(f"{age}d ago: {fmt_size(s['disk_free_bytes'])} free "
+                     f"({sign}{fmt_size(abs(delta))} free since)")
+    return lines if len(lines) > 1 else None
+
+
+def _print_disk_trend(snaps):
+    lines = format_disk_trend(snaps)
+    if not lines:
+        return
+    if RICH:
+        console.print(Panel("\n".join(lines), title="💾 Disk trend", border_style="cyan"))
+    else:
+        print("  Disk trend:")
+        for line in lines:
+            print(f"    {line}")
+        print()
+
+
+# ── Low-disk alerts ────────────────────────────────────────────────────────────
+LOW_DISK_RENOTIFY_HOURS = 24
+
+
+def load_alerts():
+    """Alert throttle state. A corrupt file self-heals, like snapshots.log."""
+    if not ALERTS_PATH.exists():
+        return {}
+    try:
+        with open(ALERTS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        print(f"Warning: corrupt or unparseable {ALERTS_PATH}, restarting", file=sys.stderr)
+        return {}
+
+
+def save_alerts(alerts):
+    try:
+        _atomic_write_json(ALERTS_PATH, alerts)
+    except Exception as e:
+        print(f"Warning: could not write alert state: {e}", file=sys.stderr)
+
+
+def _low_disk_decision(alerts, now, free_bytes, threshold_bytes):
+    """(should_notify, new_low_disk_state) — pure, so the throttle is testable
+    without touching the clock or the filesystem.
+
+    Notify on an above->below transition, then at most once per
+    LOW_DISK_RENOTIFY_HOURS while still below. Recovering to `above` clears the
+    stamp so the next dip warns immediately."""
+    prev = alerts.get("low_disk") or {}
+    if free_bytes >= threshold_bytes:
+        return False, {"state": "above", "last_notified": prev.get("last_notified")}
+
+    stamp = {"state": "below", "last_notified": now.isoformat()}
+    if prev.get("state") != "below":
+        return True, stamp
+    last = prev.get("last_notified")
+    if not last:
+        return True, stamp
+    try:
+        elapsed = now - datetime.datetime.fromisoformat(last)
+    except (TypeError, ValueError):
+        return True, stamp
+    if elapsed >= datetime.timedelta(hours=LOW_DISK_RENOTIFY_HOURS):
+        return True, stamp
+    return False, {"state": "below", "last_notified": last}
+
+
+def run_disk_check(config, json_mode=False):
+    """Cheap enough to run hourly: one disk_usage call, no measurement, no
+    snapshot. Always exits 0 — it is a monitor, not a check that fails."""
+    ds = disk_stats()
+    raw_threshold = config.get("low_disk_threshold_gb", 10)
+    try:
+        threshold_gb = float(raw_threshold)
+        if not math.isfinite(threshold_gb):
+            raise ValueError(f"non-finite threshold_gb {threshold_gb!r}")
+        if threshold_gb < 0:
+            raise ValueError(f"negative threshold_gb {threshold_gb!r}")
+        threshold = int(threshold_gb * 1024**3)
+    except (TypeError, ValueError, OverflowError):
+        print(f"Warning: invalid low_disk_threshold_gb {raw_threshold!r}, "
+              f"falling back to the default of 10 GB", file=sys.stderr)
+        threshold_gb = 10
+        threshold = int(threshold_gb * 1024**3)
+    free = ds["free_bytes"]
+    enabled = config.get("low_disk_alerts", True)
+
+    alerts = load_alerts()
+    should_notify, state = _low_disk_decision(alerts, datetime.datetime.now(), free, threshold)
+    notified = False
+    # A decision that doesn't depend on posting a notification (still-above, or
+    # still-below-but-throttled) is accurate regardless of what happens below.
+    persist_state = not should_notify
+    if enabled and should_notify:
+        notified = _notify(
+            f"Low disk space: {fmt_size(free)} free",
+            f"Below your {fmt_size(threshold)} threshold — "
+            f"open MacCleaner to reclaim space.")
+        # Only stamp the throttle when the banner actually posted — otherwise
+        # a failed notification would suppress retries for the next 24h even
+        # though the user never saw anything (finding M5).
+        persist_state = notified
+    if enabled and persist_state and alerts.get("low_disk") != state:
+        # Skip the write entirely when nothing changed, so an hourly agent
+        # isn't rewriting alerts.json every run for no reason (finding M3).
+        alerts["low_disk"] = state
+        save_alerts(alerts)
+
+    result = {
+        "free_bytes": free,
+        "free_human": fmt_size(free),
+        "threshold_bytes": threshold,
+        "below_threshold": free < threshold,
+        "notified": notified,
+    }
+    if json_mode:
+        print(json.dumps({"version": VERSION, **result}, indent=2))
+    else:
+        status = "BELOW threshold" if result["below_threshold"] else "ok"
+        print(f"Free: {result['free_human']} · threshold "
+              f"{fmt_size(threshold)} · {status}")
+    return result
 
 
 def show_report(limit=10, json_mode=False):
+    disk_history = {"current": disk_stats(), "snapshots": load_snapshots()}
     if not LOG_PATH.exists():
         if json_mode:
-            print(json.dumps({"version": VERSION, "runs": []}))
+            print(json.dumps({"version": VERSION, "runs": [], "disk_history": disk_history}))
         else:
             print("No cleanup history found. Run 'maccleaner clean' first.")
+            _print_disk_trend(disk_history["snapshots"])
         return
     with open(LOG_PATH) as f:
         logs = json.load(f)
 
     if json_mode:
-        print(json.dumps({"version": VERSION, "runs": logs[-limit:]}, indent=2))
+        print(json.dumps({"version": VERSION, "runs": logs[-limit:],
+                          "disk_history": disk_history}, indent=2))
     elif RICH:
         table = Table(title="📊 Cleanup History", show_lines=True)
         table.add_column("Date", style="cyan")
@@ -1164,6 +1759,7 @@ def show_report(limit=10, json_mode=False):
             ts = entry["timestamp"][:16].replace("T", " ")
             table.add_row(ts, entry["total_freed_human"], entry["disk_after"])
         console.print(table)
+        _print_disk_trend(disk_history["snapshots"])
     else:
         print(f"\n{'='*60}")
         print(f"Cleanup History (last {limit} runs)")
@@ -1172,6 +1768,7 @@ def show_report(limit=10, json_mode=False):
             ts = entry["timestamp"][:16].replace("T", " ")
             print(f"  {ts}  Freed: {entry['total_freed_human']:>10}  {entry['disk_after']}")
         print(f"{'='*60}\n")
+        _print_disk_trend(disk_history["snapshots"])
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
@@ -1249,6 +1846,10 @@ def build_parser():
     p_clean.add_argument("--min-size", type=float, metavar="MB", help="Skip targets smaller than this")
     p_clean.add_argument("--trash", action="store_true", help="Move to Trash instead of deleting")
     p_clean.add_argument("--json", action="store_true", help="Machine-readable results")
+    p_clean.add_argument("--dry-run", action="store_true",
+                         help="Show exactly what would be deleted, delete nothing")
+    p_clean.add_argument("--notify", action="store_true",
+                         help="Post a macOS notification when the clean finishes")
 
     p_proj = sub.add_parser("projects", help="Find stale build artifacts (node_modules, .venv, target, ...)")
     p_proj.add_argument("--roots", action="append", metavar="DIR", help="Roots to scan (default: config project_roots)")
@@ -1258,6 +1859,8 @@ def build_parser():
     p_proj.add_argument("--targets", metavar="ID,ID", help="With --clean: only these artifact IDs")
     p_proj.add_argument("--trash", action="store_true", help="Move to Trash instead of deleting")
     p_proj.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_proj.add_argument("--dry-run", action="store_true",
+                        help="Show what --clean would delete, delete nothing (implies --clean)")
 
     p_report = sub.add_parser("report", help="Show cleanup history")
     p_report.add_argument("-n", "--limit", type=int, default=10, help="Number of runs to show")
@@ -1280,6 +1883,10 @@ def build_parser():
 
     p_cats = sub.add_parser("categories", help="List categories and their targets")
     p_cats.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_disk = sub.add_parser("disk-check",
+                            help="Warn when free space is below the configured threshold (cheap; for launchd)")
+    p_disk.add_argument("--json", action="store_true", help="Machine-readable output")
 
     sub.add_parser("install-deps", help="Install 'rich' for pretty terminal output")
 
@@ -1321,13 +1928,17 @@ def main():
         run_doctor(config, json_mode=args.json)
         return
 
+    if args.command == "disk-check":
+        run_disk_check(config, json_mode=args.json)
+        return
+
     if args.command == "report":
         show_report(limit=args.limit, json_mode=args.json)
         return
 
     if args.command == "projects":
         hits, roots, min_age = scan_projects(config, roots=args.roots, min_age_days=args.min_age_days)
-        if args.clean:
+        if args.clean or args.dry_run:
             targets = projects_to_targets(hits)
             if args.targets:
                 wanted = {t.strip() for t in args.targets.split(",") if t.strip()}
@@ -1337,6 +1948,12 @@ def main():
                     print(f"Unknown artifact IDs: {', '.join(sorted(missing))}", file=sys.stderr)
                     sys.exit(1)
             mode = "trash" if args.trash else config.get("delete_mode", "rm")
+            if args.dry_run:
+                selected = _filter_git_flagged(targets, bypass=bool(args.targets))
+                run_dry_run(selected, mode=mode, json_mode=args.json)
+                return
+            if args.yes:
+                targets = _filter_git_flagged(targets, bypass=bool(args.targets))
             run_clean(targets, auto_approve=args.yes, mode=mode,
                       json_mode=args.json, explicit=bool(args.targets) or args.yes)
         elif args.json:
@@ -1372,6 +1989,11 @@ def main():
     if args.command == "scan":
         if args.min_size is not None:
             targets = filter_targets(targets, min_size_mb=args.min_size)
+        targets = measure_targets(targets)
+        if categories or args.min_size is not None:
+            record_snapshot()  # partial selection: disk numbers only
+        else:
+            record_snapshot(*snapshot_fields(targets))
         if args.json:
             scan_json(targets)
         else:
@@ -1393,7 +2015,14 @@ def main():
             targets = filter_targets(targets, min_size_mb=args.min_size)
         auto = args.yes or config.get("auto_approve", False)
         mode = "trash" if args.trash else config.get("delete_mode", "rm")
-        run_clean(targets, auto_approve=auto, mode=mode, json_mode=args.json, explicit=explicit)
+        if args.dry_run:
+            selected = [t for t in targets if t["safe"] or explicit]
+            run_dry_run(selected, mode=mode, json_mode=args.json)
+            return
+        full = not explicit and not categories and args.min_size is None
+        run_clean(targets, auto_approve=auto, mode=mode, json_mode=args.json,
+                  explicit=explicit, snapshot_scope="full" if full else "partial",
+                  notify=args.notify)
         return
 
 
