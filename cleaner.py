@@ -1364,19 +1364,15 @@ def run_doctor(config, json_mode=False):
           else "not installed to ~/mac-cleaner (running from source?)")
 
     try:
-        agents = HOME / "Library/LaunchAgents"
-        labels = [p.stem for p in sorted(agents.glob("com.fullex.maccleaner.*.plist"))] \
-            if agents.exists() else []
-        loaded = [l for l in labels if _launchd_is_loaded(l)]
-        not_loaded = [l for l in labels if l not in loaded]
-        cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
-        has_cron = cron.returncode == 0 and "mac-cleaner/cleaner.py" in cron.stdout
+        st = _schedule_state()
+        loaded = [a["label"] for a in st["agents"] if a["loaded"]]
+        not_loaded = [a["label"] for a in st["agents"] if not a["loaded"]]
         if loaded:
             note = f"launchd: {', '.join(loaded)}"
             if not_loaded:
                 note += (f" (plist present but not loaded: {', '.join(not_loaded)}"
                          " — run scheduler.sh weekly to reload)")
-            if has_cron:
+            if st["legacy_cron"]:
                 note += " (plus a legacy cron entry — run scheduler.sh weekly to clean up)"
             check("Schedule", note)
         elif not_loaded:
@@ -1385,7 +1381,7 @@ def run_doctor(config, json_mode=False):
             check("Schedule",
                   f"plist present but not loaded: {', '.join(not_loaded)}"
                   " — run scheduler.sh weekly to reload", ok=False)
-        elif has_cron:
+        elif st["legacy_cron"]:
             check("Schedule", "legacy cron entry (run scheduler.sh weekly to migrate to launchd)")
         else:
             check("Schedule", "not scheduled (run scheduler.sh weekly)")
@@ -1869,15 +1865,15 @@ def _schedule_state():
 def _print_schedule_status(state):
     print("── MacCleaner Scheduler Status ──")
     if not state["agents"]:
-        print("❌ Not scheduled (run 'maccleaner schedule weekly')")
+        print("❌ Not scheduled (run ./scheduler.sh weekly)")
     for a in state["agents"]:
         if a["loaded"]:
             print(f"✅ {a['label']} (launchd)")
         else:
             print(f"⚠️  {a['label']} — plist present but not loaded "
-                  f"(run 'maccleaner schedule weekly' to reload)")
+                  f"(run ./scheduler.sh weekly or monthly to reload)")
     if state["legacy_cron"]:
-        print("⚠️  A legacy cron entry is still present — run 'maccleaner schedule weekly' to migrate.")
+        print("⚠️  A legacy cron entry is still present — run ./scheduler.sh weekly to migrate.")
 
 
 def run_schedule_status(json_mode=False):
@@ -1913,6 +1909,9 @@ def run_schedule_install(kind, json_mode=False):
             print(f"    The plist is written to {LAUNCH_AGENTS_DIR / (label + '.plist')} — "
                   f"load it manually with:\n"
                   f"    launchctl bootstrap gui/{os.getuid()} \"{LAUNCH_AGENTS_DIR / (label + '.plist')}\"",
+                  file=sys.stderr)
+            print(f"⚠️  {label} did not load — fix the issue above, then run "
+                  f"./scheduler.sh {kind} again (or load the plist manually).",
                   file=sys.stderr)
 
     if json_mode:

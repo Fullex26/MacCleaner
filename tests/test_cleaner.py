@@ -1838,7 +1838,6 @@ class TestScheduler(unittest.TestCase):
                 '#!/bin/sh\n'
                 f'printf "{name} %s\\n" "$*" >> "$CALLS_FILE"\n'
                 'if [ "$1" = "-l" ]; then cat "$CRONTAB_FILE"; exit 0; fi\n'
-                'if [ "$1" = "list" ]; then grep -o "maccleaner[a-z.]*" "$CALLS_FILE" 2>/dev/null | head -1; exit 0; fi\n'
                 'if [ -z "$1" ] || [ "$1" = "-" ]; then cat > "$CRONTAB_FILE"; fi\n'
                 'exit 0\n')
             stub.chmod(0o755)
@@ -2318,6 +2317,25 @@ class TestScheduleSubcommand(unittest.TestCase):
         self.assertIn("I/O error", r.stderr, "real launchctl stderr surfaces")
         self.assertTrue(self.plist("clean").exists(),
                         "plist still written so manual loading works")
+
+    def test_failed_load_prints_retry_hint(self):
+        """On a failed install, each warning must be followed by a concrete
+        retry suggestion (ported from the bash scheduler.sh, which told the
+        user to fix the issue and run ./scheduler.sh <kind> again)."""
+        bad = self.bindir / "launchctl"
+        bad.write_text('#!/bin/sh\necho "Load failed: 5: I/O error" >&2\nexit 1\n')
+        r = self.run_cli("schedule", "weekly")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("fix the issue above, then run ./scheduler.sh weekly again", r.stderr)
+
+    # ── doctor shares schedule state ─────────────────────────────────────
+
+    def test_doctor_uses_sandboxed_schedule_state(self):
+        self.run_cli("schedule", "weekly", "--json")
+        r = self.run_cli("doctor", "--json")
+        d = json.loads(r.stdout)
+        sched = next(c for c in d["checks"] if c["name"] == "Schedule")
+        self.assertIn("com.fullex.maccleaner.clean", sched["status"])
 
 
 if __name__ == "__main__":
