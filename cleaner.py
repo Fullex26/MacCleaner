@@ -37,6 +37,7 @@ import tempfile
 import argparse
 import subprocess
 import datetime
+import plistlib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1735,6 +1736,223 @@ def run_disk_check(config, json_mode=False):
     return result
 
 
+# ── Scheduling (launchd) ───────────────────────────────────────────────────────
+# Port of scheduler.sh (which is now a thin wrapper over this). launchd rather
+# than cron: launchd runs a missed calendar job after the Mac wakes; cron
+# silently skips it.
+LAUNCH_AGENTS_DIR = Path(os.environ.get("MACCLEANER_LAUNCH_AGENTS_DIR",
+                                        HOME / "Library/LaunchAgents"))
+CLEAN_LABEL = "com.fullex.maccleaner.clean"
+WATCH_LABEL = "com.fullex.maccleaner.diskwatch"
+# A cron line belongs to MacCleaner only if it references the canonical
+# install path — an unanchored "cleaner.py" match would catch a user's own
+# db-cleaner.py job.
+CRON_MARKER = "mac-cleaner/cleaner.py"
+# Homebrew tools aren't on launchd's minimal default PATH; same list
+# CleanerBridge.runEngine uses, so cmd targets behave identically under the
+# app and under a scheduled agent.
+AGENT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+CRON_LOG_PATH = LOG_PATH.parent / "cron.log"   # beside report.log wherever that lives
+
+
+def _agent_plist(label, program_args, trigger):
+    """Plist dict for one agent. `trigger` is e.g.
+    {"StartInterval": 3600} or {"StartCalendarInterval": {...}}."""
+    return {
+        "Label": label,
+        "ProgramArguments": program_args,
+        "EnvironmentVariables": {"PATH": AGENT_PATH},
+        **trigger,
+        "StandardOutPath": str(CRON_LOG_PATH),
+        "StandardErrorPath": str(CRON_LOG_PATH),
+    }
+
+
+def _write_agent_plist(label, plist):
+    LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LAUNCH_AGENTS_DIR / f"{label}.plist", "wb") as f:
+        plistlib.dump(plist, f)
+
+
+def _launchctl(*args):
+    return subprocess.run(["launchctl", *args], capture_output=True, text=True, timeout=15)
+
+
+def _bootstrap_agent(label):
+    """bootout → bootstrap, falling back to unload/load for older macOS.
+    Returns (ok, error_message). The plist is already on disk either way."""
+    plist = str(LAUNCH_AGENTS_DIR / f"{label}.plist")
+    uid = os.getuid()
+    try:
+        _launchctl("bootout", f"gui/{uid}/{label}")
+        r = _launchctl("bootstrap", f"gui/{uid}", plist)
+        if r.returncode == 0:
+            return True, None
+        _launchctl("unload", plist)
+        r2 = _launchctl("load", plist)
+        if r2.returncode == 0:
+            return True, None
+        err = (r2.stderr or r.stderr or "").strip()
+        return False, err
+    except Exception as e:
+        return False, str(e)
+
+
+def _unload_agent(label):
+    plist = LAUNCH_AGENTS_DIR / f"{label}.plist"
+    try:
+        uid = os.getuid()
+        _launchctl("bootout", f"gui/{uid}/{label}")
+        _launchctl("unload", str(plist))
+    except Exception:
+        pass
+    existed = plist.exists()
+    plist.unlink(missing_ok=True)
+    return existed
+
+
+def _read_crontab():
+    try:
+        r = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
+        return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _strip_legacy_cron(say):
+    """Remove any MacCleaner cron line, echoing it. Returns True if one was
+    removed. Reports (not uses) the line's own cadence — the caller installs
+    whatever the user actually asked for."""
+    existing = _read_crontab()
+    lines = [l for l in existing.splitlines() if CRON_MARKER in l]
+    if not lines:
+        return False
+    detected = "weekly"
+    fields = lines[0].split()
+    if len(fields) >= 3 and fields[2] != "*":
+        detected = "monthly"
+    say(f"→ Found a legacy cron schedule (looked {detected}) — migrating to launchd and removing it:")
+    for l in lines:
+        say(f"    {l}")
+    kept = "\n".join(l for l in existing.splitlines() if CRON_MARKER not in l)
+    try:
+        subprocess.run(["crontab", "-"], input=kept + ("\n" if kept else ""),
+                       capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        say(f"⚠️  Could not rewrite crontab: {e}")
+        return False
+    return True
+
+
+def _schedule_state():
+    """One source of truth for status/doctor: what's installed and loaded."""
+    agents = []
+    schedule = None
+    for label in (CLEAN_LABEL, WATCH_LABEL):
+        plist_path = LAUNCH_AGENTS_DIR / f"{label}.plist"
+        present = plist_path.exists()
+        agents.append({"label": label,
+                       "plist_present": present,
+                       "loaded": _launchd_is_loaded(label) if present else False})
+        if label == CLEAN_LABEL and present:
+            try:
+                with open(plist_path, "rb") as f:
+                    cal = plistlib.load(f).get("StartCalendarInterval", {})
+                schedule = "monthly" if "Day" in cal else "weekly" if "Weekday" in cal else None
+            except Exception:
+                schedule = None
+    agents = [a for a in agents if a["plist_present"]]
+    return {"schedule": schedule, "agents": agents,
+            "legacy_cron": CRON_MARKER in _read_crontab()}
+
+
+def _print_schedule_status(state):
+    print("── MacCleaner Scheduler Status ──")
+    if not state["agents"]:
+        print("❌ Not scheduled (run 'maccleaner schedule weekly')")
+    for a in state["agents"]:
+        if a["loaded"]:
+            print(f"✅ {a['label']} (launchd)")
+        else:
+            print(f"⚠️  {a['label']} — plist present but not loaded "
+                  f"(run 'maccleaner schedule weekly' to reload)")
+    if state["legacy_cron"]:
+        print("⚠️  A legacy cron entry is still present — run 'maccleaner schedule weekly' to migrate.")
+
+
+def run_schedule_status(json_mode=False):
+    state = _schedule_state()
+    if json_mode:
+        print(json.dumps({"version": VERSION, **state}, indent=2))
+    else:
+        _print_schedule_status(state)
+    return state
+
+
+def run_schedule_install(kind, json_mode=False):
+    """Install/replace both agents. Returns True when both loaded."""
+    say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
+    migrated = _strip_legacy_cron(say)
+
+    engine = Path(__file__).resolve()
+    trigger = ({"StartCalendarInterval": {"Day": 1, "Hour": 9, "Minute": 0}}
+               if kind == "monthly" else
+               {"StartCalendarInterval": {"Weekday": 1, "Hour": 9, "Minute": 0}})
+    jobs = [
+        (CLEAN_LABEL, [sys.executable, str(engine), "clean", "--yes", "--notify"], trigger),
+        (WATCH_LABEL, [sys.executable, str(engine), "disk-check"], {"StartInterval": 3600}),
+    ]
+    ok = True
+    for label, args, trig in jobs:
+        _write_agent_plist(label, _agent_plist(label, args, trig))
+        loaded, err = _bootstrap_agent(label)
+        if not loaded:
+            ok = False
+            print(f"⚠️  Could not load {label} with launchctl.{' (' + err + ')' if err else ''}",
+                  file=sys.stderr)
+            print(f"    The plist is written to {LAUNCH_AGENTS_DIR / (label + '.plist')} — "
+                  f"load it manually with:\n"
+                  f"    launchctl bootstrap gui/{os.getuid()} \"{LAUNCH_AGENTS_DIR / (label + '.plist')}\"",
+                  file=sys.stderr)
+
+    if json_mode:
+        print(json.dumps({"version": VERSION, **_schedule_state(),
+                          "migrated_cron": migrated}, indent=2))
+    elif ok:
+        print("✅ Scheduled: 1st of every month at 9am (launchd)" if kind == "monthly"
+              else "✅ Scheduled: every Monday at 9am (launchd)")
+        print("   Low-disk check: hourly")
+        print(f"   Log: {CRON_LOG_PATH}")
+    if not ok:
+        print("❌ Scheduling incomplete — see the warning(s) above.", file=sys.stderr)
+    return ok
+
+
+def run_schedule_off(json_mode=False):
+    say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
+    existing = _read_crontab()
+    if CRON_MARKER in existing:
+        for l in existing.splitlines():
+            if CRON_MARKER in l:
+                say("   Removing legacy cron entry:")
+                say(f"     {l}")
+        kept = "\n".join(l for l in existing.splitlines() if CRON_MARKER not in l)
+        try:
+            subprocess.run(["crontab", "-"], input=kept + ("\n" if kept else ""),
+                           capture_output=True, text=True, timeout=10)
+        except Exception as e:
+            say(f"⚠️  Could not rewrite crontab: {e}")
+    removed_clean = _unload_agent(CLEAN_LABEL)
+    removed_watch = _unload_agent(WATCH_LABEL)
+    removed = removed_clean or removed_watch
+    if json_mode:
+        print(json.dumps({"version": VERSION, **_schedule_state(),
+                          "removed": removed}, indent=2))
+    else:
+        print("✅ Removed MacCleaner launchd agents" if removed
+              else "Nothing scheduled — nothing to remove.")
+
+
 def show_report(limit=10, json_mode=False):
     disk_history = {"current": disk_stats(), "snapshots": load_snapshots()}
     if not LOG_PATH.exists():
@@ -1888,6 +2106,11 @@ def build_parser():
                             help="Warn when free space is below the configured threshold (cheap; for launchd)")
     p_disk.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    p_sched = sub.add_parser("schedule",
+                             help="Manage the launchd cleanup schedule (weekly/monthly/off/status)")
+    p_sched.add_argument("action", choices=["status", "weekly", "monthly", "off"])
+    p_sched.add_argument("--json", action="store_true", help="Machine-readable output")
+
     sub.add_parser("install-deps", help="Install 'rich' for pretty terminal output")
 
     return parser
@@ -1905,6 +2128,16 @@ def main():
     if args.command == "install-deps":
         subprocess.run([sys.executable, "-m", "pip", "install", "rich", "--quiet"])
         print("✅ Dependencies installed. Re-run your command.")
+        return
+
+    if args.command == "schedule":
+        if args.action == "status":
+            run_schedule_status(json_mode=args.json)
+        elif args.action in ("weekly", "monthly"):
+            if not run_schedule_install(args.action, json_mode=args.json):
+                sys.exit(1)
+        else:
+            run_schedule_off(json_mode=args.json)
         return
 
     config = load_config()

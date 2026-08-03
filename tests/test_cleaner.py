@@ -2122,5 +2122,203 @@ class TestScheduler(unittest.TestCase):
         self.assertNotIn("legacy cron entry", (r.stdout + r.stderr).lower())
 
 
+class TestScheduleSubcommand(unittest.TestCase):
+    """`cleaner.py schedule ...` against a fully sandboxed environment.
+    Never touches the real crontab, agents, or launchd."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.agents = self.tmp / "LaunchAgents"
+        self.agents.mkdir()
+        self.bindir = self.tmp / "bin"
+        self.bindir.mkdir()
+        self.crontab_file = self.tmp / "crontab.txt"
+        self.crontab_file.write_text("")
+        self.loaded_flag = self.tmp / "loaded"   # exists => launchctl list succeeds
+        self.loaded_flag.write_text("")
+        launchctl = self.bindir / "launchctl"
+        launchctl.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = "list" ]; then [ -e "$LOADED_FLAG" ] && exit 0 || exit 1; fi\n'
+            'exit 0\n')
+        launchctl.chmod(0o755)
+        crontab = self.bindir / "crontab"
+        crontab.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = "-l" ]; then cat "$CRONTAB_FILE"; exit 0; fi\n'
+            'if [ -z "$1" ] || [ "$1" = "-" ]; then cat > "$CRONTAB_FILE"; fi\n'
+            'exit 0\n')
+        crontab.chmod(0o755)
+        self.env = {**os.environ,
+                    "PATH": f"{self.bindir}:{os.environ['PATH']}",
+                    "HOME": str(self.tmp),
+                    "MACCLEANER_LAUNCH_AGENTS_DIR": str(self.agents),
+                    "MACCLEANER_CONFIG": str(self.tmp / "config.json"),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_ALERTS": str(self.tmp / "alerts.json"),
+                    "CRONTAB_FILE": str(self.crontab_file),
+                    "LOADED_FLAG": str(self.loaded_flag)}
+        (self.tmp / "config.json").write_text("{}")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=60)
+
+    def status_json(self):
+        r = self.run_cli("schedule", "status", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def plist(self, label):
+        return self.agents / f"com.fullex.maccleaner.{label}.plist"
+
+    # ── status shapes ──────────────────────────────────────────────────────
+
+    def test_status_empty(self):
+        d = self.status_json()
+        self.assertIsNone(d["schedule"])
+        self.assertEqual(d["agents"], [])
+        self.assertFalse(d["legacy_cron"])
+
+    def test_status_after_weekly_install(self):
+        r = self.run_cli("schedule", "weekly", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = self.status_json()
+        self.assertEqual(d["schedule"], "weekly")
+        labels = {a["label"]: a for a in d["agents"]}
+        self.assertEqual(set(labels), {"com.fullex.maccleaner.clean",
+                                       "com.fullex.maccleaner.diskwatch"})
+        for a in labels.values():
+            self.assertTrue(a["plist_present"])
+            self.assertTrue(a["loaded"])
+
+    def test_status_monthly(self):
+        self.run_cli("schedule", "monthly", "--json")
+        self.assertEqual(self.status_json()["schedule"], "monthly")
+
+    def test_status_present_but_not_loaded(self):
+        self.run_cli("schedule", "weekly", "--json")
+        self.loaded_flag.unlink()          # launchctl list now exits 1
+        d = self.status_json()
+        self.assertEqual(d["schedule"], "weekly")
+        for a in d["agents"]:
+            self.assertTrue(a["plist_present"])
+            self.assertFalse(a["loaded"])
+
+    def test_status_reports_legacy_cron(self):
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        d = self.status_json()
+        self.assertTrue(d["legacy_cron"])
+        # status is read-only: the cron line must survive
+        self.assertIn("mac-cleaner/cleaner.py", self.crontab_file.read_text())
+        self.assertEqual(list(self.agents.glob("*.plist")), [])
+
+    # ── install ────────────────────────────────────────────────────────────
+
+    def test_install_writes_valid_plists(self):
+        self.run_cli("schedule", "weekly", "--json")
+        for label in ("clean", "diskwatch"):
+            lint = subprocess.run(["plutil", "-lint", str(self.plist(label))],
+                                  capture_output=True, text=True)
+            self.assertEqual(lint.returncode, 0, lint.stdout + lint.stderr)
+
+    def test_clean_plist_content(self):
+        self.run_cli("schedule", "weekly", "--json")
+        import plistlib
+        with open(self.plist("clean"), "rb") as f:
+            p = plistlib.load(f)
+        self.assertEqual(p["Label"], "com.fullex.maccleaner.clean")
+        self.assertIn("--notify", p["ProgramArguments"])
+        self.assertEqual(p["StartCalendarInterval"]["Weekday"], 1)
+        self.assertEqual(p["StartCalendarInterval"]["Hour"], 9)
+        self.assertIn("/opt/homebrew/bin", p["EnvironmentVariables"]["PATH"])
+        self.assertTrue(p["ProgramArguments"][0])   # interpreter path non-empty
+        self.assertIn("cleaner.py", p["ProgramArguments"][1])
+
+    def test_monthly_uses_day_not_weekday(self):
+        self.run_cli("schedule", "monthly", "--json")
+        import plistlib
+        with open(self.plist("clean"), "rb") as f:
+            p = plistlib.load(f)
+        self.assertEqual(p["StartCalendarInterval"]["Day"], 1)
+        self.assertNotIn("Weekday", p["StartCalendarInterval"])
+
+    def test_diskwatch_plist_content(self):
+        self.run_cli("schedule", "weekly", "--json")
+        import plistlib
+        with open(self.plist("diskwatch"), "rb") as f:
+            p = plistlib.load(f)
+        self.assertEqual(p["StartInterval"], 3600)
+        self.assertIn("disk-check", p["ProgramArguments"])
+
+    def test_reinstall_replaces(self):
+        self.run_cli("schedule", "weekly", "--json")
+        self.run_cli("schedule", "monthly", "--json")
+        self.assertEqual(self.status_json()["schedule"], "monthly")
+        self.assertEqual(len(list(self.agents.glob("*.plist"))), 2)
+
+    def test_install_json_shape(self):
+        r = self.run_cli("schedule", "weekly", "--json")
+        d = json.loads(r.stdout)
+        self.assertEqual(d["schedule"], "weekly")
+        self.assertFalse(d["migrated_cron"])
+
+    # ── cron migration ─────────────────────────────────────────────────────
+
+    def test_install_migrates_cron(self):
+        self.crontab_file.write_text(
+            "0 9 1 * * /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n"
+            "0 3 * * * /Users/x/bin/db-cleaner.py\n")
+        r = self.run_cli("schedule", "weekly", "--json")
+        d = json.loads(r.stdout)
+        self.assertTrue(d["migrated_cron"])
+        self.assertEqual(d["schedule"], "weekly",
+                         "explicitly requested cadence wins over the detected one")
+        remaining = self.crontab_file.read_text()
+        self.assertNotIn("mac-cleaner/cleaner.py", remaining)
+        self.assertIn("db-cleaner.py", remaining, "unrelated cron lines survive")
+
+    def test_migration_reports_detected_cadence_on_stderr(self):
+        self.crontab_file.write_text(
+            "0 9 1 * * /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        r = self.run_cli("schedule", "weekly", "--json")
+        self.assertIn("monthly", r.stderr, "detected cadence is reported for visibility")
+
+    # ── off ────────────────────────────────────────────────────────────────
+
+    def test_off_removes_everything(self):
+        self.run_cli("schedule", "weekly", "--json")
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        r = self.run_cli("schedule", "off", "--json")
+        self.assertEqual(r.returncode, 0)
+        d = json.loads(r.stdout)
+        self.assertTrue(d["removed"])
+        self.assertEqual(list(self.agents.glob("*.plist")), [])
+        self.assertNotIn("mac-cleaner", self.crontab_file.read_text())
+
+    def test_off_when_nothing_installed_is_success(self):
+        r = self.run_cli("schedule", "off", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(json.loads(r.stdout)["removed"])
+
+    # ── failure propagation ────────────────────────────────────────────────
+
+    def test_failed_load_exits_1_but_writes_plists(self):
+        bad = self.bindir / "launchctl"
+        bad.write_text('#!/bin/sh\necho "Load failed: 5: I/O error" >&2\nexit 1\n')
+        r = self.run_cli("schedule", "weekly")
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("✅ Scheduled", r.stdout)
+        self.assertIn("I/O error", r.stderr, "real launchctl stderr surfaces")
+        self.assertTrue(self.plist("clean").exists(),
+                        "plist still written so manual loading works")
+
+
 if __name__ == "__main__":
     unittest.main()
