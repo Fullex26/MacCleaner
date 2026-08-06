@@ -75,8 +75,16 @@ struct DiskCurrent: Codable {
     let total_bytes: Int
 }
 
+struct DiskSnapshot: Codable, Identifiable {
+    let ts: String
+    let disk_free_bytes: Int
+    let disk_total_bytes: Int
+    var id: String { ts }
+}
+
 struct DiskHistory: Codable {
     let current: DiskCurrent
+    let snapshots: [DiskSnapshot]?
 }
 
 struct HistoryReport: Codable {
@@ -172,6 +180,7 @@ final class CleanerBridge: ObservableObject {
     @Published var lastClean: CleanResult?
     @Published var lastCleanedAt: Date?
     @Published var freeBytes: Int?
+    @Published var diskSnapshots: [DiskSnapshot] = []
 
     private var lightTimer: Timer?
     private var fullTimer: Timer?
@@ -313,6 +322,7 @@ final class CleanerBridge: ObservableObject {
         else { return }
         freeBytes = report.disk_history?.current.free_bytes
         lastCleanedAt = report.runs.last.flatMap { Self.parseTimestamp($0.timestamp) }
+        diskSnapshots = report.disk_history?.snapshots ?? []
     }
 
     /// Full scan, debounced so a wake plus a menu-open doesn't launch two.
