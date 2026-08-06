@@ -95,6 +95,19 @@ struct CategoriesReport: Codable {
     let categories: [CategoryInfo]
 }
 
+struct AgentStatus: Codable, Identifiable {
+    let label: String
+    let plist_present: Bool
+    let loaded: Bool
+    var id: String { label }
+}
+
+struct ScheduleStatus: Codable {
+    let schedule: String?
+    let agents: [AgentStatus]
+    let legacy_cron: Bool
+}
+
 struct EngineConfig: Codable {
     var delete_mode: String?
     var notifications: Bool?
@@ -141,6 +154,8 @@ final class CleanerBridge: ObservableObject {
     @Published var notificationsEnabled = true
     @Published var lowDiskAlertsEnabled = true
     @Published var lowDiskThresholdGB: Double = 10
+    @Published var scheduleStatus: ScheduleStatus?
+    @Published var scheduleSupported = true
     @Published var fullRefreshHours: Double = 6 {
         didSet {
             // Reschedule the periodic timer when the configured cadence actually
@@ -488,6 +503,28 @@ final class CleanerBridge: ObservableObject {
             lowDiskThresholdGB = gb
         } catch {
             statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    func loadSchedule() async {
+        do {
+            scheduleStatus = try await run(ScheduleStatus.self, ["schedule", "status", "--json"])
+            scheduleSupported = true
+        } catch {
+            // An older engine exits 2 on the unknown subcommand; treat any
+            // failure here as "can't manage scheduling", not an error banner.
+            scheduleStatus = nil
+            scheduleSupported = false
+        }
+    }
+
+    func setSchedule(_ choice: String) async {
+        do {
+            try await runPlain(["schedule", choice])
+            await loadSchedule()
+        } catch {
+            statusMessage = "Schedule change failed: \(error.localizedDescription)"
+            await loadSchedule()   // revert the picker to the real state
         }
     }
 }
