@@ -1776,6 +1776,30 @@ AGENT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 CRON_LOG_PATH = LOG_PATH.parent / "cron.log"   # beside report.log wherever that lives
 
 
+def _is_venv_interpreter(python_path) -> bool:
+    """True if `python_path` lives inside a virtualenv.
+
+    Detected via the standard `pyvenv.cfg` marker one level above the
+    interpreter's containing directory (e.g. `.venv/bin/python3` ->
+    `.venv/pyvenv.cfg`). This is a property of the *candidate path itself*,
+    not of the current process — `sys.prefix != sys.base_prefix` only tells
+    you whether the process currently running this code is a venv; it can't
+    vet an arbitrary `python3` resolved from PATH, which is exactly the
+    candidate that matters here.
+
+    Deliberately `.absolute()`, not `.resolve()`: a venv's `bin/python3` is
+    itself almost always a symlink to the real base interpreter (e.g.
+    `.venv/bin/python3 -> python3.14 -> /opt/homebrew/.../python3.14`), so
+    fully resolving it walks straight past the venv and inspects the real
+    interpreter's directory instead — silently defeating this check.
+    """
+    try:
+        p = Path(python_path).absolute()
+    except OSError:
+        return False
+    return (p.parent.parent / "pyvenv.cfg").exists()
+
+
 def _agent_python() -> str:
     """Interpreter to embed in the scheduled agents' ProgramArguments.
 
@@ -1798,11 +1822,28 @@ def _agent_python() -> str:
     A virtualenv interpreter is worse than either choice: `.venv` is itself
     one of MacCleaner's own `projects` artifact targets, so a scheduled agent
     could end up pointing at a directory this same tool prunes. Refuse to
-    fall back to one.
+    fall back to one — and crucially, check this on the `shutil.which()`
+    candidate too, not just the `sys.executable` fallback: activating a venv
+    puts `$VIRTUAL_ENV/bin` first on PATH, so `shutil.which("python3")` *is*
+    the venv's python in the common case. Checking only the fallback branch
+    left that case unchecked.
     """
     stable = shutil.which("python3")
     if stable:
-        return stable
+        if not _is_venv_interpreter(stable):
+            return stable
+        # PATH resolved a venv interpreter — prefer the real base
+        # installation that venv itself was created from before giving up.
+        base_candidate = Path(sys.base_prefix) / "bin" / "python3"
+        if base_candidate.exists() and not _is_venv_interpreter(str(base_candidate)):
+            return str(base_candidate)
+        raise RuntimeError(
+            f"'python3' on PATH ({stable}) is a virtualenv interpreter, and "
+            "no stable system python3 could be found either — refusing to "
+            "schedule against a virtualenv. Deactivate the virtualenv (so "
+            "PATH resolves to a real python3, e.g. via Homebrew) and try "
+            "again."
+        )
     if sys.prefix != sys.base_prefix:
         raise RuntimeError(
             "no stable 'python3' found on PATH, and the running interpreter "
@@ -1838,6 +1879,11 @@ def _write_agent_plist(label, plist):
     try:
         with os.fdopen(tmp_fd, "wb") as f:
             plistlib.dump(plist, f)
+        # mkstemp creates 0600; every real plist in ~/Library/LaunchAgents
+        # (including MacCleaner's own) is 0644. Restore that before the
+        # atomic swap so this doesn't quietly change the on-disk permissions
+        # of a file launchd has to read.
+        os.chmod(tmp_name, 0o644)
         os.replace(tmp_name, str(target))
     except Exception:
         try:

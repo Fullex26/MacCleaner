@@ -2227,6 +2227,42 @@ class TestScheduleSubcommand(unittest.TestCase):
                                   capture_output=True, text=True)
             self.assertEqual(lint.returncode, 0, lint.stdout + lint.stderr)
 
+    def test_plists_are_mode_644(self):
+        """tempfile.mkstemp creates 0600 and os.replace preserves it — every
+        real plist in ~/Library/LaunchAgents (including MacCleaner's own
+        live agents) is 0644, so the atomic-write path must restore that
+        mode before the swap."""
+        self.run_cli("schedule", "weekly", "--json")
+        for label in ("clean", "diskwatch"):
+            mode = oct(self.plist(label).stat().st_mode & 0o777)
+            self.assertEqual(mode, oct(0o644), f"{label} plist has mode {mode}, expected 0o644")
+
+    def test_venv_shaped_python3_first_on_path_is_not_used_in_plist(self):
+        """Reproduces the real hazard end-to-end through `schedule weekly`:
+        a venv-shaped python3 placed first on PATH (as an activated venv
+        would do) must never be embedded in the plist. Either the real
+        stable/base interpreter is used instead, or installation refuses
+        outright — but the venv path itself must never be written."""
+        fake_python = self.bindir / "python3"
+        fake_python.write_text("#!/bin/sh\necho fake\n")
+        fake_python.chmod(0o755)
+        (self.tmp / "pyvenv.cfg").write_text("home = /usr/bin\n")
+
+        r = self.run_cli("schedule", "weekly", "--json")
+        if r.returncode == 0:
+            import plistlib
+            with open(self.plist("clean"), "rb") as f:
+                p = plistlib.load(f)
+            interpreter = p["ProgramArguments"][0]
+            self.assertNotEqual(interpreter, str(fake_python),
+                                "venv-shaped python3 must never be embedded in the plist")
+            self.assertFalse(cleaner._is_venv_interpreter(interpreter))
+        else:
+            # No usable non-venv interpreter was found anywhere -- refusing
+            # outright is correct too, as long as nothing was written.
+            self.assertFalse(self.plist("clean").exists())
+            self.assertIn("virtualenv", r.stderr.lower())
+
     def test_clean_plist_content(self):
         self.run_cli("schedule", "weekly", "--json")
         import plistlib
@@ -2410,6 +2446,29 @@ class TestScheduleSubcommand(unittest.TestCase):
         self.assertIn(missing_interpreter, paths["status"])
         self.assertIn("com.fullex.maccleaner.clean", paths["status"])
 
+    def test_doctor_flags_agent_with_missing_engine(self):
+        """Same as the missing-interpreter case above, but for
+        ProgramArguments[1] (the engine script) — a plist can also outlive
+        the cleaner.py it points at, e.g. if the repo checkout it was
+        installed from moved or was deleted."""
+        self.run_cli("schedule", "weekly", "--json")
+        import plistlib
+        clean_plist = self.plist("clean")
+        with open(clean_plist, "rb") as f:
+            p = plistlib.load(f)
+        missing_engine = str(self.tmp / "gone" / "cleaner.py")
+        p["ProgramArguments"][1] = missing_engine
+        with open(clean_plist, "wb") as f:
+            plistlib.dump(p, f)
+        r = self.run_cli("doctor", "--json")
+        d = json.loads(r.stdout)
+        paths = next((c for c in d["checks"] if c["name"] == "Schedule paths"), None)
+        self.assertIsNotNone(paths, "doctor must report a Schedule paths check")
+        self.assertFalse(paths["ok"])
+        self.assertIn(missing_engine, paths["status"])
+        self.assertIn("com.fullex.maccleaner.clean", paths["status"])
+        self.assertIn("engine", paths["status"])
+
     def test_doctor_schedule_paths_absent_when_everything_exists(self):
         self.run_cli("schedule", "weekly", "--json")
         r = self.run_cli("doctor", "--json")
@@ -2440,6 +2499,67 @@ class TestAgentPython(unittest.TestCase):
              mock.patch.object(cleaner.sys, "base_prefix", "/usr"):
             with self.assertRaises(RuntimeError):
                 cleaner._agent_python()
+
+    def test_rejects_venv_shaped_interpreter_first_on_path(self):
+        """Reproduces the real hazard, not just the unreachable fallback
+        branch: activating a venv puts its bin/ first on PATH, so
+        shutil.which('python3') resolves the venv interpreter *directly* —
+        the old code only checked for a venv on the fallback branch, so this
+        candidate sailed through unchecked and got baked into both plists.
+        Build a venv-shaped fixture (bin/python3 + a sibling pyvenv.cfg)
+        instead of a real venv, so this stays fast and hermetic."""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            venv_python = tmp / "myproject" / ".venv" / "bin" / "python3"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("#!/bin/sh\n")
+            venv_python.chmod(0o755)
+            (venv_python.parent.parent / "pyvenv.cfg").write_text("home = /usr/bin\n")
+
+            base_python = tmp / "base" / "bin" / "python3"
+            base_python.parent.mkdir(parents=True)
+            base_python.write_text("#!/bin/sh\n")
+            base_python.chmod(0o755)
+
+            with mock.patch("cleaner.shutil.which", return_value=str(venv_python)), \
+                 mock.patch.object(cleaner.sys, "base_prefix", str(tmp / "base")):
+                result = cleaner._agent_python()
+
+            self.assertEqual(result, str(base_python))
+            self.assertNotIn(".venv", result)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_raises_when_path_python3_is_venv_and_no_base_fallback(self):
+        """When PATH's python3 is a venv AND sys.base_prefix has no usable
+        python3 either, refuse outright rather than silently falling through
+        to something else."""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            venv_python = tmp / ".venv" / "bin" / "python3"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("#!/bin/sh\n")
+            venv_python.chmod(0o755)
+            (venv_python.parent.parent / "pyvenv.cfg").write_text("home = /usr/bin\n")
+
+            with mock.patch("cleaner.shutil.which", return_value=str(venv_python)), \
+                 mock.patch.object(cleaner.sys, "base_prefix", str(tmp / "nonexistent")):
+                with self.assertRaises(RuntimeError):
+                    cleaner._agent_python()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_is_venv_interpreter_detects_pyvenv_cfg_sibling(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            venv_python = tmp / ".venv" / "bin" / "python3"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("#!/bin/sh\n")
+            self.assertFalse(cleaner._is_venv_interpreter(str(venv_python)))
+            (venv_python.parent.parent / "pyvenv.cfg").write_text("home = /usr/bin\n")
+            self.assertTrue(cleaner._is_venv_interpreter(str(venv_python)))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
