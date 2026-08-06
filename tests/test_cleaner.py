@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -2236,7 +2237,21 @@ class TestScheduleSubcommand(unittest.TestCase):
         self.assertEqual(p["StartCalendarInterval"]["Weekday"], 1)
         self.assertEqual(p["StartCalendarInterval"]["Hour"], 9)
         self.assertIn("/opt/homebrew/bin", p["EnvironmentVariables"]["PATH"])
-        self.assertTrue(p["ProgramArguments"][0])   # interpreter path non-empty
+        # The interpreter must be the stable, unversioned `python3` that
+        # shutil.which() resolves — not a version-pinned Homebrew path like
+        # .../python@3.14/bin/python3.14, which brew-autoremove can delete
+        # out from under a scheduled agent (finding: fragile interpreter
+        # path). Derive the expectation from shutil.which() so this stays
+        # correct on any machine, rather than hardcoding a path.
+        expected = shutil.which("python3")
+        self.assertIsNotNone(expected, "test host must have python3 on PATH")
+        interpreter = p["ProgramArguments"][0]
+        self.assertEqual(interpreter, expected)
+        self.assertTrue(Path(interpreter).exists())
+        self.assertNotRegex(interpreter, r"python@\d+\.\d+",
+                            "must not be a version-pinned Homebrew formula path")
+        self.assertNotRegex(Path(interpreter).name, r"^python\d+\.\d+$",
+                            "must not be a version-suffixed binary like python3.14")
         self.assertIn("cleaner.py", p["ProgramArguments"][1])
 
     def test_monthly_uses_day_not_weekday(self):
@@ -2288,6 +2303,42 @@ class TestScheduleSubcommand(unittest.TestCase):
         r = self.run_cli("schedule", "weekly", "--json")
         self.assertIn("monthly", r.stderr, "detected cadence is reported for visibility")
 
+    def test_crontab_write_failure_does_not_claim_migration(self):
+        """`crontab -` exiting non-zero must not be reported as a successful
+        migration — the old code only checked for a raised exception, so a
+        clean non-zero exit slipped through as `migrated_cron: true` with the
+        cron line still present on the real crontab."""
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        crontab = self.bindir / "crontab"
+        crontab.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = "-l" ]; then cat "$CRONTAB_FILE"; exit 0; fi\n'
+            'if [ -z "$1" ] || [ "$1" = "-" ]; then cat > /dev/null; echo "write failed" >&2; exit 1; fi\n'
+            'exit 0\n')
+        crontab.chmod(0o755)
+        r = self.run_cli("schedule", "weekly", "--json")
+        d = json.loads(r.stdout)
+        self.assertFalse(d["migrated_cron"], "a failed crontab write must not be reported as migrated")
+        self.assertIn("Could not rewrite crontab", r.stderr)
+        # The original line is untouched, since our stub crontab never wrote it.
+        self.assertIn("mac-cleaner/cleaner.py", self.crontab_file.read_text())
+
+    def test_off_crontab_write_failure_warns(self):
+        self.run_cli("schedule", "weekly", "--json")
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        crontab = self.bindir / "crontab"
+        crontab.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = "-l" ]; then cat "$CRONTAB_FILE"; exit 0; fi\n'
+            'if [ -z "$1" ] || [ "$1" = "-" ]; then cat > /dev/null; echo "write failed" >&2; exit 1; fi\n'
+            'exit 0\n')
+        crontab.chmod(0o755)
+        r = self.run_cli("schedule", "off", "--json")
+        self.assertEqual(r.returncode, 0, "off still succeeds at removing the agents")
+        self.assertIn("Could not rewrite crontab", r.stderr)
+
     # ── off ────────────────────────────────────────────────────────────────
 
     def test_off_removes_everything(self):
@@ -2336,6 +2387,59 @@ class TestScheduleSubcommand(unittest.TestCase):
         d = json.loads(r.stdout)
         sched = next(c for c in d["checks"] if c["name"] == "Schedule")
         self.assertIn("com.fullex.maccleaner.clean", sched["status"])
+
+    def test_doctor_flags_agent_with_missing_interpreter(self):
+        """A plist can stay 'loaded' per launchctl forever even after the
+        interpreter it points at is deleted (e.g. brew-autoremove evicting a
+        version-pinned python@X.Y). Nothing else would ever catch this, so
+        doctor must check the ProgramArguments paths directly."""
+        self.run_cli("schedule", "weekly", "--json")
+        import plistlib
+        clean_plist = self.plist("clean")
+        with open(clean_plist, "rb") as f:
+            p = plistlib.load(f)
+        missing_interpreter = str(self.tmp / "gone" / "python3")
+        p["ProgramArguments"][0] = missing_interpreter
+        with open(clean_plist, "wb") as f:
+            plistlib.dump(p, f)
+        r = self.run_cli("doctor", "--json")
+        d = json.loads(r.stdout)
+        paths = next((c for c in d["checks"] if c["name"] == "Schedule paths"), None)
+        self.assertIsNotNone(paths, "doctor must report a Schedule paths check")
+        self.assertFalse(paths["ok"])
+        self.assertIn(missing_interpreter, paths["status"])
+        self.assertIn("com.fullex.maccleaner.clean", paths["status"])
+
+    def test_doctor_schedule_paths_absent_when_everything_exists(self):
+        self.run_cli("schedule", "weekly", "--json")
+        r = self.run_cli("doctor", "--json")
+        d = json.loads(r.stdout)
+        paths = next((c for c in d["checks"] if c["name"] == "Schedule paths"), None)
+        self.assertIsNone(paths, "no Schedule paths check should be emitted when nothing's missing")
+
+
+class TestAgentPython(unittest.TestCase):
+    """_agent_python() picks the interpreter embedded in scheduled agents'
+    plists — must prefer the stable `python3` on PATH over the (possibly
+    version-pinned) running interpreter, and must never fall back to a
+    virtualenv interpreter."""
+
+    def test_prefers_stable_python3_on_path(self):
+        with mock.patch("cleaner.shutil.which", return_value="/usr/bin/python3"):
+            self.assertEqual(cleaner._agent_python(), "/usr/bin/python3")
+
+    def test_falls_back_to_sys_executable_when_not_a_venv(self):
+        with mock.patch("cleaner.shutil.which", return_value=None), \
+             mock.patch.object(cleaner.sys, "prefix", "/usr"), \
+             mock.patch.object(cleaner.sys, "base_prefix", "/usr"):
+            self.assertEqual(cleaner._agent_python(), sys.executable)
+
+    def test_refuses_venv_interpreter_when_no_stable_python3(self):
+        with mock.patch("cleaner.shutil.which", return_value=None), \
+             mock.patch.object(cleaner.sys, "prefix", "/Users/x/project/.venv"), \
+             mock.patch.object(cleaner.sys, "base_prefix", "/usr"):
+            with self.assertRaises(RuntimeError):
+                cleaner._agent_python()
 
 
 if __name__ == "__main__":

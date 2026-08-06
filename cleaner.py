@@ -145,7 +145,6 @@ DEFAULT_CONFIG = {
     "skip_paths": [],
     "log_threshold_mb": 100,
     "auto_approve": False,
-    "schedule": "weekly",
     "delete_mode": "rm",  # "rm" = delete immediately, "trash" = move to ~/.Trash
     "project_roots": ["~/Documents", "~/Developer", "~/Projects", "~/Code", "~/dev"],
     "project_min_age_days": 30,
@@ -1388,6 +1387,32 @@ def run_doctor(config, json_mode=False):
     except Exception:
         check("Schedule", "could not determine schedule")
 
+    # A plist being "loaded" per launchctl only means launchd has it
+    # registered — it says nothing about whether the interpreter or engine
+    # script it points at still exists. If Homebrew evicts a version-pinned
+    # python@X.Y (see _agent_python), the agent stays "loaded" forever but
+    # silently never runs anything. This is the only surface that would ever
+    # tell a user that's happened, so check it directly instead of trusting
+    # launchd's idea of health.
+    try:
+        missing = []
+        for label in (CLEAN_LABEL, WATCH_LABEL):
+            plist_path = LAUNCH_AGENTS_DIR / f"{label}.plist"
+            if not plist_path.exists():
+                continue
+            try:
+                with open(plist_path, "rb") as f:
+                    args = plistlib.load(f).get("ProgramArguments", [])
+            except Exception:
+                continue  # unparseable plist — the Schedule check above already covers this
+            for idx, what in ((0, "interpreter"), (1, "engine")):
+                if len(args) > idx and not Path(args[idx]).exists():
+                    missing.append(f"{label} {what} missing: {args[idx]}")
+        if missing:
+            check("Schedule paths", "; ".join(missing), ok=False)
+    except Exception:
+        pass
+
     app_paths = [HOME / "Applications/MacCleaner.app", Path("/Applications/MacCleaner.app")]
     check("Menu bar app", "installed" if any(p.exists() for p in app_paths) else "not installed")
 
@@ -1751,6 +1776,43 @@ AGENT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 CRON_LOG_PATH = LOG_PATH.parent / "cron.log"   # beside report.log wherever that lives
 
 
+def _agent_python() -> str:
+    """Interpreter to embed in the scheduled agents' ProgramArguments.
+
+    `sys.executable` is tempting but dangerous here: on Homebrew Python it's
+    a version-pinned path (e.g. /opt/homebrew/opt/python@3.14/bin/python3.14).
+    When Homebrew moves on to a newer python@X.Y formula, the old one becomes
+    an orphaned dependency — and MacCleaner's own `brew-autoremove` target,
+    run by the very launchd agent this builds, deletes the interpreter out
+    from under itself. Both agents then silently never spawn again, and
+    nothing notices: `_schedule_state()` only checks plist presence and
+    `launchctl list`, so `schedule status` and `doctor` keep reporting
+    "loaded" indefinitely (see doctor's ProgramArguments existence check,
+    which is the one thing that would ever catch this).
+
+    `shutil.which("python3")` instead resolves the stable, unversioned
+    `python3` symlink on PATH — the same one the old bash `command -v
+    python3` used, and what already-installed real plists contain. Do not
+    "simplify" this back to `sys.executable`.
+
+    A virtualenv interpreter is worse than either choice: `.venv` is itself
+    one of MacCleaner's own `projects` artifact targets, so a scheduled agent
+    could end up pointing at a directory this same tool prunes. Refuse to
+    fall back to one.
+    """
+    stable = shutil.which("python3")
+    if stable:
+        return stable
+    if sys.prefix != sys.base_prefix:
+        raise RuntimeError(
+            "no stable 'python3' found on PATH, and the running interpreter "
+            f"({sys.executable}) is a virtualenv — refusing to schedule "
+            "against it. Put a 'python3' on PATH (deactivate the virtualenv, "
+            "or install one via Homebrew) and try again."
+        )
+    return sys.executable
+
+
 def _agent_plist(label, program_args, trigger):
     """Plist dict for one agent. `trigger` is e.g.
     {"StartInterval": 3600} or {"StartCalendarInterval": {...}}."""
@@ -1765,9 +1827,24 @@ def _agent_plist(label, program_args, trigger):
 
 
 def _write_agent_plist(label, plist):
+    """Write the plist atomically — same pattern as `_atomic_write_json`: dump
+    to a temp file beside the target, then `os.replace()`. Two overlapping
+    installs (a double-clicked Settings radio button, or the app and a
+    terminal at once) can't leave launchd a truncated plist that fails to
+    parse."""
     LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(LAUNCH_AGENTS_DIR / f"{label}.plist", "wb") as f:
-        plistlib.dump(plist, f)
+    target = LAUNCH_AGENTS_DIR / f"{label}.plist"
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "wb") as f:
+            plistlib.dump(plist, f)
+        os.replace(tmp_name, str(target))
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _launchctl(*args):
@@ -1832,10 +1909,13 @@ def _strip_legacy_cron(say):
         say(f"    {l}")
     kept = "\n".join(l for l in existing.splitlines() if CRON_MARKER not in l)
     try:
-        subprocess.run(["crontab", "-"], input=kept + ("\n" if kept else ""),
-                       capture_output=True, text=True, timeout=10)
+        r = subprocess.run(["crontab", "-"], input=kept + ("\n" if kept else ""),
+                           capture_output=True, text=True, timeout=10)
     except Exception as e:
         say(f"⚠️  Could not rewrite crontab: {e}")
+        return False
+    if r.returncode != 0:
+        say(f"⚠️  Could not rewrite crontab (exit {r.returncode}): {r.stderr.strip()}")
         return False
     return True
 
@@ -1888,6 +1968,15 @@ def run_schedule_status(json_mode=False):
 def run_schedule_install(kind, json_mode=False):
     """Install/replace both agents. Returns True when both loaded."""
     say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
+
+    try:
+        python = _agent_python()
+    except RuntimeError as e:
+        say(f"❌ {e}")
+        if json_mode:
+            print(json.dumps({"version": VERSION, "error": str(e)}, indent=2))
+        return False
+
     migrated = _strip_legacy_cron(say)
 
     engine = Path(__file__).resolve()
@@ -1895,8 +1984,8 @@ def run_schedule_install(kind, json_mode=False):
                if kind == "monthly" else
                {"StartCalendarInterval": {"Weekday": 1, "Hour": 9, "Minute": 0}})
     jobs = [
-        (CLEAN_LABEL, [sys.executable, str(engine), "clean", "--yes", "--notify"], trigger),
-        (WATCH_LABEL, [sys.executable, str(engine), "disk-check"], {"StartInterval": 3600}),
+        (CLEAN_LABEL, [python, str(engine), "clean", "--yes", "--notify"], trigger),
+        (WATCH_LABEL, [python, str(engine), "disk-check"], {"StartInterval": 3600}),
     ]
     ok = True
     for label, args, trig in jobs:
@@ -1937,8 +2026,10 @@ def run_schedule_off(json_mode=False):
                 say(f"     {l}")
         kept = "\n".join(l for l in existing.splitlines() if CRON_MARKER not in l)
         try:
-            subprocess.run(["crontab", "-"], input=kept + ("\n" if kept else ""),
-                           capture_output=True, text=True, timeout=10)
+            r = subprocess.run(["crontab", "-"], input=kept + ("\n" if kept else ""),
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                say(f"⚠️  Could not rewrite crontab (exit {r.returncode}): {r.stderr.strip()}")
         except Exception as e:
             say(f"⚠️  Could not rewrite crontab: {e}")
     removed_clean = _unload_agent(CLEAN_LABEL)
