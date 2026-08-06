@@ -2521,7 +2521,12 @@ class TestAgentPython(unittest.TestCase):
             base_python.write_text("#!/bin/sh\n")
             base_python.chmod(0o755)
 
+            # Empty the well-known-locations list so this test exercises the
+            # sys.base_prefix fallback specifically; the real ordering (stable
+            # locations first) is covered by
+            # test_prefers_stable_location_over_versioned_base_prefix.
             with mock.patch("cleaner.shutil.which", return_value=str(venv_python)), \
+                 mock.patch.object(cleaner, "STABLE_PYTHON_CANDIDATES", ()), \
                  mock.patch.object(cleaner.sys, "base_prefix", str(tmp / "base")):
                 result = cleaner._agent_python()
 
@@ -2543,9 +2548,41 @@ class TestAgentPython(unittest.TestCase):
             (venv_python.parent.parent / "pyvenv.cfg").write_text("home = /usr/bin\n")
 
             with mock.patch("cleaner.shutil.which", return_value=str(venv_python)), \
+                 mock.patch.object(cleaner, "STABLE_PYTHON_CANDIDATES", ()), \
                  mock.patch.object(cleaner.sys, "base_prefix", str(tmp / "nonexistent")):
                 with self.assertRaises(RuntimeError):
                     cleaner._agent_python()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_prefers_stable_location_over_versioned_base_prefix(self):
+        """A venv created from Homebrew python has a *version-pinned*
+        sys.base_prefix (…/python@3.14/Frameworks/…/3.14/bin/python3), so
+        falling straight back to it would trade the venv hazard for the
+        brew-autoremove one this function exists to avoid. A stable
+        unversioned location must win."""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            venv_python = tmp / ".venv" / "bin" / "python3"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("#!/bin/sh\n")
+            (venv_python.parent.parent / "pyvenv.cfg").write_text("home = /usr/bin\n")
+
+            stable = tmp / "stable" / "bin" / "python3"
+            stable.parent.mkdir(parents=True)
+            stable.write_text("#!/bin/sh\n")
+
+            versioned_base = tmp / "python@3.14" / "bin" / "python3"
+            versioned_base.parent.mkdir(parents=True)
+            versioned_base.write_text("#!/bin/sh\n")
+
+            with mock.patch("cleaner.shutil.which", return_value=str(venv_python)), \
+                 mock.patch.object(cleaner, "STABLE_PYTHON_CANDIDATES", (str(stable),)), \
+                 mock.patch.object(cleaner.sys, "base_prefix", str(tmp / "python@3.14")):
+                result = cleaner._agent_python()
+
+            self.assertEqual(result, str(stable))
+            self.assertNotIn("python@", result)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
