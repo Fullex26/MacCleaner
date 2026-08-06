@@ -7,6 +7,16 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.3.0] — Unreleased
+
+### Added
+- `schedule` subcommand (`status`/`weekly`/`monthly`/`off`, `--json`) — launchd scheduling is now first-class engine logic instead of shell script logic; `scheduler.sh` is a thin wrapper that `exec`s into it, so every existing invocation (`weekly`/`monthly`/`remove`/`status`) keeps working with the same exit codes. New `MACCLEANER_LAUNCH_AGENTS_DIR` env override
+- In-app schedule management — Settings gained a Schedule section (Off / Weekly / Monthly), so turning scheduling on or off no longer requires the terminal. `doctor`'s Schedule check now shares the same state helper as `schedule status`
+- Dashboard disk trend chart — a Swift Charts view plotting free space per day from `report --json`'s disk history, with the low-disk threshold drawn as a rule line
+- App icon
+
+---
+
 ## [2.2.0] — Unreleased
 
 ### Added

@@ -45,6 +45,32 @@ struct SettingsView: View {
             }
 
             Section {
+                if bridge.scheduleSupported {
+                    Picker("Automatic cleanup", selection: Binding(
+                        get: { bridge.isSchedulingBusy
+                            ? (bridge.pendingSchedule ?? "off")
+                            : (bridge.scheduleStatus?.schedule ?? "off") },
+                        set: { choice in Task { await bridge.setSchedule(choice) } }
+                    )) {
+                        Text("Off").tag("off")
+                        Text("Weekly — Mondays at 9am").tag("weekly")
+                        Text("Monthly — 1st at 9am").tag("monthly")
+                    }
+                    .pickerStyle(.radioGroup)
+                    .disabled(bridge.isSchedulingBusy)
+
+                    Text(scheduleCaption)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Update the MacCleaner CLI to manage scheduling here.")
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Schedule")
+            }
+
+            Section {
                 Toggle(isOn: Binding(
                     get: { bridge.notificationsEnabled },
                     set: { on in Task { await bridge.setNotifications(on) } }
@@ -86,6 +112,21 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .task { await bridge.loadSettings() }
+        .task { await bridge.loadSettings(); await bridge.loadSchedule() }
+    }
+
+    private var scheduleCaption: String {
+        if bridge.isSchedulingBusy { return "Updating schedule…" }
+        guard let status = bridge.scheduleStatus else { return "" }
+        if status.legacy_cron {
+            return "A legacy cron schedule exists — choosing an option migrates it to launchd."
+        }
+        if status.schedule != nil {
+            let allLoaded = status.agents.allSatisfy(\.loaded)
+            return allLoaded
+                ? "Active — cleans run in the background and notify when done. Low-disk check: hourly."
+                : "Installed but not loaded — pick the schedule again to reload it."
+        }
+        return "No automatic cleanup. Scans and cleans only run when you start them."
     }
 }

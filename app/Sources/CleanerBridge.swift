@@ -75,8 +75,26 @@ struct DiskCurrent: Codable {
     let total_bytes: Int
 }
 
+struct DiskSnapshot: Codable, Identifiable {
+    // Optional: the engine's `load_snapshots` only filters out non-dict
+    // entries, so one externally-corrupted entry (e.g. missing a key) must
+    // not fail decoding of the whole `HistoryReport` — that used to freeze
+    // the menu bar's free-space and "Last cleaned" display, since
+    // `performLightRefresh`'s `guard … else { return }` bails out silently
+    // on any decode failure. The chart skips entries it can't use instead.
+    let ts: String?
+    let disk_free_bytes: Int?
+    let disk_total_bytes: Int?
+    let id = UUID()
+
+    private enum CodingKeys: String, CodingKey {
+        case ts, disk_free_bytes, disk_total_bytes
+    }
+}
+
 struct DiskHistory: Codable {
     let current: DiskCurrent
+    let snapshots: [DiskSnapshot]?
 }
 
 struct HistoryReport: Codable {
@@ -93,6 +111,19 @@ struct CategoryInfo: Codable, Identifiable {
 
 struct CategoriesReport: Codable {
     let categories: [CategoryInfo]
+}
+
+struct AgentStatus: Codable, Identifiable {
+    let label: String
+    let plist_present: Bool
+    let loaded: Bool
+    var id: String { label }
+}
+
+struct ScheduleStatus: Codable {
+    let schedule: String?
+    let agents: [AgentStatus]
+    let legacy_cron: Bool
 }
 
 struct EngineConfig: Codable {
@@ -141,6 +172,16 @@ final class CleanerBridge: ObservableObject {
     @Published var notificationsEnabled = true
     @Published var lowDiskAlertsEnabled = true
     @Published var lowDiskThresholdGB: Double = 10
+    @Published var scheduleStatus: ScheduleStatus?
+    @Published var scheduleSupported = true
+    /// Set for the whole `setSchedule` round trip (bootout + bootstrap +
+    /// `launchctl list`), which is slow enough that the picker would
+    /// otherwise visibly snap back to the old value until it completes.
+    @Published var isSchedulingBusy = false
+    /// The choice the picker should display while `isSchedulingBusy` — the
+    /// real `scheduleStatus.schedule` doesn't update until `loadSchedule()`
+    /// returns at the end of the round trip.
+    @Published var pendingSchedule: String?
     @Published var fullRefreshHours: Double = 6 {
         didSet {
             // Reschedule the periodic timer when the configured cadence actually
@@ -157,6 +198,7 @@ final class CleanerBridge: ObservableObject {
     @Published var lastClean: CleanResult?
     @Published var lastCleanedAt: Date?
     @Published var freeBytes: Int?
+    @Published var diskSnapshots: [DiskSnapshot] = []
 
     private var lightTimer: Timer?
     private var fullTimer: Timer?
@@ -298,6 +340,7 @@ final class CleanerBridge: ObservableObject {
         else { return }
         freeBytes = report.disk_history?.current.free_bytes
         lastCleanedAt = report.runs.last.flatMap { Self.parseTimestamp($0.timestamp) }
+        diskSnapshots = report.disk_history?.snapshots ?? []
     }
 
     /// Full scan, debounced so a wake plus a menu-open doesn't launch two.
@@ -315,7 +358,12 @@ final class CleanerBridge: ObservableObject {
         formatter.formatOptions = [.withInternetDateTime]
         if let d = formatter.date(from: raw) { return d }
         // The engine writes datetime.isoformat(), which has no timezone suffix.
+        // Pin en_US_POSIX so this always parses the Gregorian-calendar,
+        // ASCII-digit format Python wrote, regardless of the user's region
+        // (e.g. a non-Gregorian calendar locale would otherwise misparse
+        // these and silently corrupt the chart's X axis).
         let fallback = DateFormatter()
+        fallback.locale = Locale(identifier: "en_US_POSIX")
         fallback.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
         if let d = fallback.date(from: raw) { return d }
         fallback.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
@@ -488,6 +536,32 @@ final class CleanerBridge: ObservableObject {
             lowDiskThresholdGB = gb
         } catch {
             statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    func loadSchedule() async {
+        do {
+            scheduleStatus = try await run(ScheduleStatus.self, ["schedule", "status", "--json"])
+            scheduleSupported = true
+        } catch {
+            // An older engine exits 2 on the unknown subcommand; treat any
+            // failure here as "can't manage scheduling", not an error banner.
+            scheduleStatus = nil
+            scheduleSupported = false
+        }
+    }
+
+    func setSchedule(_ choice: String) async {
+        guard !isSchedulingBusy else { return }
+        isSchedulingBusy = true
+        pendingSchedule = choice
+        defer { isSchedulingBusy = false; pendingSchedule = nil }
+        do {
+            try await runPlain(["schedule", choice])
+            await loadSchedule()
+        } catch {
+            statusMessage = "Schedule change failed: \(error.localizedDescription)"
+            await loadSchedule()   // revert the picker to the real state
         }
     }
 }

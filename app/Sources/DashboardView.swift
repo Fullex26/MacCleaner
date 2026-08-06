@@ -25,6 +25,9 @@ struct DashboardView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            DiskTrendView()
+                .padding(.horizontal)
+                .padding(.bottom, 8)
             Divider()
             content
             Divider()

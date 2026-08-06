@@ -26,6 +26,7 @@ python3 cleaner.py doctor             # Environment health check (--json)
 python3 cleaner.py categories         # List categories + targets (--json)
 python3 cleaner.py config show|path|enable C|disable C|set KEY VALUE
 python3 cleaner.py disk-check         # Cheap low-disk warning check, for launchd (--json); always exits 0
+python3 cleaner.py schedule status|weekly|monthly|off  # Manage the launchd schedule (--json); status/off always exit 0
 python3 cleaner.py install-deps       # Install 'rich' for pretty output
 ```
 
@@ -37,7 +38,7 @@ Categories (20): `xcode`, `docker`, `node`, `python`, `caches`, `logs`, `homebre
 
 ### Tests
 ```bash
-python3 -m unittest discover -s tests    # 150 tests, stdlib only, no deps
+python3 -m unittest discover -s tests    # 168 tests, stdlib only, no deps
 ```
 CI runs tests + smoke tests + the app build on `macos-latest`.
 
@@ -47,7 +48,7 @@ bash install.sh                        # Copies to ~/mac-cleaner/, adds aliases,
 ~/mac-cleaner/scheduler.sh weekly|monthly|remove|status
 ```
 
-`scheduler.sh weekly|monthly` installs two launchd agents (`com.fullex.maccleaner.clean` — `StartCalendarInterval`, runs `clean --yes --notify`; `com.fullex.maccleaner.diskwatch` — `StartInterval` 3600s, runs `disk-check`), replacing the old cron-based scheduling; both agents get an explicit `EnvironmentVariables.PATH` (Homebrew + standard dirs — the same list `CleanerBridge.runEngine` uses) so cmd-based targets don't silently no-op under launchd's minimal default PATH. launchd catches up on a missed calendar run after sleep/wake, unlike cron. `status` calls `launchctl list <label>` per agent, so it distinguishes "loaded", "plist present but not loaded", and "not installed" instead of trusting a plist's mere existence; `remove` unloads both agents. An existing cron line referencing `mac-cleaner/cleaner.py` (not an unanchored `cleaner.py` match, which could catch an unrelated user script) is stripped the first time `weekly`/`monthly` runs; the cadence actually installed is always the one you invoked, never the old cron line's own cadence, so migrating installs exactly once. `doctor`'s Schedule check makes the same `launchctl list` distinction and flags a leftover legacy cron entry.
+`scheduler.sh` is now a thin wrapper (`weekly|monthly` → `schedule <kind>`, `remove` → `schedule off`, `status` → `schedule status`, each via `exec` so exit codes pass through) over the `schedule` subcommand in `cleaner.py`, which is the actual scheduling logic and the only thing the app's Settings calls. `schedule weekly|monthly` installs two launchd agents (`com.fullex.maccleaner.clean` — `StartCalendarInterval`, runs `clean --yes --notify`; `com.fullex.maccleaner.diskwatch` — `StartInterval` 3600s, runs `disk-check`), replacing the old cron-based scheduling; both agents get an explicit `EnvironmentVariables.PATH` (Homebrew + standard dirs — the same list `CleanerBridge.runEngine` uses) so cmd-based targets don't silently no-op under launchd's minimal default PATH. launchd catches up on a missed calendar run after sleep/wake, unlike cron. `schedule status` calls `launchctl list <label>` per agent, so it distinguishes "loaded", "plist present but not loaded", and "not installed" instead of trusting a plist's mere existence, and always exits 0; `schedule off` unloads both agents and also always exits 0, even when nothing was installed. `schedule weekly|monthly` exits 1 if either agent failed to load with launchctl. An existing cron line referencing `mac-cleaner/cleaner.py` (not an unanchored `cleaner.py` match, which could catch an unrelated user script) is stripped the first time `weekly`/`monthly` runs; the cadence actually installed is always the one you invoked, never the old cron line's own cadence, so migrating installs exactly once. `--json` on any `schedule` action returns `{"version", "schedule", "agents", "legacy_cron"}` plus `"migrated_cron"` (installs) or `"removed"` (off). `doctor`'s Schedule check and `schedule status` both derive from the same `_schedule_state()` helper, so both honor `MACCLEANER_LAUNCH_AGENTS_DIR` (default `~/Library/LaunchAgents`) and make the same `launchctl list` distinction; `doctor` also flags a leftover legacy cron entry.
 
 After install, zsh aliases: `maccleaner`, `mclean`, `mpreview`, `mreport`.
 
@@ -69,8 +70,8 @@ Engine resolution order: `MACCLEANER_ENGINE` env override (dev) → `~/mac-clean
 
 ### App structure (`app/Sources/`)
 - `MacCleanerApp.swift` — `MenuBarExtra` (reclaimable size, "Last cleaned", Scan, Auto-Clean Safe, Open, Quit; `LSUIElement`, no Dock icon) + window with 4 tabs
-- `DashboardView.swift` — grouped targets with checkboxes, in-app clean via `clean --targets … --yes --json`
-- `ProjectsView.swift`, `HistoryView.swift`, `SettingsView.swift` — Settings persists through `config` subcommands so CLI and app share one config, incl. the notification/low-disk-alert toggles
+- `DashboardView.swift` — grouped targets with checkboxes, in-app clean via `clean --targets … --yes --json`; also hosts `DiskTrendView.swift`, a Swift Charts free-space-over-time chart built from `report --json`'s `disk_history.snapshots`, with the low-disk threshold drawn as a dashed rule line and explanatory text when fewer than 2 points exist
+- `ProjectsView.swift`, `HistoryView.swift`, `SettingsView.swift` — Settings persists through `config` subcommands so CLI and app share one config, incl. the notification/low-disk-alert toggles and a Schedule section (Off/Weekly/Monthly radio group backed by `cleaner.py schedule`, degrading to an explanatory row if the installed engine predates the `schedule` subcommand)
 - `NotificationManager.swift` — posts native notifications after an in-app clean; is its own `UNUserNotificationCenterDelegate` so banners still show while the app is frontmost (the default suppresses them); degrades silently if the user denies permission
 
 ### Python cleaner.py internals
@@ -93,7 +94,7 @@ Engine resolution order: `MACCLEANER_ENGINE` env override (dev) → `~/mac-clean
 Each target has a `safe` bool. `--yes` / `auto_approve` only cleans `safe=True` targets. Review targets (`safe=False` — Xcode Archives, AI models, iOS backups, Trash, …) need explicit selection (`--targets id --yes` counts as consent) or interactive confirmation.
 
 ### Config
-`config.json` (sibling to `cleaner.py`; installed: `~/mac-cleaner/config.json`) — missing keys merge with `DEFAULT_CONFIG` at load. Keys: `enabled_categories`, `skip_paths`, `log_threshold_mb`, `auto_approve`, `schedule`, `delete_mode` (`"rm"` | `"trash"`), `project_roots`, `project_min_age_days`, `project_git_check` (default `true`; disables the git dirty/unpushed check in `projects` when set `false`), `notifications` (default `true`; gates `clean --notify` and app notifications), `low_disk_alerts` (default `true`; gates `disk-check`'s warning — independent of `notifications`), `low_disk_threshold_gb` (default `10`), `full_refresh_hours` (default `6`; app-side only, the engine never reads it — how often the app runs a full `scan` between its 60s `report` ticks).
+`config.json` (sibling to `cleaner.py`; installed: `~/mac-cleaner/config.json`) — missing keys merge with `DEFAULT_CONFIG` at load. Keys: `enabled_categories`, `skip_paths`, `log_threshold_mb`, `auto_approve`, `delete_mode` (`"rm"` | `"trash"`), `project_roots`, `project_min_age_days`, `project_git_check` (default `true`; disables the git dirty/unpushed check in `projects` when set `false`), `notifications` (default `true`; gates `clean --notify` and app notifications), `low_disk_alerts` (default `true`; gates `disk-check`'s warning — independent of `notifications`), `low_disk_threshold_gb` (default `10`), `full_refresh_hours` (default `6`; app-side only, the engine never reads it — how often the app runs a full `scan` between its 60s `report` ticks). The cleanup cadence itself is `schedule`-subcommand state (launchd plists), not a config key — see below.
 
 ### Env vars
 - `MACCLEANER_CONFIG` / `MACCLEANER_LOG` / `MACCLEANER_SNAPSHOTS` / `MACCLEANER_ALERTS` — override config/log/snapshots/alerts paths (used by tests); these always win over the beside-`cleaner.py`-or-Application-Support default resolution

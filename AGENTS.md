@@ -1,6 +1,6 @@
 # AGENTS.md — MacCleaner machine interface
 
-MacCleaner is a macOS developer storage cleanup tool: it scans 70+ known cache/artifact locations across 20 categories (Xcode, Docker, npm, pip, Homebrew, AI model caches, Flutter, PHP, VMs, ...) plus stale per-project build artifacts, reports sizes, and deletes what you select. The engine is a single stdlib-only Python 3 script. Entry point: `python3 cleaner.py` from a repo checkout, or `maccleaner` (shell alias) / `python3 ~/mac-cleaner/cleaner.py` after `install.sh`. Every data command takes `--json`; that JSON interface is the contract this document specifies (the bundled macOS app is just another client of it). Current version: 2.2.0.
+MacCleaner is a macOS developer storage cleanup tool: it scans 70+ known cache/artifact locations across 20 categories (Xcode, Docker, npm, pip, Homebrew, AI model caches, Flutter, PHP, VMs, ...) plus stale per-project build artifacts, reports sizes, and deletes what you select. The engine is a single stdlib-only Python 3 script. Entry point: `python3 cleaner.py` from a repo checkout, or `maccleaner` (shell alias) / `python3 ~/mac-cleaner/cleaner.py` after `install.sh`. Every data command takes `--json`; that JSON interface is the contract this document specifies (the bundled macOS app is just another client of it). Current version: 2.3.0.
 
 ## 1. Quick recipes
 
@@ -35,6 +35,9 @@ maccleaner clean --yes --notify --json
 # Cheap low-disk check — one disk_usage call, no measurement, no snapshot; always exits 0
 maccleaner disk-check --json
 
+# Check the launchd schedule — read-only, always exits 0
+maccleaner schedule status --json
+
 # Environment health check
 maccleaner doctor --json
 
@@ -56,6 +59,7 @@ maccleaner doctor    [--json]
 maccleaner config    show | path | enable CAT | disable CAT | set KEY VALUE
 maccleaner categories [--json]
 maccleaner disk-check [--json]    # cheap; for launchd's hourly diskwatch agent
+maccleaner schedule  status | weekly | monthly | off [--json]   # manage the launchd schedule
 maccleaner install-deps          # pip-installs 'rich' (optional, cosmetic only)
 maccleaner --version
 ```
@@ -72,6 +76,7 @@ Flag details:
 - `projects --clean` requires either interactivity or `--yes`. Note: **all** project artifacts are review-level, so `projects --clean --yes` (without `--targets`) deletes everything found *except* projects flagged dirty or unpushed in git — those are skipped and listed on stderr. Name a flagged artifact explicitly via `--targets` to clean it anyway (naming it counts as consent, same as `clean --targets`). Disable the git check entirely with `config set project_git_check false`.
 - `config set` parses VALUE as JSON when possible: `config set project_min_age_days 60`, `config set project_roots '["~/Code"]'`, `config set delete_mode '"trash"'`.
 - `config show` always prints JSON (no `--json` flag needed). `config path` prints the config file path.
+- `schedule` (new in 2.3.0) takes exactly one positional `action` — `status`, `weekly`, `monthly`, or `off`; anything else is an argparse usage error, exit 2. `status` is read-only. `weekly`/`monthly` (re)install both launchd agents, replacing any existing schedule, and migrate a legacy cron entry the first time either runs. `off` unloads both agents (and strips a legacy cron entry) whether or not anything was installed. `scheduler.sh weekly|monthly|remove|status` is now a thin `exec`-based wrapper over `schedule weekly|monthly|off|status` — same behavior, same exit codes.
 
 Legacy v1 spellings still work via a pre-parse shim: `--preview`, `--clean [--yes]`, `--report`, bare `--json` (= `scan --json`), `--category`, `--config-show`, `--config-enable C`, `--config-disable C`, `--install-deps`, plus subcommand aliases `preview` → `scan` and `history` → `report`. Existing cron jobs, aliases, and the v1 menu bar app keep working unchanged.
 
@@ -83,7 +88,7 @@ Abbreviated but field-accurate examples. All JSON is pretty-printed to stdout.
 
 ```json
 {
-  "version": "2.2.0",
+  "version": "2.3.0",
   "timestamp": "2026-07-14T09:12:03.481920",
   "disk": "Used: 380Gi / 460Gi (85%)",
   "disk_stats": {
@@ -125,7 +130,7 @@ Targets are sorted by `size_bytes` descending. Command-based targets (docker/bre
 
 ```json
 {
-  "version": "2.2.0",
+  "version": "2.3.0",
   "timestamp": "2026-07-14T09:14:55.102331",
   "delete_mode": "rm",
   "freed_bytes": 14495514624,
@@ -145,7 +150,7 @@ Targets are sorted by `size_bytes` descending. Command-based targets (docker/bre
 
 ```json
 {
-  "version": "2.2.0",
+  "version": "2.3.0",
   "timestamp": "2026-07-14T09:14:55.102331",
   "dry_run": true,
   "delete_mode": "rm",
@@ -180,7 +185,7 @@ Same envelope shape as `clean --json` (`delete_mode`, `freed_bytes`, `disk_after
 
 ```json
 {
-  "version": "2.2.0",
+  "version": "2.3.0",
   "timestamp": "2026-07-14T09:16:12.000000",
   "roots": ["/Users/you/Documents", "/Users/you/Code"],
   "min_age_days": 30,
@@ -205,7 +210,7 @@ Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets`
 
 ```json
 {
-  "version": "2.2.0",
+  "version": "2.3.0",
   "ok": true,
   "checks": [
     { "name": "Python",       "status": "3.12.4", "ok": true },
@@ -216,15 +221,17 @@ Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets`
 }
 ```
 
-`ok` is false only for genuine problems: invalid config JSON, or (see Schedule below) a launchd plist present but not actually loaded. Missing optional tools are informational (`ok: true`). This is `doctor`'s own summary field, not a process exit code — `main` doesn't propagate `run_doctor`'s return value, so `doctor`'s exit code stays governed by the usual 0/1/2 contract regardless of this `ok` value.
+`ok` is false only for genuine problems: invalid config JSON, (see Schedule below) a launchd plist present but not actually loaded, or (see Schedule paths below) a scheduled agent whose interpreter or engine script no longer exists on disk. Missing optional tools are informational (`ok: true`). This is `doctor`'s own summary field, not a process exit code — `main` doesn't propagate `run_doctor`'s return value, so `doctor`'s exit code stays governed by the usual 0/1/2 contract regardless of this `ok` value.
 
 The `Schedule` check (new in 2.2.0) queries `launchctl list <label>` for each `com.fullex.maccleaner.*.plist` found in `~/Library/LaunchAgents` — a plist's mere presence on disk isn't proof launchd actually has it loaded. When at least one agent is genuinely loaded, it reports `"launchd: com.fullex.maccleaner.clean, com.fullex.maccleaner.diskwatch"` (`ok: true`), appending a note for any plist present but not loaded and for a lingering legacy cron entry. When a plist exists but launchd has nothing loaded, it reports that distinctly (`ok: false` — this is the one case the check flags as a problem, since it means scheduling silently isn't running). With no plists but a legacy cron line, it reports the cron entry and suggests migrating (`ok: true`). With neither, it reports `"not scheduled"` (`ok: true` — an unscheduled tool isn't a failure).
+
+The `Schedule paths` check (new in 2.3.0) is separate from `Schedule` above and only appears in `checks[]` at all when it finds a problem: for each installed plist, it opens `ProgramArguments` directly and checks that `[0]` (the interpreter) and `[1]` (the engine script, `cleaner.py`) still exist on disk. `launchctl list` only proves an agent is *registered* — it says nothing about whether the paths it points at are still there (e.g. `brew-autoremove` evicting a version-pinned Homebrew python@X.Y, or a repo checkout that moved). When both paths for every installed agent exist, no `Schedule paths` entry is emitted at all. When one is missing, it reports `ok: false` with a `"<label> interpreter missing: <path>"` or `"<label> engine missing: <path>"` message (semicolon-joined if more than one).
 
 ### `disk-check --json`
 
 ```json
 {
-  "version": "2.2.0",
+  "version": "2.3.0",
   "free_bytes": 8321499136,
   "free_human": "7.8 GB",
   "threshold_bytes": 10737418240,
@@ -235,11 +242,39 @@ The `Schedule` check (new in 2.2.0) queries `launchctl list <label>` for each `c
 
 New in 2.2.0. Deliberately cheap: one `shutil.disk_usage` call — no `du` measurement pass over targets, and it neither records a `snapshots.log` entry nor a `report.log` run (this is a monitor, not a scan or a clean). `below_threshold` compares `free_bytes` against config `low_disk_threshold_gb` (default 10 GB) converted to bytes. `notified` is `true` only if a notification was actually posted this run — posting is throttled to at most once per 24 hours while free space stays below the threshold (state lives in `alerts.json`, see §5), and skipped entirely (with `notified: false`, but `below_threshold` still accurate) when config `low_disk_alerts` is `false`. A malformed `low_disk_threshold_gb` (non-numeric, `NaN`, or infinite) falls back to the 10 GB default and prints a warning to stderr; the command still succeeds. **`disk-check` always exits 0** — it's a monitor meant to run unattended every hour via the `com.fullex.maccleaner.diskwatch` launchd agent, not a check that should ever fail a script.
 
+### `schedule status|weekly|monthly|off --json`
+
+New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`monthly`/`off` each add one action-specific key on top of the common envelope:
+
+```json
+{
+  "version": "2.3.0",
+  "schedule": "weekly",
+  "agents": [
+    { "label": "com.fullex.maccleaner.clean",     "plist_present": true, "loaded": true },
+    { "label": "com.fullex.maccleaner.diskwatch", "plist_present": true, "loaded": true }
+  ],
+  "legacy_cron": false
+}
+```
+
+- `"schedule"` is `"weekly"`, `"monthly"`, or `null` (nothing installed, or the clean agent's plist couldn't be parsed) — derived from the clean agent's `StartCalendarInterval` (`Day` key ⇒ monthly, `Weekday` key ⇒ weekly).
+- `"agents"` lists only agents whose plist is actually on disk (0, 1, or 2 entries) — `plist_present` is therefore always `true` for any entry present in the array; `loaded` reflects a live `launchctl list <label>` check, so a plist that's present but not bootstrapped shows `loaded: false`.
+- `"legacy_cron"` is `true` when a crontab line referencing `mac-cleaner/cleaner.py` is still present.
+- `schedule weekly --json` / `schedule monthly --json` add `"migrated_cron": bool` — `true` if a legacy cron line was found and removed as part of this install (regardless of whether the new agents loaded cleanly).
+- `schedule off --json` adds `"removed": bool` — `true` if at least one agent's plist actually existed and was unloaded/deleted; `false` when nothing was scheduled.
+
+**Exit codes**: `status` and `off` always exit `0`, even when nothing is scheduled. `weekly`/`monthly` exit `1` if either agent failed to load with `launchctl` (the plist is still written to disk either way, and the stderr output includes the manual `launchctl bootstrap` command to load it); they exit `0` when both agents loaded. An unrecognized `action` is an argparse usage error, exit `2`, before any of this runs.
+
+`weekly`/`monthly --json` have one more exit path that does **not** follow the common envelope above: if no usable, non-virtualenv `python3` interpreter can be resolved for `ProgramArguments[0]` (see `_agent_python()`), nothing is written — no plist, no `launchctl` call — and the command exits `1` printing only `{"version": "2.3.0", "error": "<message>"}`. This response has no `schedule`, `agents`, or `legacy_cron` keys at all; a strict external decoder expecting the common shape on every `weekly`/`monthly` call should check for `"error"` first.
+
+Honors `MACCLEANER_LAUNCH_AGENTS_DIR` (default `~/Library/LaunchAgents`) for both reading and writing agent plists — see §5.
+
 ### `categories --json`
 
 ```json
 {
-  "version": "2.2.0",
+  "version": "2.3.0",
   "categories": [
     {
       "name": "xcode",
@@ -260,7 +295,7 @@ Lists **all** categories and targets regardless of the enabled_categories config
 
 ```json
 {
-  "version": "2.2.0",
+  "version": "2.3.0",
   "runs": [
     {
       "timestamp": "2026-07-13T09:00:04.120394",
@@ -292,7 +327,7 @@ Lists **all** categories and targets regardless of the enabled_categories config
 }
 ```
 
-Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 50 runs. With no history: `{"version": "2.2.0", "runs": [], "disk_history": {...}}` (`disk_history` is present either way).
+Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 50 runs. With no history: `{"version": "2.3.0", "runs": [], "disk_history": {...}}` (`disk_history` is present either way).
 
 `disk_history` is **additive** (new in 2.1.0) and always present, even with no cleanup history. `current` is today's `disk_stats()` snapshot. `snapshots` is the full contents of `snapshots.log` (append-only, capped at the most recent 365 entries; a snapshot recorded on the same calendar day as the previous one replaces it instead of adding a new entry — so a machine scanned any number of times a day, including every few minutes by the menu bar app's auto-refresh, accumulates at most one entry per day, giving 365 entries roughly a year of history). Every `scan` and every real `clean`/`projects --clean` run (not `--dry-run`) records one snapshot. `reclaimable_bytes` and `categories` (a map of category → bytes) are `null` unless the run covers the **full, unscoped target list** — a plain `scan`, or a plain `clean` with no `--category`/`--min-size`/`--targets` (this doesn't depend on `--yes`: an unscoped interactive `clean` counts too). The sums span every measured target regardless of `safe` — review targets (e.g. all of `ai`, and `system`'s `trash`/`ios-backups`) are folded into `categories` too, not excluded; for `clean` the sum is taken after the run, over whatever remains uncleaned (targets not deleted/trashed this pass, including any review target skipped or declined). They're `null` for `scan --category …`, `scan --min-size …`, any `clean` scoped by `--targets`/`--category`/`--min-size`, and *every* `projects --clean` run (project artifacts aren't part of the regular category sweep, and it never records full scope) — in all of those cases only `disk_total_bytes`/`disk_free_bytes` are trustworthy. Use `MACCLEANER_SNAPSHOTS` to point the engine at a different snapshots file (see §5).
 
@@ -323,14 +358,15 @@ Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 5
 | `MACCLEANER_LOG` | Path to the run-history log (default: `report.log` next to `cleaner.py`, falling back to `~/Library/Application Support/MacCleaner/report.log` when that directory isn't writable, or when it's inside a `.app` bundle regardless of writability — e.g. running from a signed `.app` bundle's `Contents/Resources/cleaner.py`) |
 | `MACCLEANER_SNAPSHOTS` | Path to the disk-snapshots log (default: `snapshots.log` next to `cleaner.py`, with the same Application Support fallback as `MACCLEANER_LOG`) — new in 2.1.0 |
 | `MACCLEANER_ALERTS` | Path to the low-disk alert-state file (default: `alerts.json` next to `cleaner.py`, with the same Application Support fallback as `MACCLEANER_LOG`) — new in 2.2.0 |
+| `MACCLEANER_LAUNCH_AGENTS_DIR` | Directory `schedule` reads/writes launchd agent plists in (default: `~/Library/LaunchAgents`) — new in 2.3.0, used by tests |
 
 `MACCLEANER_ENGINE` is read by the macOS app only (points it at a development `cleaner.py`); the engine itself ignores it.
 
-**Config keys** (`config show` / `config set`): `enabled_categories` (list), `skip_paths` (list of path prefixes to never touch), `log_threshold_mb` (default 100), `auto_approve` (default false), `schedule`, `delete_mode` (`"rm"` | `"trash"`), `project_roots` (default `~/Documents ~/Developer ~/Projects ~/Code ~/dev`), `project_min_age_days` (default 30), `project_git_check` (default `true` — new in 2.1.0; when `true`, `projects` shells out to `git` per project to populate the `git` field and `projects --clean --yes` skips dirty/unpushed projects; set to `false` to skip the git checks entirely). Missing keys are merged from defaults at load time. Installed config lives at `~/mac-cleaner/config.json`; CLI and macOS app share it.
+**Config keys** (`config show` / `config set`): `enabled_categories` (list), `skip_paths` (list of path prefixes to never touch), `log_threshold_mb` (default 100), `auto_approve` (default false), `delete_mode` (`"rm"` | `"trash"`), `project_roots` (default `~/Documents ~/Developer ~/Projects ~/Code ~/dev`), `project_min_age_days` (default 30), `project_git_check` (default `true` — new in 2.1.0; when `true`, `projects` shells out to `git` per project to populate the `git` field and `projects --clean --yes` skips dirty/unpushed projects; set to `false` to skip the git checks entirely). Missing keys are merged from defaults at load time. Installed config lives at `~/mac-cleaner/config.json`; CLI and macOS app share it. The cleanup cadence itself is not a config key — it lives in launchd plists, managed via the `schedule` subcommand (§`schedule status|weekly|monthly|off`).
 
 **New config keys in 2.2.0** — `notifications` (default `true`): whether `clean --notify` and the app post a notification after a clean; `low_disk_alerts` (default `true`): whether `disk-check` posts a low-disk warning; `low_disk_threshold_gb` (default `10`): the free-space threshold `disk-check` warns below; `full_refresh_hours` (default `6`, app-side only — the engine never reads it): how often the macOS app runs a full `scan` between its lightweight 60-second `report` ticks. `notifications` and `low_disk_alerts` are independent switches — disabling one has no effect on the other.
 
-**Scheduling (new in 2.2.0)**: `scheduler.sh weekly|monthly` installs two launchd agents — `com.fullex.maccleaner.clean` (a `StartCalendarInterval` job: Monday 9am for `weekly`, the 1st at 9am for `monthly`; runs `clean --yes --notify`) and `com.fullex.maccleaner.diskwatch` (a `StartInterval` job, every 3600 seconds; runs `disk-check`). launchd, unlike cron, runs a job whose scheduled time passed while the Mac was asleep as soon as it wakes, instead of silently skipping it. `scheduler.sh status` is read-only — it asks `launchctl list <label>` for each installed agent, so a plist that's merely present but not actually loaded is reported distinctly from one launchd has genuinely loaded, and both are distinct from nothing installed at all; it also reports a legacy cron line if one is still present. `scheduler.sh remove` unloads both agents and strips any legacy cron line. Cron is legacy: an existing crontab entry referencing the canonical `mac-cleaner/cleaner.py` install path is removed the first time `scheduler.sh weekly`/`monthly` runs (an unanchored match would risk deleting an unrelated user cron job, e.g. `db-cleaner.py`). The cadence that gets installed is always the one you asked for (`weekly` or `monthly`) — the old cron line's own cadence is detected and reported for visibility only, never used to override your request, so migrating never produces two contradictory schedule installs.
+**Scheduling (new in 2.2.0; the `schedule` subcommand and `MACCLEANER_LAUNCH_AGENTS_DIR` are new in 2.3.0)**: `maccleaner schedule weekly|monthly` (equivalently `scheduler.sh weekly|monthly`, now a thin wrapper that `exec`s into `schedule weekly|monthly`) installs two launchd agents — `com.fullex.maccleaner.clean` (a `StartCalendarInterval` job: Monday 9am for `weekly`, the 1st at 9am for `monthly`; runs `clean --yes --notify`) and `com.fullex.maccleaner.diskwatch` (a `StartInterval` job, every 3600 seconds; runs `disk-check`). Both agents get an explicit `EnvironmentVariables.PATH` (Homebrew + standard dirs) so cmd-based targets don't silently no-op under launchd's minimal default PATH, and both log to `cron.log` beside `report.log`. launchd, unlike cron, runs a job whose scheduled time passed while the Mac was asleep as soon as it wakes, instead of silently skipping it. `schedule status` / `scheduler.sh status` is read-only — it asks `launchctl list <label>` for each installed agent, so a plist that's merely present but not actually loaded is reported distinctly from one launchd has genuinely loaded, and both are distinct from nothing installed at all; it also reports a legacy cron line if one is still present. `schedule off` / `scheduler.sh remove` unloads both agents and strips any legacy cron line, exiting `0` either way. Cron is legacy: an existing crontab entry referencing the canonical `mac-cleaner/cleaner.py` install path is removed the first time `weekly`/`monthly` runs (an unanchored match would risk deleting an unrelated user cron job, e.g. `db-cleaner.py`). The cadence that gets installed is always the one you asked for (`weekly` or `monthly`) — the old cron line's own cadence is detected and reported for visibility only, never used to override your request, so migrating never produces two contradictory schedule installs. Full JSON shapes are in §3 above; `doctor`'s Schedule check (§3) is backed by the same state helper, so it also honors `MACCLEANER_LAUNCH_AGENTS_DIR`.
 
 ## 6. Safety guarantees (blast radius)
 
@@ -343,4 +379,5 @@ Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 5
 - **Git-aware projects** (new in 2.1.0): when `project_git_check` is enabled (default), every project artifact's parent directory is checked with `git status --porcelain` (dirty) and `git rev-list --count --branches --not --remotes` (unpushed — a repo with no remotes at all counts as unpushed). These git invocations pass `--no-optional-locks` (so a concurrent `git add`/`git commit` by the user is never blocked by the scan taking `.git/index.lock`) and `-c core.fsmonitor=` (so a repo-local fsmonitor hook can't execute code during a read-only scan). Any git failure — not a repo, `git` not installed, a 2-second timeout — degrades to `"git": null` rather than blocking the scan. `projects --clean --yes` and `projects --dry-run` / `projects --clean --dry-run`, without `--targets`, both skip dirty/unpushed projects and both list them on stderr; naming one via `--targets` cleans (or previews) it anyway.
 - **`--dry-run`** (new in 2.1.0, on `clean` and `projects`): resolves and reports the exact concrete paths/sizes (or command) a real run would act on, deletes nothing, prompts for nothing, and writes no `report.log` or `snapshots.log` entry.
 - **`disk-check`** (new in 2.2.0) never deletes, measures, or scans — it's a single `shutil.disk_usage` call plus, at most, a notification and a write to `alerts.json` (its own throttle-state file, distinct from `report.log`/`snapshots.log`). It always exits 0, whether or not it's below the threshold or a warning was posted.
+- **`schedule`** (new in 2.3.0) never touches anything inside `$HOME`'s data — it only writes/removes launchd plists (under `MACCLEANER_LAUNCH_AGENTS_DIR`, default `~/Library/LaunchAgents`), calls `launchctl`, and edits the crontab to strip a legacy MacCleaner line. It writes nothing to `report.log`, `snapshots.log`, or `alerts.json`. The agents it installs (`clean --yes --notify`, `disk-check`) are themselves bound by every safety guarantee above.
 - `scan`, `projects` (without `--clean`), `doctor`, `report`, `categories`, and `config show|path` never delete anything. `scan` and every real `clean`/`projects --clean` run (not `--dry-run`) also record a disk-usage entry to `snapshots.log`; `clean` and `projects --clean` (but not `--dry-run`) additionally append a run entry to `report.log`. `--dry-run` writes to neither log.

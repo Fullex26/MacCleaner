@@ -27,3 +27,10 @@ __pycache__/
 *.pyc
 *.pyo
 build/
+
+# Icon build artifacts — regenerate via `python3 app/icon/generate_icon.py`
+# (icon.svg.tmpl is the checked-in source; icon.svg and the .iconset are
+# derived output). app/MacCleaner.icns itself IS checked in — build.sh
+# copies it into the bundle without needing the generator to run.
+app/icon/icon.svg
+app/icon/MacCleaner.iconset/
