@@ -30,8 +30,9 @@ ICNS_OUT = APP_DIR / "MacCleaner.icns"
 # Broom glyph group transform: rotate an upright broom, scale it down, and
 # place its visual center inside the 800x800 background squircle (which
 # itself sits inset within the 1024x1024 canvas at x=y=112). Tuned by
-# rendering + measuring the glyph's pixel bounding box — see
-# `python3 app/icon/generate_icon.py --measure` in dev notes below.
+# rendering and measuring the glyph's pixel bounding box by hand — this
+# script takes no arguments and always regenerates unconditionally; there is
+# no `--measure` flag.
 BROOM_TRANSFORM = "translate(434, 455) rotate(-32) scale(0.92)"
 
 # Standard macOS iconset sizes: (filename, pixel size)

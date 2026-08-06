@@ -71,7 +71,7 @@ This document tracks planned features and long-term direction. Community input w
 - [x] **Live free disk space** — shown in the menu and the Dashboard header (the bar title still shows reclaimable)
 - [x] **Low disk alerts** — macOS notification when free space drops below a configurable threshold (default 10 GB), via the hourly `disk-check` launchd agent
 - [x] **Auto-refresh** — split-cadence refresh: a light 60-second tick (`report --json`) plus a full rescan on a longer interval (`full_refresh_hours`, default 6), on wake, and when the menu opens
-- [x] **Preferences panel** — Settings tab toggles categories, delete mode, and (as of v2.3) the cleanup schedule itself (Off/Weekly/Monthly), all shared with the CLI's `config.json`
+- [x] **Preferences panel** — Settings tab toggles categories and delete mode (shared with the CLI's `config.json`), and (as of v2.3) the cleanup schedule itself (Off/Weekly/Monthly), which lives in launchd plists managed via the CLI's `schedule` subcommand rather than in `config.json`
 - [x] **Last cleaned timestamp** — the menu bar now shows "Last cleaned: 3 days ago" alongside reclaimable size
 - [x] **Per-category breakdown** — Dashboard groups targets by category with per-category size totals
 - [x] **Disk trend chart** — Dashboard shows free-space-over-time (Swift Charts) from the engine's daily disk snapshots, with the low-disk threshold as a rule line
