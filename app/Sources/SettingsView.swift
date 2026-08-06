@@ -47,7 +47,9 @@ struct SettingsView: View {
             Section {
                 if bridge.scheduleSupported {
                     Picker("Automatic cleanup", selection: Binding(
-                        get: { bridge.scheduleStatus?.schedule ?? "off" },
+                        get: { bridge.isSchedulingBusy
+                            ? (bridge.pendingSchedule ?? "off")
+                            : (bridge.scheduleStatus?.schedule ?? "off") },
                         set: { choice in Task { await bridge.setSchedule(choice) } }
                     )) {
                         Text("Off").tag("off")
@@ -55,6 +57,7 @@ struct SettingsView: View {
                         Text("Monthly — 1st at 9am").tag("monthly")
                     }
                     .pickerStyle(.radioGroup)
+                    .disabled(bridge.isSchedulingBusy)
 
                     Text(scheduleCaption)
                         .font(.caption)
@@ -113,6 +116,7 @@ struct SettingsView: View {
     }
 
     private var scheduleCaption: String {
+        if bridge.isSchedulingBusy { return "Updating schedule…" }
         guard let status = bridge.scheduleStatus else { return "" }
         if status.legacy_cron {
             return "A legacy cron schedule exists — choosing an option migrates it to launchd."

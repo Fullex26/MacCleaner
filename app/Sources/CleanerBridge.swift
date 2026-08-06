@@ -76,10 +76,20 @@ struct DiskCurrent: Codable {
 }
 
 struct DiskSnapshot: Codable, Identifiable {
-    let ts: String
-    let disk_free_bytes: Int
-    let disk_total_bytes: Int
-    var id: String { ts }
+    // Optional: the engine's `load_snapshots` only filters out non-dict
+    // entries, so one externally-corrupted entry (e.g. missing a key) must
+    // not fail decoding of the whole `HistoryReport` — that used to freeze
+    // the menu bar's free-space and "Last cleaned" display, since
+    // `performLightRefresh`'s `guard … else { return }` bails out silently
+    // on any decode failure. The chart skips entries it can't use instead.
+    let ts: String?
+    let disk_free_bytes: Int?
+    let disk_total_bytes: Int?
+    let id = UUID()
+
+    private enum CodingKeys: String, CodingKey {
+        case ts, disk_free_bytes, disk_total_bytes
+    }
 }
 
 struct DiskHistory: Codable {
@@ -164,6 +174,14 @@ final class CleanerBridge: ObservableObject {
     @Published var lowDiskThresholdGB: Double = 10
     @Published var scheduleStatus: ScheduleStatus?
     @Published var scheduleSupported = true
+    /// Set for the whole `setSchedule` round trip (bootout + bootstrap +
+    /// `launchctl list`), which is slow enough that the picker would
+    /// otherwise visibly snap back to the old value until it completes.
+    @Published var isSchedulingBusy = false
+    /// The choice the picker should display while `isSchedulingBusy` — the
+    /// real `scheduleStatus.schedule` doesn't update until `loadSchedule()`
+    /// returns at the end of the round trip.
+    @Published var pendingSchedule: String?
     @Published var fullRefreshHours: Double = 6 {
         didSet {
             // Reschedule the periodic timer when the configured cadence actually
@@ -340,7 +358,12 @@ final class CleanerBridge: ObservableObject {
         formatter.formatOptions = [.withInternetDateTime]
         if let d = formatter.date(from: raw) { return d }
         // The engine writes datetime.isoformat(), which has no timezone suffix.
+        // Pin en_US_POSIX so this always parses the Gregorian-calendar,
+        // ASCII-digit format Python wrote, regardless of the user's region
+        // (e.g. a non-Gregorian calendar locale would otherwise misparse
+        // these and silently corrupt the chart's X axis).
         let fallback = DateFormatter()
+        fallback.locale = Locale(identifier: "en_US_POSIX")
         fallback.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
         if let d = fallback.date(from: raw) { return d }
         fallback.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
@@ -529,6 +552,10 @@ final class CleanerBridge: ObservableObject {
     }
 
     func setSchedule(_ choice: String) async {
+        guard !isSchedulingBusy else { return }
+        isSchedulingBusy = true
+        pendingSchedule = choice
+        defer { isSchedulingBusy = false; pendingSchedule = nil }
         do {
             try await runPlain(["schedule", choice])
             await loadSchedule()
