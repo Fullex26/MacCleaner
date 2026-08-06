@@ -47,6 +47,14 @@ rm -f "$BUILD_DIR/MacCleaner-$NATIVE_ARCH" "$BUILD_DIR/MacCleaner-$OTHER_ARCH"
 cp "$APP_DIR/Info.plist" "$BUNDLE/Contents/"
 cp "$REPO_DIR/cleaner.py" "$BUNDLE/Contents/Resources/"
 
+# App icon (regenerate via app/icon/generate_icon.py)
+if [ -f "$APP_DIR/MacCleaner.icns" ]; then
+    echo "→ Copying app icon…"
+    cp "$APP_DIR/MacCleaner.icns" "$BUNDLE/Contents/Resources/"
+else
+    echo "→ Warning: app/MacCleaner.icns not found — building without an app icon"
+fi
+
 # Strip extended attributes (Finder/iCloud detritus breaks codesign), then
 # ad-hoc sign (required on Apple Silicon; replace with a real identity to distribute)
 xattr -cr "$BUNDLE" 2>/dev/null || true
