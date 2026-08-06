@@ -16,12 +16,14 @@
     "ai",
     "ide",
     "browsers",
-    "system"
+    "system",
+    "flutter",
+    "php",
+    "vms"
   ],
   "skip_paths": [],
   "log_threshold_mb": 100,
   "auto_approve": false,
-  "schedule": "weekly",
   "delete_mode": "rm",
   "project_roots": [
     "~/Documents",
@@ -30,5 +32,10 @@
     "~/Code",
     "~/dev"
   ],
-  "project_min_age_days": 30
+  "project_min_age_days": 30,
+  "project_git_check": true,
+  "notifications": true,
+  "low_disk_alerts": true,
+  "low_disk_threshold_gb": 10,
+  "full_refresh_hours": 6
 }

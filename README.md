@@ -68,7 +68,7 @@ Useful extras: `--category xcode` to scope a run, `--min-size 500` to ignore sma
 A SwiftUI app (macOS 13+) that's a thin client over the CLI — same engine, same config, no separate logic.
 
 - **Menu bar**: total reclaimable space and "last cleaned" at a glance, plus Scan, Auto-Clean Safe, Open Dashboard, Quit. No Dock icon. Refreshes lightly every minute, with a full rescan on a longer interval, on wake, and whenever you open the menu.
-- **Dashboard window**: four tabs — **Dashboard** (targets grouped by category with checkboxes, clean in-app, plus a free-space trend chart built from your scan history), **Projects** (stale artifact finder), **History** (past runs), **Settings** (category toggles, delete mode, and the cleanup schedule — no terminal needed — all shared with the CLI's `config.json`).
+- **Dashboard window**: four tabs — **Dashboard** (targets grouped by category with checkboxes, clean in-app, plus a free-space trend chart built from your scan history), **Projects** (stale artifact finder), **History** (past runs), **Settings** (category toggles and delete mode, shared with the CLI's `config.json`; plus the cleanup schedule — no terminal needed — which lives in launchd plists managed via the CLI's `schedule` subcommand, not in `config.json`).
 
 `install.sh` builds the app from source whenever Swift's toolchain (`swiftc`, from Xcode or the Command Line Tools) is available, so the installed app is never older than your checkout; it falls back to the committed pre-built copy only when `swiftc` isn't found. No Xcode project needed either way:
 
