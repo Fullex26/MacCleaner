@@ -18,6 +18,7 @@ This document tracks planned features and long-term direction. Community input w
 - Still here from v1: safe vs. review distinction, scheduling via `scheduler.sh` (launchd as of v2.2, cron before it), `install.sh`, optional `rich` output
 - **v2.1 additions** — 17 more targets across 3 new categories (`flutter`, `php`, `vms`), now 70+ targets across 20 categories; disk-usage snapshots with a `report` trend view (`disk_history` in `report --json`); git-aware `projects` (dirty/unpushed repos excluded from `--yes` sweeps, config `project_git_check`); `--dry-run` on `clean`/`projects` for exact-path previews with zero side effects. 69 tests total
 - **v2.2 additions** — launchd scheduling replaces cron (catches up on missed runs after sleep; existing cron schedules migrate automatically); notifications when a scheduled clean finishes (`clean --notify`) and after in-app cleans; `disk-check`, a cheap hourly low-disk watch (config `low_disk_alerts`, `low_disk_threshold_gb`, default 10 GB, throttled to once a day); a live menu bar with split-cadence refresh (60s light tick, longer full rescan, config `full_refresh_hours`) and a "Last cleaned" readout. 136 tests total
+- **v2.3 additions** — `schedule status|weekly|monthly|off` subcommand makes scheduling first-class engine logic (`--json`, `MACCLEANER_LAUNCH_AGENTS_DIR` override); `scheduler.sh` and `doctor`'s Schedule check both now delegate to it; the app's Settings gained a Schedule section (Off/Weekly/Monthly) so scheduling no longer requires the terminal; the Dashboard gained a free-space trend chart (Swift Charts) built from `report --json`'s disk history; the app now has a proper icon. 168 tests total
 
 ---
 
@@ -70,9 +71,10 @@ This document tracks planned features and long-term direction. Community input w
 - [x] **Live free disk space** — shown in the menu and the Dashboard header (the bar title still shows reclaimable)
 - [x] **Low disk alerts** — macOS notification when free space drops below a configurable threshold (default 10 GB), via the hourly `disk-check` launchd agent
 - [x] **Auto-refresh** — split-cadence refresh: a light 60-second tick (`report --json`) plus a full rescan on a longer interval (`full_refresh_hours`, default 6), on wake, and when the menu opens
-- [x] **Preferences panel** — Settings tab toggles categories and delete mode, shared with the CLI's `config.json`; schedule is still configured via `scheduler.sh`
+- [x] **Preferences panel** — Settings tab toggles categories, delete mode, and (as of v2.3) the cleanup schedule itself (Off/Weekly/Monthly), all shared with the CLI's `config.json`
 - [x] **Last cleaned timestamp** — the menu bar now shows "Last cleaned: 3 days ago" alongside reclaimable size
 - [x] **Per-category breakdown** — Dashboard groups targets by category with per-category size totals
+- [x] **Disk trend chart** — Dashboard shows free-space-over-time (Swift Charts) from the engine's daily disk snapshots, with the low-disk threshold as a rule line
 
 ---
 

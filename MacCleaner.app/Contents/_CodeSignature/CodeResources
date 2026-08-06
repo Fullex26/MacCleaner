@@ -4,18 +4,29 @@
 <dict>
 	<key>files</key>
 	<dict>
+		<key>Resources/MacCleaner.icns</key>
+		<data>
+		VrgX0i46bT9sw0j6eHZt8G3hFHY=
+		</data>
 		<key>Resources/cleaner.py</key>
 		<data>
-		5G8qHVwMDGkXcByPlkA51986Ok4=
+		PKYkeKXP8ZtjCfYsRIP8S0iKlcw=
 		</data>
 	</dict>
 	<key>files2</key>
 	<dict>
+		<key>Resources/MacCleaner.icns</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			PnK1IFgxDvT5bcZams0sWIisfHPei8xyw7Mqvz+ye70=
+			</data>
+		</dict>
 		<key>Resources/cleaner.py</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			xDcCrTiCIQ5MKVEDiD7Y3nkRLEME90QQEYoSVEL88Og=
+			T8fXpvsZ3BN3JpOaM6M5+J2AZDr48iHwkgHv7hH+QqI=
 			</data>
 		</dict>
 	</dict>

@@ -68,7 +68,7 @@ Useful extras: `--category xcode` to scope a run, `--min-size 500` to ignore sma
 A SwiftUI app (macOS 13+) that's a thin client over the CLI — same engine, same config, no separate logic.
 
 - **Menu bar**: total reclaimable space and "last cleaned" at a glance, plus Scan, Auto-Clean Safe, Open Dashboard, Quit. No Dock icon. Refreshes lightly every minute, with a full rescan on a longer interval, on wake, and whenever you open the menu.
-- **Dashboard window**: four tabs — **Dashboard** (targets grouped by category with checkboxes, clean in-app), **Projects** (stale artifact finder), **History** (past runs), **Settings** (category toggles and delete mode, shared with the CLI's `config.json`).
+- **Dashboard window**: four tabs — **Dashboard** (targets grouped by category with checkboxes, clean in-app, plus a free-space trend chart built from your scan history), **Projects** (stale artifact finder), **History** (past runs), **Settings** (category toggles, delete mode, and the cleanup schedule — no terminal needed — all shared with the CLI's `config.json`).
 
 `install.sh` builds the app from source whenever Swift's toolchain (`swiftc`, from Xcode or the Command Line Tools) is available, so the installed app is never older than your checkout; it falls back to the committed pre-built copy only when `swiftc` isn't found. No Xcode project needed either way:
 
@@ -175,6 +175,8 @@ maccleaner config set delete_mode trash
 Scheduled runs use `clean --yes --notify`, so only *safe* targets are ever touched unattended, and you get a notification once it's done. An hourly low-disk check runs alongside it, warning (at most once a day) if free space drops below `low_disk_threshold_gb`.
 
 Scheduling uses launchd, not cron — it catches up on a run that was due while your Mac was asleep instead of silently skipping it. If you already had a cron schedule from an earlier version, it's migrated to launchd automatically the next time you run `scheduler.sh weekly`/`monthly`.
+
+`scheduler.sh` is a thin wrapper around `cleaner.py schedule status|weekly|monthly|off` — the menu bar app's Settings tab drives the same command, so you can turn scheduling on, off, or switch cadence from the app instead of the terminal.
 
 ---
 
