@@ -221,9 +221,11 @@ Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets`
 }
 ```
 
-`ok` is false only for genuine problems: invalid config JSON, or (see Schedule below) a launchd plist present but not actually loaded. Missing optional tools are informational (`ok: true`). This is `doctor`'s own summary field, not a process exit code — `main` doesn't propagate `run_doctor`'s return value, so `doctor`'s exit code stays governed by the usual 0/1/2 contract regardless of this `ok` value.
+`ok` is false only for genuine problems: invalid config JSON, (see Schedule below) a launchd plist present but not actually loaded, or (see Schedule paths below) a scheduled agent whose interpreter or engine script no longer exists on disk. Missing optional tools are informational (`ok: true`). This is `doctor`'s own summary field, not a process exit code — `main` doesn't propagate `run_doctor`'s return value, so `doctor`'s exit code stays governed by the usual 0/1/2 contract regardless of this `ok` value.
 
 The `Schedule` check (new in 2.2.0) queries `launchctl list <label>` for each `com.fullex.maccleaner.*.plist` found in `~/Library/LaunchAgents` — a plist's mere presence on disk isn't proof launchd actually has it loaded. When at least one agent is genuinely loaded, it reports `"launchd: com.fullex.maccleaner.clean, com.fullex.maccleaner.diskwatch"` (`ok: true`), appending a note for any plist present but not loaded and for a lingering legacy cron entry. When a plist exists but launchd has nothing loaded, it reports that distinctly (`ok: false` — this is the one case the check flags as a problem, since it means scheduling silently isn't running). With no plists but a legacy cron line, it reports the cron entry and suggests migrating (`ok: true`). With neither, it reports `"not scheduled"` (`ok: true` — an unscheduled tool isn't a failure).
+
+The `Schedule paths` check (new in 2.3.0) is separate from `Schedule` above and only appears in `checks[]` at all when it finds a problem: for each installed plist, it opens `ProgramArguments` directly and checks that `[0]` (the interpreter) and `[1]` (the engine script, `cleaner.py`) still exist on disk. `launchctl list` only proves an agent is *registered* — it says nothing about whether the paths it points at are still there (e.g. `brew-autoremove` evicting a version-pinned Homebrew python@X.Y, or a repo checkout that moved). When both paths for every installed agent exist, no `Schedule paths` entry is emitted at all. When one is missing, it reports `ok: false` with a `"<label> interpreter missing: <path>"` or `"<label> engine missing: <path>"` message (semicolon-joined if more than one).
 
 ### `disk-check --json`
 
@@ -263,6 +265,8 @@ New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`month
 - `schedule off --json` adds `"removed": bool` — `true` if at least one agent's plist actually existed and was unloaded/deleted; `false` when nothing was scheduled.
 
 **Exit codes**: `status` and `off` always exit `0`, even when nothing is scheduled. `weekly`/`monthly` exit `1` if either agent failed to load with `launchctl` (the plist is still written to disk either way, and the stderr output includes the manual `launchctl bootstrap` command to load it); they exit `0` when both agents loaded. An unrecognized `action` is an argparse usage error, exit `2`, before any of this runs.
+
+`weekly`/`monthly --json` have one more exit path that does **not** follow the common envelope above: if no usable, non-virtualenv `python3` interpreter can be resolved for `ProgramArguments[0]` (see `_agent_python()`), nothing is written — no plist, no `launchctl` call — and the command exits `1` printing only `{"version": "2.3.0", "error": "<message>"}`. This response has no `schedule`, `agents`, or `legacy_cron` keys at all; a strict external decoder expecting the common shape on every `weekly`/`monthly` call should check for `"error"` first.
 
 Honors `MACCLEANER_LAUNCH_AGENTS_DIR` (default `~/Library/LaunchAgents`) for both reading and writing agent plists — see §5.
 
