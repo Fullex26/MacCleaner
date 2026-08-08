@@ -68,7 +68,7 @@ _maccleaner_load() {
   # it into "id<TAB>description" lines happens in a second, uncapped python3
   # call, since it only parses text we already have and can't hang.
   if engine=$(_maccleaner_engine); then
-    raw=$(_maccleaner_run_capped 2 python3 "$engine" categories --json 2>/dev/null)
+    raw=$(_maccleaner_run_capped 4 python3 "$engine" categories --json 2>/dev/null)
     if [[ -n $raw ]]; then
       raw=$(print -r -- "$raw" | python3 -c '
 import json, sys
@@ -130,16 +130,24 @@ _maccleaner_categories() {
 }
 
 # Comma-separated category list (scan/clean accept "a,b").
+#
+# _maccleaner_cats holds "id:description" pairs (the form _describe wants,
+# used correctly by _maccleaner_categories above). But _values' spec syntax
+# repurposes ":" to mean "this value takes its own argument" -- passing
+# "id:description" straight through makes _values append `-S =` after every
+# selection, so `--targets npm-ca<TAB>` inserts "npm-cache=" and
+# `cleaner.py clean --targets 'npm-cache='` then fails with "Unknown target
+# IDs: npm-cache=". Strip the description and pass bare IDs instead.
 _maccleaner_category_list() {
   _maccleaner_load categories
-  _values -s , 'category' ${(@)_maccleaner_cats}
+  _values -s , 'category' ${(@)_maccleaner_cats%%:*}
 }
 
 # Comma-separated target-ID list.
 _maccleaner_targets() {
   _maccleaner_load targets
   (( $#_maccleaner_tgts )) || { _message -e targets 'target id'; return 1 }
-  _values -s , 'target' ${(@)_maccleaner_tgts}
+  _values -s , 'target' ${(@)_maccleaner_tgts%%:*}
 }
 
 _maccleaner_config_keys() {

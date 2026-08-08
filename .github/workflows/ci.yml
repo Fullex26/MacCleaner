@@ -34,6 +34,9 @@ jobs:
           bash -n completions/maccleaner.bash
           echo "✅ completion files parse"
 
+      - name: Run shell completion behavior suite
+        run: bash completions/run_tests.sh
+
       - name: Smoke test — scan --json
         run: python3 cleaner.py scan --json | python3 -m json.tool > /dev/null
 

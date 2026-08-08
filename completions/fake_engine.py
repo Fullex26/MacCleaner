@@ -8,6 +8,14 @@ import sys, os, time, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from complete_data import CATS, TGTS
 
+# Opt-in invocation counter for tests that need to prove a caching/memo layer
+# actually prevents repeat subprocess calls (not just that the data is
+# eventually right). No-op unless FAKE_COUNTER points at a writable file, so
+# every other test using this fake is unaffected.
+if os.environ.get("FAKE_COUNTER"):
+    with open(os.environ["FAKE_COUNTER"], "a") as _f:
+        _f.write("1\n")
+
 if len(sys.argv) >= 3 and sys.argv[1] == "categories" and sys.argv[2] == "--json":
     if os.environ.get("FAKE_SLOW"):
         time.sleep(float(os.environ["FAKE_SLOW"]))

@@ -71,6 +71,32 @@ eq "zsh alias mclean --yes --targets (3-word tail)" \
 eq "zsh non-alias parity for the same case" \
    "77" "$(Z 'maccleaner clean --targets npm-cache,' | wc -l | tr -d ' ')"
 
+echo "Tier 3c: real inserted text (buffer_capture drives an actual TAB press,"
+echo "not just the candidate set -- this is what catches C1/I2-class bugs)"
+Buf(){ "$HERE/buffer_capture.zsh" "$HERE" "$1"; }
+# $(...) strips trailing NEWLINES only, never trailing spaces -- a unique
+# zsh completion match genuinely inserts a trailing space (so the next word
+# can be typed immediately), so the expected values below intentionally
+# carry one where real zsh would add it.
+eq "buffer: alias maccleaner completes a real subcommand (not a filename)" \
+   "maccleaner clean " "$(Buf 'maccleaner clea')"
+eq "buffer: alias mclean --y completes to a real flag" \
+   "mclean --yes " "$(Buf 'mclean --y')"
+eq "buffer: --targets insertion has no stray '=' (_values id:desc bug)" \
+   "maccleaner clean --targets npm-cache," "$(Buf 'maccleaner clean --targets npm-ca')"
+# _values -s ',' deliberately appends the separator after a completed value
+# so the user can keep typing more list items -- a trailing comma here is
+# correct zsh behaviour, not the stray "=" bug this tier exists to catch.
+eq "buffer: --category insertion has no stray '=' (trailing ',' is _values -s ',' working as designed)" \
+   "maccleaner scan --category xcode," "$(Buf 'maccleaner scan --category xco')"
+
+echo "Tier 3d: bash Layer-1 memo really persists across calls within one process"
+echo "(a broken-but-present engine must cost exactly ONE subprocess call, not one per TAB)"
+COUNTER=$(mktemp)
+bash "$HERE/memo_test.sh" "$HERE/maccleaner.bash" "$HERE/fake_engine.py" "$COUNTER" 3 >/dev/null
+eq "memo: failing engine called once across 3 completion passes" "1" "$(cat "$COUNTER")"
+rm -f "$COUNTER"
+
 echo "Tier 4: real engine (categories --json is the actual completion data source)"
 REAL_ENGINE="$HERE/../cleaner.py"
 RB(){ env MACCLEANER_ENGINE="$REAL_ENGINE" bash "$HERE/bashtest.sh" "$HERE/maccleaner.bash" "$1"; }

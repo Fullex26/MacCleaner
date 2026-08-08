@@ -24,19 +24,30 @@ _maccleaner_run_capped() {
 _MACCLEANER_STATIC_CATEGORIES="xcode docker node python caches logs homebrew go
 rust ruby cocoapods gradle maven ai ide browsers system flutter php vms"
 
-# Echo a space-separated id list for $1 = categories|targets.
+# Populate $_MACCLEANER_CATS / $_MACCLEANER_TGTS for $1 = categories|targets.
 # Layer 1: per-shell memo. Layer 2: disk cache keyed on engine mtime.
 # Layer 3: the tool itself. Layer 4: a static fallback.
+#
+# Callers MUST invoke this as a plain statement and read the global
+# afterward -- never wrap it in a command substitution $(...). An earlier
+# version returned its result on stdout and every caller did exactly that,
+# which forks a subshell per call; the Layer 1 "already tried this shell"
+# memo (_MACCLEANER_CATS_LOADED / _MACCLEANER_TGTS_LOADED) was being set
+# inside that subshell and thrown away the instant it exited, so it never
+# actually persisted across calls. The comment here used to claim "one
+# subprocess per shell, not one per keypress" -- false: when the engine is
+# present but failing (crashing, or just slow), Layer 2's disk cache is never
+# written either (see below), so every single TAB press paid the full
+# 2-second perl alarm cap, forever, for the life of the shell.
 _maccleaner_values() {
     local kind=$1 engine raw ids cache stamp
 
     # Layer 1 -- memo, set even on failure so a broken engine costs one
-    # subprocess per shell rather than one per keypress.
+    # subprocess per shell rather than one per keypress. Only effective now
+    # that this function is called directly (see comment above).
     case $kind in
-        categories) if [ -n "$_MACCLEANER_CATS_LOADED" ]; then
-                        printf '%s' "$_MACCLEANER_CATS"; return 0; fi ;;
-        targets)    if [ -n "$_MACCLEANER_TGTS_LOADED" ]; then
-                        printf '%s' "$_MACCLEANER_TGTS"; return 0; fi ;;
+        categories) [ -n "$_MACCLEANER_CATS_LOADED" ] && return 0 ;;
+        targets)    [ -n "$_MACCLEANER_TGTS_LOADED" ] && return 0 ;;
     esac
 
     engine=$(_maccleaner_engine)
@@ -54,7 +65,7 @@ _maccleaner_values() {
             # reshaping it into "id<TAB>description" lines happens in a
             # second, uncapped python3 call, since it only parses text we
             # already have and can't hang.
-            raw=$(_maccleaner_run_capped 2 python3 "$engine" categories --json 2>/dev/null)
+            raw=$(_maccleaner_run_capped 4 python3 "$engine" categories --json 2>/dev/null)
             if [ -n "$raw" ]; then
                 raw=$(printf '%s' "$raw" | python3 -c '
 import json, sys
@@ -93,7 +104,6 @@ for i, d in rows:
         categories) _MACCLEANER_CATS=$ids; _MACCLEANER_CATS_LOADED=1 ;;
         targets)    _MACCLEANER_TGTS=$ids; _MACCLEANER_TGTS_LOADED=1 ;;
     esac
-    printf '%s' "$ids"
 }
 
 # Complete a comma-separated list.
@@ -137,7 +147,19 @@ _maccleaner_comma_complete() {
 # bash 3.2 has no compopt, so the whole completion runs with -o nospace and we
 # append the trailing space by hand for non-list completions.
 _maccleaner_finish() {
-    if type compopt >/dev/null 2>&1; then return 0; fi
+    if type compopt >/dev/null 2>&1; then
+        # bash >= 4: `complete -o nospace` (below) sets nospace as this
+        # spec's default, and nothing was cancelling it for ordinary
+        # completions, so the cursor stayed glued to the word forever. Cancel
+        # it here so bash's own single-vs-multiple-match logic decides
+        # whether to add a trailing space. Comma-list completions want the
+        # opposite (cursor glued so the user can type the next comma) and
+        # already re-enable it themselves via `compopt -o nospace` in
+        # _maccleaner_comma_complete -- those code paths return before ever
+        # reaching this function, so there's no conflict.
+        compopt +o nospace 2>/dev/null
+        return 0
+    fi
     if [ ${#COMPREPLY[@]} -eq 1 ]; then
         COMPREPLY[0]="${COMPREPLY[0]} "
     fi
@@ -196,9 +218,11 @@ _maccleaner() {
             if [ "$sub" = "projects" ]; then
                 COMPREPLY=(); return 0
             fi
-            _maccleaner_comma_complete "$cur" "$(_maccleaner_values targets)"; return 0 ;;
+            _maccleaner_values targets
+            _maccleaner_comma_complete "$cur" "$_MACCLEANER_TGTS"; return 0 ;;
         --category)
-            _maccleaner_comma_complete "$cur" "$(_maccleaner_values categories)"; return 0 ;;
+            _maccleaner_values categories
+            _maccleaner_comma_complete "$cur" "$_MACCLEANER_CATS"; return 0 ;;
         --roots)
             COMPREPLY=( $(compgen -d -- "$cur") ); _maccleaner_finish; return 0 ;;
         --min-size|--min-age-days|-n|--limit)
@@ -237,7 +261,8 @@ categories schedule disk-check install-deps --help --version" -- "$cur") )
                 local action=${COMP_WORDS[$((i+1))]}
                 case $action in
                     enable|disable)
-                        COMPREPLY=( $(compgen -W "$(_maccleaner_values categories)" -- "$cur") ) ;;
+                        _maccleaner_values categories
+                        COMPREPLY=( $(compgen -W "$_MACCLEANER_CATS" -- "$cur") ) ;;
                     set)
                         if [ "$prev" = set ]; then
                             COMPREPLY=( $(compgen -W "enabled_categories skip_paths \

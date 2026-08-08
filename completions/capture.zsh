@@ -8,7 +8,15 @@ local buffer="$*"
 local tmp=$(mktemp -d); : > $tmp/out
 
 export COMPTEST_DIR=$compdir COMPTEST_TMP=$tmp
-export ZDOTDIR=${0:A:h}/zdot
+
+# ZDOTDIR points at a throwaway dir (not the repo's zdot/) that just sources
+# the real, checked-in fixture -- so compinit's dump file and any other
+# ZDOTDIR-relative state lands in $tmp, never in the repo.
+local real_zdot=${0:A:h}/zdot
+local fresh_zdot=$tmp/zdot
+mkdir -p $fresh_zdot
+print -r -- "source '$real_zdot/.zshrc'; source '$real_zdot/.zshrc-capture'" > $fresh_zdot/.zshrc
+export ZDOTDIR=$fresh_zdot
 
 zpty -b zt zsh -i
 
