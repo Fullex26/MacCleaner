@@ -28,6 +28,12 @@ jobs:
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -v
 
+      - name: Check shell completion syntax
+        run: |
+          zsh -n completions/_maccleaner
+          bash -n completions/maccleaner.bash
+          echo "✅ completion files parse"
+
       - name: Smoke test — scan --json
         run: python3 cleaner.py scan --json | python3 -m json.tool > /dev/null
 

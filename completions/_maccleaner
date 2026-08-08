@@ -1,0 +1,277 @@
+#compdef maccleaner mclean mpreview mreport
+# MacCleaner zsh completion.  Install as `_maccleaner` in an fpath directory.
+
+# ---------------------------------------------------------------------------
+# Dynamic value providers
+# ---------------------------------------------------------------------------
+
+# Static fallbacks, used when the engine can't be found or refuses to answer.
+# Keep these cheap and roughly current; they are only a safety net.
+# NOTE: `typeset -ga`, never `local -ga` -- zsh's `local` rejects -g.
+typeset -ga _maccleaner_static_categories
+_maccleaner_static_categories=(
+  xcode docker node python caches logs homebrew go rust ruby cocoapods
+  gradle maven ai ide browsers system flutter php vms
+)
+
+# Locate an engine we can interrogate.
+_maccleaner_engine() {
+  local cand
+  for cand in "${MACCLEANER_ENGINE}" "$HOME/mac-cleaner/cleaner.py"; do
+    [[ -n $cand && -r $cand ]] && { print -r -- "$cand"; return 0 }
+  done
+  return 1
+}
+
+# Run the engine with a wall-clock cap.  macOS has no timeout(1), so use perl's
+# alarm, which ships with the base system.  Falls back to a bare run.
+_maccleaner_run_capped() {
+  local secs=$1; shift
+  if (( $+commands[perl] )); then
+    perl -e 'alarm shift; exec @ARGV' "$secs" "$@" 2>/dev/null
+  else
+    "$@" 2>/dev/null
+  fi
+}
+
+# Populate _maccleaner_cats / _maccleaner_tgts as "id:description" arrays.
+# Three-layer strategy: per-shell memo -> zstyle disk cache -> subprocess.
+_maccleaner_load() {
+  local kind=$1              # categories | targets
+  local -a lines
+  local engine raw
+
+  # Layer 1: memo for this shell. Set even on failure so a broken/absent
+  # engine costs one subprocess per shell, not one per TAB.
+  case $kind in
+    categories) (( $+_maccleaner_cats_loaded )) && return 0 ;;
+    targets)    (( $+_maccleaner_tgts_loaded )) && return 0 ;;
+  esac
+
+  # Layer 2: zsh's on-disk cache. NOTE this is inert unless the user has
+  # `zstyle ':completion:*' use-cache on`, hence layer 1 above.
+  local cache_id="maccleaner_${kind}"
+  zstyle -s ":completion:${curcontext}:" cache-policy _ ||
+    zstyle ":completion:${curcontext}:" cache-policy _maccleaner_cache_policy
+
+  if _retrieve_cache "$cache_id"; then
+    case $kind in
+      categories) _maccleaner_cats_loaded=1 ;;
+      targets)    _maccleaner_tgts_loaded=1 ;;
+    esac
+    return 0
+  fi
+
+  # Layer 3: ask the tool.
+  if engine=$(_maccleaner_engine); then
+    raw=$(_maccleaner_run_capped 2 python3 "$engine" __complete "$kind")
+    if [[ -n $raw ]]; then
+      # engine prints "id<TAB>description" per line
+      lines=( ${(f)raw} )
+      lines=( ${lines//$'\t'/:} )
+    fi
+  fi
+
+  # Fallback when the engine is missing, too old, too slow, or errored.
+  if (( ! $#lines )); then
+    case $kind in
+      categories) lines=( $_maccleaner_static_categories ) ;;
+      targets)    lines=( ) ;;   # nothing sensible to guess; stay silent
+    esac
+  fi
+
+  case $kind in
+    categories) typeset -ga _maccleaner_cats=( $lines ); _maccleaner_cats_loaded=1
+                _store_cache "$cache_id" _maccleaner_cats ;;
+    targets)    typeset -ga _maccleaner_tgts=( $lines ); _maccleaner_tgts_loaded=1
+                _store_cache "$cache_id" _maccleaner_tgts ;;
+  esac
+  return 0
+}
+
+# Rebuild the disk cache if it is older than the engine, or older than a day.
+_maccleaner_cache_policy() {
+  local -a out
+  local engine
+  engine=$(_maccleaner_engine) || return 0
+  out=( "$1"(Nms-1) )          # modified less than 1 day ago?
+  (( $#out )) || return 0      # stale -> rebuild
+  [[ $engine -nt $1 ]] && return 0
+  return 1
+}
+
+_maccleaner_categories() {
+  _maccleaner_load categories
+  _describe -t categories 'category' _maccleaner_cats
+}
+
+# Comma-separated category list (scan/clean accept "a,b").
+_maccleaner_category_list() {
+  _maccleaner_load categories
+  _values -s , 'category' ${(@)_maccleaner_cats}
+}
+
+# Comma-separated target-ID list.
+_maccleaner_targets() {
+  _maccleaner_load targets
+  (( $#_maccleaner_tgts )) || { _message -e targets 'target id'; return 1 }
+  _values -s , 'target' ${(@)_maccleaner_tgts}
+}
+
+_maccleaner_config_keys() {
+  local -a keys=(
+    'enabled_categories:categories to include'
+    'skip_paths:paths never touched'
+    'log_threshold_mb:log size floor'
+    'auto_approve:clean safe targets without prompting'
+    'delete_mode:rm or trash'
+    'project_roots:roots for the projects scanner'
+    'project_min_age_days:minimum artifact age'
+    'project_git_check:skip dirty/unpushed projects'
+    'notifications:post notifications after a clean'
+    'low_disk_alerts:warn when free space is low'
+    'low_disk_threshold_gb:low-disk threshold'
+    'full_refresh_hours:app full-scan cadence'
+  )
+  _describe -t config-keys 'config key' keys
+}
+
+# ---------------------------------------------------------------------------
+# Main dispatch
+# ---------------------------------------------------------------------------
+
+_maccleaner() {
+  local curcontext="$curcontext" state line ret=1
+  typeset -A opt_args
+
+  # mclean/mpreview/mreport are shell aliases for `maccleaner <cmd>` (see
+  # install.sh), compdef'd to this same function. Splice the implied
+  # subcommand into $words so the rest of this function sees an ordinary
+  # `maccleaner <cmd> ...` invocation instead of offering the top-level
+  # command list again.
+  typeset -A _maccleaner_alias_cmd=( mclean clean mpreview scan mreport report )
+  if (( ${+_maccleaner_alias_cmd[$words[1]]} )); then
+    words=( maccleaner ${_maccleaner_alias_cmd[$words[1]]} "${words[2,-1]}" )
+    (( CURRENT += 1 ))
+  fi
+
+  local -a subcommands=(
+    'scan:Show what can be cleaned and how much it would free'
+    'clean:Clean targets (interactive unless --yes)'
+    'projects:Find stale build artifacts under your project roots'
+    'report:Show cleanup history'
+    'doctor:Check environment and install health'
+    'config:Show or change configuration'
+    'categories:List categories and their targets'
+    'schedule:Manage the launchd cleanup schedule'
+    'disk-check:Low-disk warning check (for launchd)'
+    'install-deps:Install rich for prettier output'
+  )
+
+  _arguments -C \
+    '(- 1 *)'{-h,--help}'[show help]' \
+    '(- 1 *)--version[show version]' \
+    '1: :->command' \
+    '*:: :->option-or-argument' && ret=0
+
+  case $state in
+    command)
+      _describe -t commands 'maccleaner command' subcommands && ret=0
+      ;;
+    option-or-argument)
+      curcontext="${curcontext%:*:*}:maccleaner-$words[1]:"
+      case $words[1] in
+        scan)
+          _arguments -s -S \
+            '*--category=[limit to category]:category:_maccleaner_category_list' \
+            '--min-size=[hide targets smaller than this]:megabytes:' \
+            '--all[include empty / not-installed targets]' \
+            '--json[machine-readable output]' \
+            '(-h --help)'{-h,--help}'[show help]' && ret=0
+          ;;
+        clean)
+          _arguments -s -S \
+            '--yes[no prompts: clean all safe targets]' \
+            '--targets=[clean only these target IDs]:target ids:_maccleaner_targets' \
+            '*--category=[limit to category]:category:_maccleaner_category_list' \
+            '--min-size=[skip targets smaller than this]:megabytes:' \
+            '--trash[move to Trash instead of deleting]' \
+            '--dry-run[resolve what would be deleted, delete nothing]' \
+            '--notify[post a notification summarising the run]' \
+            '--json[machine-readable output]' \
+            '(-h --help)'{-h,--help}'[show help]' && ret=0
+          ;;
+        projects)
+          _arguments -s -S \
+            '*--roots=[roots to scan]:directory:_files -/' \
+            '--min-age-days=[only artifacts untouched for N days]:days:' \
+            '--clean[delete the artifacts that were found]' \
+            '--yes[with --clean: no prompts]' \
+            '--targets=[with --clean: only these artifact IDs]:artifact ids:' \
+            '--trash[move to Trash instead of deleting]' \
+            '--dry-run[resolve what would be deleted, delete nothing]' \
+            '--json[machine-readable output]' \
+            '(-h --help)'{-h,--help}'[show help]' && ret=0
+          ;;
+        report)
+          _arguments -s -S \
+            '(-n --limit)'{-n+,--limit=}'[number of runs to show]:count:' \
+            '--json[machine-readable output]' \
+            '(-h --help)'{-h,--help}'[show help]' && ret=0
+          ;;
+        schedule)
+          # A positional *argument* with a fixed choice list, not a flag.
+          _arguments -s -S \
+            '1:action:((
+                status\:"show the installed schedule"
+                weekly\:"run a safe clean every week"
+                monthly\:"run a safe clean every month"
+                off\:"remove the scheduled agents"
+             ))' \
+            '--json[machine-readable output]' \
+            '(-h --help)'{-h,--help}'[show help]' && ret=0
+          ;;
+        config)
+          _arguments -C -s -S \
+            '1: :->config-action' \
+            '*:: :->config-arg' && ret=0
+          case $state in
+            config-action)
+              local -a actions=(
+                'show:print the current config as JSON'
+                'path:print the config file path'
+                'enable:enable a category'
+                'disable:disable a category'
+                'set:set a config key'
+              )
+              _describe -t config-actions 'config action' actions && ret=0
+              ;;
+            config-arg)
+              case $words[1] in
+                enable|disable) _maccleaner_categories && ret=0 ;;
+                set)
+                  _arguments \
+                    '1:config key:_maccleaner_config_keys' \
+                    '2:value:' && ret=0
+                  ;;
+                *) ret=0 ;;
+              esac
+              ;;
+          esac
+          ;;
+        doctor|categories|disk-check)
+          _arguments -s -S \
+            '--json[machine-readable output]' \
+            '(-h --help)'{-h,--help}'[show help]' && ret=0
+          ;;
+        install-deps)
+          _arguments '(-h --help)'{-h,--help}'[show help]' && ret=0
+          ;;
+      esac
+      ;;
+  esac
+
+  return ret
+}
+
+_maccleaner "$@"
