@@ -7,37 +7,37 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
-## [2.3.0] — Unreleased
+## [2.4.0] — 2026-08-08
 
-### Added
-- `schedule` subcommand (`status`/`weekly`/`monthly`/`off`, `--json`) — launchd scheduling is now first-class engine logic instead of shell script logic; `scheduler.sh` is a thin wrapper that `exec`s into it, so every existing invocation (`weekly`/`monthly`/`remove`/`status`) keeps working with the same exit codes. New `MACCLEANER_LAUNCH_AGENTS_DIR` env override
-- In-app schedule management — Settings gained a Schedule section (Off / Weekly / Monthly), so turning scheduling on or off no longer requires the terminal. `doctor`'s Schedule check now shares the same state helper as `schedule status`
-- Dashboard disk trend chart — a Swift Charts view plotting free space per day from `report --json`'s disk history, with the low-disk threshold drawn as a rule line
-- App icon
-
----
-
-## [2.2.0] — Unreleased
-
-### Added
-- launchd scheduling replaces cron — a clean whose scheduled time passed while the Mac was asleep now runs on wake instead of being skipped. An existing cron schedule is removed automatically the next time you run `scheduler.sh weekly` or `scheduler.sh monthly` (not a bare `scheduler.sh` invocation, which never touches the crontab)
-- Notifications when a scheduled clean finishes (`clean --notify`, used by the launchd agent), and in-app notifications after a clean
-- `disk-check` — a cheap hourly low-disk watch installed alongside any schedule; warns below `low_disk_threshold_gb` (default 10 GB), throttled to at most one warning per day
-- Live menu bar — free disk and "last cleaned" refresh every minute; the full reclaimable scan runs on a long interval (`full_refresh_hours`, default 6) plus on wake and when the menu opens
-- Settings toggles for notifications, low-disk alerts, and the threshold
-
-### Changed
-- `doctor`'s Schedule check reports launchd agents, and flags a legacy cron entry
-
----
-
-## [2.1.0] — Unreleased
+The first release since 2.0.0. Versions 2.1–2.3 were developed and merged but
+never individually published, so this release rolls all of that work — engine
+(2.1), scheduling & notifications (2.2), app experience (2.3), and
+distribution (2.4) — into one.
 
 ### Added
 - 17 new cleanup targets across 3 new categories — `flutter` (Dart pub cache), `php` (Composer), `vms` (Colima, Vagrant, minikube) — plus yarn classic cache, npm logs, conda clean, sccache, LM Studio & Whisper models, Xcode DocumentationCache, Cypress, MS Teams, Zoom updater, Terraform plugins, and Expo caches
 - Disk snapshots: every scan/clean records free space + reclaimable to `snapshots.log` (365 daily-deduped entries, roughly a year of history); `report` shows a disk trend and `report --json` gains `disk_history`
 - Git-aware `projects`: dirty or unpushed repos are badged and excluded from `--yes` sweeps (config `project_git_check`)
 - `clean --dry-run` / `projects --dry-run`: exact resolved paths + sizes, zero side effects
+- launchd scheduling replaces cron — a clean whose scheduled time passed while the Mac was asleep now runs on wake instead of being skipped. An existing cron schedule is removed automatically the next time you run `scheduler.sh weekly` or `scheduler.sh monthly` (not a bare `scheduler.sh` invocation, which never touches the crontab)
+- `schedule` subcommand (`status`/`weekly`/`monthly`/`off`, `--json`) — launchd scheduling is first-class engine logic; `scheduler.sh` is a thin wrapper that `exec`s into it, so every existing invocation (`weekly`/`monthly`/`remove`/`status`) keeps working with the same exit codes. New `MACCLEANER_LAUNCH_AGENTS_DIR` env override
+- Notifications when a scheduled clean finishes (`clean --notify`, used by the launchd agent), and in-app notifications after a clean
+- `disk-check` — a cheap hourly low-disk watch installed alongside any schedule; warns below `low_disk_threshold_gb` (default 10 GB), throttled to at most one warning per day
+- Live menu bar — free disk and "last cleaned" refresh every minute; the full reclaimable scan runs on a long interval (`full_refresh_hours`, default 6) plus on wake and when the menu opens
+- In-app schedule management — Settings gained a Schedule section (Off / Weekly / Monthly), so turning scheduling on or off no longer requires the terminal. `doctor`'s Schedule check now shares the same state helper as `schedule status`
+- Settings toggles for notifications, low-disk alerts, and the threshold
+- Dashboard disk trend chart — a Swift Charts view plotting free space per day from `report --json`'s disk history, with the low-disk threshold drawn as a rule line
+- App icon
+- Shell completions for zsh and bash — subcommands, per-subcommand flags, config keys, and live category/target-ID completion from the engine (cached, with a timeout and static fallback). Installed automatically by `install.sh` and shipped in the CLI tarball
+- Release-time code signing and notarization, gated on repository secrets: the workflow ships ad-hoc signed exactly as before when they are absent, and signs, notarizes, and staples automatically once they exist — no workflow change needed
+- `Casks/maccleaner.rb` — a validated Homebrew cask, plus `docs/RELEASING.md` documenting the signing secrets, the release steps, and how to publish the tap
+
+### Changed
+- `doctor`'s Schedule check reports launchd agents, and flags a legacy cron entry
+- Shell shortcuts (`maccleaner`, `mclean`, `mpreview`, `mreport`) are now functions instead of aliases — zsh's `complete_aliases` is off by default, so aliases never reached the completion system. `install.sh` migrates existing alias lines in place
+
+### Notes
+- The public Homebrew tap is intentionally unpublished until releases are notarized: Homebrew 6 removed `--no-quarantine`, so an unsigned cask cannot launch cleanly and there is no supported workaround
 
 ---
 

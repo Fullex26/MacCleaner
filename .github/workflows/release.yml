@@ -44,6 +44,165 @@ jobs:
       - name: Build app bundle from source
         run: bash app/build.sh
 
+      - name: Detect signing credentials
+        id: signing
+        env:
+          CERT: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+        run: |
+          # `secrets` cannot be referenced in any `if:` — job or step. `env`
+          # can, but only in a step-level `if:`. So probe here, publish a
+          # boolean, and gate the real steps on the output.
+          #
+          # Only MACOS_CERTIFICATE_P12 decides the unsigned/signed fork —
+          # that invariant is load-bearing for the rest of the workflow. The
+          # other four secrets (MACOS_CERTIFICATE_PWD, APPLE_ID,
+          # APPLE_TEAM_ID, NOTARY_PASSWORD) are validated at the top of the
+          # signing step itself, so a partially-configured setup fails
+          # loudly there — before any re-signing — instead of silently
+          # shipping ad-hoc or failing later with an opaque notarytool
+          # auth error.
+          if [ -n "$CERT" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "→ Signing credentials present — will sign and notarize"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "→ No signing credentials — shipping an ad-hoc signed build"
+          fi
+
+      - name: Sign, notarize, and staple
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERT_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          APP="build/MacCleaner.app"
+
+          # 0. `env:` maps an unset secret to an empty string, so `set -u`
+          # alone can't catch a partially-configured setup (e.g. the
+          # certificate was stored before the notary credentials existed).
+          # Check all five explicitly, before touching the keychain or
+          # re-signing anything, and name exactly which ones are missing.
+          # (Names only — never the values — in the log.)
+          missing=()
+          [ -z "$CERT_P12" ] && missing+=("MACOS_CERTIFICATE_P12")
+          [ -z "$CERT_PWD" ] && missing+=("MACOS_CERTIFICATE_PWD")
+          [ -z "$APPLE_ID" ] && missing+=("APPLE_ID")
+          [ -z "$APPLE_TEAM_ID" ] && missing+=("APPLE_TEAM_ID")
+          [ -z "$NOTARY_PASSWORD" ] && missing+=("NOTARY_PASSWORD")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Signing is only partially configured — missing secret(s): ${missing[*]}. Set all five (MACOS_CERTIFICATE_P12, MACOS_CERTIFICATE_PWD, APPLE_ID, APPLE_TEAM_ID, NOTARY_PASSWORD) or none."
+            exit 1
+          fi
+
+          # Always scrub the decoded certificate on the way out, even if
+          # import fails partway through. $RUNNER_TEMP dies with the
+          # runner, but don't rely on that as the only safety net.
+          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT
+
+          # 1. Import the certificate into a throwaway keychain.
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PWD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PWD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Without this, codesign blocks on a GUI keychain prompt that never comes.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PWD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+          IDENTITY_LINE="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | grep 'Developer ID Application' | head -n1 || true)"
+          IDENTITY="$(echo "$IDENTITY_LINE" | awk '{print $2}')"
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No 'Developer ID Application' identity found in the imported certificate."
+            echo "This same message also fires for a certificate that IS present but"
+            echo "untrusted (missing Developer ID intermediate CA) or expired —"
+            echo "'find-identity -v' reports 0 valid identities found for those too."
+            echo "Unfiltered identity list below (shows the real reason, e.g."
+            echo "CSSMERR_TP_NOT_TRUSTED; contains no secret material):"
+            echo "── security find-identity -p codesigning (unfiltered) ──"
+            security find-identity -p codesigning "$KEYCHAIN" || true
+            echo "──────────────────────────────────────────────────────"
+            exit 1
+          fi
+
+          # Cross-check the team id embedded in the identity string
+          # (`"Developer ID Application: Name (TEAMID)"`) against the
+          # APPLE_TEAM_ID secret. A mismatch here becomes a clear local
+          # assertion instead of an opaque notarytool auth failure later.
+          # CERT_TEAM_ID comes from the certificate itself, not a secret,
+          # so it's safe to print; APPLE_TEAM_ID's value is not echoed.
+          CERT_TEAM_ID="$(echo "$IDENTITY_LINE" | sed -n 's/.*(\([A-Z0-9]*\)).*/\1/p')"
+          if [ -n "$CERT_TEAM_ID" ] && [ "$CERT_TEAM_ID" != "$APPLE_TEAM_ID" ]; then
+            echo "::error::The team id embedded in the signing identity ('$CERT_TEAM_ID') does not match the APPLE_TEAM_ID secret. Double-check the APPLE_TEAM_ID secret value."
+            exit 1
+          fi
+
+          # 2. Sign. --options runtime (hardened runtime) is mandatory for
+          # notarization; --timestamp is required for a distributable signature.
+          # No entitlements file is needed: the only Mach-O is Contents/MacOS/
+          # MacCleaner, and it launches /usr/bin/python3 as a separate
+          # Apple-signed process, which the hardened runtime does not restrict.
+          # (--deep is intentionally NOT used for signing — Apple discourages
+          # it there because it doesn't propagate options correctly to nested
+          # code; inside-out signing is the recommended pattern. It's a no-op
+          # today with a single Mach-O but would become a real hazard if a
+          # helper tool or framework is ever added. --deep is correct and
+          # kept on --verify below, which is a read-only check.)
+          codesign --force --options runtime --timestamp \
+            --sign "$IDENTITY" --keychain "$KEYCHAIN" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          # 3. Notarize. notarytool cannot take a bare .app — only .zip/.dmg/.pkg.
+          # --timeout bounds --wait client-side: the notary service has no
+          # documented SLA, and GitHub's default job timeout is 360 minutes,
+          # so without this a service backlog looks like a silently hung job.
+          # Apple keeps processing after a client-side timeout, so nothing
+          # submitted is lost.
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/notarize.zip"
+          SUBMIT_JSON="$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$NOTARY_PASSWORD" --timeout 30m --wait \
+            --output-format json)"
+          echo "$SUBMIT_JSON"
+          SUBMISSION_ID="$(echo "$SUBMIT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+          STATUS="$(echo "$SUBMIT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')"
+          if [ "$STATUS" != "Accepted" ]; then
+            # notarytool doesn't document a non-zero exit for a non-Accepted
+            # result — left unchecked, this job only dies later at `stapler
+            # staple` (no ticket is issued for an Invalid submission), so the
+            # log ends in "cannot staple" instead of the actual rejection
+            # reason. Fetch the notary log now, with the same credentials,
+            # while we still have the submission id.
+            echo "::error::Notarization did not succeed (status: ${STATUS:-unknown}). Fetching the notary log for the actual reason…"
+            if [ -n "$SUBMISSION_ID" ]; then
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+                --password "$NOTARY_PASSWORD" || true
+            fi
+            exit 1
+          fi
+
+          # 4. Staple the ticket to the .app (not the zip) so it validates offline.
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+
+          # 5. The definitive "will Gatekeeper accept this on a user's Mac" check.
+          spctl -a -vvv -t exec "$APP"
+          echo "✅ Signed, notarized, and stapled"
+
+      - name: Remove signing keychain
+        if: always() && steps.signing.outputs.enabled == 'true'
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
       - name: Package app bundle as zip
         id: package_app
         run: |
@@ -71,6 +230,19 @@ jobs:
 
           mkdir -p "${CLI_DIR}"
           cp cleaner.py install.sh scheduler.sh config.json README.md AGENTS.md LICENSE "${CLI_DIR}/"
+
+          # Copy only the completion scripts and install.sh's runtime
+          # templates, not the test harness. install.sh reads
+          # shell-shortcuts.sh/zsh-compdef-init.zsh from $SCRIPT_DIR at
+          # install time and cats their contents into the user's rc file --
+          # without them here, a CLI-tarball install (no git clone) would
+          # silently install completion FILES but never wire them up
+          # (SHORTCUTS_SRC's existence check just no-ops).
+          mkdir -p "${CLI_DIR}/completions"
+          for f in _maccleaner maccleaner.bash shell-shortcuts.sh zsh-compdef-init.zsh; do
+              [ -f "completions/$f" ] && cp "completions/$f" "${CLI_DIR}/completions/"
+          done
+
           echo "${VERSION}" > "${CLI_DIR}/VERSION"
 
           tar -czf "${CLI_TAR}" "${CLI_DIR}/"
@@ -91,8 +263,10 @@ jobs:
             echo "bash install.sh"
             echo "open ~/Applications/MacCleaner.app"
             echo '```'
-            echo "> **First launch:** macOS may block the app (it is not yet notarized)."
-            echo "> Right-click MacCleaner.app → Open → confirm."
+            if [ "${{ steps.signing.outputs.enabled }}" != "true" ]; then
+              echo "> **First launch:** macOS may block the app (it is not yet notarized)."
+              echo "> Right-click MacCleaner.app → Open → confirm."
+            fi
             echo ""
             echo "### Option 2 — CLI only"
             echo "Download \`MacCleaner-${VERSION}-cli.tar.gz\` and run:"

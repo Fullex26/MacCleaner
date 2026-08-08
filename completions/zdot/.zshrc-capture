@@ -1,0 +1,29 @@
+# Capture-mode overlay, sourced ONLY by capture.zsh (never by
+# buffer_capture.zsh or a real user's shell) on top of the base .zshrc.
+#
+# This file must NOT be folded into the base .zshrc: the compadd override
+# below calls the real `builtin compadd` TWICE per completion (once as a
+# -O dry run to snapshot the candidates, once for real). Two calls corrupt
+# zsh's internal match-count bookkeeping for that completion round, which
+# changes real completion BEHAVIOR -- specifically, a unique match that
+# should auto-insert (e.g. `maccleaner clea<TAB>` -> `maccleaner clean `)
+# instead falls through to zsh's default filename completer. That's exactly
+# the class of bug buffer_capture.zsh exists to catch, so if this override
+# were shared, buffer_capture.zsh could never see genuine completion
+# behavior -- it would always be looking at behavior-under-double-compadd
+# instead. Discovered when buffer_capture.zsh, sharing this file, reported
+# `maccleaner clea<TAB>` completing to a real *filename* ("cleaner.py") in
+# the repo instead of the subcommand "clean" -- capture.zsh's own
+# compadd-interception tests (which only ever exercise this doubled path)
+# never surfaced it because they inspect the *candidate set* compadd
+# computed, not what the buffer actually becomes after a real Tab.
+#
+# Intercept compadd. `-O arr` makes compadd compute the matches it *would*
+# have added and store them, honouring every other option (-a, -d, prefixes,
+# match specs) instead of us re-parsing them by hand.
+compadd() {
+  local -a _cap
+  builtin compadd -O _cap "$@" 2>/dev/null
+  (( $#_cap )) && print -l -- "${_cap[@]}" >> "$COMPTEST_TMP/out"
+  builtin compadd "$@"
+}

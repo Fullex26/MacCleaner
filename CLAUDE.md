@@ -38,7 +38,7 @@ Categories (20): `xcode`, `docker`, `node`, `python`, `caches`, `logs`, `homebre
 
 ### Tests
 ```bash
-python3 -m unittest discover -s tests    # 168 tests, stdlib only, no deps
+python3 -m unittest discover -s tests    # 186 tests, stdlib only, no deps
 ```
 CI runs tests + smoke tests + the app build on `macos-latest`.
 
@@ -57,7 +57,7 @@ After install, zsh aliases: `maccleaner`, `mclean`, `mpreview`, `mreport`.
 bash app/build.sh              # swiftc → build/MacCleaner.app (universal arm64+x86_64 when possible, ad-hoc signed)
 bash app/build.sh --install    # …then copy to ~/Applications/
 ```
-No Xcode project needed. The build bundles `cleaner.py` into `Contents/Resources/` as a fallback engine.
+No Xcode project needed. The build bundles `cleaner.py` into `Contents/Resources/` as a fallback engine. `app/build.sh` itself always ad-hoc signs (`codesign --force --sign -`) — that's what every local/dev build gets. Real Developer ID signing + notarization happens only in CI, only on a tag push, and only when the signing secrets are configured (see `## Distribution` below); it never changes what `app/build.sh` does locally.
 
 ## Architecture
 
@@ -102,6 +102,17 @@ Each target has a `safe` bool. `--yes` / `auto_approve` only cleans `safe=True` 
 
 ## Install Path vs. Source
 Source lives in this repo; installed copy lives at `~/mac-cleaner/`, app at `~/Applications/MacCleaner.app`. When testing changes, either re-run `install.sh` or call `cleaner.py` directly from the repo path (for the app, set `MACCLEANER_ENGINE` to the repo's `cleaner.py`).
+
+## Distribution
+
+### Shell completions
+`completions/_maccleaner` (zsh) and `completions/maccleaner.bash` (bash) are hand-written, no runtime dependency — they complete subcommands, per-subcommand flags, `config` keys, and live category/target IDs by shelling out to `cleaner.py categories --json` (cached on disk, bounded by a wall-clock timeout, falling back to a static ID list if the engine can't be reached in time). `completions/` also holds a dev-only test harness (`run_tests.sh` and friends) that is deliberately **not** shipped — only the two completion files are copied by `install.sh` (to `~/mac-cleaner/completions/`, wired into `~/.zshrc` always and into `~/.bash_profile`/`~/.bashrc` only if those files already exist, each under its own rc guard string distinct from the alias guard) and packaged into the release CLI tarball. The drift tripwire is `TestCompletions` in `tests/test_cleaner.py`: it cross-references `build_parser()` against both completion files, so adding a subcommand or flag without updating them fails the suite.
+
+### Release-time signing
+`app/build.sh` always ad-hoc signs, for local/dev builds and as the fallback CI uses when nothing else is configured. `.github/workflows/release.yml` additionally probes for `MACOS_CERTIFICATE_P12` on every tag push; when it (and four other secrets: `MACOS_CERTIFICATE_PWD`, `APPLE_ID`, `APPLE_TEAM_ID`, `NOTARY_PASSWORD`) are present, it re-signs with a Developer ID certificate, notarizes (`notarytool submit --timeout 30m --wait`, fetching `notarytool log` on rejection), staples the ticket, and verifies with `spctl` before the release ships. Without the secrets, the release ships the same ad-hoc signed build as always, including the existing Gatekeeper caveat in the release notes. `docs/RELEASING.md` is the authoritative reference for the exact secrets, steps, and failure modes — read it before touching `release.yml`'s signing stage.
+
+### Homebrew cask
+`Casks/maccleaner.rb` is written and validated (`brew style --cask` / `brew audit --cask` clean against a scratch tap) but the public tap is **deliberately not published yet**: Homebrew 6 removed `--no-quarantine` and never had a `quarantine: false` cask stanza, so an unsigned/unnotarized cask install is Gatekeeper-blocked with no supported workaround. Publishing waits on the signing secrets above landing in CI. Don't advertise a `brew install` command anywhere user-facing until then — see `docs/RELEASING.md` §4 for the exact steps to publish the tap once notarization is live.
 
 ## Optional Dependency
 `rich` is optional — detected at import, falls back to plain text (`RICH = False`). All output paths have both rich and plain variants.

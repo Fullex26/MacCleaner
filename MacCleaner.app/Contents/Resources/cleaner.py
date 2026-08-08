@@ -107,7 +107,7 @@ LOG_PATH = _resolve_state_path("MACCLEANER_LOG", "report.log")
 SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 SNAPSHOT_CAP = 365
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -1773,6 +1773,14 @@ CRON_MARKER = "mac-cleaner/cleaner.py"
 # CleanerBridge.runEngine uses, so cmd targets behave identically under the
 # app and under a scheduled agent.
 AGENT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# Unversioned python3 locations, tried in order when PATH resolves to a
+# virtualenv. `/usr/bin/python3` is last because it always exists on macOS,
+# so reaching the end of this list (and the sys.base_prefix fallback after
+# it) is nearly impossible in practice — which is the point. A module
+# constant rather than a literal so tests can empty it to exercise the
+# give-up path.
+STABLE_PYTHON_CANDIDATES = ("/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                            "/usr/bin/python3")
 CRON_LOG_PATH = LOG_PATH.parent / "cron.log"   # beside report.log wherever that lives
 
 
@@ -1832,8 +1840,16 @@ def _agent_python() -> str:
     if stable:
         if not _is_venv_interpreter(stable):
             return stable
-        # PATH resolved a venv interpreter — prefer the real base
-        # installation that venv itself was created from before giving up.
+        # PATH resolved a venv interpreter. Prefer a stable unversioned
+        # python3 from a well-known location before falling back to
+        # sys.base_prefix: the base prefix of a Homebrew-created venv is
+        # itself the version-pinned path this function exists to avoid
+        # (…/python@3.14/Frameworks/…/3.14/bin/python3), so using it would
+        # trade the venv hazard straight back for the brew-autoremove one.
+        # /usr/bin/python3 is last because it always exists on macOS.
+        for candidate in STABLE_PYTHON_CANDIDATES:
+            if os.path.exists(candidate) and not _is_venv_interpreter(candidate):
+                return candidate
         base_candidate = Path(sys.base_prefix) / "bin" / "python3"
         if base_candidate.exists() and not _is_venv_interpreter(str(base_candidate)):
             return str(base_candidate)

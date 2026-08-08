@@ -2599,5 +2599,61 @@ class TestAgentPython(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestCompletions(unittest.TestCase):
+    """The completion files are hand-written, so they can drift from the
+    parser silently. This test is the tripwire: adding a subcommand or flag
+    without updating both completion files fails the suite."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.zsh = (REPO / "completions" / "_maccleaner").read_text()
+        cls.bash = (REPO / "completions" / "maccleaner.bash").read_text()
+        cls.parser = cleaner.build_parser()
+
+    def _subparser_action(self):
+        import argparse
+        for action in self.parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                return action
+        self.fail("no subparsers found in build_parser()")
+
+    def test_every_subcommand_in_both_files(self):
+        for name in self._subparser_action().choices:
+            self.assertIn(name, self.zsh, f"zsh completion missing subcommand {name}")
+            self.assertIn(name, self.bash, f"bash completion missing subcommand {name}")
+
+    def test_every_flag_in_both_files(self):
+        missing = []
+        for name, sub in self._subparser_action().choices.items():
+            for action in sub._actions:
+                for flag in action.option_strings:
+                    if flag in ("-h", "--help"):
+                        continue
+                    if flag not in self.zsh:
+                        missing.append(f"zsh: {name} {flag}")
+                    if flag not in self.bash:
+                        missing.append(f"bash: {name} {flag}")
+        self.assertEqual(missing, [], "completion files are stale:\n" + "\n".join(missing))
+
+    def test_schedule_actions_present(self):
+        """schedule's positional choices are values, not flags — easy to miss."""
+        for action in self._subparser_action().choices["schedule"]._actions:
+            if action.dest == "action":
+                for choice in action.choices:
+                    self.assertIn(choice, self.zsh, f"zsh missing schedule {choice}")
+                    self.assertIn(choice, self.bash, f"bash missing schedule {choice}")
+                return
+        self.fail("schedule subparser has no 'action' positional")
+
+    def test_config_subcommands_present(self):
+        for action in self._subparser_action().choices["config"]._actions:
+            if action.choices and "show" in action.choices:
+                for choice in action.choices:
+                    self.assertIn(choice, self.zsh, f"zsh missing config {choice}")
+                    self.assertIn(choice, self.bash, f"bash missing config {choice}")
+                return
+        self.fail("config subparser has no sub-subparsers")
+
+
 if __name__ == "__main__":
     unittest.main()
