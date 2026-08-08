@@ -13,7 +13,8 @@ and which `brew audit` invocation is the actual correctness gate.
 
 ## 1. Signing secrets
 
-`.github/workflows/release.yml` builds the app unsigned first, then — only if
+`.github/workflows/release.yml` builds the app ad-hoc signed first (that is what
+`app/build.sh` does, and it is all a dev build needs), then — only if
 `MACOS_CERTIFICATE_P12` is present — re-signs it with a `Developer ID
 Application` certificate and submits it to Apple's notary service. Five
 repository secrets (Settings → Secrets and variables → Actions) drive this:
@@ -101,6 +102,11 @@ release automatically.
 These match the `maccleaner-release` skill, with one addition the skill's
 version-sync list currently omits (see the note below).
 
+**Two rules carried over from the skill:** release only from `main` (the tag
+must point at a commit that is on `main`, since `release.yml` builds whatever
+the tag points at), and tags are `vX.Y.Z` — a tag containing a hyphen (e.g.
+`v2.4.0-rc1`) is published as a **prerelease** automatically.
+
 1. **Determine the version** (e.g. `2.4.0`, no `v` prefix in the files
    themselves — the `v` prefix belongs only to the git tag and, downstream of
    that, the release-asset filenames).
@@ -120,8 +126,11 @@ version-sync list currently omits (see the note below).
      Verify the exact count and locations before editing, since it changes
      release to release as sections are added:
      ```bash
-     grep -n '"version": "X.Y.Z"' AGENTS.md   # the JSON examples
-     grep -n "Current version:" AGENTS.md     # the intro prose
+     # Derive the version already in the tree rather than typing it — a literal
+     # placeholder here would match nothing and silently look like "no drift".
+     OLD=$(python3 -c 'import re;print(re.search(r"VERSION = \"([^\"]+)\"",open("cleaner.py").read()).group(1))')
+     grep -n "\"version\": \"$OLD\"" AGENTS.md   # the JSON examples
+     grep -n "Current version:" AGENTS.md        # the intro prose
      ```
      **Do not** touch the separate `(new in 2.3.0)` / `New in 2.3.0.`
      feature-provenance callouts scattered through `AGENTS.md` (e.g. next to
