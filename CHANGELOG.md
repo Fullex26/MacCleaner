@@ -7,6 +7,18 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.4.0] — Unreleased
+
+### Added
+- Shell completions for zsh and bash — subcommands, per-subcommand flags, config keys, and live category/target-ID completion from the engine (cached, with a timeout and static fallback). Installed automatically by `install.sh` and shipped in the CLI tarball
+- Release-time code signing and notarization, gated on repository secrets: the workflow ships ad-hoc signed exactly as before when they are absent, and signs, notarizes, and staples automatically once they exist — no workflow change needed
+- `Casks/maccleaner.rb` — a validated Homebrew cask, plus `docs/RELEASING.md` documenting the signing secrets, the release steps, and how to publish the tap
+
+### Notes
+- The public Homebrew tap is intentionally unpublished until releases are notarized: Homebrew 6 removed `--no-quarantine`, so an unsigned cask cannot launch cleanly and there is no supported workaround
+
+---
+
 ## [2.3.0] — Unreleased
 
 ### Added

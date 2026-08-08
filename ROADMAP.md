@@ -4,7 +4,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ---
 
-## Current State — v2.0 ✅
+## Current State — v2.4 ✅
 
 - Subcommand CLI — `scan`, `clean`, `projects`, `report`, `doctor`, `config`, `categories` — with every v1 spelling (`--preview`, `--clean --yes`, `--report`, `--json`, `--config-*`) still working, so existing cron jobs, aliases, and the old menu bar app don't break
 - Agent-ready interface — `--json` on every data command, stable kebab-case target IDs (`clean --targets npm-cache,pip-cache`), JSON on stdout / messages on stderr, documented exit codes, `AGENTS.md` contract
@@ -18,7 +18,8 @@ This document tracks planned features and long-term direction. Community input w
 - Still here from v1: safe vs. review distinction, scheduling via `scheduler.sh` (launchd as of v2.2, cron before it), `install.sh`, optional `rich` output
 - **v2.1 additions** — 17 more targets across 3 new categories (`flutter`, `php`, `vms`), now 70+ targets across 20 categories; disk-usage snapshots with a `report` trend view (`disk_history` in `report --json`); git-aware `projects` (dirty/unpushed repos excluded from `--yes` sweeps, config `project_git_check`); `--dry-run` on `clean`/`projects` for exact-path previews with zero side effects. 69 tests total
 - **v2.2 additions** — launchd scheduling replaces cron (catches up on missed runs after sleep; existing cron schedules migrate automatically); notifications when a scheduled clean finishes (`clean --notify`) and after in-app cleans; `disk-check`, a cheap hourly low-disk watch (config `low_disk_alerts`, `low_disk_threshold_gb`, default 10 GB, throttled to once a day); a live menu bar with split-cadence refresh (60s light tick, longer full rescan, config `full_refresh_hours`) and a "Last cleaned" readout. 136 tests total
-- **v2.3 additions** — `schedule status|weekly|monthly|off` subcommand makes scheduling first-class engine logic (`--json`, `MACCLEANER_LAUNCH_AGENTS_DIR` override); `scheduler.sh` and `doctor`'s Schedule check both now delegate to it; the app's Settings gained a Schedule section (Off/Weekly/Monthly) so scheduling no longer requires the terminal; the Dashboard gained a free-space trend chart (Swift Charts) built from `report --json`'s disk history; the app now has a proper icon. 168 tests total
+- **v2.3 additions** — `schedule status|weekly|monthly|off` subcommand makes scheduling first-class engine logic (`--json`, `MACCLEANER_LAUNCH_AGENTS_DIR` override); `scheduler.sh` and `doctor`'s Schedule check both now delegate to it; the app's Settings gained a Schedule section (Off/Weekly/Monthly) so scheduling no longer requires the terminal; the Dashboard gained a free-space trend chart (Swift Charts) built from `report --json`'s disk history; the app now has a proper icon. 182 tests total
+- **v2.4 additions** — hand-written zsh/bash shell completions (`completions/`, no runtime dependency) for subcommands, flags, config keys, and live category/target IDs, installed by `install.sh` and shipped in the release CLI tarball, with a parser cross-reference test guarding against drift; release-time code signing and notarization in CI, gated on repository secrets so the workflow ships ad-hoc signed exactly as before when they're absent; a validated, in-repo Homebrew cask (`Casks/maccleaner.rb`) and a tracked release procedure (`docs/RELEASING.md`) — the public tap stays unpublished until a signed/notarized release exists (see Phase 4 below). 186 tests total
 
 ---
 
@@ -26,10 +27,10 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
-- [ ] **Shell completions** — zsh/bash completion for subcommands, categories, and target IDs
+- [x] **Shell completions** — hand-written zsh/bash completion for subcommands, flags, config keys, and live category/target IDs (`completions/`), installed by `install.sh` and shipped in the CLI tarball
 - [x] **Notifications** — macOS notification when a scheduled clean finishes (`clean --notify`) or an in-app clean completes, plus low-disk alerts (`disk-check`) when free space drops below a configurable threshold (default 10 GB, throttled to once a day)
 - [ ] **Sparkle auto-updater** — installed apps update themselves when new versions ship
-- [ ] **Homebrew Cask** — `brew install --cask maccleaner` without cloning the repo
+- [ ] **Homebrew Cask** — `Casks/maccleaner.rb` is written and validated, but the public tap is unpublished: Homebrew 6 removed `--no-quarantine` and never had `quarantine: false`, so an unsigned cask install is Gatekeeper-blocked with no workaround. Waiting on Code signing/Notarization below
 - [x] **launchd instead of cron** — the native macOS scheduler; catches up on missed runs after sleep, no crontab editing. Existing cron schedules migrate automatically
 - [x] **More targets** — 17 added in v2.1: 3 new categories (`flutter`, `php`, `vms` — Dart/Composer/Colima/Vagrant/minikube) plus sccache, conda clean, Yarn classic cache, npm logs, LM Studio, Whisper, Xcode docs cache, Cypress, Teams, Zoom, Terraform, and Expo caches. Always room for more; open an issue with the `cleanup-target` label
 
@@ -82,11 +83,11 @@ This document tracks planned features and long-term direction. Community input w
 
 > Required before sharing with non-developers or putting on GitHub Releases.
 
-- [ ] **Code signing** — sign the `.app` with an Apple Developer certificate (`build.sh` currently ad-hoc signs)
-- [ ] **Notarization** — submit to Apple's notarization service so Gatekeeper allows it
+- [ ] **Code signing** — pipeline ready, waiting on an Apple Developer ID: `release.yml` already re-signs with a Developer ID certificate when `MACOS_CERTIFICATE_P12` and friends are set (`docs/RELEASING.md` §1); `build.sh` itself still always ad-hoc signs for local/dev builds
+- [ ] **Notarization** — pipeline ready, waiting on an Apple Developer ID: `release.yml` already submits to `notarytool`, staples, and verifies with `spctl` once the same secrets are present; without them CI ships ad-hoc signed exactly as before
 - [x] **Buildable from source** — `app/build.sh` builds the app with plain `swiftc`, no `.xcodeproj` needed; contributors run one command
-- [x] **GitHub Actions release build** — CI packages the `.app` and a CLI tarball on version tags and attaches them to the GitHub Release; artifacts stay unsigned until the two items above land
-- [ ] **Homebrew Cask** — `brew install --cask maccleaner` for one-command install without cloning the repo
+- [x] **GitHub Actions release build** — CI packages the `.app` and a CLI tarball on version tags and attaches them to the GitHub Release; artifacts stay ad-hoc signed until the two items above land (i.e. until the secrets exist — no workflow change needed then)
+- [ ] **Homebrew Cask** — `Casks/maccleaner.rb` is written and validated (`brew style --cask` / `brew audit --cask` clean); the public tap is unpublished pending notarization above — Homebrew 6 removed `--no-quarantine` and never had `quarantine: false`, so an unsigned cask install is Gatekeeper-blocked with no supported workaround
 
 ---
 
