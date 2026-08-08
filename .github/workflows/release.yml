@@ -71,7 +71,12 @@ jobs:
 
           mkdir -p "${CLI_DIR}"
           cp cleaner.py install.sh scheduler.sh config.json README.md AGENTS.md LICENSE "${CLI_DIR}/"
-          cp -R completions "${CLI_DIR}/"
+
+          # Copy only the completion scripts, not the test harness
+          mkdir -p "${CLI_DIR}/completions"
+          [ -f completions/_maccleaner ] && cp completions/_maccleaner "${CLI_DIR}/completions/"
+          [ -f completions/maccleaner.bash ] && cp completions/maccleaner.bash "${CLI_DIR}/completions/"
+
           echo "${VERSION}" > "${CLI_DIR}/VERSION"
 
           tar -czf "${CLI_TAR}" "${CLI_DIR}/"

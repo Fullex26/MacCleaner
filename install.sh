@@ -16,7 +16,9 @@ cp "$SCRIPT_DIR/cleaner.py" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/scheduler.sh" "$INSTALL_DIR/"
 if [ -d "$SCRIPT_DIR/completions" ]; then
     mkdir -p "$INSTALL_DIR/completions"
-    cp "$SCRIPT_DIR/completions/"* "$INSTALL_DIR/completions/" 2>/dev/null || true
+    for f in _maccleaner maccleaner.bash; do
+        [ -f "$SCRIPT_DIR/completions/$f" ] && cp "$SCRIPT_DIR/completions/$f" "$INSTALL_DIR/completions/" || true
+    done
 fi
 if [ ! -f "$INSTALL_DIR/config.json" ] && [ -f "$SCRIPT_DIR/config.json" ]; then
     cp "$SCRIPT_DIR/config.json" "$INSTALL_DIR/"
