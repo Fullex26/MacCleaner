@@ -14,6 +14,10 @@ mkdir -p "$INSTALL_DIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cp "$SCRIPT_DIR/cleaner.py" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/scheduler.sh" "$INSTALL_DIR/"
+if [ -d "$SCRIPT_DIR/completions" ]; then
+    mkdir -p "$INSTALL_DIR/completions"
+    cp "$SCRIPT_DIR/completions/"* "$INSTALL_DIR/completions/" 2>/dev/null || true
+fi
 if [ ! -f "$INSTALL_DIR/config.json" ] && [ -f "$SCRIPT_DIR/config.json" ]; then
     cp "$SCRIPT_DIR/config.json" "$INSTALL_DIR/"
 fi
@@ -40,7 +44,39 @@ if ! grep -q "mac-cleaner" "$SHELL_RC" 2>/dev/null; then
     echo "→ Added shell aliases: maccleaner, mclean, mpreview, mreport"
 fi
 
-# 5. Schedule (skipped when not running interactively)
+# 5. Shell completions (own guard — the alias guard above already matches for
+# anyone who has ever run this installer, so reusing it would silently skip
+# completions for every existing user)
+COMPLETIONS_DIR="$INSTALL_DIR/completions"
+if [ -d "$COMPLETIONS_DIR" ]; then
+    ZSHRC="$HOME/.zshrc"
+    if ! grep -q "mac-cleaner/completions" "$ZSHRC" 2>/dev/null; then
+        {
+            echo ""
+            echo "# MacCleaner completions"
+            echo "fpath=(\"\$HOME/mac-cleaner/completions\" \$fpath)"
+            echo "autoload -Uz compinit && compinit -u"
+        } >> "$ZSHRC"
+        echo "→ Added zsh completions (restart your shell to use them)"
+    fi
+
+    # bash: macOS ships bash 3.2, and there may be no bash-completion install,
+    # so source the file directly from whichever rc file bash actually reads.
+    for BASHRC in "$HOME/.bash_profile" "$HOME/.bashrc"; do
+        [ -f "$BASHRC" ] || continue
+        if ! grep -q "mac-cleaner/completions" "$BASHRC" 2>/dev/null; then
+            {
+                echo ""
+                echo "# MacCleaner completions"
+                echo "[ -r \"\$HOME/mac-cleaner/completions/maccleaner.bash\" ] && \\"
+                echo "    . \"\$HOME/mac-cleaner/completions/maccleaner.bash\""
+            } >> "$BASHRC"
+            echo "→ Added bash completions to $(basename "$BASHRC")"
+        fi
+    done
+fi
+
+# 6. Schedule (skipped when not running interactively)
 if [ -t 0 ]; then
     echo ""
     echo "📅 Schedule cleanup?"
@@ -58,7 +94,7 @@ else
     echo "→ Non-interactive install — schedule later with '$INSTALL_DIR/scheduler.sh weekly'"
 fi
 
-# 6. Menu bar app: build fresh from source whenever possible, so the app
+# 7. Menu bar app: build fresh from source whenever possible, so the app
 # installed from a `git clone && bash install.sh` can never be older than the
 # checkout — falling back to the committed bundle only when swiftc isn't
 # available (the committed bundle is rebuilt each release, but a clone

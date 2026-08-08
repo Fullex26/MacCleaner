@@ -71,6 +71,7 @@ jobs:
 
           mkdir -p "${CLI_DIR}"
           cp cleaner.py install.sh scheduler.sh config.json README.md AGENTS.md LICENSE "${CLI_DIR}/"
+          cp -R completions "${CLI_DIR}/"
           echo "${VERSION}" > "${CLI_DIR}/VERSION"
 
           tar -czf "${CLI_TAR}" "${CLI_DIR}/"
