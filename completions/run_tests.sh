@@ -27,6 +27,8 @@ eq "targets 3rd value"    "76" "$(B 'maccleaner clean --targets npm-cache,pip-ca
 eq "comma keeps prefix"   "npm-cache,pip-cache" "$(B 'maccleaner clean --targets npm-cache,pip')"
 eq "equals form"          "npm-cache,pip-cache" "$(B 'maccleaner clean --targets=npm-cache,pip')"
 eq "no dupes offered"     "0"  "$(B 'maccleaner clean --targets npm-cache,' | grep -cx 'npm-cache')"
+eq "projects --targets is freeform, not cleanup ids" "0" "$(B 'maccleaner projects --targets ' | grep -cx 'npm-cache')"
+eq "projects --targets freeform w/ prefix"           "0" "$(B 'maccleaner projects --targets npm' | grep -cx 'npm-cache')"
 eq "config actions"       "show path enable disable set" "$(B 'maccleaner config ' | grep -v '^--' | tr '\n' ' ' | sed 's/ $//')"
 eq "config enable cats"   "20" "$(B 'maccleaner config enable ' | wc -l | tr -d ' ')"
 eq "engine down -> static" "20" "$(env MACCLEANER_ENGINE=/nope HOME=/tmp/nohome bash "$HERE/bashtest.sh" "$HERE/maccleaner.bash" 'maccleaner config enable ' | wc -l | tr -d ' ')"
@@ -56,6 +58,37 @@ eq "zsh alias mclean flags" "--category --dry-run --help --json --min-size --not
 eq "zsh alias mclean --y"   "--yes" "$(Z 'mclean --y' | tr '\n' ' ' | sed 's/ $//')"
 eq "zsh alias mpreview --a" "--all" "$(Z 'mpreview --a' | tr '\n' ' ' | sed 's/ $//')"
 eq "zsh alias mreport --l"  "--limit" "$(Z 'mreport --l' | tr '\n' ' ' | sed 's/ $//')"
+
+# Everything above is a zero- or single-word tail after the alias name, which
+# the old "${words[2,-1]}" splice (missing the (@) flag) handled fine -- it
+# only breaks once the tail has 2+ words, because that's when zsh's implicit
+# join-to-scalar actually loses structure. These reproduce the parity numbers
+# checked by hand against the non-alias path (`maccleaner clean --targets ...`).
+eq "zsh alias mclean --targets (multi-word tail)" \
+   "77" "$(Z 'mclean --targets npm-cache,' | wc -l | tr -d ' ')"
+eq "zsh alias mclean --yes --targets (3-word tail)" \
+   "77" "$(Z 'mclean --yes --targets npm-cache,' | wc -l | tr -d ' ')"
+eq "zsh non-alias parity for the same case" \
+   "77" "$(Z 'maccleaner clean --targets npm-cache,' | wc -l | tr -d ' ')"
+
+echo "Tier 4: real engine (categories --json is the actual completion data source)"
+REAL_ENGINE="$HERE/../cleaner.py"
+RB(){ env MACCLEANER_ENGINE="$REAL_ENGINE" bash "$HERE/bashtest.sh" "$HERE/maccleaner.bash" "$1"; }
+RZ(){ env MACCLEANER_ENGINE="$REAL_ENGINE" "$HERE/capture.zsh" "$HERE" "$1"; }
+rm -f "${TMPDIR:-/tmp}"/.maccleaner-comp-* 2>/dev/null
+eq "real engine bash: --targets returns real target ids" \
+   "1" "$(RB 'maccleaner clean --targets ' | grep -cx 'npm-cache')"
+eq "real engine bash: --targets count matches the live engine" \
+   "78" "$(RB 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
+eq "real engine bash: --category reflects the live engine, not the static list" \
+   "1" "$(RB 'maccleaner config enable ' | grep -cx 'xcode')"
+eq "real engine zsh: --targets returns real target ids" \
+   "1" "$(RZ 'maccleaner clean --targets ' | grep -cx 'npm-cache')"
+eq "real engine zsh: --targets count matches the live engine" \
+   "78" "$(RZ 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
+eq "real engine zsh: --category reflects the live engine, not the static list" \
+   "1" "$(RZ 'maccleaner config enable ' | grep -cx 'xcode')"
+rm -f "${TMPDIR:-/tmp}"/.maccleaner-comp-* 2>/dev/null
 
 echo
 echo "passed=$PASS failed=$FAIL"

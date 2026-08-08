@@ -62,11 +62,35 @@ _maccleaner_load() {
     return 0
   fi
 
-  # Layer 3: ask the tool.
+  # Layer 3: ask the tool. There is no `__complete` subcommand; the real data
+  # source is `categories --json` (categories with nested targets, 78 targets
+  # across 20 categories). The capped call only fetches the JSON -- reshaping
+  # it into "id<TAB>description" lines happens in a second, uncapped python3
+  # call, since it only parses text we already have and can't hang.
   if engine=$(_maccleaner_engine); then
-    raw=$(_maccleaner_run_capped 2 python3 "$engine" __complete "$kind")
+    raw=$(_maccleaner_run_capped 2 python3 "$engine" categories --json 2>/dev/null)
     if [[ -n $raw ]]; then
-      # engine prints "id<TAB>description" per line
+      raw=$(print -r -- "$raw" | python3 -c '
+import json, sys
+kind = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+rows = []
+if kind == "targets":
+    for cat in data.get("categories", []):
+        for t in cat.get("targets", []):
+            rows.append((t.get("id", ""), t.get("label", "")))
+else:
+    for cat in data.get("categories", []):
+        rows.append((cat.get("name", ""), cat.get("description", "")))
+for i, d in rows:
+    print("%s\t%s" % (i, d.replace("\t", " ")))
+' "$kind" 2>/dev/null)
+    fi
+    if [[ -n $raw ]]; then
+      # reshaped as "id<TAB>description" per line
       lines=( ${(f)raw} )
       lines=( ${lines//$'\t'/:} )
     fi
@@ -151,7 +175,10 @@ _maccleaner() {
   # command list again.
   typeset -A _maccleaner_alias_cmd=( mclean clean mpreview scan mreport report )
   if (( ${+_maccleaner_alias_cmd[$words[1]]} )); then
-    words=( maccleaner ${_maccleaner_alias_cmd[$words[1]]} "${words[2,-1]}" )
+    # (@) is required here: without it, "${words[2,-1]}" joins the tail into
+    # a single scalar instead of preserving it as separate array elements,
+    # which silently breaks every completion past the first word.
+    words=( maccleaner ${_maccleaner_alias_cmd[$words[1]]} "${(@)words[2,-1]}" )
     (( CURRENT += 1 ))
   fi
 

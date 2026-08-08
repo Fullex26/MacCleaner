@@ -48,7 +48,33 @@ _maccleaner_values() {
         if [ -s "$cache" ]; then
             ids=$(cat "$cache")
         else
-            raw=$(_maccleaner_run_capped 2 python3 "$engine" __complete "$kind")
+            # There is no `__complete` subcommand; the real data source is
+            # `categories --json` (categories with nested targets, 78 targets
+            # across 20 categories). The capped call only fetches the JSON --
+            # reshaping it into "id<TAB>description" lines happens in a
+            # second, uncapped python3 call, since it only parses text we
+            # already have and can't hang.
+            raw=$(_maccleaner_run_capped 2 python3 "$engine" categories --json 2>/dev/null)
+            if [ -n "$raw" ]; then
+                raw=$(printf '%s' "$raw" | python3 -c '
+import json, sys
+kind = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+rows = []
+if kind == "targets":
+    for cat in data.get("categories", []):
+        for t in cat.get("targets", []):
+            rows.append((t.get("id", ""), t.get("label", "")))
+else:
+    for cat in data.get("categories", []):
+        rows.append((cat.get("name", ""), cat.get("description", "")))
+for i, d in rows:
+    print("%s\t%s" % (i, d.replace("\t", " ")))
+' "$kind" 2>/dev/null)
+            fi
             # engine prints "id<TAB>description"; completion only needs the id
             ids=$(printf '%s\n' "$raw" | cut -f1 | tr '\n' ' ')
             case $ids in
@@ -162,6 +188,14 @@ _maccleaner() {
     # Value position for an option that takes one.
     case $prev in
         --targets)
+            # `projects --targets` takes generated project-artifact IDs
+            # (project-<slug>), a different namespace from cleanup target
+            # IDs, and those only exist after a `projects` scan -- which is
+            # too slow to run for a completion. Leave it freeform, matching
+            # zsh's `projects` spec.
+            if [ "$sub" = "projects" ]; then
+                COMPREPLY=(); return 0
+            fi
             _maccleaner_comma_complete "$cur" "$(_maccleaner_values targets)"; return 0 ;;
         --category)
             _maccleaner_comma_complete "$cur" "$(_maccleaner_values categories)"; return 0 ;;
