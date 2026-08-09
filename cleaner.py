@@ -115,6 +115,20 @@ ALL_CATEGORIES = [
     "go", "rust", "ruby", "cocoapods", "gradle", "maven",
     "ai", "ide", "browsers", "system",
     "flutter", "php", "vms",
+    "tmp", "simulators",
+]
+
+# Frozen snapshot of the category list as of v2.4 — the baseline for the
+# known_categories migration below. A config saved before known_categories
+# existed is assumed to know exactly these; anything in ALL_CATEGORIES
+# beyond this list is "new since the user last saved" and gets auto-enabled.
+# Append-only: never edit this list again; future releases only grow
+# ALL_CATEGORIES.
+V24_CATEGORIES = [
+    "xcode", "docker", "node", "python", "caches", "logs", "homebrew",
+    "go", "rust", "ruby", "cocoapods", "gradle", "maven",
+    "ai", "ide", "browsers", "system",
+    "flutter", "php", "vms",
 ]
 
 CATEGORY_DESCRIPTIONS = {
@@ -138,6 +152,8 @@ CATEGORY_DESCRIPTIONS = {
     "flutter":   "Dart & Flutter pub package cache",
     "php":       "Composer package cache",
     "vms":       "VM disks and container runtimes (Colima, Vagrant, minikube) — review carefully",
+    "tmp":        "Stale build artifacts in /private/tmp left by tools and AI coding sessions — review carefully",
+    "simulators": "Stale iOS simulator devices and unused runtime images (via simctl) — review carefully",
 }
 
 DEFAULT_CONFIG = {
@@ -149,6 +165,8 @@ DEFAULT_CONFIG = {
     "project_roots": ["~/Documents", "~/Developer", "~/Projects", "~/Code", "~/dev"],
     "project_min_age_days": 30,
     "project_git_check": True,
+    "tmp_min_age_days": 3,           # /tmp dirs younger than this are never offered
+    "simulator_stale_days": 30,      # simulators not booted for this long count as stale
     "notifications": True,           # notify when a scheduled clean finishes
     "low_disk_alerts": True,         # warn when free space drops below the threshold
     "low_disk_threshold_gb": 10,     # the low-disk warning threshold
@@ -163,6 +181,14 @@ def load_config():
         # Merge with defaults for any missing keys
         for k, v in DEFAULT_CONFIG.items():
             cfg.setdefault(k, v)
+        # Auto-enable categories added since this config was last saved.
+        # Without this, a category added in a new release never appears for
+        # existing installs (enabled_categories is a saved list, not merged).
+        known = set(cfg.get("known_categories", V24_CATEGORIES))
+        for c in ALL_CATEGORIES:
+            if c not in known and c not in cfg["enabled_categories"]:
+                cfg["enabled_categories"].append(c)
+        cfg["known_categories"] = list(ALL_CATEGORIES)
         return cfg
     return json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
 

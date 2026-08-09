@@ -56,7 +56,8 @@ class TestConfig(unittest.TestCase):
     def test_merge_missing_keys(self):
         cleaner.CONFIG_PATH.write_text('{"enabled_categories": ["node"]}')
         cfg = cleaner.load_config()
-        self.assertEqual(cfg["enabled_categories"], ["node"])
+        # Pre-v2.5 configs get new categories auto-enabled
+        self.assertEqual(cfg["enabled_categories"], ["node", "tmp", "simulators"])
         self.assertIn("project_roots", cfg)
         self.assertEqual(cfg["log_threshold_mb"], 100)
 
@@ -1366,7 +1367,8 @@ class TestNotify(unittest.TestCase):
         try:
             cleaner.CONFIG_PATH.write_text('{"enabled_categories": ["node"]}')
             cfg = cleaner.load_config()
-            self.assertEqual(cfg["enabled_categories"], ["node"])
+            # Pre-v2.5 configs get new categories auto-enabled
+            self.assertEqual(cfg["enabled_categories"], ["node", "tmp", "simulators"])
             self.assertTrue(cfg["low_disk_alerts"])
             self.assertEqual(cfg["low_disk_threshold_gb"], 10)
         finally:
@@ -2597,6 +2599,40 @@ class TestAgentPython(unittest.TestCase):
             self.assertTrue(cleaner._is_venv_interpreter(str(venv_python)))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestCategoryMigration(unittest.TestCase):
+    def _load_with(self, cfg_dict):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "config.json"
+            p.write_text(json.dumps(cfg_dict))
+            with mock.patch.object(cleaner, "CONFIG_PATH", p):
+                return cleaner.load_config()
+
+    def test_new_categories_auto_enable_for_pre25_config(self):
+        cfg = self._load_with({"enabled_categories": list(cleaner.V24_CATEGORIES)})
+        self.assertIn("tmp", cfg["enabled_categories"])
+        self.assertIn("simulators", cfg["enabled_categories"])
+        self.assertEqual(cfg["known_categories"], list(cleaner.ALL_CATEGORIES))
+
+    def test_user_disabled_category_stays_disabled(self):
+        old = [c for c in cleaner.V24_CATEGORIES if c != "docker"]
+        cfg = self._load_with({"enabled_categories": old})
+        self.assertNotIn("docker", cfg["enabled_categories"])
+        self.assertIn("tmp", cfg["enabled_categories"])
+
+    def test_known_categories_respected_once_written(self):
+        cfg = self._load_with({
+            "enabled_categories": ["node"],
+            "known_categories": list(cleaner.ALL_CATEGORIES),
+        })
+        # tmp/simulators already known -> a user who disabled them stays disabled
+        self.assertNotIn("tmp", cfg["enabled_categories"])
+
+    def test_new_config_keys_default(self):
+        cfg = self._load_with({"enabled_categories": []})
+        self.assertEqual(cfg["tmp_min_age_days"], 3)
+        self.assertEqual(cfg["simulator_stale_days"], 30)
 
 
 class TestCompletions(unittest.TestCase):
