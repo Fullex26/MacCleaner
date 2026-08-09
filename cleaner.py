@@ -729,8 +729,11 @@ def delete_target(t, mode="rm"):
     """Delete a target. Returns (bytes_freed, error_message_or_None)."""
     if t.get("cmd"):
         try:
-            # cmd strings are static literals from get_targets() (need `|| true`
-            # and pipes) — never user input, so shell=True is safe here
+            # cmd strings are either static literals from get_targets() (need
+            # `|| true` and pipes) or assembled by scanners (scan_simulator_
+            # targets) exclusively from simctl identifiers that passed
+            # _SIMCTL_UDID_RE/_SIMCTL_RUNTIME_ID_RE — never raw user input,
+            # so shell=True is safe here
             subprocess.run(t["cmd"], shell=True, capture_output=True, timeout=600)
             return 0, None  # Can't easily measure cmd-based targets
         except Exception as e:
@@ -1218,6 +1221,14 @@ TMP_CLONE_ARTIFACTS = {
     "dist", ".next", "Pods", ".venv", "venv",
 }
 
+# ── Simulator dynamic targets ─────────────────────────────────────────────────
+# Device UDIDs and runtime identifiers from `simctl ... -j` output end up
+# interpolated into shell cmd strings (delete_target runs cmd targets with
+# shell=True) — anything that fails these shapes is dropped rather than ever
+# reaching a shell, so a malformed/hostile simctl response can't inject.
+_SIMCTL_UDID_RE = re.compile(r"[0-9A-Fa-f-]{8,}\Z")
+_SIMCTL_RUNTIME_ID_RE = re.compile(r"[A-Za-z0-9.-]+\Z")
+
 
 def _git_info(project_dir):
     """Git activity signals for a project dir, or None when unknowable.
@@ -1497,7 +1508,12 @@ def scan_simulator_targets(config):
     Device timestamp field: older Xcode/simctl emits "lastBootedAt"; newer
     versions renamed it "lastUsedAt" (observed on Xcode's current simctl) —
     both are checked, falling back to the device's dataPath mtime when
-    neither is present."""
+    neither is present.
+
+    Every udid/identifier that ends up in a cmd string is validated against
+    _SIMCTL_UDID_RE/_SIMCTL_RUNTIME_ID_RE first and silently dropped (not
+    included in the target at all) if it doesn't match — simctl's own JSON
+    is untrusted input from delete_target's shell=True point of view."""
     targets = []
     data = _simctl_json(["list", "devices"])
     if not data:
@@ -1507,7 +1523,8 @@ def scan_simulator_targets(config):
     stale, stale_bytes, used_runtimes = [], 0, set()
     for runtime_id, devs in data.get("devices", {}).items():
         for d in devs:
-            if not d.get("udid"):
+            udid = d.get("udid")
+            if not udid or not _SIMCTL_UDID_RE.fullmatch(udid):
                 continue
             used_runtimes.add(runtime_id)
             if d.get("state") == "Booted":
@@ -1559,17 +1576,22 @@ def scan_simulator_targets(config):
         unused = [r for r in runtimes
                   if isinstance(r, dict)
                   and r.get("runtimeIdentifier", r.get("identifier")) not in used_runtimes
-                  and r.get("state") == "Ready"]
+                  and r.get("state") == "Ready"
+                  and r.get("identifier")
+                  and _SIMCTL_RUNTIME_ID_RE.fullmatch(r["identifier"])]
         if unused:
-            ids = [r.get("identifier") for r in unused if r.get("identifier")]
+            ids = [r["identifier"] for r in unused]
             size = sum(int(r.get("sizeBytes") or 0) for r in unused)
             targets.append({
                 "id": "simulator-unused-runtimes", "category": "simulators",
                 "label": "Unused simulator runtimes (%d)" % len(ids),
                 "description": "Runtime images with no simulator devices — re-downloadable in Xcode",
                 "path": None, "glob": None, "skip": [], "safe": False,
-                "cmd": " && ".join("xcrun simctl runtime delete %s" % i for i in ids)
-                       + " 2>/dev/null || true",
+                # "; "-joined with per-command suppression (not "&&") so one
+                # failing delete doesn't short-circuit and skip every later
+                # identifier; trailing "; true" keeps the overall exit 0.
+                "cmd": "; ".join("xcrun simctl runtime delete %s 2>/dev/null" % i
+                                 for i in ids) + "; true",
                 "estimate_cmd": None, "estimate_parser": None,
                 "empty_only": False, "precomputed_bytes": size,
             })

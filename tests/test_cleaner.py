@@ -2927,14 +2927,21 @@ class TestTmpDeletionCarveOut(unittest.TestCase):
 
 
 SIMCTL_DEVICES = {"devices": {
+    # Real simctl UDIDs are full hex UUIDs (>=8 chars) -- _SIMCTL_UDID_RE
+    # requires that shape, so these use repeated-letter UUID-style values
+    # (still uniquely matched by the "AAA"/"BBB"/"CCC" substring assertions
+    # below) rather than the 3-char placeholders a real device would never have.
     "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
-        {"udid": "AAA", "name": "iPhone 17 Pro", "state": "Booted",
+        {"udid": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", "name": "iPhone 17 Pro",
+         "state": "Booted",
          "lastBootedAt": "2026-08-09T00:00:00Z", "dataPath": "/dev/null"},
-        {"udid": "BBB", "name": "iPhone Air", "state": "Shutdown",
+        {"udid": "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB", "name": "iPhone Air",
+         "state": "Shutdown",
          "lastBootedAt": "2026-01-01T00:00:00Z", "dataPath": "/dev/null"},
     ],
     "com.apple.CoreSimulator.SimRuntime.iOS-18-1": [
-        {"udid": "CCC", "name": "old phone", "state": "Shutdown",
+        {"udid": "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC", "name": "old phone",
+         "state": "Shutdown",
          "dataPath": "/dev/null"},  # no lastBootedAt -> falls back to dataPath mtime
     ],
 }}
@@ -2961,7 +2968,8 @@ class TestSimulatorTargets(unittest.TestCase):
         old = time.time() - 400 * 86400
         os.utime(self.old_datapath, (old, old))
         self.devices = {"devices": {
-            k: [dict(d, dataPath=self.old_datapath) if d["udid"] == "CCC" else d
+            k: [dict(d, dataPath=self.old_datapath)
+                if d["udid"].startswith("CCC") else d
                 for d in v]
             for k, v in SIMCTL_DEVICES["devices"].items()
         }}
@@ -3027,13 +3035,62 @@ class TestSimulatorTargets(unittest.TestCase):
         self.assertIn("iOS-18-6", rt[0]["cmd"])
         self.assertNotIn("iOS-26-5", rt[0]["cmd"])
         self.assertEqual(rt[0]["precomputed_bytes"], 6000000000)
+        # "; "-joined with per-command suppression, not "&&" -- one failing
+        # delete must not short-circuit and skip every later identifier.
+        self.assertEqual(
+            rt[0]["cmd"],
+            "xcrun simctl runtime delete "
+            "com.apple.CoreSimulator.SimRuntime.iOS-18-6 2>/dev/null; true")
+        self.assertNotIn("&&", rt[0]["cmd"])
+
+    def test_malicious_udid_dropped_before_reaching_cmd(self):
+        # A udid that doesn't look like a UDID (whatever produced this JSON --
+        # a compromised/buggy simctl, a MITM'd subprocess, anything) must
+        # never make it into the shell=True cmd string delete_target runs.
+        devices = {"devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+                {"udid": "AAA; rm -rf ~", "name": "evil", "state": "Shutdown",
+                 "lastBootedAt": "2026-01-01T00:00:00Z", "dataPath": "/dev/null"},
+                {"udid": "DEADBEEF-CAFE-BABE-0000-000000000001",
+                 "name": "legit", "state": "Shutdown",
+                 "lastBootedAt": "2026-01-01T00:00:00Z", "dataPath": "/dev/null"},
+            ],
+        }}
+        targets = self._scan(devices=devices)
+        stale = [t for t in targets if t["id"] == "simulator-stale-devices"]
+        self.assertEqual(len(stale), 1)
+        self.assertNotIn("rm -rf", stale[0]["cmd"])
+        self.assertNotIn("AAA; rm -rf ~", stale[0]["cmd"])
+        self.assertIn("DEADBEEF-CAFE-BABE-0000-000000000001", stale[0]["cmd"])
+        # dropped entirely, not just kept out of the cmd -- byte accounting
+        # must not include the rejected device's data either.
+        self.assertEqual(stale[0]["precomputed_bytes"], 123)
+
+    def test_malicious_runtime_identifier_dropped_before_reaching_cmd(self):
+        runtimes = {"runtimes": [
+            {"identifier": "bad id $(evil)", "runtimeIdentifier": "bad id $(evil)",
+             "state": "Ready", "sizeBytes": 999},
+            {"identifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
+             "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
+             "state": "Ready", "sizeBytes": 6000000000},
+        ]}
+        targets = self._scan(runtimes=runtimes)
+        rt = [t for t in targets if t["id"] == "simulator-unused-runtimes"]
+        self.assertEqual(len(rt), 1)
+        self.assertNotIn("evil", rt[0]["cmd"])
+        self.assertNotIn("bad id", rt[0]["cmd"])
+        self.assertIn("iOS-18-6", rt[0]["cmd"])
+        # size must come from the same filtered (valid-only) list as the
+        # cmd/ids, not sum the rejected runtime's sizeBytes in too.
+        self.assertEqual(rt[0]["precomputed_bytes"], 6000000000)
 
     def test_no_stale_devices_no_unused_runtimes_empty(self):
         # Everything booted or recently booted, and every runtime in use ->
         # neither target should be synthesized (0 targets, not 2 empty ones).
         devices = {"devices": {
             "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
-                {"udid": "AAA", "name": "iPhone 17 Pro", "state": "Booted",
+                {"udid": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+                 "name": "iPhone 17 Pro", "state": "Booted",
                  "lastBootedAt": "2026-08-09T00:00:00Z", "dataPath": "/dev/null"},
             ],
         }}
