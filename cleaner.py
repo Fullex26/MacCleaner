@@ -53,7 +53,6 @@ except ImportError:
     console = None
 
 HOME = Path.home()
-CONFIG_PATH = Path(os.environ.get("MACCLEANER_CONFIG", Path(__file__).parent / "config.json"))
 
 
 def _is_inside_app_bundle(path: Path) -> bool:
@@ -106,6 +105,7 @@ def _resolve_state_path(env_var: str, filename: str, script_dir: Path = None) ->
 LOG_PATH = _resolve_state_path("MACCLEANER_LOG", "report.log")
 SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
+CONFIG_PATH = _resolve_state_path("MACCLEANER_CONFIG", "config.json")
 SNAPSHOT_CAP = 365
 VERSION = "2.4.0"
 

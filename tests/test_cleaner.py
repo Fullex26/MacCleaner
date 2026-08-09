@@ -2702,5 +2702,26 @@ class TestCompletions(unittest.TestCase):
         self.fail("config subparser has no sub-subparsers")
 
 
+class TestConfigPathResolution(unittest.TestCase):
+    def test_env_override_wins(self):
+        with mock.patch.dict(os.environ, {"MACCLEANER_CONFIG": "/x/y/config.json"}):
+            p = cleaner._resolve_state_path("MACCLEANER_CONFIG", "config.json")
+        self.assertEqual(p, Path("/x/y/config.json"))
+
+    def test_bundle_resident_engine_routes_to_app_support(self):
+        bundle_dir = Path("/Applications/MacCleaner.app/Contents/Resources")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MACCLEANER_CONFIG", None)
+            p = cleaner._resolve_state_path("MACCLEANER_CONFIG", "config.json",
+                                            script_dir=bundle_dir)
+        self.assertEqual(
+            p, cleaner.HOME / "Library/Application Support/MacCleaner/config.json")
+
+    def test_config_path_module_level_uses_resolver(self):
+        # Beside-script remains the default for a writable non-bundle dir
+        # (the ~/mac-cleaner install case) — i.e. today's behavior is kept.
+        self.assertEqual(cleaner.CONFIG_PATH.name, "config.json")
+
+
 if __name__ == "__main__":
     unittest.main()
