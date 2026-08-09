@@ -182,9 +182,19 @@ fi
 if [ -d "$APP_BUNDLE" ]; then
     mkdir -p "$HOME/Applications"
     rm -rf "$APP_DEST"
-    cp -R "$APP_BUNDLE" "$APP_DEST" 2>/dev/null || \
-    cp -R "$APP_BUNDLE" "/Applications/MacCleaner.app" 2>/dev/null || true
+    INSTALLED_DEST=""
+    if cp -R "$APP_BUNDLE" "$APP_DEST" 2>/dev/null; then
+        INSTALLED_DEST="$APP_DEST"
+    elif cp -R "$APP_BUNDLE" "/Applications/MacCleaner.app" 2>/dev/null; then
+        INSTALLED_DEST="/Applications/MacCleaner.app"
+    fi
     echo "→ Installed MacCleaner.app to ~/Applications/"
+    if [ -n "$INSTALLED_DEST" ] && pgrep -xq MacCleaner; then
+        killall MacCleaner 2>/dev/null || true
+        sleep 1
+        open "$INSTALLED_DEST" 2>/dev/null || true
+        echo "→ Relaunched MacCleaner.app (was running an older build)"
+    fi
 else
     echo "→ No Swift toolchain and no committed app bundle found — skipping menu bar app install"
     echo "  Install Xcode Command Line Tools and re-run, or run 'bash app/build.sh --install' later"

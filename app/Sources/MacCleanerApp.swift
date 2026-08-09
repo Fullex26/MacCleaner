@@ -7,6 +7,16 @@ struct MacCleanerApp: App {
 
     init() {
         NotificationManager.shared.requestAuthorization()
+
+        // NSAlert and other AppKit surfaces render NSApp.applicationIconImage.
+        // Resolving it from CFBundleIconFile can silently fall back to the
+        // generic icon when icon services has a stale cache entry for this
+        // bundle path (common for ad-hoc-signed bundles replaced in place by
+        // install.sh). Loading the icns ourselves makes the icon deterministic.
+        if let path = Bundle.main.path(forResource: "MacCleaner", ofType: "icns"),
+           let image = NSImage(contentsOfFile: path) {
+            NSApplication.shared.applicationIconImage = image
+        }
     }
 
     var body: some Scene {
@@ -67,6 +77,7 @@ struct MenuBarContent: View {
             alert.addButton(withTitle: "Clean Now")
             alert.addButton(withTitle: "Cancel")
             alert.alertStyle = .warning
+            alert.icon = NSApplication.shared.applicationIconImage
             if alert.runModal() == .alertFirstButtonReturn {
                 Task { await bridge.autoCleanSafe() }
             }
