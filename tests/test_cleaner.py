@@ -2634,6 +2634,17 @@ class TestCategoryMigration(unittest.TestCase):
         self.assertEqual(cfg["tmp_min_age_days"], 3)
         self.assertEqual(cfg["simulator_stale_days"], 30)
 
+    def test_fresh_install_disable_survives_reload(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "config.json"
+            with mock.patch.object(cleaner, "CONFIG_PATH", p):
+                cfg = cleaner.load_config()          # no file on disk
+                cfg["enabled_categories"].remove("tmp")
+                cleaner.save_config(cfg)
+                cfg2 = cleaner.load_config()
+        self.assertNotIn("tmp", cfg2["enabled_categories"])
+        self.assertIn("known_categories", cfg2)
+
 
 class TestCompletions(unittest.TestCase):
     """The completion files are hand-written, so they can drift from the

@@ -152,7 +152,7 @@ CATEGORY_DESCRIPTIONS = {
     "flutter":   "Dart & Flutter pub package cache",
     "php":       "Composer package cache",
     "vms":       "VM disks and container runtimes (Colima, Vagrant, minikube) — review carefully",
-    "tmp":        "Stale build artifacts in /private/tmp left by tools and AI coding sessions — review carefully",
+    "tmp":       "Stale build artifacts in /private/tmp left by tools and AI coding sessions — review carefully",
     "simulators": "Stale iOS simulator devices and unused runtime images (via simctl) — review carefully",
 }
 
@@ -190,7 +190,15 @@ def load_config():
                 cfg["enabled_categories"].append(c)
         cfg["known_categories"] = list(ALL_CATEGORIES)
         return cfg
-    return json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    # Fresh install (no config.json on disk yet): stamp known_categories here.
+    # Do NOT add this to DEFAULT_CONFIG — the setdefault loop above runs
+    # BEFORE the migration block, so a DEFAULT_CONFIG entry would apply
+    # known_categories=ALL_CATEGORIES to old configs and silently disable the
+    # migration for every pre-v2.5 install. Users who disable new categories on
+    # fresh install must have that choice survive a config reload.
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    cfg["known_categories"] = list(ALL_CATEGORIES)
+    return cfg
 
 
 def save_config(cfg):
