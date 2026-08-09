@@ -621,6 +621,18 @@ def get_targets(config, all_categories=False):
     return targets
 
 
+def collect_targets(config, all_categories=False):
+    """Static targets plus dynamic scanner targets (tmp; simulators join in
+    a later task). scan/clean/dry-run call this; `categories` deliberately
+    keeps calling get_targets() — dynamic per-dir IDs are unstable and the
+    completions' live-ID pipeline must not see them."""
+    targets = get_targets(config, all_categories=all_categories)
+    enabled = set(ALL_CATEGORIES) if all_categories else set(config["enabled_categories"])
+    if "tmp" in enabled:
+        targets += tmp_to_targets(scan_tmp_artifacts(config))
+    return targets
+
+
 def _target_paths(t):
     """Concrete filesystem paths for a target (glob patterns expanded).
 
@@ -671,6 +683,21 @@ def _safe_to_delete(path: Path) -> bool:
     return str(rp).startswith(str(home) + os.sep)
 
 
+def _tmp_scan_path_allowed(path):
+    """The single, narrow carve-out to the home-only rule: a path is
+    deletable outside $HOME only when it is a DIRECT child of the tmp scan
+    root (resolved, so /tmp symlinking to /private/tmp is handled) — and
+    delete_target additionally requires the target to carry the tmp_scan
+    marker that only scan_tmp_artifacts()/tmp_to_targets() set. There is
+    deliberately no config key that widens this."""
+    try:
+        rp = Path(path).resolve()
+        root = TMP_SCAN_ROOT.resolve()
+    except OSError:
+        return False
+    return rp.parent == root and rp != root
+
+
 def _remove(path: Path):
     if path.is_symlink():
         path.unlink(missing_ok=True)
@@ -714,8 +741,9 @@ def delete_target(t, mode="rm"):
         if not path.exists() and not path.is_symlink():
             continue
         if not _safe_to_delete(path):
-            errors.append(f"refused (outside home): {path}")
-            continue
+            if not (t.get("tmp_scan") and _tmp_scan_path_allowed(path)):
+                errors.append(f"refused (outside home): {path}")
+                continue
         freed += get_size(path)
         try:
             if t.get("empty_only"):
@@ -1118,7 +1146,10 @@ def run_dry_run(targets, mode="rm", json_mode=False):
                 except (PermissionError, FileNotFoundError, OSError):
                     continue
                 paths.extend(c for c in sorted(children) if _safe_to_delete(c))
-            elif _safe_to_delete(p):
+            # Same carve-out delete_target applies: a tmp_scan-marked target's
+            # direct-child-of-TMP_SCAN_ROOT path previews correctly too, so
+            # dry-run actually resolves what a real clean would delete.
+            elif _safe_to_delete(p) or (t.get("tmp_scan") and _tmp_scan_path_allowed(p)):
                 paths.append(p)
         entries = [{"path": str(p), "size_bytes": get_size(p)} for p in paths]
         size = sum(e["size_bytes"] for e in entries)
@@ -2501,7 +2532,7 @@ def main():
         return
 
     # scan / clean share target selection
-    targets = get_targets(config)
+    targets = collect_targets(config)
     categories = parse_categories(getattr(args, "category", None))
     if categories:
         valid = set(ALL_CATEGORIES)

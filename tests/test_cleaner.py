@@ -2809,5 +2809,99 @@ class TestTmpScanner(unittest.TestCase):
         self.assertEqual(len({t["id"] for t in targets}), 2)
 
 
+class TestTmpDeletionCarveOut(unittest.TestCase):
+    """The single, narrow exception to the home-only delete guarantee:
+    marker (tmp_scan=True, set only by tmp_to_targets) AND a path that is a
+    DIRECT child of TMP_SCAN_ROOT. Both are required; either alone refuses."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self._patch = mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self.td.cleanup()
+
+    def _tmp_target(self, path):
+        return {"id": "tmp-x", "category": "tmp", "label": "x", "description": "",
+                "path": path, "glob": None, "skip": [], "safe": False,
+                "cmd": None, "estimate_cmd": None, "estimate_parser": None,
+                "empty_only": False, "tmp_scan": True}
+
+    def test_marker_plus_tmp_child_is_deleted(self):
+        d = self.root / "junk"; (d / "Build").mkdir(parents=True)
+        (d / "Build" / "f").write_bytes(b"x" * 100)
+        freed, err = cleaner.delete_target(self._tmp_target(d))
+        self.assertIsNone(err)
+        self.assertFalse(d.exists())
+
+    def test_no_marker_refuses_tmp_path(self):
+        d = self.root / "junk2"; d.mkdir()
+        t = self._tmp_target(d); del t["tmp_scan"]
+        freed, err = cleaner.delete_target(t)
+        self.assertIn("refused", err or "")
+        self.assertTrue(d.exists())
+
+    def test_marker_with_non_tmp_path_refused(self):
+        with tempfile.TemporaryDirectory() as other:
+            d = Path(other) / "elsewhere"; d.mkdir()
+            freed, err = cleaner.delete_target(self._tmp_target(d))
+            self.assertIn("refused", err or "")
+            self.assertTrue(d.exists())
+
+    def test_marker_with_nested_path_refused(self):
+        d = self.root / "top" / "nested"; d.mkdir(parents=True)
+        freed, err = cleaner.delete_target(self._tmp_target(d))
+        self.assertIn("refused", err or "")
+
+    def test_collect_targets_merges_tmp_when_enabled(self):
+        (self.root / "dd" / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        old = time.time() - 5 * 86400
+        os.utime(self.root / "dd", (old, old))
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        targets = cleaner.collect_targets(cfg)
+        self.assertTrue(any(t.get("tmp_scan") for t in targets))
+        cfg["enabled_categories"] = ["node"]
+        targets = cleaner.collect_targets(cfg)
+        self.assertFalse(any(t.get("tmp_scan") for t in targets))
+
+    def test_clean_yes_never_touches_tmp_targets(self):
+        # safe=False + auto_approve without explicit selection: run_clean
+        # must skip review targets, never delete them (adapted to the real
+        # run_clean signature at cleaner.py:980 — auto_approve/json_mode/
+        # explicit; LOG_PATH/SNAPSHOTS_PATH patched so this never touches the
+        # real report.log/snapshots.log next to cleaner.py).
+        d = self.root / "dd2"; (d / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        t = self._tmp_target(d)
+        t["size"] = 1
+        with tempfile.TemporaryDirectory() as state_dir:
+            with mock.patch.object(cleaner, "LOG_PATH", Path(state_dir) / "report.log"), \
+                 mock.patch.object(cleaner, "SNAPSHOTS_PATH", Path(state_dir) / "snapshots.log"), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                cleaner.run_clean([t], auto_approve=True, json_mode=True, explicit=False)
+        self.assertTrue(d.exists())
+
+    def test_dry_run_previews_tmp_target_correctly(self):
+        # run_dry_run has its own _safe_to_delete path-safety check, separate
+        # from delete_target's — it needs the same carve-out or dry-run
+        # misreports 0 bytes/no paths for a tmp target a real clean would
+        # actually delete (found while sanity-checking `clean --dry-run
+        # --targets <tmp-id>`; not in the original brief's step 3, but the
+        # same narrow marker+direct-child guard, just applied to the preview
+        # path instead of the delete path — dry-run deletes nothing either way).
+        d = self.root / "dd3"; (d / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        (d / "Build" / "Intermediates.noindex" / "f").write_bytes(b"x" * 4096)
+        t = self._tmp_target(d)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            total, items = cleaner.run_dry_run([t], json_mode=True)
+        self.assertGreater(total, 0)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["status"], "would-delete")
+        self.assertTrue(items[0]["paths"])
+        self.assertTrue(d.exists())  # dry-run must not delete anything
+
+
 if __name__ == "__main__":
     unittest.main()
