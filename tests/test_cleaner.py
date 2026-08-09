@@ -2856,6 +2856,29 @@ class TestTmpDeletionCarveOut(unittest.TestCase):
         freed, err = cleaner.delete_target(self._tmp_target(d))
         self.assertIn("refused", err or "")
 
+    def test_root_itself_refused(self):
+        # Pins the `rp != root` clause: a tmp_scan target whose path IS
+        # TMP_SCAN_ROOT itself (not a child of it) must never be deletable —
+        # otherwise a misconfigured/mis-scanned target could wipe /tmp itself.
+        freed, err = cleaner.delete_target(self._tmp_target(self.root))
+        self.assertIn("refused", err or "")
+        self.assertTrue(self.root.exists())
+
+    def test_symlink_child_pointing_outside_refused(self):
+        # The .resolve() in _tmp_scan_path_allowed must dereference symlinks:
+        # a symlink directly under TMP_SCAN_ROOT that points somewhere else
+        # (e.g. into $HOME) must not let that somewhere-else get deleted just
+        # because the symlink's own path looks like a direct child.
+        with tempfile.TemporaryDirectory() as other:
+            real_dir = Path(other) / "real-target"
+            real_dir.mkdir()
+            (real_dir / "f").write_bytes(b"x" * 100)
+            link = self.root / "escape-link"
+            link.symlink_to(real_dir)
+            freed, err = cleaner.delete_target(self._tmp_target(link))
+            self.assertIn("refused", err or "")
+            self.assertTrue(real_dir.exists())
+
     def test_collect_targets_merges_tmp_when_enabled(self):
         (self.root / "dd" / "Build" / "Intermediates.noindex").mkdir(parents=True)
         old = time.time() - 5 * 86400
