@@ -22,7 +22,7 @@ _maccleaner_run_capped() {
 }
 
 _MACCLEANER_STATIC_CATEGORIES="xcode docker node python caches logs homebrew go
-rust ruby cocoapods gradle maven ai ide browsers system flutter php vms"
+rust ruby cocoapods gradle maven ai ide browsers system flutter php vms tmp simulators"
 
 # Populate $_MACCLEANER_CATS / $_MACCLEANER_TGTS for $1 = categories|targets.
 # Layer 1: per-shell memo. Layer 2: disk cache keyed on engine mtime.

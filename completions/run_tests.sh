@@ -30,8 +30,8 @@ eq "no dupes offered"     "0"  "$(B 'maccleaner clean --targets npm-cache,' | gr
 eq "projects --targets is freeform, not cleanup ids" "0" "$(B 'maccleaner projects --targets ' | grep -cx 'npm-cache')"
 eq "projects --targets freeform w/ prefix"           "0" "$(B 'maccleaner projects --targets npm' | grep -cx 'npm-cache')"
 eq "config actions"       "show path enable disable set" "$(B 'maccleaner config ' | grep -v '^--' | tr '\n' ' ' | sed 's/ $//')"
-eq "config enable cats"   "20" "$(B 'maccleaner config enable ' | wc -l | tr -d ' ')"
-eq "engine down -> static" "20" "$(env MACCLEANER_ENGINE=/nope HOME=/tmp/nohome bash "$HERE/bashtest.sh" "$HERE/maccleaner.bash" 'maccleaner config enable ' | wc -l | tr -d ' ')"
+eq "config enable cats"   "22" "$(B 'maccleaner config enable ' | wc -l | tr -d ' ')"
+eq "engine down -> static" "22" "$(env MACCLEANER_ENGINE=/nope HOME=/tmp/nohome bash "$HERE/bashtest.sh" "$HERE/maccleaner.bash" 'maccleaner config enable ' | wc -l | tr -d ' ')"
 
 echo "Tier 2b: mclean/mpreview/mreport alias completion (each bakes in a subcommand)"
 eq "alias mclean flags"    "--yes --targets --category --min-size --trash --dry-run --notify --json --help" "$(B 'mclean ' | tr '\n' ' ' | sed 's/ $//')"
@@ -51,7 +51,7 @@ eq "zsh targets 1st"      "78" "$(Z 'maccleaner clean --targets ' | wc -l | tr -
 eq "zsh targets 2nd"      "77" "$(Z 'maccleaner clean --targets npm-cache,' | wc -l | tr -d ' ')"
 eq "zsh targets 3rd"      "76" "$(Z 'maccleaner clean --targets npm-cache,pip-cache,' | wc -l | tr -d ' ')"
 eq "zsh config set keys"  "12" "$(Z 'maccleaner config set ' | wc -l | tr -d ' ')"
-eq "zsh engine down"      "20" "$(env MACCLEANER_ENGINE=/nope HOME=/tmp/nohome "$HERE/capture.zsh" "$HERE" 'maccleaner config enable ' | wc -l | tr -d ' ')"
+eq "zsh engine down"      "22" "$(env MACCLEANER_ENGINE=/nope HOME=/tmp/nohome "$HERE/capture.zsh" "$HERE" 'maccleaner config enable ' | wc -l | tr -d ' ')"
 
 echo "Tier 3b: mclean/mpreview/mreport alias completion (zsh)"
 eq "zsh alias mclean flags" "--category --dry-run --help --json --min-size --notify --targets --trash --yes -h" "$(Z 'mclean ' | tr '\n' ' ' | sed 's/ $//')"
@@ -105,13 +105,13 @@ rm -f "${TMPDIR:-/tmp}"/.maccleaner-comp-* 2>/dev/null
 eq "real engine bash: --targets returns real target ids" \
    "1" "$(RB 'maccleaner clean --targets ' | grep -cx 'npm-cache')"
 eq "real engine bash: --targets count matches the live engine" \
-   "78" "$(RB 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
+   "80" "$(RB 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
 eq "real engine bash: --category reflects the live engine, not the static list" \
    "1" "$(RB 'maccleaner config enable ' | grep -cx 'xcode')"
 eq "real engine zsh: --targets returns real target ids" \
    "1" "$(RZ 'maccleaner clean --targets ' | grep -cx 'npm-cache')"
 eq "real engine zsh: --targets count matches the live engine" \
-   "78" "$(RZ 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
+   "80" "$(RZ 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
 eq "real engine zsh: --category reflects the live engine, not the static list" \
    "1" "$(RZ 'maccleaner config enable ' | grep -cx 'xcode')"
 rm -f "${TMPDIR:-/tmp}"/.maccleaner-comp-* 2>/dev/null

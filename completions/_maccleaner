@@ -11,7 +11,7 @@
 typeset -ga _maccleaner_static_categories
 _maccleaner_static_categories=(
   xcode docker node python caches logs homebrew go rust ruby cocoapods
-  gradle maven ai ide browsers system flutter php vms
+  gradle maven ai ide browsers system flutter php vms tmp simulators
 )
 
 # Locate an engine we can interrogate.
