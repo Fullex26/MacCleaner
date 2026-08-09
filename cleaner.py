@@ -622,14 +622,16 @@ def get_targets(config, all_categories=False):
 
 
 def collect_targets(config, all_categories=False):
-    """Static targets plus dynamic scanner targets (tmp; simulators join in
-    a later task). scan/clean/dry-run call this; `categories` deliberately
-    keeps calling get_targets() — dynamic per-dir IDs are unstable and the
-    completions' live-ID pipeline must not see them."""
+    """Static targets plus dynamic scanner targets (tmp, simulators).
+    scan/clean/dry-run call this; `categories` deliberately keeps calling
+    get_targets() — dynamic per-dir IDs are unstable and the completions'
+    live-ID pipeline must not see them."""
     targets = get_targets(config, all_categories=all_categories)
     enabled = set(ALL_CATEGORIES) if all_categories else set(config["enabled_categories"])
     if "tmp" in enabled:
         targets += tmp_to_targets(scan_tmp_artifacts(config))
+    if "simulators" in enabled:
+        targets += scan_simulator_targets(config)
     return targets
 
 
@@ -658,6 +660,9 @@ def measure_targets(targets):
         existing = [p for p in paths if p.exists()]
         if existing:
             t["size"] = sum(get_size(p) for p in existing)
+            t["exists"] = True
+        elif t.get("precomputed_bytes") is not None:
+            t["size"] = t["precomputed_bytes"]
             t["exists"] = True
         elif t.get("cmd"):
             t["size"] = _run_estimate(t["estimate_cmd"], t.get("estimate_parser")) if t.get("estimate_cmd") else 0
@@ -1456,6 +1461,118 @@ def tmp_to_targets(hits):
             "empty_only": False,
             "tmp_scan": True,
         })
+    return targets
+
+
+def _simctl_json(args):
+    """Run `xcrun simctl <args> -j` and parse JSON; None when simctl is
+    missing (no Xcode), errors, or emits garbage — callers degrade to no
+    targets, matching how a missing docker degrades."""
+    try:
+        out = subprocess.run(["xcrun", "simctl"] + args + ["-j"],
+                             capture_output=True, text=True, timeout=60)
+        if out.returncode != 0:
+            return None
+        return json.loads(out.stdout)
+    except Exception:
+        return None
+
+
+def _parse_simctl_date(s):
+    # "2026-08-09T00:00:00Z" or with offset; simctl emits ISO8601
+    try:
+        return datetime.datetime.strptime(
+            s.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def scan_simulator_targets(config):
+    """Dynamic review-only targets for stale simulator devices and unused
+    runtime images. Deletion goes through simctl (raw rm corrupts its
+    registry) — so these are cmd targets whose commands are assembled from
+    simctl's own enumeration. simctl handles the system-domain runtime
+    cryptexes in /Library/Developer that the engine could never touch.
+
+    Device timestamp field: older Xcode/simctl emits "lastBootedAt"; newer
+    versions renamed it "lastUsedAt" (observed on Xcode's current simctl) —
+    both are checked, falling back to the device's dataPath mtime when
+    neither is present."""
+    targets = []
+    data = _simctl_json(["list", "devices"])
+    if not data:
+        return targets
+    stale_days = config.get("simulator_stale_days", 30)
+    cutoff = time.time() - stale_days * 86400
+    stale, stale_bytes, used_runtimes = [], 0, set()
+    for runtime_id, devs in data.get("devices", {}).items():
+        for d in devs:
+            if not d.get("udid"):
+                continue
+            used_runtimes.add(runtime_id)
+            if d.get("state") == "Booted":
+                continue
+            ts = _parse_simctl_date(d.get("lastBootedAt") or d.get("lastUsedAt"))
+            if ts is None:
+                try:
+                    ts = os.stat(d.get("dataPath", "")).st_mtime
+                except OSError:
+                    continue
+            if ts < cutoff:
+                stale.append(d)
+                dp = d.get("dataPath")
+                if dp:
+                    try:
+                        stale_bytes += get_size(Path(dp))
+                    except OSError:
+                        pass
+    if stale:
+        udids = " ".join(d["udid"] for d in stale)
+        names = ", ".join(d.get("name", "?") for d in stale[:4])
+        more = "" if len(stale) <= 4 else " +%d more" % (len(stale) - 4)
+        targets.append({
+            "id": "simulator-stale-devices", "category": "simulators",
+            "label": "Stale simulator devices (%d)" % len(stale),
+            "description": "Not booted in %dd: %s%s — deleted via simctl"
+                           % (stale_days, names, more),
+            "path": None, "glob": None, "skip": [], "safe": False,
+            "cmd": "xcrun simctl delete %s 2>/dev/null || true" % udids,
+            "estimate_cmd": None, "estimate_parser": None,
+            "empty_only": False, "precomputed_bytes": stale_bytes,
+        })
+    rt = _simctl_json(["runtime", "list"])
+    if rt:
+        # simctl has shipped at least three runtime-list shapes across
+        # versions: {"runtimes": [...]}, a bare top-level [...], and (the
+        # shape observed from current Xcode) a bare dict keyed by runtime
+        # UUID with no "runtimes" wrapper at all — {uuid: {...}, ...}.
+        if isinstance(rt, list):
+            runtimes = rt
+        elif isinstance(rt, dict) and "runtimes" in rt:
+            runtimes = rt["runtimes"]
+            if isinstance(runtimes, dict):
+                runtimes = list(runtimes.values())
+        elif isinstance(rt, dict):
+            runtimes = list(rt.values())
+        else:
+            runtimes = []
+        unused = [r for r in runtimes
+                  if isinstance(r, dict)
+                  and r.get("runtimeIdentifier", r.get("identifier")) not in used_runtimes
+                  and r.get("state") == "Ready"]
+        if unused:
+            ids = [r.get("identifier") for r in unused if r.get("identifier")]
+            size = sum(int(r.get("sizeBytes") or 0) for r in unused)
+            targets.append({
+                "id": "simulator-unused-runtimes", "category": "simulators",
+                "label": "Unused simulator runtimes (%d)" % len(ids),
+                "description": "Runtime images with no simulator devices — re-downloadable in Xcode",
+                "path": None, "glob": None, "skip": [], "safe": False,
+                "cmd": " && ".join("xcrun simctl runtime delete %s" % i for i in ids)
+                       + " 2>/dev/null || true",
+                "estimate_cmd": None, "estimate_parser": None,
+                "empty_only": False, "precomputed_bytes": size,
+            })
     return targets
 
 

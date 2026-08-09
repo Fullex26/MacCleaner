@@ -2926,5 +2926,148 @@ class TestTmpDeletionCarveOut(unittest.TestCase):
         self.assertTrue(d.exists())  # dry-run must not delete anything
 
 
+SIMCTL_DEVICES = {"devices": {
+    "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+        {"udid": "AAA", "name": "iPhone 17 Pro", "state": "Booted",
+         "lastBootedAt": "2026-08-09T00:00:00Z", "dataPath": "/dev/null"},
+        {"udid": "BBB", "name": "iPhone Air", "state": "Shutdown",
+         "lastBootedAt": "2026-01-01T00:00:00Z", "dataPath": "/dev/null"},
+    ],
+    "com.apple.CoreSimulator.SimRuntime.iOS-18-1": [
+        {"udid": "CCC", "name": "old phone", "state": "Shutdown",
+         "dataPath": "/dev/null"},  # no lastBootedAt -> falls back to dataPath mtime
+    ],
+}}
+SIMCTL_RUNTIMES = {"runtimes": [
+    {"identifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+     "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+     "state": "Ready", "sizeBytes": 5000000000},
+    {"identifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
+     "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
+     "state": "Ready", "sizeBytes": 6000000000},
+]}
+
+
+class TestSimulatorTargets(unittest.TestCase):
+    def setUp(self):
+        # On this machine (Darwin devfs) /dev/null's mtime always reads back
+        # as "now", not a fixed old timestamp -- stat()ing it can't exercise
+        # the dataPath-mtime fallback deterministically. Give device "CCC"
+        # (the one with no lastBootedAt/lastUsedAt) a real file with a
+        # pinned old mtime instead, so the fallback path is actually tested.
+        self.td = tempfile.TemporaryDirectory()
+        self.old_datapath = str(Path(self.td.name) / "old_datapath")
+        Path(self.old_datapath).write_bytes(b"")
+        old = time.time() - 400 * 86400
+        os.utime(self.old_datapath, (old, old))
+        self.devices = {"devices": {
+            k: [dict(d, dataPath=self.old_datapath) if d["udid"] == "CCC" else d
+                for d in v]
+            for k, v in SIMCTL_DEVICES["devices"].items()
+        }}
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _scan(self, devices=None, runtimes=SIMCTL_RUNTIMES):
+        devices = self.devices if devices is None else devices
+
+        def fake(args):
+            return devices if args[:2] == ["list", "devices"] else runtimes
+        with mock.patch.object(cleaner, "_simctl_json", side_effect=fake):
+            with mock.patch.object(cleaner, "get_size", return_value=123):
+                return cleaner.scan_simulator_targets({"simulator_stale_days": 30})
+
+    def test_stale_devices_target_built(self):
+        targets = self._scan()
+        stale = [t for t in targets if t["id"] == "simulator-stale-devices"]
+        self.assertEqual(len(stale), 1)
+        self.assertIn("BBB", stale[0]["cmd"])
+        self.assertIn("CCC", stale[0]["cmd"])       # missing lastBootedAt counts via mtime
+        self.assertNotIn("AAA", stale[0]["cmd"])    # booted device never stale
+        self.assertFalse(stale[0]["safe"])
+        self.assertEqual(stale[0]["category"], "simulators")
+
+    def test_unused_runtimes_target_built(self):
+        targets = self._scan()
+        rt = [t for t in targets if t["id"] == "simulator-unused-runtimes"]
+        self.assertEqual(len(rt), 1)
+        self.assertIn("iOS-18-6", rt[0]["cmd"])     # zero devices reference it
+        self.assertNotIn("iOS-26-5", rt[0]["cmd"])  # has devices
+        self.assertEqual(rt[0]["precomputed_bytes"], 6000000000)
+        self.assertFalse(rt[0]["safe"])
+        self.assertEqual(rt[0]["category"], "simulators")
+
+    def test_no_simctl_degrades_to_empty(self):
+        with mock.patch.object(cleaner, "_simctl_json", return_value=None):
+            self.assertEqual(cleaner.scan_simulator_targets({}), [])
+
+    def test_unused_runtimes_uid_keyed_dict_shape(self):
+        # `xcrun simctl runtime list -j` on real (current-Xcode) machines
+        # returns a bare dict keyed by runtime UUID -- {uuid: {...}, ...} --
+        # with no top-level "runtimes" wrapper key at all, unlike the
+        # wrapped-list shape used elsewhere in this test class. Confirmed
+        # against the actual `xcrun simctl runtime list -j` output on this
+        # development machine.
+        uid_keyed_runtimes = {
+            "7EC20E6E-F277-4A98-A693-EFAD7A8BA74F": {
+                "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+                "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+                "state": "Ready", "sizeBytes": 5000000000,
+            },
+            "8F2D0371-60AE-4D92-B93E-D5EA487B3BA2": {
+                "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
+                "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
+                "state": "Ready", "sizeBytes": 6000000000,
+            },
+        }
+        targets = self._scan(runtimes=uid_keyed_runtimes)
+        rt = [t for t in targets if t["id"] == "simulator-unused-runtimes"]
+        self.assertEqual(len(rt), 1)
+        self.assertIn("iOS-18-6", rt[0]["cmd"])
+        self.assertNotIn("iOS-26-5", rt[0]["cmd"])
+        self.assertEqual(rt[0]["precomputed_bytes"], 6000000000)
+
+    def test_no_stale_devices_no_unused_runtimes_empty(self):
+        # Everything booted or recently booted, and every runtime in use ->
+        # neither target should be synthesized (0 targets, not 2 empty ones).
+        devices = {"devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+                {"udid": "AAA", "name": "iPhone 17 Pro", "state": "Booted",
+                 "lastBootedAt": "2026-08-09T00:00:00Z", "dataPath": "/dev/null"},
+            ],
+        }}
+        runtimes = {"runtimes": [
+            {"identifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+             "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+             "state": "Ready", "sizeBytes": 5000000000},
+        ]}
+        targets = self._scan(devices=devices, runtimes=runtimes)
+        self.assertEqual(targets, [])
+
+    def test_measure_honors_precomputed_bytes(self):
+        t = {"id": "x", "path": None, "glob": None, "cmd": "true",
+             "estimate_cmd": None, "estimate_parser": None,
+             "precomputed_bytes": 42, "empty_only": False}
+        measured = cleaner.measure_targets([t])
+        self.assertEqual(measured[0]["size"], 42)
+
+    def test_collect_targets_merges_simulators_when_enabled(self):
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg["enabled_categories"] = ["simulators"]
+        with mock.patch.object(cleaner, "scan_simulator_targets",
+                                return_value=[{"id": "simulator-stale-devices"}]):
+            targets = cleaner.collect_targets(cfg)
+        self.assertTrue(any(t.get("id") == "simulator-stale-devices" for t in targets))
+
+    def test_collect_targets_skips_simulators_when_disabled(self):
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg["enabled_categories"] = ["node"]
+        with mock.patch.object(cleaner, "scan_simulator_targets",
+                                return_value=[{"id": "simulator-stale-devices"}]):
+            targets = cleaner.collect_targets(cfg)
+        self.assertFalse(any(t.get("id") == "simulator-stale-devices" for t in targets))
+
+
 if __name__ == "__main__":
     unittest.main()
