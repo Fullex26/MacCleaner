@@ -123,6 +123,14 @@ class TestTargets(unittest.TestCase):
         self.assertTrue(targets["trash"]["empty_only"])
         self.assertTrue(targets["general-caches"]["empty_only"])
 
+    def test_codex_session_targets_exist_and_are_review(self):
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        targets = {t["id"]: t for t in cleaner.get_targets(cfg)}
+        for tid in ("codex-sessions", "codex-archived-sessions"):
+            self.assertIn(tid, targets)
+            self.assertFalse(targets[tid]["safe"])
+            self.assertEqual(targets[tid]["category"], "ai")
+
 
 class TestLegacyTranslation(unittest.TestCase):
     def t(self, argv):

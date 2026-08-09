@@ -467,6 +467,11 @@ def get_targets(config, all_categories=False):
         desc="Downloaded LM Studio models — re-download from the app if needed")
     add("ai", "whisper-models", "Whisper models", "~/.cache/whisper", safe=False,
         desc="Downloaded OpenAI Whisper models")
+    add("ai", "codex-sessions", "Codex session transcripts", "~/.codex/sessions", safe=False,
+        desc="OpenAI Codex CLI conversation history — delete only if you don't need past sessions")
+    add("ai", "codex-archived-sessions", "Codex archived sessions", "~/.codex/archived_sessions", safe=False,
+        desc="Codex CLI sessions already archived by the tool — old conversation history")
+
 
     # IDE / editors
     add("ide", "vscode-cache", "VS Code cache", "~/Library/Application Support/Code/Cache",
