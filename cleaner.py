@@ -1167,6 +1167,21 @@ ARTIFACT_MANIFESTS = {
 }
 PROJECT_SCAN_MAX_DEPTH = 5
 
+# ── AI-session and /tmp build artifacts ───────────────────────────────────────
+TMP_SCAN_ROOT = Path(os.environ.get("MACCLEANER_TMP_ROOT", "/private/tmp"))
+# Active AI-session scratch dirs — never offered even when old (Claude Code
+# keeps per-session scratchpads under /private/tmp/claude-<uid>/).
+TMP_ACTIVE_PREFIXES = ("claude-",)
+TMP_CLONE_MANIFESTS = {
+    "package.json", "Cargo.toml", "pyproject.toml", "go.mod", "Gemfile",
+    "pubspec.yaml", "composer.json", "Package.swift", "pom.xml",
+    "build.gradle", "build.gradle.kts", "requirements.txt",
+}
+TMP_CLONE_ARTIFACTS = {
+    "build", "Build", ".build", "DerivedData", "node_modules", "target",
+    "dist", ".next", "Pods", ".venv", "venv",
+}
+
 
 def _git_info(project_dir):
     """Git activity signals for a project dir, or None when unknowable.
@@ -1315,6 +1330,100 @@ def projects_to_targets(hits):
             "size": h["size_bytes"],
             "exists": True,
             "git": git,
+        })
+    return targets
+
+
+def _classify_tmp_dir(p):
+    """Classify a top-level /tmp dir by CONTENT (never by name).
+
+    Returns "derived-data", "repo-clone", or None. Name-based matching was
+    rejected in the v2.5 design: session dirs are named after projects
+    ("underbark-pr74-...") and won't generalize across users."""
+    try:
+        if (p / "Build" / "Intermediates.noindex").is_dir():
+            return "derived-data"
+        logs = p / "Logs" / "Build"
+        if logs.is_dir():
+            try:
+                with os.scandir(logs) as entries:
+                    if any(f.name.endswith(".xcactivitylog") for f in entries):
+                        return "derived-data"
+            except OSError:
+                pass
+        if (p / "info.plist").exists() and (p / "Build").is_dir() and (p / "Index.noindex").is_dir():
+            return "derived-data"
+        if (p / ".git").exists():
+            try:
+                names = {e.name for e in os.scandir(p)}
+            except OSError:
+                return None
+            has_manifest = (names & TMP_CLONE_MANIFESTS) or any(
+                n.endswith(".xcodeproj") for n in names)
+            if has_manifest and (names & TMP_CLONE_ARTIFACTS):
+                return "repo-clone"
+    except OSError:
+        return None
+    return None
+
+
+def scan_tmp_artifacts(config):
+    """Top-level-only scan of TMP_SCAN_ROOT for stale build junk.
+
+    Guards (all mandatory, see the v2.5 design doc): min-age via
+    tmp_min_age_days, symlinks never followed or classified, other-owner
+    dirs skipped, active AI-session prefixes skipped, plain files skipped."""
+    min_age = config.get("tmp_min_age_days", 3)
+    cutoff = time.time() - min_age * 86400
+    hits = []
+    try:
+        entries = list(os.scandir(TMP_SCAN_ROOT))
+    except OSError:
+        return hits
+    uid = os.getuid()
+    for e in entries:
+        try:
+            if not e.is_dir(follow_symlinks=False):
+                continue
+            if any(e.name.startswith(pre) for pre in TMP_ACTIVE_PREFIXES):
+                continue
+            st = e.stat(follow_symlinks=False)
+            if st.st_uid != uid or st.st_mtime > cutoff:
+                continue
+            kind = _classify_tmp_dir(Path(e.path))
+            if kind:
+                hits.append({"path": Path(e.path), "kind": kind, "mtime": st.st_mtime})
+        except OSError:
+            continue
+    hits.sort(key=lambda h: str(h["path"]))
+    return hits
+
+
+def tmp_to_targets(hits):
+    targets, seen = [], set()
+    for h in hits:
+        base = "tmp-" + slugify(h["path"].name)
+        tid, n = base, 2
+        while tid in seen:
+            tid, n = "%s-%d" % (base, n), n + 1
+        seen.add(tid)
+        kind_desc = ("Xcode-style derived build products"
+                     if h["kind"] == "derived-data"
+                     else "Stale repo clone containing build artifacts")
+        targets.append({
+            "id": tid,
+            "category": "tmp",
+            "label": "/tmp: %s" % h["path"].name,
+            "description": "%s; left in /private/tmp by a tool or AI session" % kind_desc,
+            "path": h["path"],
+            "glob": None,
+            "skip": [],
+            "safe": False,
+            "cmd": None,
+            "estimate_cmd": None,
+            "estimate_parser": None,
+            "empty_only": False,
+            "tmp_scan": True,
         })
     return targets
 

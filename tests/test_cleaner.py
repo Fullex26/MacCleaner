@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -2721,6 +2722,91 @@ class TestConfigPathResolution(unittest.TestCase):
         # Beside-script remains the default for a writable non-bundle dir
         # (the ~/mac-cleaner install case) — i.e. today's behavior is kept.
         self.assertEqual(cleaner.CONFIG_PATH.name, "config.json")
+
+
+class TestTmpScanner(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self._patch = mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root)
+        self._patch.start()
+        self.cfg = {"tmp_min_age_days": 3}
+
+    def tearDown(self):
+        self._patch.stop()
+        self.td.cleanup()
+
+    def _age(self, p, days=5):
+        old = time.time() - days * 86400
+        os.utime(p, (old, old))
+
+    def _derived(self, name):
+        d = self.root / name
+        (d / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        self._age(d)
+        return d
+
+    def _repo_clone(self, name):
+        d = self.root / name
+        (d / ".git").mkdir(parents=True)
+        (d / "package.json").write_text("{}")
+        (d / "node_modules").mkdir()
+        self._age(d)
+        return d
+
+    def test_derived_data_layout_classified(self):
+        self._derived("SomethingDerivedData")
+        hits = cleaner.scan_tmp_artifacts(self.cfg)
+        self.assertEqual([h["kind"] for h in hits], ["derived-data"])
+
+    def test_xcactivitylog_layout_classified(self):
+        d = self.root / "build-logs"
+        (d / "Logs" / "Build").mkdir(parents=True)
+        (d / "Logs" / "Build" / "1.xcactivitylog").write_bytes(b"x")
+        self._age(d)
+        self.assertEqual(cleaner._classify_tmp_dir(d), "derived-data")
+
+    def test_repo_clone_classified(self):
+        self._repo_clone("myproj-session-42")
+        hits = cleaner.scan_tmp_artifacts(self.cfg)
+        self.assertEqual([h["kind"] for h in hits], ["repo-clone"])
+
+    def test_plain_dir_not_classified(self):
+        d = self.root / "innocent"; d.mkdir(); self._age(d)
+        self.assertEqual(cleaner.scan_tmp_artifacts(self.cfg), [])
+
+    def test_git_without_build_artifacts_not_classified(self):
+        d = self.root / "clean-checkout"
+        (d / ".git").mkdir(parents=True)
+        (d / "package.json").write_text("{}")
+        self._age(d)
+        self.assertEqual(cleaner.scan_tmp_artifacts(self.cfg), [])
+
+    def test_young_dir_skipped(self):
+        self._derived("fresh")  # then reset mtime to now
+        os.utime(self.root / "fresh", None)
+        self.assertEqual(cleaner.scan_tmp_artifacts(self.cfg), [])
+
+    def test_symlink_skipped(self):
+        real = self._derived("real-dd")
+        (self.root / "sneaky-link").symlink_to(real)
+        hits = cleaner.scan_tmp_artifacts(self.cfg)
+        self.assertEqual([h["path"].name for h in hits], ["real-dd"])
+
+    def test_claude_session_dirs_skipped(self):
+        d = self.root / "claude-501"
+        (d / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        self._age(d)
+        self.assertEqual(cleaner.scan_tmp_artifacts(self.cfg), [])
+
+    def test_targets_are_review_only_with_marker_and_unique_ids(self):
+        self._derived("foo-bar"); self._repo_clone("foo_bar")  # slugify collision
+        targets = cleaner.tmp_to_targets(cleaner.scan_tmp_artifacts(self.cfg))
+        self.assertEqual(len(targets), 2)
+        self.assertTrue(all(t["safe"] is False for t in targets))
+        self.assertTrue(all(t["tmp_scan"] for t in targets))
+        self.assertTrue(all(t["category"] == "tmp" for t in targets))
+        self.assertEqual(len({t["id"] for t in targets}), 2)
 
 
 if __name__ == "__main__":
