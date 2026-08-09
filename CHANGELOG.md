@@ -7,6 +7,28 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.5.0] — 2026-08-09
+
+AI-era cleanup: two new dynamic scanners for the mess coding agents and
+simulators leave behind, plus a bundle-install fix and a category migration
+so existing installs pick up new categories automatically.
+
+### Added
+- `/private/tmp` build-artifact scanner (`tmp` category) — finds stale Xcode-style DerivedData layouts and stale repo clones with build directories directly under `/private/tmp`, gated by a minimum age (`tmp_min_age_days`, default 3 days) and classified by directory *contents*, never by name. Review-only, and the one narrow, regression-tested carve-out to the home-only delete rule (direct children of the tmp root only, marker-gated — never the root itself, never anything nested, symlinks and out-of-home escapes refused)
+- Simulator cleanup (`simulators` category) — stale devices not booted in `simulator_stale_days` (default 30) and runtime images with no devices left, both driven entirely through `xcrun simctl` rather than raw filesystem deletes; every device/runtime identifier from `simctl`'s own JSON is regex-validated before it's allowed anywhere near a shell command
+- `codex-sessions` / `codex-archived-sessions` review targets (`ai` category) for OpenAI Codex CLI conversation history under `~/.codex/`. `.gemini` and `.cursor` were deliberately left out — both are browser-profile-shaped (saved logins, installed extensions), not simple cache/log dirs safe for a generic cleanup pass
+- Category auto-enable migration (`known_categories`) — categories introduced by a new release now show up automatically for existing installs on upgrade, while a fresh install's deliberate category disables still survive a config reload
+
+### Fixed
+- `CONFIG_PATH` is now bundle-aware, with the same Application Support fallback as the other state files — a prerequisite for a future signed/notarized Homebrew cask install
+- App icon now renders deterministically on alert panels; `install.sh` relaunches a running app after installing so users aren't left running a stale binary
+
+### Notes
+- 22 categories total (up from 20); `AGENTS.md` and shell completions updated for both new categories and the dynamic-target semantics of `tmp-*`/`simulator-*` IDs
+- Homebrew tap publishing follows this release, once notarization is live (see `docs/RELEASING.md` §4)
+
+---
+
 ## [2.4.0] — 2026-08-08
 
 The first release since 2.0.0. Versions 2.1–2.3 were developed and merged but
