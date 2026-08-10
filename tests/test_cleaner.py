@@ -366,14 +366,23 @@ class TestCLIIntegration(unittest.TestCase):
         cls.home = cls.tmp / "home"
         (cls.home / ".npm" / "_cacache").mkdir(parents=True)
         (cls.home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
-        cfg = {"enabled_categories": ["node"], "log_threshold_mb": 100}
+        cls.tmproot = cls.tmp / "tmproot"
+        cls.tmproot.mkdir()
+        # known_categories must be stamped, otherwise load_config()'s
+        # migration auto-enables tmp/simulators (not requested here) on top
+        # of "node" -- which would make a plain `scan`/`clean` shell out to
+        # the real /private/tmp and real simctl on this machine (F4).
+        # MACCLEANER_TMP_ROOT is set anyway as defense in depth.
+        cfg = {"enabled_categories": ["node"], "log_threshold_mb": 100,
+               "known_categories": list(cleaner.ALL_CATEGORIES)}
         cls.cfg_path = cls.tmp / "config.json"
         cls.cfg_path.write_text(json.dumps(cfg))
         cls.env = {**os.environ,
                    "HOME": str(cls.home),
                    "MACCLEANER_CONFIG": str(cls.cfg_path),
                    "MACCLEANER_LOG": str(cls.tmp / "report.log"),
-                   "MACCLEANER_SNAPSHOTS": str(cls.tmp / "snapshots.log")}
+                   "MACCLEANER_SNAPSHOTS": str(cls.tmp / "snapshots.log"),
+                   "MACCLEANER_TMP_ROOT": str(cls.tmproot)}
 
     @classmethod
     def tearDownClass(cls):
@@ -459,6 +468,67 @@ class TestCLIIntegration(unittest.TestCase):
         self.assertIn("current", data["disk_history"])
         self.assertIn("snapshots", data["disk_history"])
         self.assertIn("runs", data)  # existing key untouched
+
+
+class TestTmpE2E(unittest.TestCase):
+    """F5: the only end-to-end round trip for the tmp scanner + clean path.
+    Everything else exercising MACCLEANER_TMP_ROOT does so via direct
+    in-process calls to scan_tmp_artifacts()/collect_targets() -- nothing
+    else in the suite drives it through a real subprocess and main()'s
+    dynamic-id selection (`clean --targets <tmp-scanned-id>`), which is the
+    actual path a user or agent hits."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
+        self.derived = self.tmproot / "e2e-derived"
+        (self.derived / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        (self.derived / "Build" / "Intermediates.noindex" / "f").write_bytes(b"x" * 4096)
+        old = time.time() - 5 * 86400
+        os.utime(self.derived, (old, old))
+        cfg = {"enabled_categories": ["tmp"],
+               "known_categories": list(cleaner.ALL_CATEGORIES)}
+        self.cfg_path = self.tmp / "config.json"
+        self.cfg_path.write_text(json.dumps(cfg))
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_scan_then_targeted_clean_round_trip(self):
+        scan = self.run_cli("scan", "--json")
+        self.assertEqual(scan.returncode, 0, scan.stderr)
+        data = json.loads(scan.stdout)
+        tmp_targets = [t for t in data["targets"] if t["id"].startswith("tmp-")]
+        self.assertEqual(len(tmp_targets), 1, "the aged DerivedData fixture must surface exactly once")
+        target_id = tmp_targets[0]["id"]
+        self.assertFalse(tmp_targets[0]["safe"], "tmp targets are review-only")
+
+        # A bare `clean --yes` (no explicit selection) must never sweep a
+        # review-only tmp target -- confirms before we prove the targeted
+        # path actually deletes it.
+        bare = self.run_cli("clean", "--yes", "--json")
+        self.assertEqual(bare.returncode, 0, bare.stderr)
+        self.assertTrue(self.derived.exists(),
+                        "bare clean --yes must not touch review-only tmp targets")
+
+        clean = self.run_cli("clean", "--targets", target_id, "--yes", "--json")
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        clean_data = json.loads(clean.stdout)
+        item = next(i for i in clean_data["items"] if i["id"] == target_id)
+        self.assertEqual(item["status"], "deleted")
+        self.assertFalse(self.derived.exists(), "explicitly-targeted clean must delete it")
 
 
 class TestDoctorSchedule(unittest.TestCase):
@@ -981,14 +1051,20 @@ class TestDryRun(unittest.TestCase):
         self.home = self.tmp / "home"
         (self.home / ".npm" / "_cacache").mkdir(parents=True)
         (self.home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
         cfg_path = self.tmp / "config.json"
-        cfg_path.write_text(json.dumps({"enabled_categories": ["node"]}))
+        # known_categories stamped so the migration can't auto-enable
+        # tmp/simulators here and reach the real filesystem/simctl (F4).
+        cfg_path.write_text(json.dumps({"enabled_categories": ["node"],
+                                        "known_categories": list(cleaner.ALL_CATEGORIES)}))
         self.log_path = self.tmp / "report.log"
         self.snap_path = self.tmp / "snapshots.log"
         self.env = {**os.environ, "HOME": str(self.home),
                     "MACCLEANER_CONFIG": str(cfg_path),
                     "MACCLEANER_LOG": str(self.log_path),
-                    "MACCLEANER_SNAPSHOTS": str(self.snap_path)}
+                    "MACCLEANER_SNAPSHOTS": str(self.snap_path),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot)}
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -1047,12 +1123,18 @@ class TestDryRunSafeOnlyFilter(unittest.TestCase):
         archive = archive_dir / "2026-01-01" / "App.xcarchive"
         archive.mkdir(parents=True)
         (archive / "blob").write_text("y" * 4096)
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
         cfg_path = self.tmp / "config.json"
-        cfg_path.write_text(json.dumps({"enabled_categories": ["xcode"]}))
+        # known_categories stamped so the migration can't auto-enable
+        # tmp/simulators here and reach the real filesystem/simctl (F4).
+        cfg_path.write_text(json.dumps({"enabled_categories": ["xcode"],
+                                        "known_categories": list(cleaner.ALL_CATEGORIES)}))
         self.env = {**os.environ, "HOME": str(self.home),
                     "MACCLEANER_CONFIG": str(cfg_path),
                     "MACCLEANER_LOG": str(self.tmp / "report.log"),
-                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log")}
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot)}
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -1090,12 +1172,18 @@ class TestDryRunExpansion(unittest.TestCase):
         (caches / "child_a" / "f").write_text("x" * 4096)
         (caches / "child_b").mkdir(parents=True)
         (caches / "child_b" / "f").write_text("y" * 4096)
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
         cfg_path = self.tmp / "config.json"
-        cfg_path.write_text(json.dumps({"enabled_categories": ["caches", "docker"]}))
+        # known_categories stamped so the migration can't auto-enable
+        # tmp/simulators here and reach the real filesystem/simctl (F4).
+        cfg_path.write_text(json.dumps({"enabled_categories": ["caches", "docker"],
+                                        "known_categories": list(cleaner.ALL_CATEGORIES)}))
         self.env = {**os.environ, "HOME": str(self.home),
                     "MACCLEANER_CONFIG": str(cfg_path),
                     "MACCLEANER_LOG": str(self.tmp / "report.log"),
-                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log")}
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot)}
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -1196,11 +1284,17 @@ class TestScanSnapshotScope(unittest.TestCase):
         self.home = self.tmp / "home"
         (self.home / ".npm" / "_cacache").mkdir(parents=True)
         (self.home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
         cfg_path = self.tmp / "config.json"
-        cfg_path.write_text(json.dumps({"enabled_categories": ["node"]}))
+        # known_categories stamped so the migration can't auto-enable
+        # tmp/simulators here and reach the real filesystem/simctl (F4).
+        cfg_path.write_text(json.dumps({"enabled_categories": ["node"],
+                                        "known_categories": list(cleaner.ALL_CATEGORIES)}))
         self.snap_path = self.tmp / "snapshots.log"
         self.env = {**os.environ, "HOME": str(self.home),
                     "MACCLEANER_CONFIG": str(cfg_path),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot),
                     "MACCLEANER_LOG": str(self.tmp / "report.log"),
                     "MACCLEANER_SNAPSHOTS": str(self.snap_path)}
 
@@ -1234,6 +1328,57 @@ class TestScanSnapshotScope(unittest.TestCase):
         self.assertEqual(len(snaps), 1)
         self.assertIsNone(snaps[0]["reclaimable_bytes"])
         self.assertIsNone(snaps[0]["categories"])
+
+
+class TestEmptyCategoryFilter(unittest.TestCase):
+    """F2: a category name that's valid but legitimately produces zero
+    targets right now (tmp/simulators are the first categories that can be
+    enabled and empty -- clean /tmp, no Xcode installed) is not an error.
+    AGENTS.md promises exit 0 covers "nothing to clean"; exit 1 stays
+    reserved for a genuinely unknown category name."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
+        cfg = {"enabled_categories": ["tmp"],
+               "known_categories": list(cleaner.ALL_CATEGORIES)}
+        self.cfg_path = self.tmp / "config.json"
+        self.cfg_path.write_text(json.dumps(cfg))
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_scan_empty_category_exits_zero_with_json(self):
+        r = self.run_cli("scan", "--category", "tmp", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["targets"], [])
+        self.assertEqual(data["total_reclaimable_bytes"], 0)
+        self.assertIn("enabled but no targets found", r.stderr)
+
+    def test_clean_empty_category_exits_zero_with_json(self):
+        r = self.run_cli("clean", "--category", "tmp", "--yes", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["items"], [])
+        self.assertEqual(data["freed_bytes"], 0)
+
+    def test_unknown_category_still_exits_1(self):
+        r = self.run_cli("scan", "--category", "warp-drive", "--json")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Unknown categories", r.stderr)
 
 
 class TestStatePathFallback(unittest.TestCase):
@@ -1443,18 +1588,24 @@ class TestCleanNotify(unittest.TestCase):
         self.home = self.tmp / "home"
         (self.home / ".npm" / "_cacache").mkdir(parents=True)
         (self.home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
         self.cfg_path = self.tmp / "config.json"
         self.env = {**os.environ, "HOME": str(self.home),
                     "MACCLEANER_CONFIG": str(self.cfg_path),
                     "MACCLEANER_LOG": str(self.tmp / "report.log"),
                     "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
-                    "MACCLEANER_ALERTS": str(self.tmp / "alerts.json")}
+                    "MACCLEANER_ALERTS": str(self.tmp / "alerts.json"),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot)}
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def write_cfg(self, **extra):
-        cfg = {"enabled_categories": ["node"]}
+        # known_categories stamped so the migration can't auto-enable
+        # tmp/simulators here and reach the real filesystem/simctl (F4).
+        cfg = {"enabled_categories": ["node"],
+               "known_categories": list(cleaner.ALL_CATEGORIES)}
         cfg.update(extra)
         self.cfg_path.write_text(json.dumps(cfg))
 
@@ -2726,10 +2877,72 @@ class TestConfigPathResolution(unittest.TestCase):
         self.assertEqual(
             p, cleaner.HOME / "Library/Application Support/MacCleaner/config.json")
 
-    def test_config_path_module_level_uses_resolver(self):
+
+class TestConfigPathBundleFallback(unittest.TestCase):
+    """F6: CONFIG_PATH has one rule beyond the shared _resolve_state_path
+    logic every other state file (report.log/snapshots.log/alerts.json)
+    uses -- an EXISTING sibling config.json wins even when the script
+    directory isn't writable, so a shared/admin-owned install (e.g.
+    /opt/mac-cleaner, owned by an admin, readable but not writable by this
+    user) keeps reading its shared config instead of silently falling back
+    to a fresh per-user Application Support default. That fallback was a
+    regression vs 2.4 behavior for exactly this case. These run the real
+    CLI as a subprocess against a copy of cleaner.py placed at each of the
+    three script-dir shapes, since CONFIG_PATH is computed once at import
+    time from Path(__file__).parent and can't be poked via mock.patch on
+    an already-running process."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _engine_copy(self, dest_dir):
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        engine = dest_dir / "cleaner.py"
+        shutil.copy(REPO / "cleaner.py", engine)
+        return engine
+
+    def run_config_path(self, engine):
+        env = {**os.environ, "HOME": str(self.home)}
+        env.pop("MACCLEANER_CONFIG", None)
+        return subprocess.run([sys.executable, str(engine), "config", "path"],
+                              capture_output=True, text=True, env=env, timeout=60)
+
+    def test_bundle_resident_engine_routes_to_app_support(self):
+        engine = self._engine_copy(self.tmp / "Fake.app" / "Contents" / "Resources")
+        r = self.run_config_path(engine)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        expected = self.home / "Library/Application Support/MacCleaner/config.json"
+        self.assertEqual(r.stdout.strip(), str(expected))
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                      "root bypasses directory write-permission checks")
+    def test_readonly_dir_with_existing_sibling_config_uses_sibling(self):
+        engine_dir = self.tmp / "opt-install"
+        engine = self._engine_copy(engine_dir)
+        sibling_cfg = engine_dir / "config.json"
+        sibling_cfg.write_text("{}")
+        os.chmod(engine_dir, 0o555)
+        try:
+            r = self.run_config_path(engine)
+        finally:
+            os.chmod(engine_dir, 0o755)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), str(sibling_cfg))
+
+    def test_writable_dir_no_sibling_uses_sibling_path(self):
         # Beside-script remains the default for a writable non-bundle dir
-        # (the ~/mac-cleaner install case) — i.e. today's behavior is kept.
-        self.assertEqual(cleaner.CONFIG_PATH.name, "config.json")
+        # with no pre-existing config (the ~/mac-cleaner fresh-install
+        # case) -- today's behavior is kept.
+        engine_dir = self.tmp / "mac-cleaner"
+        engine = self._engine_copy(engine_dir)
+        r = self.run_config_path(engine)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), str(engine_dir / "config.json"))
 
 
 class TestTmpScanner(unittest.TestCase):
@@ -2807,6 +3020,18 @@ class TestTmpScanner(unittest.TestCase):
         self._age(d)
         self.assertEqual(cleaner.scan_tmp_artifacts(self.cfg), [])
 
+    def test_skip_paths_excludes_matching_dir(self):
+        # AGENTS.md documents skip_paths as "never touch" -- the tmp scanner
+        # must honor it exactly like the static get_targets()/add() path
+        # already does (finding F1). Uses an expanduser-style ~ prefix, same
+        # shape as add()'s skip logic, to exercise the expansion too.
+        skipped = self._derived("skip-me")
+        kept = self._derived("keep-me")
+        cfg = dict(self.cfg, skip_paths=[str(skipped)])
+        hits = cleaner.scan_tmp_artifacts(cfg)
+        self.assertEqual([h["path"].name for h in hits], ["keep-me"])
+        self.assertTrue(kept.exists())
+
     def test_targets_are_review_only_with_marker_and_unique_ids(self):
         self._derived("foo-bar"); self._repo_clone("foo_bar")  # slugify collision
         targets = cleaner.tmp_to_targets(cleaner.scan_tmp_artifacts(self.cfg))
@@ -2814,6 +3039,8 @@ class TestTmpScanner(unittest.TestCase):
         self.assertTrue(all(t["safe"] is False for t in targets))
         self.assertTrue(all(t["tmp_scan"] for t in targets))
         self.assertTrue(all(t["category"] == "tmp" for t in targets))
+        self.assertTrue(all(not t["empty_only"] for t in targets),
+                        "tmp targets delete the whole dir, never empty_only")
         self.assertEqual(len({t["id"] for t in targets}), 2)
 
 
@@ -2892,11 +3119,34 @@ class TestTmpDeletionCarveOut(unittest.TestCase):
         old = time.time() - 5 * 86400
         os.utime(self.root / "dd", (old, old))
         cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
-        targets = cleaner.collect_targets(cfg)
-        self.assertTrue(any(t.get("tmp_scan") for t in targets))
-        cfg["enabled_categories"] = ["node"]
-        targets = cleaner.collect_targets(cfg)
-        self.assertFalse(any(t.get("tmp_scan") for t in targets))
+        # This test is about tmp merging, not simulators -- DEFAULT_CONFIG
+        # enables "simulators" too, and collect_targets() would otherwise
+        # shell out to the real `xcrun simctl` on this machine (F4).
+        with mock.patch.object(cleaner, "scan_simulator_targets", return_value=[]):
+            targets = cleaner.collect_targets(cfg)
+            self.assertTrue(any(t.get("tmp_scan") for t in targets))
+            cfg["enabled_categories"] = ["node"]
+            targets = cleaner.collect_targets(cfg)
+            self.assertFalse(any(t.get("tmp_scan") for t in targets))
+
+    def test_collect_targets_respects_skip_paths(self):
+        # End-to-end version of F1: a skip-listed dir under TMP_SCAN_ROOT
+        # must never surface as a target via the same collect_targets() path
+        # scan/clean actually call, while an unrelated sibling still does.
+        skipped = self.root / "skip-me"
+        (skipped / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        old = time.time() - 5 * 86400
+        os.utime(skipped, (old, old))
+        kept = self.root / "keep-me"
+        (kept / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        os.utime(kept, (old, old))
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg["skip_paths"] = [str(skipped)]
+        with mock.patch.object(cleaner, "scan_simulator_targets", return_value=[]):
+            targets = cleaner.collect_targets(cfg)
+        tmp_ids = {t["id"] for t in targets if t.get("tmp_scan")}
+        self.assertNotIn("tmp-skip-me", tmp_ids)
+        self.assertIn("tmp-keep-me", tmp_ids)
 
     def test_clean_yes_never_touches_tmp_targets(self):
         # safe=False + auto_approve without explicit selection: run_clean
@@ -3075,9 +3325,21 @@ class TestSimulatorTargets(unittest.TestCase):
         self.assertEqual(stale[0]["precomputed_bytes"], 123)
 
     def test_malicious_runtime_identifier_dropped_before_reaching_cmd(self):
+        # "all"/"--outdated"/"--unusable" are real `xcrun simctl runtime
+        # delete` arguments -- "delete all" wipes every runtime image on the
+        # machine. A regex that only checks character class (no required
+        # com.apple.CoreSimulator.SimRuntime. prefix) would let these
+        # letters-and-hyphens-only strings straight through to the shell
+        # cmd (finding F3).
         runtimes = {"runtimes": [
             {"identifier": "bad id $(evil)", "runtimeIdentifier": "bad id $(evil)",
              "state": "Ready", "sizeBytes": 999},
+            {"identifier": "all", "runtimeIdentifier": "all",
+             "state": "Ready", "sizeBytes": 111},
+            {"identifier": "--outdated", "runtimeIdentifier": "--outdated",
+             "state": "Ready", "sizeBytes": 222},
+            {"identifier": "--unusable", "runtimeIdentifier": "--unusable",
+             "state": "Ready", "sizeBytes": 333},
             {"identifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
              "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
              "state": "Ready", "sizeBytes": 6000000000},
@@ -3087,9 +3349,12 @@ class TestSimulatorTargets(unittest.TestCase):
         self.assertEqual(len(rt), 1)
         self.assertNotIn("evil", rt[0]["cmd"])
         self.assertNotIn("bad id", rt[0]["cmd"])
+        self.assertNotIn("delete all", rt[0]["cmd"])
+        self.assertNotIn("--outdated", rt[0]["cmd"])
+        self.assertNotIn("--unusable", rt[0]["cmd"])
         self.assertIn("iOS-18-6", rt[0]["cmd"])
         # size must come from the same filtered (valid-only) list as the
-        # cmd/ids, not sum the rejected runtime's sizeBytes in too.
+        # cmd/ids, not sum the rejected runtimes' sizeBytes in too.
         self.assertEqual(rt[0]["precomputed_bytes"], 6000000000)
 
     def test_no_stale_devices_no_unused_runtimes_empty(self):
@@ -3109,6 +3374,24 @@ class TestSimulatorTargets(unittest.TestCase):
         ]}
         targets = self._scan(devices=devices, runtimes=runtimes)
         self.assertEqual(targets, [])
+
+    def test_no_timestamp_and_nonexistent_datapath_excluded_from_stale(self):
+        # A device with neither lastBootedAt/lastUsedAt nor a stat-able
+        # dataPath (already deleted, or simctl reporting a bogus path) must
+        # fall through the os.stat(dataPath) fallback's OSError and be
+        # silently excluded, not crash and not be treated as "always
+        # stale" (M4).
+        devices = {"devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+                {"udid": "EEEEEEEE-EEEE-EEEE-EEEE-EEEEEEEEEEEE",
+                 "name": "ghost phone", "state": "Shutdown",
+                 "dataPath": "/nonexistent/x"},
+            ],
+        }}
+        targets = self._scan(devices=devices)
+        stale = [t for t in targets if t["id"] == "simulator-stale-devices"]
+        self.assertEqual(stale, [],
+                         "no timestamp + unreadable dataPath must not count as stale")
 
     def test_measure_honors_precomputed_bytes(self):
         t = {"id": "x", "path": None, "glob": None, "cmd": "true",
