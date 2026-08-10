@@ -21,6 +21,16 @@ MacCleaner finds and removes the developer detritus that accumulates silently �
 
 ## Install
 
+### Homebrew (app only — signed & notarized)
+
+```bash
+brew install --cask Fullex26/tap/maccleaner
+```
+
+Use this exact fully-qualified form — it taps and trusts `Fullex26/tap` in one step (the separate `brew tap` + `brew install` two-step fails on tap trust under Homebrew 6). Installs the menu bar app to `/Applications`; the app bundles its own engine, so no separate CLI install is needed. For the CLI shortcuts and shell completions too, use the full install below.
+
+### Full install (CLI + app + completions + scheduling)
+
 ```bash
 git clone https://github.com/Fullex26/MacCleaner && cd MacCleaner && bash install.sh
 ```
