@@ -11,7 +11,7 @@
 typeset -ga _maccleaner_static_categories
 _maccleaner_static_categories=(
   xcode docker node python caches logs homebrew go rust ruby cocoapods
-  gradle maven ai ide browsers system flutter php vms
+  gradle maven ai ide browsers system flutter php vms tmp simulators
 )
 
 # Locate an engine we can interrogate.
@@ -164,6 +164,8 @@ _maccleaner_config_keys() {
     'low_disk_alerts:warn when free space is low'
     'low_disk_threshold_gb:low-disk threshold'
     'full_refresh_hours:app full-scan cadence'
+    'tmp_min_age_days:minimum /tmp artifact age'
+    'simulator_stale_days:minimum unused simulator age'
   )
   _describe -t config-keys 'config key' keys
 }

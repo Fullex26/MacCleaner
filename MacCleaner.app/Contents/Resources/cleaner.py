@@ -53,7 +53,6 @@ except ImportError:
     console = None
 
 HOME = Path.home()
-CONFIG_PATH = Path(os.environ.get("MACCLEANER_CONFIG", Path(__file__).parent / "config.json"))
 
 
 def _is_inside_app_bundle(path: Path) -> bool:
@@ -103,14 +102,59 @@ def _resolve_state_path(env_var: str, filename: str, script_dir: Path = None) ->
     return fallback_dir / filename
 
 
+def _resolve_config_path(script_dir: Path = None) -> Path:
+    """Resolve CONFIG_PATH -- like _resolve_state_path (used for the other
+    three state files), but with one extra rule ahead of it: an EXISTING
+    sibling config.json wins even when the script directory isn't writable.
+    Without this, a shared/admin-owned install (e.g. /opt/mac-cleaner,
+    owned by an admin, readable but not writable by this user) would
+    silently abandon its shared config and read fresh per-user Application
+    Support defaults instead -- a regression vs 2.4 behavior (finding F6).
+
+    Three cases, in order:
+      1. MACCLEANER_CONFIG env override -> always wins (same as every
+         other state file).
+      2. Not inside a .app bundle AND a sibling config.json already exists
+         -> the sibling, even if the directory itself isn't writable
+         (reads still work; a later `config set` write may fail exactly as
+         it did before this fix -- acceptable, and no worse than 2.4).
+      3. Otherwise -> _resolve_state_path's normal bundle-routes-to-App-
+         Support / writable-or-fallback rule (unchanged, same as every
+         other state file)."""
+    override = os.environ.get("MACCLEANER_CONFIG")
+    if override:
+        return Path(override)
+    script_dir = Path(script_dir) if script_dir is not None else Path(__file__).parent
+    if not _is_inside_app_bundle(script_dir):
+        sibling = script_dir / "config.json"
+        if sibling.exists():
+            return sibling
+    return _resolve_state_path("MACCLEANER_CONFIG", "config.json", script_dir=script_dir)
+
+
 LOG_PATH = _resolve_state_path("MACCLEANER_LOG", "report.log")
 SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
+CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
+    "xcode", "docker", "node", "python", "caches", "logs", "homebrew",
+    "go", "rust", "ruby", "cocoapods", "gradle", "maven",
+    "ai", "ide", "browsers", "system",
+    "flutter", "php", "vms",
+    "tmp", "simulators",
+]
+
+# Frozen snapshot of the category list as of v2.4 — the baseline for the
+# known_categories migration below. A config saved before known_categories
+# existed is assumed to know exactly these; anything in ALL_CATEGORIES
+# beyond this list is "new since the user last saved" and gets auto-enabled.
+# Append-only: never edit this list again; future releases only grow
+# ALL_CATEGORIES.
+V24_CATEGORIES = [
     "xcode", "docker", "node", "python", "caches", "logs", "homebrew",
     "go", "rust", "ruby", "cocoapods", "gradle", "maven",
     "ai", "ide", "browsers", "system",
@@ -131,13 +175,15 @@ CATEGORY_DESCRIPTIONS = {
     "cocoapods": "CocoaPods cache",
     "gradle":    "Gradle build caches",
     "maven":     "Maven local repository",
-    "ai":        "Downloaded AI models (Hugging Face, PyTorch, Ollama) — re-downloadable",
+    "ai":        "Downloaded AI models (Hugging Face, PyTorch, Ollama — re-downloadable) and Codex session transcripts (not re-downloadable) — review carefully",
     "ide":       "Editor caches (VS Code, JetBrains)",
     "browsers":  "Browser caches (Arc, Brave, Edge, Firefox)",
     "system":    "Trash and iOS device backups — review carefully",
     "flutter":   "Dart & Flutter pub package cache",
     "php":       "Composer package cache",
     "vms":       "VM disks and container runtimes (Colima, Vagrant, minikube) — review carefully",
+    "tmp":       "Stale build artifacts in /private/tmp left by tools and AI coding sessions — review carefully",
+    "simulators": "Stale iOS simulator devices and unused runtime images (via simctl) — review carefully",
 }
 
 DEFAULT_CONFIG = {
@@ -149,6 +195,8 @@ DEFAULT_CONFIG = {
     "project_roots": ["~/Documents", "~/Developer", "~/Projects", "~/Code", "~/dev"],
     "project_min_age_days": 30,
     "project_git_check": True,
+    "tmp_min_age_days": 3,           # /tmp dirs younger than this are never offered
+    "simulator_stale_days": 30,      # simulators not booted for this long count as stale
     "notifications": True,           # notify when a scheduled clean finishes
     "low_disk_alerts": True,         # warn when free space drops below the threshold
     "low_disk_threshold_gb": 10,     # the low-disk warning threshold
@@ -163,8 +211,24 @@ def load_config():
         # Merge with defaults for any missing keys
         for k, v in DEFAULT_CONFIG.items():
             cfg.setdefault(k, v)
+        # Auto-enable categories added since this config was last saved.
+        # Without this, a category added in a new release never appears for
+        # existing installs (enabled_categories is a saved list, not merged).
+        known = set(cfg.get("known_categories", V24_CATEGORIES))
+        for c in ALL_CATEGORIES:
+            if c not in known and c not in cfg["enabled_categories"]:
+                cfg["enabled_categories"].append(c)
+        cfg["known_categories"] = list(ALL_CATEGORIES)
         return cfg
-    return json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    # Fresh install (no config.json on disk yet): stamp known_categories here.
+    # Do NOT add this to DEFAULT_CONFIG — the setdefault loop above runs
+    # BEFORE the migration block, so a DEFAULT_CONFIG entry would apply
+    # known_categories=ALL_CATEGORIES to old configs and silently disable the
+    # migration for every pre-v2.5 install. Users who disable new categories on
+    # fresh install must have that choice survive a config reload.
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    cfg["known_categories"] = list(ALL_CATEGORIES)
+    return cfg
 
 
 def save_config(cfg):
@@ -433,6 +497,10 @@ def get_targets(config, all_categories=False):
         desc="Downloaded LM Studio models — re-download from the app if needed")
     add("ai", "whisper-models", "Whisper models", "~/.cache/whisper", safe=False,
         desc="Downloaded OpenAI Whisper models")
+    add("ai", "codex-sessions", "Codex session transcripts", "~/.codex/sessions", safe=False,
+        desc="OpenAI Codex CLI conversation history — delete only if you don't need past sessions")
+    add("ai", "codex-archived-sessions", "Codex archived sessions", "~/.codex/archived_sessions", safe=False,
+        desc="Codex CLI sessions already archived by the tool — old conversation history")
 
     # IDE / editors
     add("ide", "vscode-cache", "VS Code cache", "~/Library/Application Support/Code/Cache",
@@ -587,6 +655,20 @@ def get_targets(config, all_categories=False):
     return targets
 
 
+def collect_targets(config, all_categories=False):
+    """Static targets plus dynamic scanner targets (tmp, simulators).
+    scan/clean/dry-run call this; `categories` deliberately keeps calling
+    get_targets() — dynamic per-dir IDs are unstable and the completions'
+    live-ID pipeline must not see them."""
+    targets = get_targets(config, all_categories=all_categories)
+    enabled = set(ALL_CATEGORIES) if all_categories else set(config["enabled_categories"])
+    if "tmp" in enabled:
+        targets += tmp_to_targets(scan_tmp_artifacts(config))
+    if "simulators" in enabled:
+        targets += scan_simulator_targets(config)
+    return targets
+
+
 def _target_paths(t):
     """Concrete filesystem paths for a target (glob patterns expanded).
 
@@ -613,6 +695,9 @@ def measure_targets(targets):
         if existing:
             t["size"] = sum(get_size(p) for p in existing)
             t["exists"] = True
+        elif t.get("precomputed_bytes") is not None:
+            t["size"] = t["precomputed_bytes"]
+            t["exists"] = True
         elif t.get("cmd"):
             t["size"] = _run_estimate(t["estimate_cmd"], t.get("estimate_parser")) if t.get("estimate_cmd") else 0
             t["exists"] = True  # command-based targets are always runnable
@@ -635,6 +720,21 @@ def _safe_to_delete(path: Path) -> bool:
     if str(rp).rstrip("/") in ("", "/", str(home).rstrip("/")):
         return False
     return str(rp).startswith(str(home) + os.sep)
+
+
+def _tmp_scan_path_allowed(path):
+    """The single, narrow carve-out to the home-only rule: a path is
+    deletable outside $HOME only when it is a DIRECT child of the tmp scan
+    root (resolved, so /tmp symlinking to /private/tmp is handled) — and
+    delete_target additionally requires the target to carry the tmp_scan
+    marker that only scan_tmp_artifacts()/tmp_to_targets() set. There is
+    deliberately no config key that widens this."""
+    try:
+        rp = Path(path).resolve()
+        root = TMP_SCAN_ROOT.resolve()
+    except OSError:
+        return False
+    return rp.parent == root and rp != root
 
 
 def _remove(path: Path):
@@ -663,8 +763,11 @@ def delete_target(t, mode="rm"):
     """Delete a target. Returns (bytes_freed, error_message_or_None)."""
     if t.get("cmd"):
         try:
-            # cmd strings are static literals from get_targets() (need `|| true`
-            # and pipes) — never user input, so shell=True is safe here
+            # cmd strings are either static literals from get_targets() (need
+            # `|| true` and pipes) or assembled by scanners (scan_simulator_
+            # targets) exclusively from simctl identifiers that passed
+            # _SIMCTL_UDID_RE/_SIMCTL_RUNTIME_ID_RE — never raw user input,
+            # so shell=True is safe here
             subprocess.run(t["cmd"], shell=True, capture_output=True, timeout=600)
             return 0, None  # Can't easily measure cmd-based targets
         except Exception as e:
@@ -680,8 +783,9 @@ def delete_target(t, mode="rm"):
         if not path.exists() and not path.is_symlink():
             continue
         if not _safe_to_delete(path):
-            errors.append(f"refused (outside home): {path}")
-            continue
+            if not (t.get("tmp_scan") and _tmp_scan_path_allowed(path)):
+                errors.append(f"refused (outside home): {path}")
+                continue
         freed += get_size(path)
         try:
             if t.get("empty_only"):
@@ -1084,7 +1188,10 @@ def run_dry_run(targets, mode="rm", json_mode=False):
                 except (PermissionError, FileNotFoundError, OSError):
                     continue
                 paths.extend(c for c in sorted(children) if _safe_to_delete(c))
-            elif _safe_to_delete(p):
+            # Same carve-out delete_target applies: a tmp_scan-marked target's
+            # direct-child-of-TMP_SCAN_ROOT path previews correctly too, so
+            # dry-run actually resolves what a real clean would delete.
+            elif _safe_to_delete(p) or (t.get("tmp_scan") and _tmp_scan_path_allowed(p)):
                 paths.append(p)
         entries = [{"path": str(p), "size_bytes": get_size(p)} for p in paths]
         size = sum(e["size_bytes"] for e in entries)
@@ -1132,6 +1239,33 @@ ARTIFACT_MANIFESTS = {
     ".ruff_cache":   [],
 }
 PROJECT_SCAN_MAX_DEPTH = 5
+
+# ── AI-session and /tmp build artifacts ───────────────────────────────────────
+TMP_SCAN_ROOT = Path(os.environ.get("MACCLEANER_TMP_ROOT", "/private/tmp"))
+# Active AI-session scratch dirs — never offered even when old (Claude Code
+# keeps per-session scratchpads under /private/tmp/claude-<uid>/).
+TMP_ACTIVE_PREFIXES = ("claude-",)
+TMP_CLONE_MANIFESTS = {
+    "package.json", "Cargo.toml", "pyproject.toml", "go.mod", "Gemfile",
+    "pubspec.yaml", "composer.json", "Package.swift", "pom.xml",
+    "build.gradle", "build.gradle.kts", "requirements.txt",
+}
+TMP_CLONE_ARTIFACTS = {
+    "build", "Build", ".build", "DerivedData", "node_modules", "target",
+    "dist", ".next", "Pods", ".venv", "venv",
+}
+
+# ── Simulator dynamic targets ─────────────────────────────────────────────────
+# Device UDIDs and runtime identifiers from `simctl ... -j` output end up
+# interpolated into shell cmd strings (delete_target runs cmd targets with
+# shell=True) — anything that fails these shapes is dropped rather than ever
+# reaching a shell, so a malformed/hostile simctl response can't inject.
+_SIMCTL_UDID_RE = re.compile(r"[0-9A-Fa-f-]{8,}\Z")
+# Anchored to the real shape genuine identifiers always carry -- a bare
+# character-class check let "all", "--outdated", "--unusable" (all real
+# `xcrun simctl runtime delete` arguments, "all" deletes every runtime image
+# on the machine) through as if they were valid runtime identifiers (F3).
+_SIMCTL_RUNTIME_ID_RE = re.compile(r"com\.apple\.CoreSimulator\.SimRuntime\.[A-Za-z0-9.-]+\Z")
 
 
 def _git_info(project_dir):
@@ -1282,6 +1416,231 @@ def projects_to_targets(hits):
             "exists": True,
             "git": git,
         })
+    return targets
+
+
+def _classify_tmp_dir(p):
+    """Classify a top-level /tmp dir by CONTENT (never by name).
+
+    Returns "derived-data", "repo-clone", or None. Name-based matching was
+    rejected in the v2.5 design: session dirs are named after projects
+    ("underbark-pr74-...") and won't generalize across users."""
+    try:
+        if (p / "Build" / "Intermediates.noindex").is_dir():
+            return "derived-data"
+        logs = p / "Logs" / "Build"
+        if logs.is_dir():
+            try:
+                with os.scandir(logs) as entries:
+                    if any(f.name.endswith(".xcactivitylog") for f in entries):
+                        return "derived-data"
+            except OSError:
+                pass
+        if (p / "info.plist").exists() and (p / "Build").is_dir() and (p / "Index.noindex").is_dir():
+            return "derived-data"
+        if (p / ".git").exists():
+            try:
+                names = {e.name for e in os.scandir(p)}
+            except OSError:
+                return None
+            has_manifest = (names & TMP_CLONE_MANIFESTS) or any(
+                n.endswith(".xcodeproj") for n in names)
+            if has_manifest and (names & TMP_CLONE_ARTIFACTS):
+                return "repo-clone"
+    except OSError:
+        return None
+    return None
+
+
+def scan_tmp_artifacts(config):
+    """Top-level-only scan of TMP_SCAN_ROOT for stale build junk.
+
+    Guards (all mandatory, see the v2.5 design doc): min-age via
+    tmp_min_age_days, symlinks never followed or classified, other-owner
+    dirs skipped, active AI-session prefixes skipped, plain files skipped,
+    skip_paths honored (AGENTS.md documents it as "never touch" -- the
+    static get_targets()/add() path already drops any target under a
+    skip prefix, and this scanner must match that, finding F1)."""
+    min_age = config.get("tmp_min_age_days", 3)
+    cutoff = time.time() - min_age * 86400
+    skip = [Path(os.path.expanduser(p)) for p in config.get("skip_paths", [])]
+    hits = []
+    try:
+        entries = list(os.scandir(TMP_SCAN_ROOT))
+    except OSError:
+        return hits
+    uid = os.getuid()
+    for e in entries:
+        try:
+            if not e.is_dir(follow_symlinks=False):
+                continue
+            if any(e.name.startswith(pre) for pre in TMP_ACTIVE_PREFIXES):
+                continue
+            st = e.stat(follow_symlinks=False)
+            if st.st_uid != uid or st.st_mtime > cutoff:
+                continue
+            resolved = Path(e.path).resolve()
+            if any(resolved == s.resolve() or str(resolved).startswith(str(s.resolve()) + os.sep)
+                   for s in skip):
+                continue
+            kind = _classify_tmp_dir(Path(e.path))
+            if kind:
+                hits.append({"path": Path(e.path), "kind": kind, "mtime": st.st_mtime})
+        except OSError:
+            continue
+    hits.sort(key=lambda h: str(h["path"]))
+    return hits
+
+
+def tmp_to_targets(hits):
+    targets, seen = [], set()
+    for h in hits:
+        base = "tmp-" + slugify(h["path"].name)
+        tid, n = base, 2
+        while tid in seen:
+            tid, n = "%s-%d" % (base, n), n + 1
+        seen.add(tid)
+        kind_desc = ("Xcode-style derived build products"
+                     if h["kind"] == "derived-data"
+                     else "Stale repo clone containing build artifacts")
+        targets.append({
+            "id": tid,
+            "category": "tmp",
+            "label": "/tmp: %s" % h["path"].name,
+            "description": "%s; left in /private/tmp by a tool or AI session" % kind_desc,
+            "path": h["path"],
+            "glob": None,
+            "skip": [],
+            "safe": False,
+            "cmd": None,
+            "estimate_cmd": None,
+            "estimate_parser": None,
+            "empty_only": False,
+            "tmp_scan": True,
+        })
+    return targets
+
+
+def _simctl_json(args):
+    """Run `xcrun simctl <args> -j` and parse JSON; None when simctl is
+    missing (no Xcode), errors, or emits garbage — callers degrade to no
+    targets, matching how a missing docker degrades."""
+    try:
+        out = subprocess.run(["xcrun", "simctl"] + args + ["-j"],
+                             capture_output=True, text=True, timeout=60)
+        if out.returncode != 0:
+            return None
+        return json.loads(out.stdout)
+    except Exception:
+        return None
+
+
+def _parse_simctl_date(s):
+    # "2026-08-09T00:00:00Z" or with offset; simctl emits ISO8601
+    try:
+        return datetime.datetime.strptime(
+            s.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def scan_simulator_targets(config):
+    """Dynamic review-only targets for stale simulator devices and unused
+    runtime images. Deletion goes through simctl (raw rm corrupts its
+    registry) — so these are cmd targets whose commands are assembled from
+    simctl's own enumeration. simctl handles the system-domain runtime
+    cryptexes in /Library/Developer that the engine could never touch.
+
+    Device timestamp field: older Xcode/simctl emits "lastBootedAt"; newer
+    versions renamed it "lastUsedAt" (observed on Xcode's current simctl) —
+    both are checked, falling back to the device's dataPath mtime when
+    neither is present.
+
+    Every udid/identifier that ends up in a cmd string is validated against
+    _SIMCTL_UDID_RE/_SIMCTL_RUNTIME_ID_RE first and silently dropped (not
+    included in the target at all) if it doesn't match — simctl's own JSON
+    is untrusted input from delete_target's shell=True point of view."""
+    targets = []
+    data = _simctl_json(["list", "devices"])
+    if not data:
+        return targets
+    stale_days = config.get("simulator_stale_days", 30)
+    cutoff = time.time() - stale_days * 86400
+    stale, stale_bytes, used_runtimes = [], 0, set()
+    for runtime_id, devs in data.get("devices", {}).items():
+        for d in devs:
+            udid = d.get("udid")
+            if not udid or not _SIMCTL_UDID_RE.fullmatch(udid):
+                continue
+            used_runtimes.add(runtime_id)
+            if d.get("state") == "Booted":
+                continue
+            ts = _parse_simctl_date(d.get("lastBootedAt") or d.get("lastUsedAt"))
+            if ts is None:
+                try:
+                    ts = os.stat(d.get("dataPath", "")).st_mtime
+                except OSError:
+                    continue
+            if ts < cutoff:
+                stale.append(d)
+                dp = d.get("dataPath")
+                if dp:
+                    try:
+                        stale_bytes += get_size(Path(dp))
+                    except OSError:
+                        pass
+    if stale:
+        udids = " ".join(d["udid"] for d in stale)
+        names = ", ".join(d.get("name", "?") for d in stale[:4])
+        more = "" if len(stale) <= 4 else " +%d more" % (len(stale) - 4)
+        targets.append({
+            "id": "simulator-stale-devices", "category": "simulators",
+            "label": "Stale simulator devices (%d)" % len(stale),
+            "description": "Not booted in %dd: %s%s — deleted via simctl"
+                           % (stale_days, names, more),
+            "path": None, "glob": None, "skip": [], "safe": False,
+            "cmd": "xcrun simctl delete %s 2>/dev/null || true" % udids,
+            "estimate_cmd": None, "estimate_parser": None,
+            "empty_only": False, "precomputed_bytes": stale_bytes,
+        })
+    rt = _simctl_json(["runtime", "list"])
+    if rt:
+        # simctl has shipped at least three runtime-list shapes across
+        # versions: {"runtimes": [...]}, a bare top-level [...], and (the
+        # shape observed from current Xcode) a bare dict keyed by runtime
+        # UUID with no "runtimes" wrapper at all — {uuid: {...}, ...}.
+        if isinstance(rt, list):
+            runtimes = rt
+        elif isinstance(rt, dict) and "runtimes" in rt:
+            runtimes = rt["runtimes"]
+            if isinstance(runtimes, dict):
+                runtimes = list(runtimes.values())
+        elif isinstance(rt, dict):
+            runtimes = list(rt.values())
+        else:
+            runtimes = []
+        unused = [r for r in runtimes
+                  if isinstance(r, dict)
+                  and r.get("runtimeIdentifier", r.get("identifier")) not in used_runtimes
+                  and r.get("state") == "Ready"
+                  and r.get("identifier")
+                  and _SIMCTL_RUNTIME_ID_RE.fullmatch(r["identifier"])]
+        if unused:
+            ids = [r["identifier"] for r in unused]
+            size = sum(int(r.get("sizeBytes") or 0) for r in unused)
+            targets.append({
+                "id": "simulator-unused-runtimes", "category": "simulators",
+                "label": "Unused simulator runtimes (%d)" % len(ids),
+                "description": "Runtime images with no simulator devices — re-downloadable in Xcode",
+                "path": None, "glob": None, "skip": [], "safe": False,
+                # "; "-joined with per-command suppression (not "&&") so one
+                # failing delete doesn't short-circuit and skip every later
+                # identifier; trailing "; true" keeps the overall exit 0.
+                "cmd": "; ".join("xcrun simctl runtime delete %s 2>/dev/null" % i
+                                 for i in ids) + "; true",
+                "estimate_cmd": None, "estimate_parser": None,
+                "empty_only": False, "precomputed_bytes": size,
+            })
     return targets
 
 
@@ -2358,7 +2717,7 @@ def main():
         return
 
     # scan / clean share target selection
-    targets = get_targets(config)
+    targets = collect_targets(config)
     categories = parse_categories(getattr(args, "category", None))
     if categories:
         valid = set(ALL_CATEGORIES)
@@ -2368,8 +2727,22 @@ def main():
             sys.exit(1)
         targets = [t for t in targets if t["category"] in categories]
         if not targets:
-            print(f"No targets for {', '.join(categories)} (category may be disabled — see 'maccleaner categories')", file=sys.stderr)
-            sys.exit(1)
+            # A valid category with zero targets right now is not an error
+            # (AGENTS.md: exit 0 covers "nothing to clean") -- tmp/simulators
+            # are the first categories that can be enabled and legitimately
+            # empty (clean /tmp, no Xcode installed). Only an unknown
+            # category name (handled above) is a usage error. Proceed with
+            # the empty list so scan/clean still emit well-formed JSON with
+            # zero targets / total 0, and note why on stderr.
+            enabled = set(config["enabled_categories"])
+            disabled = sorted(c for c in categories if c not in enabled)
+            if disabled:
+                print(f"No targets for {', '.join(categories)} "
+                      f"({', '.join(disabled)} disabled — see 'maccleaner categories')",
+                      file=sys.stderr)
+            else:
+                print(f"{', '.join(categories)} enabled but no targets found "
+                      f"on this machine right now", file=sys.stderr)
 
     if args.command == "scan":
         if args.min_size is not None:

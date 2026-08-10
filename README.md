@@ -9,11 +9,12 @@
 
 MacCleaner finds and removes the developer detritus that accumulates silently — Xcode DerivedData, Docker layers, package manager caches, downloaded AI models, stale `node_modules` in projects you abandoned months ago. A single command can reclaim tens of gigabytes.
 
-- **CLI** — `scan`, `clean`, `projects`, `report`, `doctor`, `config`. 70+ cleanup targets across 20 categories. Interactive checklist or fully unattended.
+- **CLI** — `scan`, `clean`, `projects`, `report`, `doctor`, `config`. 80+ cleanup targets across 22 categories. Interactive checklist or fully unattended.
 - **macOS app** — SwiftUI menu bar app (macOS 13+) with a dashboard: see everything, tick what goes, clean in-app.
 - **Agent-ready** — every command speaks `--json`, every target has a stable ID, exit codes are documented. Point your AI agent at [AGENTS.md](AGENTS.md) and it can operate the whole tool.
 - **Safe by design** — deletes only inside your home directory, never follows symlinks, and can move things to the Trash instead of deleting.
 - **Know before you act** — `--dry-run` previews the exact paths and sizes a clean would touch with zero side effects, `report` tracks disk-space trends over time, and `projects` automatically skips repos with uncommitted or unpushed work.
+- **AI-era cleanup** — finds stale build/clone litter that AI coding sessions leave under `/private/tmp` (classified by contents, never by name, and always review-only), plus unused iOS simulator devices and runtime images via `simctl`.
 - **Stay in the loop** — a notification when a scheduled clean finishes, a low-disk warning if free space drops below a configurable threshold (10 GB by default), and a menu bar that shows free space and "last cleaned" without opening the app.
 
 ---
@@ -97,7 +98,7 @@ python3 ~/mac-cleaner/cleaner.py clean --targets npm-cache,pip-cache,xcode-deriv
 
 ## What It Cleans
 
-20 categories, 70+ targets. Enable or disable any category via `maccleaner config enable|disable <category>`; run `maccleaner categories` to list every target and its ID.
+22 categories, 80+ targets. Enable or disable any category via `maccleaner config enable|disable <category>`; run `maccleaner categories` to list every target and its ID.
 
 | Category | What's in it |
 |----------|--------------|
@@ -114,13 +115,15 @@ python3 ~/mac-cleaner/cleaner.py clean --targets npm-cache,pip-cache,xcode-deriv
 | **cocoapods** | CocoaPods cache |
 | **gradle** | Gradle build caches |
 | **maven** | Maven local repository |
-| **ai** | Downloaded models — Hugging Face hub, PyTorch hub, Ollama (re-downloadable) |
+| **ai** | Downloaded models — Hugging Face hub, PyTorch hub, Ollama, LM Studio, Whisper (re-downloadable) — plus Codex CLI session transcripts (conversation history, *not* re-downloadable) |
 | **ide** | VS Code and JetBrains caches |
 | **browsers** | Arc, Brave, Edge, Firefox caches |
 | **system** | Empty Trash, iOS device backups — review carefully |
 | **flutter** | Dart & Flutter pub package cache |
 | **php** | Composer package cache |
 | **vms** | VM disks and container runtimes — Colima, Vagrant, minikube (review carefully) |
+| **tmp** | Stale build/clone artifacts left in `/private/tmp` by tools and AI coding sessions, classified by contents not name — review carefully |
+| **simulators** | Stale iOS simulator devices and unused runtime images, via `simctl` — review carefully |
 
 ---
 
@@ -146,6 +149,8 @@ python3 ~/mac-cleaner/cleaner.py clean --targets npm-cache,pip-cache,xcode-deriv
   "delete_mode": "rm",
   "project_roots": ["~/Documents", "~/Developer", "~/Projects", "~/Code", "~/dev"],
   "project_min_age_days": 30,
+  "tmp_min_age_days": 3,
+  "simulator_stale_days": 30,
   "notifications": true,
   "low_disk_alerts": true,
   "low_disk_threshold_gb": 10
