@@ -188,7 +188,12 @@ if [ -d "$APP_BUNDLE" ]; then
     elif cp -R "$APP_BUNDLE" "/Applications/MacCleaner.app" 2>/dev/null; then
         INSTALLED_DEST="/Applications/MacCleaner.app"
     fi
-    echo "→ Installed MacCleaner.app to ~/Applications/"
+    if [ -n "$INSTALLED_DEST" ]; then
+        echo "→ Installed MacCleaner.app to $INSTALLED_DEST"
+    else
+        echo "→ Could not install MacCleaner.app (no write access to ~/Applications or /Applications)"
+        echo "  Try 'bash app/build.sh --install' after fixing permissions"
+    fi
     if [ -n "$INSTALLED_DEST" ] && pgrep -xq MacCleaner; then
         killall MacCleaner 2>/dev/null || true
         sleep 1

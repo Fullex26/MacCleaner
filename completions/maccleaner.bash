@@ -268,7 +268,7 @@ categories schedule disk-check install-deps --help --version" -- "$cur") )
                             COMPREPLY=( $(compgen -W "enabled_categories skip_paths \
 log_threshold_mb auto_approve delete_mode project_roots project_min_age_days \
 project_git_check notifications low_disk_alerts low_disk_threshold_gb \
-full_refresh_hours" -- "$cur") )
+full_refresh_hours tmp_min_age_days simulator_stale_days" -- "$cur") )
                         else
                             COMPREPLY=()
                         fi ;;

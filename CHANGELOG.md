@@ -20,8 +20,11 @@ so existing installs pick up new categories automatically.
 - Category auto-enable migration (`known_categories`) — categories introduced by a new release now show up automatically for existing installs on upgrade, while a fresh install's deliberate category disables still survive a config reload
 
 ### Fixed
-- `CONFIG_PATH` is now bundle-aware, with the same Application Support fallback as the other state files — a prerequisite for a future signed/notarized Homebrew cask install
+- `CONFIG_PATH` is now bundle-aware, with the same Application Support fallback as the other state files — a prerequisite for a future signed/notarized Homebrew cask install; an existing sibling `config.json` beside a non-writable script directory (e.g. a shared/admin-owned `/opt/mac-cleaner` install) is now still read instead of being silently abandoned for a fresh per-user default
 - App icon now renders deterministically on alert panels; `install.sh` relaunches a running app after installing so users aren't left running a stale binary
+- The `tmp` scanner now honors `skip_paths`, matching every other cleanup target
+- `scan --category`/`clean --category` with a valid category that's simply empty right now (the `tmp`/`simulators` scanners often are) exits 0 with well-formed JSON instead of exit 1 — exit 1 stays reserved for an unknown category name
+- Tightened the simulator-runtime-identifier validation regex to require the real `com.apple.CoreSimulator.SimRuntime.` prefix, closing a gap where `simctl`-shaped strings like `all`/`--outdated`/`--unusable` could otherwise reach the delete command
 
 ### Notes
 - 22 categories total (up from 20); `AGENTS.md` and shell completions updated for both new categories and the dynamic-target semantics of `tmp-*`/`simulator-*` IDs
