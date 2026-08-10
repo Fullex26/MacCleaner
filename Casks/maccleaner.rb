@@ -1,9 +1,6 @@
 cask "maccleaner" do
-  version "2.4.0"
-  # Placeholder — replaced at release time from the published asset.
-  # See docs/RELEASING.md. A wrong sha256 makes `brew install` fail loudly,
-  # which is the desired failure mode for an unpublished cask.
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  version "2.5.0"
+  sha256 "ae7c57f9c1512b35ce110177bda28ef7e3fef470718360bb983c2a23b6e2c232"
 
   url "https://github.com/Fullex26/MacCleaner/releases/download/v#{version}/MacCleaner-v#{version}-macos-universal.zip",
       verified: "github.com/Fullex26/MacCleaner/"
