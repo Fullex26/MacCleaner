@@ -102,10 +102,40 @@ def _resolve_state_path(env_var: str, filename: str, script_dir: Path = None) ->
     return fallback_dir / filename
 
 
+def _resolve_config_path(script_dir: Path = None) -> Path:
+    """Resolve CONFIG_PATH -- like _resolve_state_path (used for the other
+    three state files), but with one extra rule ahead of it: an EXISTING
+    sibling config.json wins even when the script directory isn't writable.
+    Without this, a shared/admin-owned install (e.g. /opt/mac-cleaner,
+    owned by an admin, readable but not writable by this user) would
+    silently abandon its shared config and read fresh per-user Application
+    Support defaults instead -- a regression vs 2.4 behavior (finding F6).
+
+    Three cases, in order:
+      1. MACCLEANER_CONFIG env override -> always wins (same as every
+         other state file).
+      2. Not inside a .app bundle AND a sibling config.json already exists
+         -> the sibling, even if the directory itself isn't writable
+         (reads still work; a later `config set` write may fail exactly as
+         it did before this fix -- acceptable, and no worse than 2.4).
+      3. Otherwise -> _resolve_state_path's normal bundle-routes-to-App-
+         Support / writable-or-fallback rule (unchanged, same as every
+         other state file)."""
+    override = os.environ.get("MACCLEANER_CONFIG")
+    if override:
+        return Path(override)
+    script_dir = Path(script_dir) if script_dir is not None else Path(__file__).parent
+    if not _is_inside_app_bundle(script_dir):
+        sibling = script_dir / "config.json"
+        if sibling.exists():
+            return sibling
+    return _resolve_state_path("MACCLEANER_CONFIG", "config.json", script_dir=script_dir)
+
+
 LOG_PATH = _resolve_state_path("MACCLEANER_LOG", "report.log")
 SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
-CONFIG_PATH = _resolve_state_path("MACCLEANER_CONFIG", "config.json")
+CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
 VERSION = "2.5.0"
 
@@ -145,7 +175,7 @@ CATEGORY_DESCRIPTIONS = {
     "cocoapods": "CocoaPods cache",
     "gradle":    "Gradle build caches",
     "maven":     "Maven local repository",
-    "ai":        "Downloaded AI models (Hugging Face, PyTorch, Ollama) — re-downloadable",
+    "ai":        "Downloaded AI models (Hugging Face, PyTorch, Ollama — re-downloadable) and Codex session transcripts (not re-downloadable) — review carefully",
     "ide":       "Editor caches (VS Code, JetBrains)",
     "browsers":  "Browser caches (Arc, Brave, Edge, Firefox)",
     "system":    "Trash and iOS device backups — review carefully",
@@ -471,7 +501,6 @@ def get_targets(config, all_categories=False):
         desc="OpenAI Codex CLI conversation history — delete only if you don't need past sessions")
     add("ai", "codex-archived-sessions", "Codex archived sessions", "~/.codex/archived_sessions", safe=False,
         desc="Codex CLI sessions already archived by the tool — old conversation history")
-
 
     # IDE / editors
     add("ide", "vscode-cache", "VS Code cache", "~/Library/Application Support/Code/Cache",
@@ -1232,7 +1261,11 @@ TMP_CLONE_ARTIFACTS = {
 # shell=True) — anything that fails these shapes is dropped rather than ever
 # reaching a shell, so a malformed/hostile simctl response can't inject.
 _SIMCTL_UDID_RE = re.compile(r"[0-9A-Fa-f-]{8,}\Z")
-_SIMCTL_RUNTIME_ID_RE = re.compile(r"[A-Za-z0-9.-]+\Z")
+# Anchored to the real shape genuine identifiers always carry -- a bare
+# character-class check let "all", "--outdated", "--unusable" (all real
+# `xcrun simctl runtime delete` arguments, "all" deletes every runtime image
+# on the machine) through as if they were valid runtime identifiers (F3).
+_SIMCTL_RUNTIME_ID_RE = re.compile(r"com\.apple\.CoreSimulator\.SimRuntime\.[A-Za-z0-9.-]+\Z")
 
 
 def _git_info(project_dir):
@@ -1424,9 +1457,13 @@ def scan_tmp_artifacts(config):
 
     Guards (all mandatory, see the v2.5 design doc): min-age via
     tmp_min_age_days, symlinks never followed or classified, other-owner
-    dirs skipped, active AI-session prefixes skipped, plain files skipped."""
+    dirs skipped, active AI-session prefixes skipped, plain files skipped,
+    skip_paths honored (AGENTS.md documents it as "never touch" -- the
+    static get_targets()/add() path already drops any target under a
+    skip prefix, and this scanner must match that, finding F1)."""
     min_age = config.get("tmp_min_age_days", 3)
     cutoff = time.time() - min_age * 86400
+    skip = [Path(os.path.expanduser(p)) for p in config.get("skip_paths", [])]
     hits = []
     try:
         entries = list(os.scandir(TMP_SCAN_ROOT))
@@ -1441,6 +1478,10 @@ def scan_tmp_artifacts(config):
                 continue
             st = e.stat(follow_symlinks=False)
             if st.st_uid != uid or st.st_mtime > cutoff:
+                continue
+            resolved = Path(e.path).resolve()
+            if any(resolved == s.resolve() or str(resolved).startswith(str(s.resolve()) + os.sep)
+                   for s in skip):
                 continue
             kind = _classify_tmp_dir(Path(e.path))
             if kind:
@@ -2686,8 +2727,22 @@ def main():
             sys.exit(1)
         targets = [t for t in targets if t["category"] in categories]
         if not targets:
-            print(f"No targets for {', '.join(categories)} (category may be disabled — see 'maccleaner categories')", file=sys.stderr)
-            sys.exit(1)
+            # A valid category with zero targets right now is not an error
+            # (AGENTS.md: exit 0 covers "nothing to clean") -- tmp/simulators
+            # are the first categories that can be enabled and legitimately
+            # empty (clean /tmp, no Xcode installed). Only an unknown
+            # category name (handled above) is a usage error. Proceed with
+            # the empty list so scan/clean still emit well-formed JSON with
+            # zero targets / total 0, and note why on stderr.
+            enabled = set(config["enabled_categories"])
+            disabled = sorted(c for c in categories if c not in enabled)
+            if disabled:
+                print(f"No targets for {', '.join(categories)} "
+                      f"({', '.join(disabled)} disabled — see 'maccleaner categories')",
+                      file=sys.stderr)
+            else:
+                print(f"{', '.join(categories)} enabled but no targets found "
+                      f"on this machine right now", file=sys.stderr)
 
     if args.command == "scan":
         if args.min_size is not None:
