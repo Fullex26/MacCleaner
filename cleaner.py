@@ -655,16 +655,34 @@ def get_targets(config, all_categories=False):
     return targets
 
 
-def collect_targets(config, all_categories=False):
+def collect_targets(config, all_categories=False, categories=None, target_ids=None):
     """Static targets plus dynamic scanner targets (tmp, simulators).
     scan/clean/dry-run call this; `categories` deliberately keeps calling
     get_targets() — dynamic per-dir IDs are unstable and the completions'
-    live-ID pipeline must not see them."""
+    live-ID pipeline must not see them.
+
+    categories/target_ids are optional SELECTION HINTS from the CLI
+    invocation (--category / --targets): when a hint proves a scanner's
+    output can't be selected, the scanner is skipped — a targeted
+    `clean --targets npm-cache` shouldn't pay two simctl calls and a /tmp
+    walk (popover one-click clean latency, v2.6). Hints never widen
+    anything: enabled_categories still gates as before, and hints=None
+    behaves exactly like pre-2.6."""
     targets = get_targets(config, all_categories=all_categories)
     enabled = set(ALL_CATEGORIES) if all_categories else set(config["enabled_categories"])
-    if "tmp" in enabled:
+
+    def _wanted(cat, prefix):
+        if cat not in enabled:
+            return False
+        if categories is not None and cat not in set(categories):
+            return False
+        if target_ids is not None and not any(str(t).startswith(prefix) for t in target_ids):
+            return False
+        return True
+
+    if _wanted("tmp", "tmp-"):
         targets += tmp_to_targets(scan_tmp_artifacts(config))
-    if "simulators" in enabled:
+    if _wanted("simulators", "simulator-"):
         targets += scan_simulator_targets(config)
     return targets
 
@@ -2717,8 +2735,18 @@ def main():
         return
 
     # scan / clean share target selection
-    targets = collect_targets(config)
     categories = parse_categories(getattr(args, "category", None))
+    target_ids = None
+    if args.command == "clean":
+        raw_targets = getattr(args, "targets", None)
+        if raw_targets:
+            target_ids = {t.strip() for t in raw_targets.split(",") if t.strip()}
+    # categories/target_ids are selection hints only (v2.6 scanner scoping):
+    # they let collect_targets skip a dynamic scanner it can prove won't be
+    # selected, but never widen what enabled_categories already gates.
+    targets = collect_targets(config,
+                               categories=set(categories) if categories else None,
+                               target_ids=target_ids)
     if categories:
         valid = set(ALL_CATEGORIES)
         unknown = [c for c in categories if c not in valid]
@@ -2760,10 +2788,9 @@ def main():
 
     if args.command == "clean":
         explicit = False
-        if args.targets:
-            wanted = {t.strip() for t in args.targets.split(",") if t.strip()}
-            targets = [t for t in targets if t["id"] in wanted]
-            missing = wanted - {t["id"] for t in targets}
+        if target_ids:
+            targets = [t for t in targets if t["id"] in target_ids]
+            missing = target_ids - {t["id"] for t in targets}
             if missing:
                 print(f"Unknown target IDs: {', '.join(sorted(missing))}. Run 'maccleaner scan --json' to list IDs.",
                       file=sys.stderr)

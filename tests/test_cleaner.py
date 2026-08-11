@@ -3417,5 +3417,114 @@ class TestSimulatorTargets(unittest.TestCase):
         self.assertFalse(any(t.get("id") == "simulator-stale-devices" for t in targets))
 
 
+class TestScannerScoping(unittest.TestCase):
+    """collect_targets() takes optional categories/target_ids SELECTION HINTS
+    (v2.6): when a hint proves a dynamic scanner's output can't be selected,
+    the scanner is skipped entirely -- a targeted `clean --targets npm-cache`
+    shouldn't pay two simctl calls and a /tmp walk (popover one-click clean
+    latency). Hints never widen anything: enabled_categories still gates as
+    before, and hints=None must behave exactly like pre-2.6."""
+
+    def setUp(self):
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        # known_categories stamped so the F4 auto-enable migration can't
+        # surprise these assertions with a different enabled set.
+        self.cfg["known_categories"] = list(cleaner.ALL_CATEGORIES)
+
+    def _patched(self):
+        tmp = mock.patch.object(cleaner, "scan_tmp_artifacts", return_value=[])
+        sim = mock.patch.object(cleaner, "scan_simulator_targets", return_value=[])
+        return tmp, sim
+
+    def test_unscoped_runs_both(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg)
+        mtmp.assert_called_once()
+        msim.assert_called_once()
+
+    def test_category_scope_excluding_skips_both(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, categories={"node"})
+        mtmp.assert_not_called()
+        msim.assert_not_called()
+
+    def test_category_scope_including_tmp_runs_only_tmp(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, categories={"tmp", "node"})
+        mtmp.assert_called_once()
+        msim.assert_not_called()
+
+    def test_target_ids_scope_simulator_only(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, target_ids={"simulator-stale-devices"})
+        mtmp.assert_not_called()
+        msim.assert_called_once()
+
+    def test_target_ids_npm_only_runs_neither(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, target_ids={"npm-cache"})
+        mtmp.assert_not_called()
+        msim.assert_not_called()
+
+    def test_disabled_category_still_never_runs(self):
+        # Hints only ever narrow -- a category hint that includes "tmp"
+        # can't resurrect a category the config has disabled.
+        self.cfg["enabled_categories"] = ["node"]
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, categories={"tmp"})
+        mtmp.assert_not_called()
+
+    def test_cli_targets_scope_skips_simctl(self):
+        """clean --targets npm-cache must not invoke xcrun: PATH gets a fake
+        xcrun that logs invocations to a file, following the same PATH-stub
+        idiom TestCleanNotify.run_cli uses for osascript (tests/test_cleaner.py
+        ~L1612) -- the log must stay empty."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            home = tmp_dir / "home"
+            (home / ".npm" / "_cacache").mkdir(parents=True)
+            (home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+            tmproot = tmp_dir / "tmproot"
+            tmproot.mkdir()
+            cfg_path = tmp_dir / "config.json"
+            # known_categories stamped + MACCLEANER_TMP_ROOT set so this
+            # never reaches the real /private/tmp or a real simctl (F4).
+            cfg = {"enabled_categories": list(cleaner.ALL_CATEGORIES),
+                   "known_categories": list(cleaner.ALL_CATEGORIES)}
+            cfg_path.write_text(json.dumps(cfg))
+
+            bindir = tmp_dir / "bin"
+            bindir.mkdir()
+            recorded = tmp_dir / "xcrun_calls.txt"
+            stub = bindir / "xcrun"
+            stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$RECORD_FILE"\necho "{}"\n')
+            stub.chmod(0o755)
+
+            env = {**os.environ, "HOME": str(home),
+                   "MACCLEANER_CONFIG": str(cfg_path),
+                   "MACCLEANER_LOG": str(tmp_dir / "report.log"),
+                   "MACCLEANER_SNAPSHOTS": str(tmp_dir / "snapshots.log"),
+                   "MACCLEANER_ALERTS": str(tmp_dir / "alerts.json"),
+                   "MACCLEANER_TMP_ROOT": str(tmproot)}
+            env["PATH"] = f"{bindir}:{env['PATH']}"
+            env["RECORD_FILE"] = str(recorded)
+
+            r = subprocess.run(
+                [sys.executable, str(REPO / "cleaner.py"),
+                 "clean", "--targets", "npm-cache", "--dry-run", "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse(recorded.exists(),
+                             "clean --targets npm-cache must never invoke xcrun")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
