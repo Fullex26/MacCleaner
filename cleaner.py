@@ -2737,13 +2737,24 @@ def main():
     # scan / clean share target selection
     categories = parse_categories(getattr(args, "category", None))
     target_ids = None
+    # targets_given tracks whether --targets was supplied at all (RAW string
+    # truthiness), independent of whether it parsed to anything: a garbage
+    # value like " , " parses to an empty target_ids set, but the downstream
+    # filter/explicit gate must still key off "was --targets supplied",
+    # exactly like the pre-2.6 `if args.targets:` check did -- otherwise an
+    # empty parsed set reads as "no --targets given", the filter is skipped,
+    # and --yes performs a full safe auto-clean instead of a no-op.
+    targets_given = False
     if args.command == "clean":
         raw_targets = getattr(args, "targets", None)
         if raw_targets:
+            targets_given = True
             target_ids = {t.strip() for t in raw_targets.split(",") if t.strip()}
     # categories/target_ids are selection hints only (v2.6 scanner scoping):
     # they let collect_targets skip a dynamic scanner it can prove won't be
-    # selected, but never widen what enabled_categories already gates.
+    # selected, but never widen what enabled_categories already gates. An
+    # empty-but-supplied target_ids correctly scopes scanners OUT here (the
+    # any() check in collect_targets is False for an empty set).
     targets = collect_targets(config,
                                categories=set(categories) if categories else None,
                                target_ids=target_ids)
@@ -2788,7 +2799,7 @@ def main():
 
     if args.command == "clean":
         explicit = False
-        if target_ids:
+        if targets_given:
             targets = [t for t in targets if t["id"] in target_ids]
             missing = target_ids - {t["id"] for t in targets}
             if missing:

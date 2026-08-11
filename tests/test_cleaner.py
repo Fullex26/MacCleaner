@@ -3480,6 +3480,28 @@ class TestScannerScoping(unittest.TestCase):
             cleaner.collect_targets(self.cfg, categories={"tmp"})
         mtmp.assert_not_called()
 
+    def _sandbox(self, tmp_dir):
+        """Shared F4 sandbox setup: a fake $HOME with a real npm-cache
+        target, an empty tmp scan root, and a config with every category
+        enabled + known_categories stamped (so the migration can't surprise
+        the enabled set and this never reaches the real /private/tmp or a
+        real simctl). Returns the env dict for subprocess.run."""
+        home = tmp_dir / "home"
+        (home / ".npm" / "_cacache").mkdir(parents=True)
+        (home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        tmproot = tmp_dir / "tmproot"
+        tmproot.mkdir()
+        cfg_path = tmp_dir / "config.json"
+        cfg = {"enabled_categories": list(cleaner.ALL_CATEGORIES),
+               "known_categories": list(cleaner.ALL_CATEGORIES)}
+        cfg_path.write_text(json.dumps(cfg))
+        return {**os.environ, "HOME": str(home),
+                "MACCLEANER_CONFIG": str(cfg_path),
+                "MACCLEANER_LOG": str(tmp_dir / "report.log"),
+                "MACCLEANER_SNAPSHOTS": str(tmp_dir / "snapshots.log"),
+                "MACCLEANER_ALERTS": str(tmp_dir / "alerts.json"),
+                "MACCLEANER_TMP_ROOT": str(tmproot)}
+
     def test_cli_targets_scope_skips_simctl(self):
         """clean --targets npm-cache must not invoke xcrun: PATH gets a fake
         xcrun that logs invocations to a file, following the same PATH-stub
@@ -3487,17 +3509,7 @@ class TestScannerScoping(unittest.TestCase):
         ~L1612) -- the log must stay empty."""
         tmp_dir = Path(tempfile.mkdtemp())
         try:
-            home = tmp_dir / "home"
-            (home / ".npm" / "_cacache").mkdir(parents=True)
-            (home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
-            tmproot = tmp_dir / "tmproot"
-            tmproot.mkdir()
-            cfg_path = tmp_dir / "config.json"
-            # known_categories stamped + MACCLEANER_TMP_ROOT set so this
-            # never reaches the real /private/tmp or a real simctl (F4).
-            cfg = {"enabled_categories": list(cleaner.ALL_CATEGORIES),
-                   "known_categories": list(cleaner.ALL_CATEGORIES)}
-            cfg_path.write_text(json.dumps(cfg))
+            env = self._sandbox(tmp_dir)
 
             bindir = tmp_dir / "bin"
             bindir.mkdir()
@@ -3505,13 +3517,6 @@ class TestScannerScoping(unittest.TestCase):
             stub = bindir / "xcrun"
             stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$RECORD_FILE"\necho "{}"\n')
             stub.chmod(0o755)
-
-            env = {**os.environ, "HOME": str(home),
-                   "MACCLEANER_CONFIG": str(cfg_path),
-                   "MACCLEANER_LOG": str(tmp_dir / "report.log"),
-                   "MACCLEANER_SNAPSHOTS": str(tmp_dir / "snapshots.log"),
-                   "MACCLEANER_ALERTS": str(tmp_dir / "alerts.json"),
-                   "MACCLEANER_TMP_ROOT": str(tmproot)}
             env["PATH"] = f"{bindir}:{env['PATH']}"
             env["RECORD_FILE"] = str(recorded)
 
@@ -3522,6 +3527,52 @@ class TestScannerScoping(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertFalse(recorded.exists(),
                              "clean --targets npm-cache must never invoke xcrun")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_whitespace_targets_dry_run_is_noop(self):
+        """Regression: --targets " , " parses to an empty target-ID set, but
+        the RAW string is non-empty. Pre-2.6, the downstream filter/explicit
+        block gated on `if args.targets:` (raw string truthiness), so a
+        malformed --targets value filtered the target list down to empty and
+        set explicit=True -- a no-op dry run. Gating that block on the
+        PARSED set's truthiness instead treats "empty parsed set" as
+        "no --targets was given", skipping the filter entirely: explicit
+        stays False and every safe target is previewed, not just nothing."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            env = self._sandbox(tmp_dir)
+            r = subprocess.run(
+                [sys.executable, str(REPO / "cleaner.py"),
+                 "clean", "--targets", " , ", "--dry-run", "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            data = json.loads(r.stdout)
+            self.assertEqual(data["items"], [],
+                             "a whitespace-only --targets must preview nothing, "
+                             "never fall through to a full safe-target preview")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_garbage_targets_yes_deletes_nothing(self):
+        """Same regression as test_whitespace_targets_dry_run_is_noop, but
+        for the real (non-dry-run) --yes path where the consequence is an
+        actual unintended full safe auto-clean rather than just a wrong
+        preview."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            env = self._sandbox(tmp_dir)
+            r = subprocess.run(
+                [sys.executable, str(REPO / "cleaner.py"),
+                 "clean", "--targets", ",,,", "--yes", "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            data = json.loads(r.stdout)
+            self.assertEqual(data["items"], [],
+                             "a garbage --targets value must clean nothing, "
+                             "never fall through to a full safe auto-clean")
+            self.assertTrue((Path(env["HOME"]) / ".npm" / "_cacache").exists(),
+                            "npm-cache must survive a garbage --targets clean")
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
