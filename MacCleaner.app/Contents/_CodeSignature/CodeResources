@@ -10,11 +10,20 @@
 		</data>
 		<key>Resources/cleaner.py</key>
 		<data>
-		bPrX63a4cXc821JuVjWdDPiHnO4=
+		Rd4lusE3PXkvmsA4recCxO0cuBQ=
 		</data>
 	</dict>
 	<key>files2</key>
 	<dict>
+		<key>Frameworks/Sparkle.framework</key>
+		<dict>
+			<key>cdhash</key>
+			<data>
+			RsHPcsSp2tqM8CeVizgrrFNK/gk=
+			</data>
+			<key>requirement</key>
+			<string>cdhash H"46c1cf72c4a9dada8cf027958b382bac534afe09" or cdhash H"c5e275ca38aecd7d98b775e024f2be8b90d279ac"</string>
+		</dict>
 		<key>Resources/MacCleaner.icns</key>
 		<dict>
 			<key>hash2</key>
@@ -26,7 +35,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			EC8QQb9yi5SubJf2H6b5WfUNLqbsrJqE2mnB1wsO4zI=
+			nA3JAbIuKXsiXpOZIwOFg5l8zRWlfLClm/Pa5OUSoBQ=
 			</data>
 		</dict>
 	</dict>

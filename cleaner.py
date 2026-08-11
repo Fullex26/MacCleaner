@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -206,8 +206,19 @@ DEFAULT_CONFIG = {
 
 def load_config():
     if CONFIG_PATH.exists():
-        with open(CONFIG_PATH) as f:
-            cfg = json.load(f)
+        try:
+            with open(CONFIG_PATH) as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            # A torn write (crash mid-save, two Settings clicks racing before
+            # save_config became atomic) can leave invalid JSON on disk. That
+            # must never traceback the CLI, the app's bridge call, or the
+            # launchd agent — fall back to defaults and let the next save_config
+            # (now atomic) heal the file on disk.
+            print(f"Warning: config.json is corrupt ({e}); using defaults", file=sys.stderr)
+            cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+            cfg["known_categories"] = list(ALL_CATEGORIES)
+            return cfg
         # Merge with defaults for any missing keys
         for k, v in DEFAULT_CONFIG.items():
             cfg.setdefault(k, v)
@@ -232,9 +243,10 @@ def load_config():
 
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
-        f.write("\n")
+    """Atomic write (temp file + os.replace) so a torn write (two Settings
+    clicks racing, or a crash mid-save) can never leave invalid JSON on disk
+    for load_config to trip over."""
+    _atomic_write_json(CONFIG_PATH, cfg)
 
 
 # ── Size helpers ───────────────────────────────────────────────────────────────
@@ -296,12 +308,18 @@ def _notify(title: str, message: str) -> bool:
 
 
 def disk_free() -> str:
-    result = subprocess.run(["df", "-h", "/"], capture_output=True, text=True)
-    for line in result.stdout.splitlines()[1:]:
-        parts = line.split()
-        if parts:
-            return f"Used: {parts[2]} / {parts[1]} ({parts[4]})"
-    return "unknown"
+    """Human-readable disk summary, built from disk_stats() (shutil, the data
+    volume) so it always agrees with the disk_stats key shipped alongside it.
+    Previously this shelled out to `df -h /` separately, which reports the
+    read-only system volume -- a different number that could visibly
+    contradict disk_stats in the same JSON payload (and, since v2.6, next to
+    each other in the app's disk ring)."""
+    try:
+        ds = disk_stats()
+        return (f"Used: {fmt_size(ds['used_bytes'])} / {fmt_size(ds['total_bytes'])} "
+                f"({ds['percent_used']:.0f}%)")
+    except Exception:
+        return "unknown"
 
 
 def disk_stats() -> dict:
@@ -655,16 +673,34 @@ def get_targets(config, all_categories=False):
     return targets
 
 
-def collect_targets(config, all_categories=False):
+def collect_targets(config, all_categories=False, categories=None, target_ids=None):
     """Static targets plus dynamic scanner targets (tmp, simulators).
     scan/clean/dry-run call this; `categories` deliberately keeps calling
     get_targets() — dynamic per-dir IDs are unstable and the completions'
-    live-ID pipeline must not see them."""
+    live-ID pipeline must not see them.
+
+    categories/target_ids are optional SELECTION HINTS from the CLI
+    invocation (--category / --targets): when a hint proves a scanner's
+    output can't be selected, the scanner is skipped — a targeted
+    `clean --targets npm-cache` shouldn't pay two simctl calls and a /tmp
+    walk (popover one-click clean latency, v2.6). Hints never widen
+    anything: enabled_categories still gates as before, and hints=None
+    behaves exactly like pre-2.6."""
     targets = get_targets(config, all_categories=all_categories)
     enabled = set(ALL_CATEGORIES) if all_categories else set(config["enabled_categories"])
-    if "tmp" in enabled:
+
+    def _wanted(cat, prefix):
+        if cat not in enabled:
+            return False
+        if categories is not None and cat not in set(categories):
+            return False
+        if target_ids is not None and not any(str(t).startswith(prefix) for t in target_ids):
+            return False
+        return True
+
+    if _wanted("tmp", "tmp-"):
         targets += tmp_to_targets(scan_tmp_artifacts(config))
-    if "simulators" in enabled:
+    if _wanted("simulators", "simulator-"):
         targets += scan_simulator_targets(config)
     return targets
 
@@ -1698,6 +1734,16 @@ def _launchd_is_loaded(label: str) -> bool:
         return False
 
 
+def _app_bundle_version(app_path: Path):
+    """CFBundleShortVersionString from an app bundle's Info.plist, or None if
+    the bundle/plist/key is missing or unreadable. Never raises."""
+    try:
+        with open(app_path / "Contents" / "Info.plist", "rb") as f:
+            return plistlib.load(f).get("CFBundleShortVersionString")
+    except Exception:
+        return None
+
+
 def run_doctor(config, json_mode=False):
     checks = []
 
@@ -1773,7 +1819,24 @@ def run_doctor(config, json_mode=False):
         pass
 
     app_paths = [HOME / "Applications/MacCleaner.app", Path("/Applications/MacCleaner.app")]
-    check("Menu bar app", "installed" if any(p.exists() for p in app_paths) else "not installed")
+    installed_app = next((p for p in app_paths if p.exists()), None)
+    check("Menu bar app", f"installed at {installed_app}" if installed_app else "not installed")
+
+    # A6: Sparkle (v2.6) updates the app bundle but never touches the
+    # installed engine at ~/mac-cleaner/cleaner.py -- the app delegates ALL
+    # cleaning logic to that engine (MACCLEANER_ENGINE override aside), and
+    # it takes priority over the bundled fallback. After an auto-update the
+    # new UI can end up driving a stale engine with nothing to detect it.
+    # Compare this engine's VERSION against the app bundle's
+    # CFBundleShortVersionString and warn on a mismatch. Degrades silently
+    # when the app isn't installed or its Info.plist can't be read/parsed --
+    # this is a nice-to-have signal, not a hard requirement.
+    if installed_app is not None:
+        app_version = _app_bundle_version(installed_app)
+        if app_version is not None and app_version != VERSION:
+            check("Engine/App version",
+                  f"engine {VERSION} != app {app_version} — re-run bash install.sh",
+                  ok=False)
 
     for tool in ["brew", "docker", "xcrun", "node", "npm", "pnpm", "yarn", "bun", "deno",
                  "go", "cargo", "gem", "pod", "gradle", "mvn", "uv", "ollama",
@@ -2717,8 +2780,30 @@ def main():
         return
 
     # scan / clean share target selection
-    targets = collect_targets(config)
     categories = parse_categories(getattr(args, "category", None))
+    target_ids = None
+    # targets_given tracks whether --targets was SUPPLIED at all (presence,
+    # via `is not None` -- argparse leaves the attribute None when the flag is
+    # absent and "" when it is passed empty), independent of whether the value
+    # parsed to anything. A garbage value like " , " or an explicit "" parses
+    # to an empty target_ids set, but the downstream filter/explicit gate must
+    # still key off "was --targets supplied" -- otherwise an empty parsed set
+    # reads as "no --targets given", the filter is skipped, and --yes performs
+    # a full safe auto-clean instead of the no-op the user asked for.
+    targets_given = False
+    if args.command == "clean":
+        raw_targets = getattr(args, "targets", None)
+        if raw_targets is not None:
+            targets_given = True
+            target_ids = {t.strip() for t in raw_targets.split(",") if t.strip()}
+    # categories/target_ids are selection hints only (v2.6 scanner scoping):
+    # they let collect_targets skip a dynamic scanner it can prove won't be
+    # selected, but never widen what enabled_categories already gates. An
+    # empty-but-supplied target_ids correctly scopes scanners OUT here (the
+    # any() check in collect_targets is False for an empty set).
+    targets = collect_targets(config,
+                               categories=set(categories) if categories else None,
+                               target_ids=target_ids)
     if categories:
         valid = set(ALL_CATEGORIES)
         unknown = [c for c in categories if c not in valid]
@@ -2760,10 +2845,9 @@ def main():
 
     if args.command == "clean":
         explicit = False
-        if args.targets:
-            wanted = {t.strip() for t in args.targets.split(",") if t.strip()}
-            targets = [t for t in targets if t["id"] in wanted]
-            missing = wanted - {t["id"] for t in targets}
+        if targets_given:
+            targets = [t for t in targets if t["id"] in target_ids]
+            missing = target_ids - {t["id"] for t in targets}
             if missing:
                 print(f"Unknown target IDs: {', '.join(sorted(missing))}. Run 'maccleaner scan --json' to list IDs.",
                       file=sys.stderr)

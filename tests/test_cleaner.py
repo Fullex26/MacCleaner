@@ -9,6 +9,7 @@ import datetime
 import io
 import json
 import os
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -76,6 +77,37 @@ class TestConfig(unittest.TestCase):
         cleaner.cmd_config_set_key(cfg, "delete_mode", "trash")
         reloaded = json.loads(cleaner.CONFIG_PATH.read_text())
         self.assertEqual(reloaded["delete_mode"], "trash")
+
+    def test_corrupt_config_loads_as_defaults_with_warning(self):
+        """A1: a torn write (crash mid-save, two Settings clicks racing before
+        save_config became atomic) can leave invalid JSON on disk. load_config
+        must never traceback -- it should warn on stderr and fall back to
+        DEFAULT_CONFIG (with known_categories stamped, same as the fresh-
+        install path) instead of propagating json.JSONDecodeError."""
+        cleaner.CONFIG_PATH.write_text('{"broken')
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            cfg = cleaner.load_config()
+        self.assertEqual(cfg["enabled_categories"], cleaner.ALL_CATEGORIES)
+        self.assertEqual(cfg["delete_mode"], "rm")
+        self.assertEqual(cfg["known_categories"], list(cleaner.ALL_CATEGORIES))
+        self.assertIn("corrupt", buf.getvalue().lower())
+
+    def test_save_config_is_atomic(self):
+        """A1: save_config must write via temp-file + os.replace() (the same
+        pattern as _atomic_write_json, already used for report.log/
+        snapshots.log) rather than truncating the file in place -- so a
+        concurrent reader (or a crash mid-write) never sees a partial file.
+        We can't easily interrupt os.replace() mid-flight in a unit test, but
+        we can assert the observable contract: no leftover temp file, and the
+        file on disk parses cleanly and round-trips the data after save."""
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg["log_threshold_mb"] = 42
+        cleaner.save_config(cfg)
+        leftover = list(self.tmp.glob(".config.json.*.tmp"))
+        self.assertEqual(leftover, [], "atomic write must not leave a temp file behind")
+        reloaded = json.loads(cleaner.CONFIG_PATH.read_text())
+        self.assertEqual(reloaded["log_threshold_mb"], 42)
 
 
 class TestTargets(unittest.TestCase):
@@ -409,6 +441,22 @@ class TestCLIIntegration(unittest.TestCase):
                         "size_bytes", "size_human", "safe", "exists"]:
                 self.assertIn(key, t)
 
+    def test_disk_string_agrees_with_disk_stats(self):
+        """A3 regression: the legacy `disk` string used to come from `df -h /`
+        (the read-only system volume) while `disk_stats` uses shutil on the
+        data volume -- two different numbers in the same payload. `disk` must
+        now be derived from disk_stats() so the used/total bytes it reports
+        match, not just look plausible independently."""
+        r = self.run_cli("scan", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        ds = data["disk_stats"]
+        expected = (f"Used: {cleaner.fmt_size(ds['used_bytes'])} / "
+                    f"{cleaner.fmt_size(ds['total_bytes'])} "
+                    f"({ds['percent_used']:.0f}%)")
+        self.assertEqual(data["disk"], expected,
+                         "disk string must be derived from disk_stats, not a separate df call")
+
     def test_legacy_bare_json_is_scan(self):
         """The menu bar app contract: `cleaner.py --json` = scan --json."""
         r = self.run_cli("--json")
@@ -593,6 +641,52 @@ class TestDoctorSchedule(unittest.TestCase):
         sched = next(c for c in data["checks"] if c["name"] == "Schedule")
         self.assertTrue(sched["ok"])
         self.assertIn("not scheduled", sched["status"].lower())
+
+    def _write_app_info_plist(self, version):
+        app_contents = self.home / "Applications" / "MacCleaner.app" / "Contents"
+        app_contents.mkdir(parents=True)
+        with open(app_contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleShortVersionString": version}, f)
+
+    def test_engine_app_version_mismatch_warns(self):
+        """A6: Sparkle updates the app bundle but never the installed engine
+        at ~/mac-cleaner/cleaner.py. doctor must compare this engine's
+        VERSION against the app's CFBundleShortVersionString and flag a
+        mismatch with the re-run-install.sh remedy."""
+        self._write_app_info_plist("0.0.1")
+        r = self.run_doctor()
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        c = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNotNone(c, "a version mismatch must produce an Engine/App version check")
+        self.assertFalse(c["ok"])
+        self.assertIn("install.sh", c["status"])
+        self.assertFalse(data["ok"], "a version mismatch must fail the overall doctor check")
+
+    def test_engine_app_version_match_is_silent(self):
+        self._write_app_info_plist(cleaner.VERSION)
+        r = self.run_doctor()
+        data = json.loads(r.stdout)
+        c = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNone(c, "matching versions must not add a warning row")
+
+    def test_engine_app_version_check_absent_without_app(self):
+        # No Info.plist at all (app not installed) -- must degrade silently,
+        # not raise or add a spurious check.
+        r = self.run_doctor()
+        data = json.loads(r.stdout)
+        c = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNone(c)
+
+    def test_engine_app_version_check_absent_with_unreadable_plist(self):
+        app_contents = self.home / "Applications" / "MacCleaner.app" / "Contents"
+        app_contents.mkdir(parents=True)
+        (app_contents / "Info.plist").write_text("not a plist")
+        r = self.run_doctor()
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        c = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNone(c, "an unparseable Info.plist must degrade silently, not crash doctor")
 
 
 class TestNewTargetsV21(unittest.TestCase):
@@ -3415,6 +3509,191 @@ class TestSimulatorTargets(unittest.TestCase):
                                 return_value=[{"id": "simulator-stale-devices"}]):
             targets = cleaner.collect_targets(cfg)
         self.assertFalse(any(t.get("id") == "simulator-stale-devices" for t in targets))
+
+
+class TestScannerScoping(unittest.TestCase):
+    """collect_targets() takes optional categories/target_ids SELECTION HINTS
+    (v2.6): when a hint proves a dynamic scanner's output can't be selected,
+    the scanner is skipped entirely -- a targeted `clean --targets npm-cache`
+    shouldn't pay two simctl calls and a /tmp walk (popover one-click clean
+    latency). Hints never widen anything: enabled_categories still gates as
+    before, and hints=None must behave exactly like pre-2.6."""
+
+    def setUp(self):
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        # known_categories stamped so the F4 auto-enable migration can't
+        # surprise these assertions with a different enabled set.
+        self.cfg["known_categories"] = list(cleaner.ALL_CATEGORIES)
+
+    def _patched(self):
+        tmp = mock.patch.object(cleaner, "scan_tmp_artifacts", return_value=[])
+        sim = mock.patch.object(cleaner, "scan_simulator_targets", return_value=[])
+        return tmp, sim
+
+    def test_unscoped_runs_both(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg)
+        mtmp.assert_called_once()
+        msim.assert_called_once()
+
+    def test_category_scope_excluding_skips_both(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, categories={"node"})
+        mtmp.assert_not_called()
+        msim.assert_not_called()
+
+    def test_category_scope_including_tmp_runs_only_tmp(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, categories={"tmp", "node"})
+        mtmp.assert_called_once()
+        msim.assert_not_called()
+
+    def test_target_ids_scope_simulator_only(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, target_ids={"simulator-stale-devices"})
+        mtmp.assert_not_called()
+        msim.assert_called_once()
+
+    def test_target_ids_npm_only_runs_neither(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, target_ids={"npm-cache"})
+        mtmp.assert_not_called()
+        msim.assert_not_called()
+
+    def test_disabled_category_still_never_runs(self):
+        # Hints only ever narrow -- a category hint that includes "tmp"
+        # can't resurrect a category the config has disabled.
+        self.cfg["enabled_categories"] = ["node"]
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, categories={"tmp"})
+        mtmp.assert_not_called()
+
+    def _sandbox(self, tmp_dir):
+        """Shared F4 sandbox setup: a fake $HOME with a real npm-cache
+        target, an empty tmp scan root, and a config with every category
+        enabled + known_categories stamped (so the migration can't surprise
+        the enabled set and this never reaches the real /private/tmp or a
+        real simctl). Returns the env dict for subprocess.run."""
+        home = tmp_dir / "home"
+        (home / ".npm" / "_cacache").mkdir(parents=True)
+        (home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        tmproot = tmp_dir / "tmproot"
+        tmproot.mkdir()
+        cfg_path = tmp_dir / "config.json"
+        cfg = {"enabled_categories": list(cleaner.ALL_CATEGORIES),
+               "known_categories": list(cleaner.ALL_CATEGORIES)}
+        cfg_path.write_text(json.dumps(cfg))
+        return {**os.environ, "HOME": str(home),
+                "MACCLEANER_CONFIG": str(cfg_path),
+                "MACCLEANER_LOG": str(tmp_dir / "report.log"),
+                "MACCLEANER_SNAPSHOTS": str(tmp_dir / "snapshots.log"),
+                "MACCLEANER_ALERTS": str(tmp_dir / "alerts.json"),
+                "MACCLEANER_TMP_ROOT": str(tmproot)}
+
+    def test_cli_targets_scope_skips_simctl(self):
+        """clean --targets npm-cache must not invoke xcrun: PATH gets a fake
+        xcrun that logs invocations to a file, following the same PATH-stub
+        idiom TestCleanNotify.run_cli uses for osascript (tests/test_cleaner.py
+        ~L1612) -- the log must stay empty."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            env = self._sandbox(tmp_dir)
+
+            bindir = tmp_dir / "bin"
+            bindir.mkdir()
+            recorded = tmp_dir / "xcrun_calls.txt"
+            stub = bindir / "xcrun"
+            stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$RECORD_FILE"\necho "{}"\n')
+            stub.chmod(0o755)
+            env["PATH"] = f"{bindir}:{env['PATH']}"
+            env["RECORD_FILE"] = str(recorded)
+
+            r = subprocess.run(
+                [sys.executable, str(REPO / "cleaner.py"),
+                 "clean", "--targets", "npm-cache", "--dry-run", "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse(recorded.exists(),
+                             "clean --targets npm-cache must never invoke xcrun")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_whitespace_targets_dry_run_is_noop(self):
+        """Regression: --targets " , " parses to an empty target-ID set, but
+        the RAW string is non-empty. Pre-2.6, the downstream filter/explicit
+        block gated on `if args.targets:` (raw string truthiness), so a
+        malformed --targets value filtered the target list down to empty and
+        set explicit=True -- a no-op dry run. Gating that block on the
+        PARSED set's truthiness instead treats "empty parsed set" as
+        "no --targets was given", skipping the filter entirely: explicit
+        stays False and every safe target is previewed, not just nothing."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            env = self._sandbox(tmp_dir)
+            r = subprocess.run(
+                [sys.executable, str(REPO / "cleaner.py"),
+                 "clean", "--targets", " , ", "--dry-run", "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            data = json.loads(r.stdout)
+            self.assertEqual(data["items"], [],
+                             "a whitespace-only --targets must preview nothing, "
+                             "never fall through to a full safe-target preview")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_garbage_targets_yes_deletes_nothing(self):
+        """Same regression as test_whitespace_targets_dry_run_is_noop, but
+        for the real (non-dry-run) --yes path where the consequence is an
+        actual unintended full safe auto-clean rather than just a wrong
+        preview."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            env = self._sandbox(tmp_dir)
+            r = subprocess.run(
+                [sys.executable, str(REPO / "cleaner.py"),
+                 "clean", "--targets", ",,,", "--yes", "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            data = json.loads(r.stdout)
+            self.assertEqual(data["items"], [],
+                             "a garbage --targets value must clean nothing, "
+                             "never fall through to a full safe auto-clean")
+            self.assertTrue((Path(env["HOME"]) / ".npm" / "_cacache").exists(),
+                            "npm-cache must survive a garbage --targets clean")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_empty_string_targets_yes_deletes_nothing(self):
+        """A2 regression: argparse gives args.targets == "" for an explicitly
+        empty `--targets ""`, distinct from None when the flag is absent
+        entirely. Pre-fix the downstream gate was `if raw_targets:` (falsy for
+        ""), so this fell through to "no --targets given" and performed a
+        full safe auto-clean -- exactly the bug CHANGELOG claimed was fixed.
+        The gate must be `raw_targets is not None` so an explicitly-empty
+        value still counts as "targets were given" and filters to nothing."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            env = self._sandbox(tmp_dir)
+            r = subprocess.run(
+                [sys.executable, str(REPO / "cleaner.py"),
+                 "clean", "--targets", "", "--yes", "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            data = json.loads(r.stdout)
+            self.assertEqual(data["items"], [],
+                             "clean --targets '' must clean nothing, "
+                             "never fall through to a full safe auto-clean")
+            self.assertTrue((Path(env["HOME"]) / ".npm" / "_cacache").exists(),
+                            "npm-cache must survive a clean --targets '' run")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

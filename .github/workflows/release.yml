@@ -48,6 +48,7 @@ jobs:
         id: signing
         env:
           CERT: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
           # `secrets` cannot be referenced in any `if:` — job or step. `env`
           # can, but only in a step-level `if:`. So probe here, publish a
@@ -67,6 +68,19 @@ jobs:
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "→ No signing credentials — shipping an ad-hoc signed build"
+          fi
+
+          # SPARKLE_ED_PRIVATE_KEY gates a separate fork (appcast
+          # generation) that ALSO requires signing to be enabled — an
+          # ad-hoc build's SUPublicEDKey can't be proven to correspond to
+          # any private key at install time, so it must never advertise
+          # updates Sparkle would just reject anyway. Probed the same way,
+          # for the same reason: not usable directly in a step `if:`.
+          if [ -n "$SPARKLE_KEY" ]; then
+            echo "sparkle_key_present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sparkle_key_present=false" >> "$GITHUB_OUTPUT"
+            echo "→ No SPARKLE_ED_PRIVATE_KEY — no appcast will be generated"
           fi
 
       - name: Sign, notarize, and staple
@@ -146,6 +160,52 @@ jobs:
             exit 1
           fi
 
+          # 1.5. Sign nested Sparkle pieces inside-out, bottom-up, BEFORE the
+          # app bundle itself — this is exactly the hazard the --deep note
+          # below used to only warn about: a framework has been added.
+          # Apple's guidance is to sign nested code first, then the
+          # container, without --deep (which doesn't propagate options
+          # correctly to nested code). Only runs when build.sh actually
+          # embedded Sparkle; app/build.sh's fetch is fatal-on-failure under
+          # CI (GitHub Actions always sets CI=true for every job, which is
+          # what build.sh's `[ -n "${CI:-}" ]` check keys off), so on a real
+          # release build this directory is always present — the `-d` guard
+          # is just defense against running this against a non-CI artifact.
+          FRAMEWORK="$APP/Contents/Frameworks/Sparkle.framework"
+          if [ -d "$FRAMEWORK" ]; then
+            echo "→ Signing embedded Sparkle.framework (inside-out)…"
+
+            # Freshly downloaded/extracted files can carry resource forks,
+            # Finder info, or provenance xattrs that `codesign --verify
+            # --deep --strict` below (and Gatekeeper) reject as "resource
+            # fork, Finder information, or similar detritus not allowed".
+            # Strip them before signing, not just before the final verify.
+            xattr -cr "$FRAMEWORK"
+
+            for XPC in "$FRAMEWORK"/Versions/B/XPCServices/*.xpc; do
+              [ -e "$XPC" ] || continue
+              codesign --force --options runtime --timestamp \
+                --sign "$IDENTITY" --keychain "$KEYCHAIN" "$XPC"
+            done
+            # Unlike the XPC loop above (whose contents are genuinely
+            # optional), Autoupdate and Updater.app are load-bearing parts of
+            # every Sparkle release -- their absence means Sparkle's
+            # distribution layout changed underneath us, not "nothing to
+            # sign here". Assert they exist instead of swallowing the
+            # codesign failure with `2>/dev/null || true`, which would have
+            # silently shipped a release with an unsigned/missing updater.
+            for BIN in "$FRAMEWORK/Versions/B/Autoupdate" "$FRAMEWORK/Versions/B/Updater.app"; do
+              if [ ! -e "$BIN" ]; then
+                echo "::error::Expected Sparkle component missing: $BIN -- Sparkle's distribution layout may have changed."
+                exit 1
+              fi
+              codesign --force --options runtime --timestamp \
+                --sign "$IDENTITY" --keychain "$KEYCHAIN" "$BIN"
+            done
+            codesign --force --options runtime --timestamp \
+              --sign "$IDENTITY" --keychain "$KEYCHAIN" "$FRAMEWORK"
+          fi
+
           # 2. Sign. --options runtime (hardened runtime) is mandatory for
           # notarization; --timestamp is required for a distributable signature.
           # No entitlements file is needed: the only Mach-O is Contents/MacOS/
@@ -153,10 +213,9 @@ jobs:
           # Apple-signed process, which the hardened runtime does not restrict.
           # (--deep is intentionally NOT used for signing — Apple discourages
           # it there because it doesn't propagate options correctly to nested
-          # code; inside-out signing is the recommended pattern. It's a no-op
-          # today with a single Mach-O but would become a real hazard if a
-          # helper tool or framework is ever added. --deep is correct and
-          # kept on --verify below, which is a read-only check.)
+          # code; inside-out signing is the recommended pattern — see step 1.5
+          # above, which now does exactly that for Sparkle.framework. --deep
+          # is correct and kept on --verify below, which is a read-only check.)
           codesign --force --options runtime --timestamp \
             --sign "$IDENTITY" --keychain "$KEYCHAIN" "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
@@ -284,6 +343,227 @@ jobs:
             echo "Every command supports \`--json\` — see \`AGENTS.md\` for the full machine interface."
           } > release_notes.md
 
+      - name: Generate appcast
+        id: appcast
+        if: steps.signing.outputs.enabled == 'true' && steps.signing.outputs.sparkle_key_present == 'true'
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          SHORT_VERSION="${VERSION#v}"
+          ZIP_NAME="${{ steps.package_app.outputs.app_zip }}"
+          APP="build/MacCleaner.app"
+
+          if [ -z "$ZIP_NAME" ] || [ ! -f "$ZIP_NAME" ]; then
+            echo "::error::Generate appcast: expected app zip '$ZIP_NAME' not found -- signing was enabled but no app bundle was packaged."
+            exit 1
+          fi
+
+          # Never put the secret on a command line (visible in a process
+          # listing or an error trace) -- file redirection only, cleaned up
+          # via trap-delete below regardless of how this step exits. GitHub
+          # also masks the raw secret value out of logs, but that is a
+          # second line of defense, not the only one.
+          echo "$SPARKLE_ED_PRIVATE_KEY" > "$RUNNER_TEMP/ed_key"
+          chmod 600 "$RUNNER_TEMP/ed_key"
+          trap 'rm -f "$RUNNER_TEMP/ed_key" "$RUNNER_TEMP/derive_pubkey.py" "$RUNNER_TEMP/gen_appcast.py"' EXIT
+
+          # --- Key-correspondence gate: runs BEFORE anything is generated
+          # or uploaded. Proves the Ed25519 public key baked into the
+          # shipped Info.plist (SUPublicEDKey, committed in app/Info.plist)
+          # actually corresponds to the private key in the
+          # SPARKLE_ED_PRIVATE_KEY secret we are about to sign with.
+          # Without this, a stale/rotated public key in Info.plist would
+          # silently ship an update Sparkle can never verify -- installed
+          # apps would fail every signature check with no error surfaced
+          # anywhere.
+          EXPECTED_PUB="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$APP/Contents/Info.plist" 2>/dev/null || true)"
+          if [ -z "$EXPECTED_PUB" ]; then
+            echo "::error::Generate appcast: $APP/Contents/Info.plist has no SUPublicEDKey -- can't verify the signing key corresponds to the shipped app."
+            exit 1
+          fi
+
+          # Write the derivation script to a file rather than piping it
+          # through a heredoc nested inside "$(...)" -- bash's parser
+          # (verified with the system bash macOS runners ship, 3.2.57)
+          # mishandles apostrophes appearing inside a heredoc body when
+          # that heredoc is nested inside a double-quoted command
+          # substitution assignment; writing to a file first sidesteps the
+          # whole class of bug regardless of what future comments say.
+          cat > "$RUNNER_TEMP/derive_pubkey.py" <<'PY'
+          import base64
+          import hashlib
+          import sys
+
+          # Pure-stdlib Ed25519 public-key-from-seed derivation (RFC 8032 seed
+          # expansion). Deliberately not openssl: verified locally that the openssl
+          # first on PATH on a macOS runner (Apple's system /usr/bin/openssl, which
+          # is LibreSSL 3.3.6) does not support Ed25519 pkey operations at all
+          # ("unsupported private key algorithm TYPE=Ed25519" on both genpkey and
+          # loading a raw PKCS8-wrapped seed) -- an openssl-based derivation would
+          # depend on Homebrew's openssl@3 winning a PATH race it is not guaranteed
+          # to win. This algorithm was checked against 4 independently
+          # openssl-genpkey-generated Ed25519 keypairs before being trusted here.
+
+          b = 256
+          q = 2**255 - 19
+
+
+          def H(m):
+              return hashlib.sha512(m).digest()
+
+
+          def expmod(base, e, m):
+              if e == 0:
+                  return 1
+              t = expmod(base, e // 2, m) ** 2 % m
+              if e & 1:
+                  t = (t * base) % m
+              return t
+
+
+          def inv(x):
+              return expmod(x, q - 2, q)
+
+
+          d = -121665 * inv(121666) % q
+          I = expmod(2, (q - 1) // 4, q)
+
+
+          def xrecover(y):
+              xx = (y * y - 1) * inv(d * y * y + 1)
+              x = expmod(xx, (q + 3) // 8, q)
+              if (x * x - xx) % q != 0:
+                  x = (x * I) % q
+              if x % 2 != 0:
+                  x = q - x
+              return x
+
+
+          By = 4 * inv(5)
+          Bx = xrecover(By)
+          Bpoint = (Bx % q, By % q)
+
+
+          def edwards(P, Q):
+              x1, y1 = P
+              x2, y2 = Q
+              x3 = (x1 * y2 + x2 * y1) * inv(1 + d * x1 * x2 * y1 * y2)
+              y3 = (y1 * y2 + x1 * x2) * inv(1 - d * x1 * x2 * y1 * y2)
+              return (x3 % q, y3 % q)
+
+
+          def scalarmult(P, e):
+              if e == 0:
+                  return (0, 1)
+              Qp = scalarmult(P, e // 2)
+              Qp = edwards(Qp, Qp)
+              if e & 1:
+                  Qp = edwards(Qp, P)
+              return Qp
+
+
+          def encodepoint(P):
+              x, y = P
+              bits = [(y >> i) & 1 for i in range(b - 1)] + [x & 1]
+              return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(b // 8))
+
+
+          def bit(h, i):
+              return (h[i // 8] >> (i % 8)) & 1
+
+
+          def publickey_from_seed(seed32):
+              h = H(seed32)
+              a = 2 ** (b - 2) + sum(2 ** i * bit(h, i) for i in range(3, b - 2))
+              A = scalarmult(Bpoint, a)
+              return encodepoint(A)
+
+
+          seed_b64 = open(sys.argv[1]).read().strip()
+          seed = base64.b64decode(seed_b64)
+          if len(seed) != 32:
+              print(f"seed must decode to 32 bytes, got {len(seed)}", file=sys.stderr)
+              sys.exit(1)
+          print(base64.b64encode(publickey_from_seed(seed)).decode())
+          PY
+          DERIVED_PUB=$(python3 "$RUNNER_TEMP/derive_pubkey.py" "$RUNNER_TEMP/ed_key")
+
+          if [ "$DERIVED_PUB" != "$EXPECTED_PUB" ]; then
+            echo "::error::SPARKLE_ED_PRIVATE_KEY does not correspond to the SUPublicEDKey shipped in $APP/Contents/Info.plist. The public key baked into the app cannot verify updates signed with this secret. Fix SUPublicEDKey (app/Info.plist) or rotate the secret so they match -- refusing to generate or upload an appcast."
+            exit 1
+          fi
+          echo "✅ SPARKLE_ED_PRIVATE_KEY corresponds to the shipped SUPublicEDKey"
+
+          # --- Locate the Sparkle tools dir without hardcoding a version ---
+          # app/build.sh pins its own SPARKLE_VERSION independently; hardcoding
+          # a copy of that string here just guarantees the two drift apart on
+          # the next Sparkle bump. Derive it from what build.sh actually
+          # fetched/cached instead. (bash 3.2-safe: no mapfile/arrays-of-glob.)
+          SPARKLE_DIR=""
+          SPARKLE_DIR_COUNT=0
+          for d in build/sparkle-*/; do
+            [ -d "$d" ] || continue
+            SPARKLE_DIR="${d%/}"
+            SPARKLE_DIR_COUNT=$((SPARKLE_DIR_COUNT + 1))
+          done
+          if [ "$SPARKLE_DIR_COUNT" -ne 1 ]; then
+            echo "::error::Generate appcast: expected exactly one build/sparkle-*/ directory, found $SPARKLE_DIR_COUNT -- app/build.sh's Sparkle fetch/cache may have changed."
+            exit 1
+          fi
+
+          # --- Sign the zip and build the appcast ---------------------------
+          SIG="$("$SPARKLE_DIR/bin/sign_update" -f "$RUNNER_TEMP/ed_key" "$ZIP_NAME")"
+          # sign_update (no -p) prints exactly:
+          #   sparkle:edSignature="..." length="..."
+          # -- the two attributes the <enclosure> tag needs, verified
+          # against Sparkle 2.9.5's actual binary output (Task 7's cache).
+
+          DOWNLOAD_URL="https://github.com/Fullex26/MacCleaner/releases/download/${VERSION}/${ZIP_NAME}"
+          RELEASE_NOTES_LINK="https://github.com/Fullex26/MacCleaner/releases/tag/${VERSION}"
+
+          cat > "$RUNNER_TEMP/gen_appcast.py" <<'PY'
+          import html
+          import os
+          import sys
+
+          short_version, url, sig, notes_link = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          body = open("release_notes.md").read() if os.path.exists("release_notes.md") else ""
+          body = body.replace("]]>", "]]&gt;")
+          # <description> is raw Markdown (release_notes.md), but Sparkle's
+          # update dialog renders it as HTML -- unescaped Markdown reads as a
+          # wall of literal #/*/`` characters to the user. sparkle:releaseNotesLink
+          # points Sparkle at the rendered GitHub release page instead; the
+          # CDATA body stays as a fallback for the rare client that ignores
+          # releaseNotesLink.
+          print(f'''<?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+          <channel>
+          <title>MacCleaner</title>
+          <item>
+          <title>Version {short_version}</title>
+          <sparkle:version>{short_version}</sparkle:version>
+          <sparkle:shortVersionString>{short_version}</sparkle:shortVersionString>
+          <sparkle:releaseNotesLink>{html.escape(notes_link)}</sparkle:releaseNotesLink>
+          <description><![CDATA[{body}]]></description>
+          <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+          <enclosure url="{html.escape(url)}" {sig} type="application/octet-stream"/>
+          </item>
+          </channel>
+          </rss>''')
+          PY
+          python3 "$RUNNER_TEMP/gen_appcast.py" "$SHORT_VERSION" "$DOWNLOAD_URL" "$SIG" "$RELEASE_NOTES_LINK" > appcast.xml
+
+          xmllint --noout appcast.xml
+          echo "appcast_generated=true" >> "$GITHUB_OUTPUT"
+          echo "✅ appcast.xml generated and validated"
+
+      - name: Warn if this release ships without an appcast
+        if: steps.appcast.outputs.appcast_generated != 'true'
+        run: |
+          echo "::warning::This release (${{ steps.version.outputs.version }}) is shipping WITHOUT appcast.xml (signing enabled=${{ steps.signing.outputs.enabled }}, SPARKLE_ED_PRIVATE_KEY present=${{ steps.signing.outputs.sparkle_key_present }}). Consequence: because this becomes the 'latest' release, its appcast.xml release asset does not exist, so <feed-url>/releases/latest/download/appcast.xml now 404s for EVERY installed app's Sparkle update check -- not just 'stale', fully broken -- until the NEXT tag is released with both the Developer ID signing secrets AND SPARKLE_ED_PRIVATE_KEY configured. If this was unintentional, add the missing secret(s) and cut a follow-up signed release promptly."
+
       - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
@@ -294,5 +574,6 @@ jobs:
           files: |
             ${{ steps.package_cli.outputs.cli_tar }}
             ${{ steps.package_app.outputs.app_zip_exists == 'true' && steps.package_app.outputs.app_zip || '' }}
+            ${{ steps.appcast.outputs.appcast_generated == 'true' && 'appcast.xml' || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

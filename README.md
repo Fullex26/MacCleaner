@@ -10,12 +10,13 @@
 MacCleaner finds and removes the developer detritus that accumulates silently — Xcode DerivedData, Docker layers, package manager caches, downloaded AI models, stale `node_modules` in projects you abandoned months ago. A single command can reclaim tens of gigabytes.
 
 - **CLI** — `scan`, `clean`, `projects`, `report`, `doctor`, `config`. 80+ cleanup targets across 22 categories. Interactive checklist or fully unattended.
-- **macOS app** — SwiftUI menu bar app (macOS 13+) with a dashboard: see everything, tick what goes, clean in-app.
+- **macOS app, redesigned in v2.6** — sidebar navigation, glass panels, and a rich menu bar popover (disk ring, reclaimable hero number, top categories, one-click "Clean safe items") over the same engine and config as the CLI.
 - **Agent-ready** — every command speaks `--json`, every target has a stable ID, exit codes are documented. Point your AI agent at [AGENTS.md](AGENTS.md) and it can operate the whole tool.
 - **Safe by design** — deletes only inside your home directory, never follows symlinks, and can move things to the Trash instead of deleting.
 - **Know before you act** — `--dry-run` previews the exact paths and sizes a clean would touch with zero side effects, `report` tracks disk-space trends over time, and `projects` automatically skips repos with uncommitted or unpushed work.
 - **AI-era cleanup** — finds stale build/clone litter that AI coding sessions leave under `/private/tmp` (classified by contents, never by name, and always review-only), plus unused iOS simulator devices and runtime images via `simctl`.
 - **Stay in the loop** — a notification when a scheduled clean finishes, a low-disk warning if free space drops below a configurable threshold (10 GB by default), and a menu bar that shows free space and "last cleaned" without opening the app.
+- **Updates itself** — the app checks for new versions daily via Sparkle and prompts with release notes when one's available (or check manually from Settings); installed via Homebrew? `brew upgrade` still works as before. Sparkle only updates the app bundle, not the installed CLI engine at `~/mac-cleaner/cleaner.py` — re-run `bash install.sh` to update that too (`maccleaner doctor` flags a version mismatch between the two).
 
 ---
 
@@ -76,10 +77,10 @@ Useful extras: `--category xcode` to scope a run, `--min-size 500` to ignore sma
 
 ## Menu Bar App
 
-A SwiftUI app (macOS 13+) that's a thin client over the CLI — same engine, same config, no separate logic.
+A SwiftUI app (macOS 13+) that's a thin client over the CLI — same engine, same config, no separate logic. Redesigned in v2.6 ("Glass & Sparkle"): sidebar navigation, glass panels, monospaced sizes, per-category color dots, and one design system driving both light and dark mode.
 
-- **Menu bar**: total reclaimable space and "last cleaned" at a glance, plus Scan, Auto-Clean Safe, Open Dashboard, Quit. No Dock icon. Refreshes lightly every minute, with a full rescan on a longer interval, on wake, and whenever you open the menu.
-- **Dashboard window**: four tabs — **Dashboard** (targets grouped by category with checkboxes, clean in-app, plus a free-space trend chart built from your scan history), **Projects** (stale artifact finder), **History** (past runs), **Settings** (category toggles and delete mode, shared with the CLI's `config.json`; plus the cleanup schedule — no terminal needed — which lives in launchd plists managed via the CLI's `schedule` subcommand, not in `config.json`).
+- **Menu bar popover**: a disk-usage ring, your reclaimable space as a hero number, your top 3 categories, and a one-click "Clean safe items" button with a self-expiring "freed" confirmation — no need to open the full window for a quick clean. No Dock icon. Refreshes lightly every minute, with a full rescan on a longer interval, on wake, and whenever you open the popover.
+- **Dashboard window**: sidebar-navigated — **Dashboard** (targets grouped by category with checkboxes, All/None/Safe-only selection, clean in-app with live per-item progress, plus a free-space trend chart built from your scan history), **Projects** (stale artifact finder with Select All/None), **History** (past runs), **Settings** (category toggles and delete mode, shared with the CLI's `config.json`; the cleanup schedule, which lives in launchd plists managed via the CLI's `schedule` subcommand, not in `config.json`; and "Check for Updates…", backed by Sparkle).
 
 `install.sh` builds the app from source whenever Swift's toolchain (`swiftc`, from Xcode or the Command Line Tools) is available, so the installed app is never older than your checkout; it falls back to the committed pre-built copy only when `swiftc` isn't found. No Xcode project needed either way:
 
@@ -88,9 +89,7 @@ bash app/build.sh            # swiftc → build/MacCleaner.app (universal, ad-ho
 bash app/build.sh --install  # …then copy to ~/Applications
 ```
 
-The bundle includes `cleaner.py` as a fallback engine, so the app works even without `install.sh`.
-
-> **First launch:** macOS may warn about unsigned apps. Right-click → Open → Open. Notarization is on the [roadmap](ROADMAP.md).
+The bundle includes `cleaner.py` as a fallback engine, so the app works even without `install.sh`. Releases from `git tag`/GitHub Actions are signed and notarized when the maintainer's signing secrets are configured (see `docs/RELEASING.md`); a local `app/build.sh` run always ad-hoc signs, so if you build it yourself, the first launch may still need Right-click → Open → Open once.
 
 ---
 

@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Combine
 
 // ── JSON models (contract with cleaner.py --json, see AGENTS.md) ───────────────
 
@@ -46,6 +47,14 @@ struct CleanResult: Codable {
     let items: [CleanItem]
 }
 
+/// `null` when git status couldn't be determined (not a repo, `git` missing,
+/// any git failure, or `project_git_check` disabled); otherwise the two
+/// signals `projects --json` reports per AGENTS.md §"projects --json".
+struct GitInfo: Codable, Hashable {
+    let dirty: Bool
+    let unpushed: Bool
+}
+
 struct ProjectArtifact: Codable, Identifiable, Hashable {
     let id: String
     let path: String
@@ -53,6 +62,7 @@ struct ProjectArtifact: Codable, Identifiable, Hashable {
     let project: String
     let age_days: Int
     let size_bytes: Int
+    let git: GitInfo?
 }
 
 struct ProjectsReport: Codable {
@@ -67,7 +77,34 @@ struct HistoryRun: Codable, Identifiable {
     let total_freed_bytes: Int
     let total_freed_human: String
     let disk_after: String
+    let items: [CleanItem]
     var id: String { timestamp }
+
+    private enum CodingKeys: String, CodingKey {
+        case timestamp, total_freed_bytes, total_freed_human, disk_after, items
+    }
+
+    // FIX7 idiom (see DiskSnapshot's comment just below): report.log is a
+    // mutable, externally-editable file — one entry missing or misshaping
+    // `items` (hand edit, partial write, a future schema change) must not
+    // fail decoding of the whole HistoryReport. That used to freeze both
+    // the History tab (this struct's own consumer) and
+    // performLightRefresh()'s 60s menu bar tick, whose `try?` swallows the
+    // decode error and whose `guard let … else { return }` then bails
+    // silently, leaving the free-space/"Last cleaned" display stuck. Every
+    // other field here was already required pre-FIX7 (and a run with a
+    // missing timestamp/freed total is arguably not recoverable as a
+    // display row anyway) — only `items` gets the tolerant treatment,
+    // matching the reviewer's ask precisely: default to `[]` rather than
+    // losing the whole run over a missing/malformed items array.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        timestamp = try container.decode(String.self, forKey: .timestamp)
+        total_freed_bytes = try container.decode(Int.self, forKey: .total_freed_bytes)
+        total_freed_human = try container.decode(String.self, forKey: .total_freed_human)
+        disk_after = try container.decode(String.self, forKey: .disk_after)
+        items = (try? container.decodeIfPresent([CleanItem].self, forKey: .items)) ?? []
+    }
 }
 
 struct DiskCurrent: Codable {
@@ -192,18 +229,56 @@ final class CleanerBridge: ObservableObject {
             scheduleFullTimer()
         }
     }
-    @Published var isBusy = false
+    /// Split from a single shared `isBusy` (finding "Also fix"): Dashboard's
+    /// `scan()` and Projects' `scanProjects()` are independent subprocess
+    /// calls, so a Projects re-scan must not make the Dashboard's own Scan
+    /// button/spinner claim to be busy, and vice versa. `fullRefreshIfStale()`
+    /// still watches both — see its guard below.
+    @Published var isScanning = false
+    @Published var isScanningProjects = false
     @Published var isCleaning = false
     @Published var statusMessage: String?
     @Published var lastClean: CleanResult?
     @Published var lastCleanedAt: Date?
+    /// Set in the catch block of `clean(ids:)`/`autoCleanSafe()`/
+    /// `cleanProjects(ids:)` (finding B2) alongside clearing `lastClean`, so
+    /// a failed clean can never render as if the previous run's success was
+    /// still current. `statusMessage` alone can't carry this: both
+    /// `clean(ids:)` and `autoCleanSafe()` call `scan()` right after the
+    /// catch block, and a successful `scan()` sets `statusMessage = nil`,
+    /// erasing the "Clean failed" text before the UI ever gets to show it.
+    /// Cleared at the start of every clean attempt (success or another
+    /// failure both overwrite it correctly) and rendered only while "fresh"
+    /// (via `lastCleanFailedAt`), mirroring how `lastClean`/`lastCleanedAt`
+    /// already work.
+    @Published var lastCleanFailed: String?
+    @Published var lastCleanFailedAt: Date?
     @Published var freeBytes: Int?
     @Published var diskSnapshots: [DiskSnapshot] = []
+    /// Live per-item clean progress, for Dashboard row spinners/checks (and
+    /// any other consumer, e.g. the menu bar popover). The engine only
+    /// returns per-item results once the whole `clean` process exits — there
+    /// is no true streaming — so `cleaningIDs` is the optimistic "about to
+    /// touch these ids" set set by `clean(ids:)` before launching, and
+    /// `cleanedIDs` is the real, reconciled-from-`CleanResult.items` set set
+    /// after it exits. An id is never added to `cleanedIDs` before the
+    /// process actually exits — no "done" state is ever guessed. Both are
+    /// cleared the next time `scan()` completes successfully, so a stale
+    /// clean's spinners/checks can't leak into a later scan's target list.
+    @Published var cleaningIDs: Set<String> = []
+    @Published var cleanedIDs: Set<String> = []
 
     private var lightTimer: Timer?
     private var fullTimer: Timer?
     private var lastFullScan: Date?
     private var wakeObserver: NSObjectProtocol?
+    /// Memoized subscription to `UpdaterManager.shared.pendingUpdateVersion`
+    /// (finding B1) — set up once (see `observeUpdater()`) regardless of
+    /// whether the main window is ever opened, matching `ensureSettingsLoaded()`'s
+    /// "menu-bar-only session still works" precedent. Harmless no-op wiring
+    /// in the `SPARKLE_DISABLED` stub build, since `pendingUpdateVersion`
+    /// there is always nil and the publisher never fires.
+    private var updaterCancellable: AnyCancellable?
     /// Memoized so settings load exactly once per app run no matter how many
     /// call sites race to trigger it (menu bar `.task`, main window `.task`,
     /// a notification-gated action) — awaiting it elsewhere just joins the
@@ -270,13 +345,39 @@ final class CleanerBridge: ObservableObject {
 
     // ── Actions ────────────────────────────────────────────────────────────────
 
+    /// One-time (memoized) subscription that surfaces a scheduled Sparkle
+    /// update (finding B1) as a native notification, reusing
+    /// `NotificationManager` rather than building new plumbing. Safe to call
+    /// from multiple `.task`s (MenuBarPanel, MainView) — only the first
+    /// subscribes. `UpdaterManager.shared.pendingUpdateVersion` exists in
+    /// both the Sparkle-enabled and `SPARKLE_DISABLED` builds (always nil in
+    /// the stub), so this needs no `#if` of its own.
+    func observeUpdater() {
+        guard updaterCancellable == nil else { return }
+        updaterCancellable = UpdaterManager.shared.$pendingUpdateVersion
+            .compactMap { $0 }
+            .removeDuplicates()
+            .sink { [weak self] version in
+                guard let self, self.notificationsEnabled else { return }
+                NotificationManager.shared.post(
+                    title: "MacCleaner update available",
+                    body: "Version \(version) is ready to install.")
+            }
+    }
+
     func scan() async {
-        isBusy = true
-        defer { isBusy = false }
+        isScanning = true
+        defer { isScanning = false }
         do {
             report = try await run(ScanReport.self, ["scan", "--json"])
             statusMessage = nil
             lastFullScan = Date()
+            // A fresh, successful scan is the signal that any prior clean's
+            // progress is now stale — the target list it was tracking has
+            // just been replaced. Left untouched on failure: a failed scan
+            // shouldn't erase the last real clean result off the screen.
+            cleaningIDs.removeAll()
+            cleanedIDs.removeAll()
         } catch {
             statusMessage = "Scan failed: \(error.localizedDescription)"
         }
@@ -345,7 +446,10 @@ final class CleanerBridge: ObservableObject {
 
     /// Full scan, debounced so a wake plus a menu-open doesn't launch two.
     func fullRefreshIfStale() async {
-        guard !isCleaning, !isBusy else { return }
+        // Watches both scan flags (finding "Also fix" — split isBusy): a
+        // Projects re-scan in flight must still hold off the debounced
+        // Dashboard refresh, and vice versa.
+        guard !isCleaning, !isScanning, !isScanningProjects else { return }
         let interval = max(3600, fullRefreshHours * 3600)
         if let last = lastFullScan, Date().timeIntervalSince(last) < interval { return }
         await scan()
@@ -372,7 +476,24 @@ final class CleanerBridge: ObservableObject {
 
     func clean(ids: [String]) async {
         guard !ids.isEmpty else { return }
+        // Re-entrancy guard (finding B3): a popover clean and a Dashboard
+        // clean both drive the same shared `isCleaning`/`cleaningIDs` state,
+        // so letting a second one start mid-flight means whichever finishes
+        // first clears that shared state out from under the other, stranding
+        // its UI. Matches the existing `setSchedule` precedent.
+        guard !isCleaning else { return }
         isCleaning = true
+        // Optimistic: every requested id shows a spinner immediately. Reset
+        // cleanedIDs too, in case an earlier clean's reconciled checkmarks
+        // are still showing (scan() normally clears them, but a batch that
+        // targets an id no prior scan cleared should never inherit a stale
+        // "done" from a previous run).
+        cleaningIDs = Set(ids)
+        cleanedIDs.removeAll()
+        // Optimistically cleared here so a success path never has to
+        // remember to do it (see the property's doc comment for why this
+        // can't just piggyback on `statusMessage`).
+        lastCleanFailed = nil
         defer { isCleaning = false }
         do {
             var args = ["clean", "--targets", ids.joined(separator: ","), "--yes"]
@@ -380,6 +501,14 @@ final class CleanerBridge: ObservableObject {
             args.append("--json")
             lastClean = try await run(CleanResult.self, args)
             statusMessage = nil
+            // Reconcile from the real per-item results now that the process
+            // has exited — only ids the engine actually reported on move to
+            // cleanedIDs; anything it stayed silent on (shouldn't happen,
+            // but never assume) keeps its spinner rather than being guessed
+            // as done.
+            let resultIDs = Set(lastClean?.items.map(\.id) ?? [])
+            cleaningIDs.subtract(resultIDs)
+            cleanedIDs.formUnion(resultIDs)
             // Settings must be loaded before this check even in a menu-bar-only
             // session (finding I4) — see ensureSettingsLoaded().
             await ensureSettingsLoaded().value
@@ -390,6 +519,14 @@ final class CleanerBridge: ObservableObject {
             }
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
+            // B2: a failed clean must never leave the previous run's success
+            // displayed as if it were still current.
+            lastClean = nil
+            lastCleanFailed = error.localizedDescription
+            lastCleanFailedAt = Date()
+            // The process never produced per-item results, so nothing can
+            // honestly move to cleanedIDs — just stop showing spinners for it.
+            cleaningIDs.removeAll()
         }
         await scan()
         await loadHistory()
@@ -402,7 +539,10 @@ final class CleanerBridge: ObservableObject {
     }
 
     func autoCleanSafe() async {
+        // Re-entrancy guard (finding B3) — see clean(ids:)'s comment.
+        guard !isCleaning else { return }
         isCleaning = true
+        lastCleanFailed = nil
         defer { isCleaning = false }
         do {
             lastClean = try await run(CleanResult.self, ["clean", "--yes", "--json"])
@@ -417,6 +557,11 @@ final class CleanerBridge: ObservableObject {
             }
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
+            // B2: a failed clean must never leave the previous run's success
+            // displayed as if it were still current.
+            lastClean = nil
+            lastCleanFailed = error.localizedDescription
+            lastCleanFailedAt = Date()
         }
         await scan()
         await loadHistory()
@@ -429,8 +574,8 @@ final class CleanerBridge: ObservableObject {
     }
 
     func scanProjects() async {
-        isBusy = true
-        defer { isBusy = false }
+        isScanningProjects = true
+        defer { isScanningProjects = false }
         do {
             projects = try await run(ProjectsReport.self, ["projects", "--json"])
             statusMessage = nil
@@ -441,7 +586,10 @@ final class CleanerBridge: ObservableObject {
 
     func cleanProjects(ids: [String]) async {
         guard !ids.isEmpty else { return }
+        // Re-entrancy guard (finding B3) — see clean(ids:)'s comment.
+        guard !isCleaning else { return }
         isCleaning = true
+        lastCleanFailed = nil
         defer { isCleaning = false }
         do {
             var args = ["projects", "--clean", "--targets", ids.joined(separator: ","), "--yes"]
@@ -451,6 +599,11 @@ final class CleanerBridge: ObservableObject {
             statusMessage = nil
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
+            // B2: a failed clean must never leave the previous run's success
+            // displayed as if it were still current.
+            lastClean = nil
+            lastCleanFailed = error.localizedDescription
+            lastCleanFailedAt = Date()
         }
         await scanProjects()
         await loadHistory()

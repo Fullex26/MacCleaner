@@ -33,6 +33,7 @@ struct DiskTrendView: View {
                     ForEach(points) { p in
                         LineMark(x: .value("Day", p.day),
                                  y: .value("Free (GB)", p.freeGB))
+                            .foregroundStyle(Color.accentCyan)
                     }
                     RuleMark(y: .value("Low-disk warning", thresholdGB))
                         .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
@@ -43,9 +44,22 @@ struct DiskTrendView: View {
                                 .foregroundStyle(.orange)
                         }
                 }
+                .chartXAxis {
+                    AxisMarks { _ in
+                        AxisGridLine().foregroundStyle(.secondary)
+                        AxisValueLabel()
+                    }
+                }
+                .chartYAxis {
+                    AxisMarks { _ in
+                        AxisGridLine().foregroundStyle(.secondary)
+                        AxisValueLabel()
+                    }
+                }
                 .chartYScale(domain: 0...maxY)
                 .chartYAxisLabel("Free (GB)")
                 .frame(height: 140)
+                .padding()
             } else {
                 // Compact rather than reserving the full 140pt chart height
                 // for one centered sentence — a fresh install shouldn't
@@ -55,8 +69,10 @@ struct DiskTrendView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
                     .frame(height: 32)
+                    .padding()
             }
         }
+        .glassPanel()
     }
 
     private var maxY: Double {

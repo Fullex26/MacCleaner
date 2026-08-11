@@ -4,6 +4,9 @@ Todo.txt
 # Claude Code local config (personal — skills, memory, session data)
 .claude/
 
+# Superpowers local scratch (SDD ledger, brainstorm mockups)
+.superpowers/
+
 # Build artifacts (bare binary, not the .app bundle)
 MacCleaner
 
