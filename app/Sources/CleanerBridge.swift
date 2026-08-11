@@ -199,6 +199,18 @@ final class CleanerBridge: ObservableObject {
     @Published var lastCleanedAt: Date?
     @Published var freeBytes: Int?
     @Published var diskSnapshots: [DiskSnapshot] = []
+    /// Live per-item clean progress, for Dashboard row spinners/checks (and
+    /// any other consumer, e.g. the menu bar popover). The engine only
+    /// returns per-item results once the whole `clean` process exits — there
+    /// is no true streaming — so `cleaningIDs` is the optimistic "about to
+    /// touch these ids" set set by `clean(ids:)` before launching, and
+    /// `cleanedIDs` is the real, reconciled-from-`CleanResult.items` set set
+    /// after it exits. An id is never added to `cleanedIDs` before the
+    /// process actually exits — no "done" state is ever guessed. Both are
+    /// cleared the next time `scan()` completes successfully, so a stale
+    /// clean's spinners/checks can't leak into a later scan's target list.
+    @Published var cleaningIDs: Set<String> = []
+    @Published var cleanedIDs: Set<String> = []
 
     private var lightTimer: Timer?
     private var fullTimer: Timer?
@@ -277,6 +289,12 @@ final class CleanerBridge: ObservableObject {
             report = try await run(ScanReport.self, ["scan", "--json"])
             statusMessage = nil
             lastFullScan = Date()
+            // A fresh, successful scan is the signal that any prior clean's
+            // progress is now stale — the target list it was tracking has
+            // just been replaced. Left untouched on failure: a failed scan
+            // shouldn't erase the last real clean result off the screen.
+            cleaningIDs.removeAll()
+            cleanedIDs.removeAll()
         } catch {
             statusMessage = "Scan failed: \(error.localizedDescription)"
         }
@@ -373,6 +391,13 @@ final class CleanerBridge: ObservableObject {
     func clean(ids: [String]) async {
         guard !ids.isEmpty else { return }
         isCleaning = true
+        // Optimistic: every requested id shows a spinner immediately. Reset
+        // cleanedIDs too, in case an earlier clean's reconciled checkmarks
+        // are still showing (scan() normally clears them, but a batch that
+        // targets an id no prior scan cleared should never inherit a stale
+        // "done" from a previous run).
+        cleaningIDs = Set(ids)
+        cleanedIDs.removeAll()
         defer { isCleaning = false }
         do {
             var args = ["clean", "--targets", ids.joined(separator: ","), "--yes"]
@@ -380,6 +405,14 @@ final class CleanerBridge: ObservableObject {
             args.append("--json")
             lastClean = try await run(CleanResult.self, args)
             statusMessage = nil
+            // Reconcile from the real per-item results now that the process
+            // has exited — only ids the engine actually reported on move to
+            // cleanedIDs; anything it stayed silent on (shouldn't happen,
+            // but never assume) keeps its spinner rather than being guessed
+            // as done.
+            let resultIDs = Set(lastClean?.items.map(\.id) ?? [])
+            cleaningIDs.subtract(resultIDs)
+            cleanedIDs.formUnion(resultIDs)
             // Settings must be loaded before this check even in a menu-bar-only
             // session (finding I4) — see ensureSettingsLoaded().
             await ensureSettingsLoaded().value
@@ -390,6 +423,9 @@ final class CleanerBridge: ObservableObject {
             }
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
+            // The process never produced per-item results, so nothing can
+            // honestly move to cleanedIDs — just stop showing spinners for it.
+            cleaningIDs.removeAll()
         }
         await scan()
         await loadHistory()
