@@ -8,6 +8,14 @@ struct MacCleanerApp: App {
     init() {
         NotificationManager.shared.requestAuthorization()
 
+        // Eagerly instantiate the updater so the daily automatic check starts
+        // at launch for menu-bar-only users. UpdaterManager.shared is
+        // otherwise only referenced from SettingsView, and lazy `static let`
+        // singletons don't run their initializer until first touched — a
+        // user who never opens Settings would otherwise never get
+        // SPUStandardUpdaterController's scheduled check started at all.
+        _ = UpdaterManager.shared
+
         // NSAlert and other AppKit surfaces render NSApp.applicationIconImage.
         // Resolving it from CFBundleIconFile can silently fall back to the
         // generic icon when icon services has a stale cache entry for this

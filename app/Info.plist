@@ -26,5 +26,13 @@
     <true/>
     <key>NSHumanReadableCopyright</key>
     <string>MIT License — github.com/Fullex26/MacCleaner</string>
+    <key>SUFeedURL</key>
+    <string>https://github.com/Fullex26/MacCleaner/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>pozlfRIcd9s0JQwteBAhzxg8A2Ex0/YeZK3su9IDe9k=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
 </dict>
 </plist>
