@@ -78,6 +78,32 @@ struct HistoryRun: Codable, Identifiable {
     let disk_after: String
     let items: [CleanItem]
     var id: String { timestamp }
+
+    private enum CodingKeys: String, CodingKey {
+        case timestamp, total_freed_bytes, total_freed_human, disk_after, items
+    }
+
+    // FIX7 idiom (see DiskSnapshot's comment just below): report.log is a
+    // mutable, externally-editable file — one entry missing or misshaping
+    // `items` (hand edit, partial write, a future schema change) must not
+    // fail decoding of the whole HistoryReport. That used to freeze both
+    // the History tab (this struct's own consumer) and
+    // performLightRefresh()'s 60s menu bar tick, whose `try?` swallows the
+    // decode error and whose `guard let … else { return }` then bails
+    // silently, leaving the free-space/"Last cleaned" display stuck. Every
+    // other field here was already required pre-FIX7 (and a run with a
+    // missing timestamp/freed total is arguably not recoverable as a
+    // display row anyway) — only `items` gets the tolerant treatment,
+    // matching the reviewer's ask precisely: default to `[]` rather than
+    // losing the whole run over a missing/malformed items array.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        timestamp = try container.decode(String.self, forKey: .timestamp)
+        total_freed_bytes = try container.decode(Int.self, forKey: .total_freed_bytes)
+        total_freed_human = try container.decode(String.self, forKey: .total_freed_human)
+        disk_after = try container.decode(String.self, forKey: .disk_after)
+        items = (try? container.decodeIfPresent([CleanItem].self, forKey: .items)) ?? []
+    }
 }
 
 struct DiskCurrent: Codable {
