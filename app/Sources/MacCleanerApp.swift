@@ -106,20 +106,57 @@ struct MenuBarContent: View {
     }
 }
 
+/// The four top-level sections reachable from the sidebar. `⌘1`–`⌘4` jump
+/// straight to a section (see the hidden shortcut buttons in `MainView`).
+enum AppSection: String, CaseIterable, Identifiable {
+    case dashboard, projects, history, settings
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .dashboard: return "Dashboard"
+        case .projects: return "Projects"
+        case .history: return "History"
+        case .settings: return "Settings"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .dashboard: return "gauge"
+        case .projects: return "folder"
+        case .history: return "clock"
+        case .settings: return "gearshape"
+        }
+    }
+}
+
 struct MainView: View {
     @EnvironmentObject var bridge: CleanerBridge
+    @State private var selection: AppSection? = .dashboard
 
     var body: some View {
-        TabView {
-            DashboardView()
-                .tabItem { Label("Dashboard", systemImage: "gauge") }
-            ProjectsView()
-                .tabItem { Label("Projects", systemImage: "folder") }
-            HistoryView()
-                .tabItem { Label("History", systemImage: "clock") }
-            SettingsView()
-                .tabItem { Label("Settings", systemImage: "gearshape") }
+        NavigationSplitView {
+            List(AppSection.allCases, selection: $selection) { section in
+                Label(section.title, systemImage: section.symbolName)
+                    .tag(section)
+            }
+            .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 240)
+            .listStyle(.sidebar)
+        } detail: {
+            Group {
+                switch selection ?? .dashboard {
+                case .dashboard: DashboardView()
+                case .projects: ProjectsView()
+                case .history: HistoryView()
+                case .settings: SettingsView()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
+        .tint(.accentCyan)
+        .background(keyboardShortcuts)
         .task {
             bridge.startAutoRefresh()
             // Load config (incl. full_refresh_hours) in the background so launch
@@ -142,5 +179,20 @@ struct MainView: View {
                     .transition(.opacity)
             }
         }
+    }
+
+    /// Invisible buttons purely to register `⌘1`–`⌘4` as section-switch
+    /// shortcuts without needing a `Commands` scene builder (out of scope —
+    /// `MacCleanerApp`'s `Scene` isn't touched by this view).
+    private var keyboardShortcuts: some View {
+        Group {
+            Button("") { selection = .dashboard }.keyboardShortcut("1", modifiers: .command)
+            Button("") { selection = .projects }.keyboardShortcut("2", modifiers: .command)
+            Button("") { selection = .history }.keyboardShortcut("3", modifiers: .command)
+            Button("") { selection = .settings }.keyboardShortcut("4", modifiers: .command)
+        }
+        .frame(width: 0, height: 0)
+        .opacity(0)
+        .accessibilityHidden(true)
     }
 }
