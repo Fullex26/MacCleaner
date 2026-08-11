@@ -23,6 +23,7 @@ SOURCES=("$APP_DIR"/Sources/*.swift)
 NATIVE_ARCH="$(uname -m)"
 echo "→ Compiling $NATIVE_ARCH slice…"
 swiftc -O -swift-version 5 \
+    -DSPARKLE_DISABLED \
     -target "$NATIVE_ARCH-apple-macos$MIN_MACOS" \
     -o "$BUILD_DIR/MacCleaner-$NATIVE_ARCH" \
     "${SOURCES[@]}"
@@ -31,6 +32,7 @@ swiftc -O -swift-version 5 \
 OTHER_ARCH="x86_64"
 [ "$NATIVE_ARCH" = "x86_64" ] && OTHER_ARCH="arm64"
 if swiftc -O -swift-version 5 \
+    -DSPARKLE_DISABLED \
     -target "$OTHER_ARCH-apple-macos$MIN_MACOS" \
     -o "$BUILD_DIR/MacCleaner-$OTHER_ARCH" \
     "${SOURCES[@]}" 2>/dev/null; then
