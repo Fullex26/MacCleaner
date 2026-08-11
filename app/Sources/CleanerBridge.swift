@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Combine
 
 // ── JSON models (contract with cleaner.py --json, see AGENTS.md) ───────────────
 
@@ -228,11 +229,30 @@ final class CleanerBridge: ObservableObject {
             scheduleFullTimer()
         }
     }
-    @Published var isBusy = false
+    /// Split from a single shared `isBusy` (finding "Also fix"): Dashboard's
+    /// `scan()` and Projects' `scanProjects()` are independent subprocess
+    /// calls, so a Projects re-scan must not make the Dashboard's own Scan
+    /// button/spinner claim to be busy, and vice versa. `fullRefreshIfStale()`
+    /// still watches both — see its guard below.
+    @Published var isScanning = false
+    @Published var isScanningProjects = false
     @Published var isCleaning = false
     @Published var statusMessage: String?
     @Published var lastClean: CleanResult?
     @Published var lastCleanedAt: Date?
+    /// Set in the catch block of `clean(ids:)`/`autoCleanSafe()`/
+    /// `cleanProjects(ids:)` (finding B2) alongside clearing `lastClean`, so
+    /// a failed clean can never render as if the previous run's success was
+    /// still current. `statusMessage` alone can't carry this: both
+    /// `clean(ids:)` and `autoCleanSafe()` call `scan()` right after the
+    /// catch block, and a successful `scan()` sets `statusMessage = nil`,
+    /// erasing the "Clean failed" text before the UI ever gets to show it.
+    /// Cleared at the start of every clean attempt (success or another
+    /// failure both overwrite it correctly) and rendered only while "fresh"
+    /// (via `lastCleanFailedAt`), mirroring how `lastClean`/`lastCleanedAt`
+    /// already work.
+    @Published var lastCleanFailed: String?
+    @Published var lastCleanFailedAt: Date?
     @Published var freeBytes: Int?
     @Published var diskSnapshots: [DiskSnapshot] = []
     /// Live per-item clean progress, for Dashboard row spinners/checks (and
@@ -252,6 +272,13 @@ final class CleanerBridge: ObservableObject {
     private var fullTimer: Timer?
     private var lastFullScan: Date?
     private var wakeObserver: NSObjectProtocol?
+    /// Memoized subscription to `UpdaterManager.shared.pendingUpdateVersion`
+    /// (finding B1) — set up once (see `observeUpdater()`) regardless of
+    /// whether the main window is ever opened, matching `ensureSettingsLoaded()`'s
+    /// "menu-bar-only session still works" precedent. Harmless no-op wiring
+    /// in the `SPARKLE_DISABLED` stub build, since `pendingUpdateVersion`
+    /// there is always nil and the publisher never fires.
+    private var updaterCancellable: AnyCancellable?
     /// Memoized so settings load exactly once per app run no matter how many
     /// call sites race to trigger it (menu bar `.task`, main window `.task`,
     /// a notification-gated action) — awaiting it elsewhere just joins the
@@ -318,9 +345,29 @@ final class CleanerBridge: ObservableObject {
 
     // ── Actions ────────────────────────────────────────────────────────────────
 
+    /// One-time (memoized) subscription that surfaces a scheduled Sparkle
+    /// update (finding B1) as a native notification, reusing
+    /// `NotificationManager` rather than building new plumbing. Safe to call
+    /// from multiple `.task`s (MenuBarPanel, MainView) — only the first
+    /// subscribes. `UpdaterManager.shared.pendingUpdateVersion` exists in
+    /// both the Sparkle-enabled and `SPARKLE_DISABLED` builds (always nil in
+    /// the stub), so this needs no `#if` of its own.
+    func observeUpdater() {
+        guard updaterCancellable == nil else { return }
+        updaterCancellable = UpdaterManager.shared.$pendingUpdateVersion
+            .compactMap { $0 }
+            .removeDuplicates()
+            .sink { [weak self] version in
+                guard let self, self.notificationsEnabled else { return }
+                NotificationManager.shared.post(
+                    title: "MacCleaner update available",
+                    body: "Version \(version) is ready to install.")
+            }
+    }
+
     func scan() async {
-        isBusy = true
-        defer { isBusy = false }
+        isScanning = true
+        defer { isScanning = false }
         do {
             report = try await run(ScanReport.self, ["scan", "--json"])
             statusMessage = nil
@@ -399,7 +446,10 @@ final class CleanerBridge: ObservableObject {
 
     /// Full scan, debounced so a wake plus a menu-open doesn't launch two.
     func fullRefreshIfStale() async {
-        guard !isCleaning, !isBusy else { return }
+        // Watches both scan flags (finding "Also fix" — split isBusy): a
+        // Projects re-scan in flight must still hold off the debounced
+        // Dashboard refresh, and vice versa.
+        guard !isCleaning, !isScanning, !isScanningProjects else { return }
         let interval = max(3600, fullRefreshHours * 3600)
         if let last = lastFullScan, Date().timeIntervalSince(last) < interval { return }
         await scan()
@@ -426,6 +476,12 @@ final class CleanerBridge: ObservableObject {
 
     func clean(ids: [String]) async {
         guard !ids.isEmpty else { return }
+        // Re-entrancy guard (finding B3): a popover clean and a Dashboard
+        // clean both drive the same shared `isCleaning`/`cleaningIDs` state,
+        // so letting a second one start mid-flight means whichever finishes
+        // first clears that shared state out from under the other, stranding
+        // its UI. Matches the existing `setSchedule` precedent.
+        guard !isCleaning else { return }
         isCleaning = true
         // Optimistic: every requested id shows a spinner immediately. Reset
         // cleanedIDs too, in case an earlier clean's reconciled checkmarks
@@ -434,6 +490,10 @@ final class CleanerBridge: ObservableObject {
         // "done" from a previous run).
         cleaningIDs = Set(ids)
         cleanedIDs.removeAll()
+        // Optimistically cleared here so a success path never has to
+        // remember to do it (see the property's doc comment for why this
+        // can't just piggyback on `statusMessage`).
+        lastCleanFailed = nil
         defer { isCleaning = false }
         do {
             var args = ["clean", "--targets", ids.joined(separator: ","), "--yes"]
@@ -459,6 +519,11 @@ final class CleanerBridge: ObservableObject {
             }
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
+            // B2: a failed clean must never leave the previous run's success
+            // displayed as if it were still current.
+            lastClean = nil
+            lastCleanFailed = error.localizedDescription
+            lastCleanFailedAt = Date()
             // The process never produced per-item results, so nothing can
             // honestly move to cleanedIDs — just stop showing spinners for it.
             cleaningIDs.removeAll()
@@ -474,7 +539,10 @@ final class CleanerBridge: ObservableObject {
     }
 
     func autoCleanSafe() async {
+        // Re-entrancy guard (finding B3) — see clean(ids:)'s comment.
+        guard !isCleaning else { return }
         isCleaning = true
+        lastCleanFailed = nil
         defer { isCleaning = false }
         do {
             lastClean = try await run(CleanResult.self, ["clean", "--yes", "--json"])
@@ -489,6 +557,11 @@ final class CleanerBridge: ObservableObject {
             }
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
+            // B2: a failed clean must never leave the previous run's success
+            // displayed as if it were still current.
+            lastClean = nil
+            lastCleanFailed = error.localizedDescription
+            lastCleanFailedAt = Date()
         }
         await scan()
         await loadHistory()
@@ -501,8 +574,8 @@ final class CleanerBridge: ObservableObject {
     }
 
     func scanProjects() async {
-        isBusy = true
-        defer { isBusy = false }
+        isScanningProjects = true
+        defer { isScanningProjects = false }
         do {
             projects = try await run(ProjectsReport.self, ["projects", "--json"])
             statusMessage = nil
@@ -513,7 +586,10 @@ final class CleanerBridge: ObservableObject {
 
     func cleanProjects(ids: [String]) async {
         guard !ids.isEmpty else { return }
+        // Re-entrancy guard (finding B3) — see clean(ids:)'s comment.
+        guard !isCleaning else { return }
         isCleaning = true
+        lastCleanFailed = nil
         defer { isCleaning = false }
         do {
             var args = ["projects", "--clean", "--targets", ids.joined(separator: ","), "--yes"]
@@ -523,6 +599,11 @@ final class CleanerBridge: ObservableObject {
             statusMessage = nil
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
+            // B2: a failed clean must never leave the previous run's success
+            // displayed as if it were still current.
+            lastClean = nil
+            lastCleanFailed = error.localizedDescription
+            lastCleanFailedAt = Date()
         }
         await scanProjects()
         await loadHistory()
