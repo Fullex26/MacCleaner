@@ -248,14 +248,30 @@ Remove the placeholder comment above `sha256` once a real hash is in place.
 Commit and push to `Fullex26/homebrew-tap`. No CI write-token touches the
 tap — this step runs locally under the maintainer's own credentials.
 
-`Casks/maccleaner.rb` also sets `auto_updates true` — since v2.6.0 the app
-updates itself in place via Sparkle (see §7 below), so Homebrew shouldn't
-expect `brew upgrade --cask` to be the only way a user's installed copy ever
-moves forward. `auto_updates true` doesn't change what this bump procedure
-does (you still bump `version`/`sha256` here so a *fresh* `brew install`
-pulls the current release); it only tells `brew outdated --cask` and `brew
-upgrade --cask` not to nag about a version drift that Sparkle itself is
-already handling for existing installs. Leave it set on every future bump.
+`Casks/maccleaner.rb` deliberately does **not** set `auto_updates true` yet,
+even though v2.6.0 wires up Sparkle. Setting it tells Homebrew "this cask's
+installed copy updates itself, don't bother nagging about version drift" —
+`brew upgrade` (without `--greedy`) then silently skips the cask entirely.
+That's fine once the *previously installed* build actually has Sparkle in
+it, but it is not fine on the 2.5.0 → 2.6.0 hop specifically: the cask's
+currently-shipping version (2.5.0, at the time this section was written) was
+built and released before Sparkle existed, so an existing cask user's
+installed 2.5.0 app has no self-update mechanism at all. If `auto_updates`
+were set on this bump, neither path would ever move that user forward —
+`brew upgrade` skips them (auto_updates says "not my job"), and their 2.5.0
+binary has nothing in it that could discover or apply an update. They'd be
+stranded at 2.5.0 permanently, with no error or warning anywhere.
+
+**Sequencing:** leave `auto_updates` unset through the 2.5.0 → 2.6.0 cask
+bump. Only add `auto_updates true` starting with the *next* bump after that
+— i.e. once the version the cask currently points at is itself a
+Sparkle-bearing build (2.6.0+), so "the installed copy can update itself" is
+actually true for everyone who's on it. Until then, if a cask user needs to
+move to 2.6.0+ before their own next `brew upgrade` happens to catch it,
+`brew upgrade --greedy --cask` (or `brew upgrade --cask --greedy-latest`,
+depending on the installed Homebrew version) is the manual path — it ignores
+`auto_updates`/`version :latest` skip logic and force-checks every cask
+regardless.
 
 ## 6. Why `brew audit --cask --new` is not the gate
 
@@ -400,3 +416,51 @@ would be too late for the nested pieces. This whole block is gated on
 `[ -d "$FRAMEWORK" ]`; a non-CI build (or one where the Sparkle fetch fell
 back to `-DSPARKLE_DISABLED` — see `app/build.sh`) simply has nothing to
 sign here and proceeds straight to step 4.
+
+### One unsigned release 404s the feed until the next signed one
+
+`SUFeedURL` always points at `.../releases/latest/download/appcast.xml` (see
+above) — there is no fallback to a previous release's asset if the *current*
+"latest" release doesn't have one. Since `Generate appcast` only runs when
+**both** the five Developer ID secrets **and** `SPARKLE_ED_PRIVATE_KEY` are
+present, any tag pushed without that full set (a signing secret expired,
+someone cut a release from a fork without secrets configured, etc.) ships
+with no `appcast.xml` asset at all. The consequence is not "stale feed" —
+it's every already-installed app's daily Sparkle check, and every manual
+"Check for Updates…" click, hitting a 404 against `releases/latest/...`,
+silently or with a generic Sparkle error, for every user, until a
+*subsequent* tag is pushed with the full secret set restored. `release.yml`'s
+`Warn if this release ships without an appcast` step emits an `::error::`-
+adjacent `::workflow warning::` annotation on the run summary when this
+happens, precisely so it's visible at release time rather than discovered
+days later from a support report. If you see that warning: either the
+secrets are missing and should be added before the release is considered
+done, or (rare) this was an intentional unsigned/manual release — in which
+case push a follow-up signed tag promptly to restore the feed.
+
+### Key rotation is effectively a one-way door
+
+`SUPublicEDKey` (`app/Info.plist`) is baked into every shipped build and
+verified against on the client side — Sparkle refuses an update whose
+signature doesn't check out against the public key the *currently installed*
+app already has. That has two consequences that make "just rotate the key"
+much harder than it sounds once any build has shipped:
+
+- **The private key (`SPARKLE_ED_PRIVATE_KEY`) needs a real offline
+  backup.** If it's lost, there's no way to sign an update that any existing
+  installed copy will accept — you cannot regenerate a "matching" key from
+  the public half. Every current install would be stuck permanently on
+  whatever version it's on unless the user manually reinstalls.
+- **You cannot rotate both halves in the same release.** Shipping a new
+  keypair (new `SUPublicEDKey` in `app/Info.plist` *and* a new
+  `SPARKLE_ED_PRIVATE_KEY` secret) in one go breaks every existing install:
+  they verify the incoming appcast/update against their *old* embedded
+  public key, which no longer matches what the new private key produces —
+  the key-correspondence gate (above) would even refuse to build that
+  release, by design. A genuine rotation is therefore at minimum a two-step
+  process: ship one release that is still signed with the OLD private key
+  but carries the NEW public key in `SUPublicEDKey`, let that reach
+  (effectively) all installs, and only then switch `SPARKLE_ED_PRIVATE_KEY`
+  to the new private key for the release after that. Skipping the first
+  step strands every install that hasn't already updated by the time you
+  make the switch.

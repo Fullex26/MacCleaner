@@ -16,7 +16,7 @@ MacCleaner finds and removes the developer detritus that accumulates silently �
 - **Know before you act** — `--dry-run` previews the exact paths and sizes a clean would touch with zero side effects, `report` tracks disk-space trends over time, and `projects` automatically skips repos with uncommitted or unpushed work.
 - **AI-era cleanup** — finds stale build/clone litter that AI coding sessions leave under `/private/tmp` (classified by contents, never by name, and always review-only), plus unused iOS simulator devices and runtime images via `simctl`.
 - **Stay in the loop** — a notification when a scheduled clean finishes, a low-disk warning if free space drops below a configurable threshold (10 GB by default), and a menu bar that shows free space and "last cleaned" without opening the app.
-- **Updates itself** — the app checks for new versions daily via Sparkle and prompts with release notes when one's available (or check manually from Settings); installed via Homebrew? `brew upgrade` still works as before.
+- **Updates itself** — the app checks for new versions daily via Sparkle and prompts with release notes when one's available (or check manually from Settings); installed via Homebrew? `brew upgrade` still works as before. Sparkle only updates the app bundle, not the installed CLI engine at `~/mac-cleaner/cleaner.py` — re-run `bash install.sh` to update that too (`maccleaner doctor` flags a version mismatch between the two).
 
 ---
 

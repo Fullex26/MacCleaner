@@ -41,9 +41,13 @@ installs.
 ### Fixed
 - The app's History tab (and the menu bar's background refresh) tolerates a
   malformed history entry instead of failing to decode the whole run list
-- `clean --targets` with a whitespace-only or empty value (e.g. `" , "`)
-  is now correctly a no-op, not a full safe auto-clean — it was silently
-  falling through to "no `--targets` given" and cleaning everything
+- `clean --targets` with an explicitly empty, whitespace-only, or garbage
+  value (`""`, `" , "`, `",,,"`) is now correctly a no-op, not a full safe
+  auto-clean. The gate that decides "was `--targets` given at all" now keys
+  off argument *presence* (`is not None`) rather than raw-string truthiness
+  — a truthiness check treats `--targets ""` the same as the flag being
+  absent entirely, which fell through to "no `--targets` given" and
+  auto-cleaned everything
 
 ### Notes
 - This is the first release with Sparkle wired up. The signing key,
