@@ -85,11 +85,12 @@ This document tracks planned features and long-term direction. Community input w
 
 > Required before sharing with non-developers or putting on GitHub Releases.
 
-- [ ] **Code signing** — pipeline ready, waiting on an Apple Developer ID: `release.yml` already re-signs with a Developer ID certificate when `MACOS_CERTIFICATE_P12` and friends are set (`docs/RELEASING.md` §1); `build.sh` itself still always ad-hoc signs for local/dev builds
-- [ ] **Notarization** — pipeline ready, waiting on an Apple Developer ID: `release.yml` already submits to `notarytool`, staples, and verifies with `spctl` once the same secrets are present; without them CI ships ad-hoc signed exactly as before
+- [x] **Code signing** — live since v2.5.0: `release.yml` re-signs with the Developer ID certificate (Synapse Labs Pty Ltd) on every `v*` tag, embedded Sparkle framework signed inside-out as of v2.6.0 (`docs/RELEASING.md` §1, §7); `build.sh` still always ad-hoc signs for local/dev builds
+- [x] **Notarization** — live since v2.5.0: `release.yml` submits to `notarytool`, staples, and verifies with `spctl` automatically on every tagged release
 - [x] **Buildable from source** — `app/build.sh` builds the app with plain `swiftc`, no `.xcodeproj` needed; contributors run one command
-- [x] **GitHub Actions release build** — CI packages the `.app` and a CLI tarball on version tags and attaches them to the GitHub Release; artifacts stay ad-hoc signed until the two items above land (i.e. until the secrets exist — no workflow change needed then)
-- [ ] **Homebrew Cask** — `Casks/maccleaner.rb` is written and validated (`brew style --cask` / `brew audit --cask` clean); the public tap is unpublished pending notarization above — Homebrew 6 removed `--no-quarantine` and never had `quarantine: false`, so an unsigned cask install is Gatekeeper-blocked with no supported workaround
+- [x] **GitHub Actions release build** — CI packages the `.app` and a CLI tarball on version tags and attaches them to the GitHub Release, now signed and notarized
+- [x] **Homebrew Cask** — published: `brew install --cask Fullex26/tap/maccleaner` (the tap `Fullex26/homebrew-tap` went live with v2.5.0, once notarization unblocked it)
+- [x] **Auto-updates** — Sparkle ships in v2.6.0: daily check + prompt, EdDSA-signed appcast generated per release (`docs/RELEASING.md` §7)
 
 ---
 
