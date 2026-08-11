@@ -206,8 +206,19 @@ DEFAULT_CONFIG = {
 
 def load_config():
     if CONFIG_PATH.exists():
-        with open(CONFIG_PATH) as f:
-            cfg = json.load(f)
+        try:
+            with open(CONFIG_PATH) as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            # A torn write (crash mid-save, two Settings clicks racing before
+            # save_config became atomic) can leave invalid JSON on disk. That
+            # must never traceback the CLI, the app's bridge call, or the
+            # launchd agent — fall back to defaults and let the next save_config
+            # (now atomic) heal the file on disk.
+            print(f"Warning: config.json is corrupt ({e}); using defaults", file=sys.stderr)
+            cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+            cfg["known_categories"] = list(ALL_CATEGORIES)
+            return cfg
         # Merge with defaults for any missing keys
         for k, v in DEFAULT_CONFIG.items():
             cfg.setdefault(k, v)
@@ -232,9 +243,10 @@ def load_config():
 
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
-        f.write("\n")
+    """Atomic write (temp file + os.replace) so a torn write (two Settings
+    clicks racing, or a crash mid-save) can never leave invalid JSON on disk
+    for load_config to trip over."""
+    _atomic_write_json(CONFIG_PATH, cfg)
 
 
 # ── Size helpers ───────────────────────────────────────────────────────────────
@@ -296,12 +308,18 @@ def _notify(title: str, message: str) -> bool:
 
 
 def disk_free() -> str:
-    result = subprocess.run(["df", "-h", "/"], capture_output=True, text=True)
-    for line in result.stdout.splitlines()[1:]:
-        parts = line.split()
-        if parts:
-            return f"Used: {parts[2]} / {parts[1]} ({parts[4]})"
-    return "unknown"
+    """Human-readable disk summary, built from disk_stats() (shutil, the data
+    volume) so it always agrees with the disk_stats key shipped alongside it.
+    Previously this shelled out to `df -h /` separately, which reports the
+    read-only system volume -- a different number that could visibly
+    contradict disk_stats in the same JSON payload (and, since v2.6, next to
+    each other in the app's disk ring)."""
+    try:
+        ds = disk_stats()
+        return (f"Used: {fmt_size(ds['used_bytes'])} / {fmt_size(ds['total_bytes'])} "
+                f"({ds['percent_used']:.0f}%)")
+    except Exception:
+        return "unknown"
 
 
 def disk_stats() -> dict:
@@ -1716,6 +1734,16 @@ def _launchd_is_loaded(label: str) -> bool:
         return False
 
 
+def _app_bundle_version(app_path: Path):
+    """CFBundleShortVersionString from an app bundle's Info.plist, or None if
+    the bundle/plist/key is missing or unreadable. Never raises."""
+    try:
+        with open(app_path / "Contents" / "Info.plist", "rb") as f:
+            return plistlib.load(f).get("CFBundleShortVersionString")
+    except Exception:
+        return None
+
+
 def run_doctor(config, json_mode=False):
     checks = []
 
@@ -1791,7 +1819,24 @@ def run_doctor(config, json_mode=False):
         pass
 
     app_paths = [HOME / "Applications/MacCleaner.app", Path("/Applications/MacCleaner.app")]
-    check("Menu bar app", "installed" if any(p.exists() for p in app_paths) else "not installed")
+    installed_app = next((p for p in app_paths if p.exists()), None)
+    check("Menu bar app", f"installed at {installed_app}" if installed_app else "not installed")
+
+    # A6: Sparkle (v2.6) updates the app bundle but never touches the
+    # installed engine at ~/mac-cleaner/cleaner.py -- the app delegates ALL
+    # cleaning logic to that engine (MACCLEANER_ENGINE override aside), and
+    # it takes priority over the bundled fallback. After an auto-update the
+    # new UI can end up driving a stale engine with nothing to detect it.
+    # Compare this engine's VERSION against the app bundle's
+    # CFBundleShortVersionString and warn on a mismatch. Degrades silently
+    # when the app isn't installed or its Info.plist can't be read/parsed --
+    # this is a nice-to-have signal, not a hard requirement.
+    if installed_app is not None:
+        app_version = _app_bundle_version(installed_app)
+        if app_version is not None and app_version != VERSION:
+            check("Engine/App version",
+                  f"engine {VERSION} != app {app_version} — re-run bash install.sh",
+                  ok=False)
 
     for tool in ["brew", "docker", "xcrun", "node", "npm", "pnpm", "yarn", "bun", "deno",
                  "go", "cargo", "gem", "pod", "gradle", "mvn", "uv", "ollama",
@@ -2747,7 +2792,7 @@ def main():
     targets_given = False
     if args.command == "clean":
         raw_targets = getattr(args, "targets", None)
-        if raw_targets:
+        if raw_targets is not None:
             targets_given = True
             target_ids = {t.strip() for t in raw_targets.split(",") if t.strip()}
     # categories/target_ids are selection hints only (v2.6 scanner scoping):
