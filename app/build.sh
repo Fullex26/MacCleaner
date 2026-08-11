@@ -38,11 +38,26 @@ SPARKLE_ARCHIVE_SHA256="015336b601493e05c237964954bff6191370003d94edefe663724c88
 
 SPARKLE_SWIFT_FLAGS=(-DSPARKLE_DISABLED)
 SPARKLE_ENABLED=0
+SPARKLE_VERIFIED_MARKER="$SPARKLE_CACHE_DIR/.verified-sha256"
 
-if [ -d "$SPARKLE_CACHE_DIR/Sparkle.framework" ]; then
-    echo "→ Sparkle $SPARKLE_VERSION framework cached — skipping fetch"
+# A cache hit used to skip the pinned-SHA check entirely -- trusting whatever
+# is on disk under build/sparkle-<version>/ just because the directory
+# exists and looks right. That silently defeats the checksum pin for every
+# build after the first: a tampered or corrupted cache dir (or a directory
+# an attacker pre-seeded before CI's first run) would be reused forever.
+# Persist the verified hash alongside the cache and require it to match on
+# every cache hit too; anything else forces a re-fetch instead of trusting
+# stale/tampered bytes.
+if [ -d "$SPARKLE_CACHE_DIR/Sparkle.framework" ] \
+    && [ -f "$SPARKLE_VERIFIED_MARKER" ] \
+    && [ "$(cat "$SPARKLE_VERIFIED_MARKER" 2>/dev/null)" = "$SPARKLE_ARCHIVE_SHA256" ]; then
+    echo "→ Sparkle $SPARKLE_VERSION framework cached (checksum verified) — skipping fetch"
     SPARKLE_ENABLED=1
 else
+    if [ -d "$SPARKLE_CACHE_DIR" ]; then
+        echo "→ Cached Sparkle $SPARKLE_VERSION found but not checksum-verified (missing/mismatched marker) — re-fetching"
+        rm -rf "$SPARKLE_CACHE_DIR"
+    fi
     echo "→ Fetching Sparkle $SPARKLE_VERSION…"
     SPARKLE_ARCHIVE="$BUILD_DIR/Sparkle-$SPARKLE_VERSION.tar.xz"
     SPARKLE_FETCH_OK=1
@@ -72,6 +87,7 @@ else
 
     if [ "$SPARKLE_FETCH_OK" = "1" ] && [ -d "$SPARKLE_CACHE_DIR/Sparkle.framework" ]; then
         echo "→ Sparkle $SPARKLE_VERSION fetched and verified"
+        echo "$SPARKLE_ARCHIVE_SHA256" > "$SPARKLE_VERIFIED_MARKER"
         SPARKLE_ENABLED=1
     else
         rm -rf "$SPARKLE_CACHE_DIR"

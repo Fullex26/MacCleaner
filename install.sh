@@ -179,6 +179,28 @@ if command -v swiftc >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/app/build.sh" ]; then
 elif [ -d "$APP_BUNDLE" ]; then
     echo "→ swiftc not found — using the committed app bundle (may be older than this checkout)"
 fi
+
+# 7b. A Sparkle fetch failure outside CI is NOT fatal for app/build.sh — it
+# falls back to -DSPARKLE_DISABLED and still exits 0 (see app/build.sh's
+# fetch-or-fatal comment: only `[ -n "${CI:-}" ]` is fatal). Left unchecked,
+# the "build succeeded" branch above would happily prefer that fresh-but-
+# updater-less build over an older committed bundle that DOES have Sparkle
+# embedded, and this script would go on to print "Installation complete!"
+# with no indication the install just lost its auto-updater. Catch that here:
+# prefer the committed bundle when it has Sparkle and the chosen one doesn't;
+# otherwise remember to warn loudly in the final summary instead of silently
+# shipping a Sparkle-less app.
+SPARKLE_WARNING=""
+COMMITTED_APP_BUNDLE="$SCRIPT_DIR/MacCleaner.app"
+if [ -d "$APP_BUNDLE" ] && [ ! -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]; then
+    if [ "$APP_BUNDLE" != "$COMMITTED_APP_BUNDLE" ] && [ -d "$COMMITTED_APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]; then
+        echo "→ Freshly built app has no Sparkle.framework (fetch likely failed, e.g. offline) — preferring the committed Sparkle-bearing bundle instead"
+        APP_BUNDLE="$COMMITTED_APP_BUNDLE"
+    else
+        SPARKLE_WARNING="⚠️  This build has no auto-updater (Sparkle.framework missing) — re-run install.sh once you're back online to get auto-updates."
+    fi
+fi
+
 if [ -d "$APP_BUNDLE" ]; then
     mkdir -p "$HOME/Applications"
     rm -rf "$APP_DEST"
@@ -207,6 +229,10 @@ fi
 
 echo ""
 echo "✅ Installation complete!"
+if [ -n "$SPARKLE_WARNING" ]; then
+    echo ""
+    echo "$SPARKLE_WARNING"
+fi
 echo ""
 echo "Commands:"
 echo "  maccleaner            — show help & available commands"

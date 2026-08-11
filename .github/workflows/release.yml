@@ -187,9 +187,21 @@ jobs:
               codesign --force --options runtime --timestamp \
                 --sign "$IDENTITY" --keychain "$KEYCHAIN" "$XPC"
             done
-            codesign --force --options runtime --timestamp \
-              --sign "$IDENTITY" --keychain "$KEYCHAIN" \
-              "$FRAMEWORK/Versions/B/Autoupdate" "$FRAMEWORK/Versions/B/Updater.app" 2>/dev/null || true
+            # Unlike the XPC loop above (whose contents are genuinely
+            # optional), Autoupdate and Updater.app are load-bearing parts of
+            # every Sparkle release -- their absence means Sparkle's
+            # distribution layout changed underneath us, not "nothing to
+            # sign here". Assert they exist instead of swallowing the
+            # codesign failure with `2>/dev/null || true`, which would have
+            # silently shipped a release with an unsigned/missing updater.
+            for BIN in "$FRAMEWORK/Versions/B/Autoupdate" "$FRAMEWORK/Versions/B/Updater.app"; do
+              if [ ! -e "$BIN" ]; then
+                echo "::error::Expected Sparkle component missing: $BIN -- Sparkle's distribution layout may have changed."
+                exit 1
+              fi
+              codesign --force --options runtime --timestamp \
+                --sign "$IDENTITY" --keychain "$KEYCHAIN" "$BIN"
+            done
             codesign --force --options runtime --timestamp \
               --sign "$IDENTITY" --keychain "$KEYCHAIN" "$FRAMEWORK"
           fi
@@ -484,23 +496,47 @@ jobs:
           fi
           echo "✅ SPARKLE_ED_PRIVATE_KEY corresponds to the shipped SUPublicEDKey"
 
+          # --- Locate the Sparkle tools dir without hardcoding a version ---
+          # app/build.sh pins its own SPARKLE_VERSION independently; hardcoding
+          # a copy of that string here just guarantees the two drift apart on
+          # the next Sparkle bump. Derive it from what build.sh actually
+          # fetched/cached instead. (bash 3.2-safe: no mapfile/arrays-of-glob.)
+          SPARKLE_DIR=""
+          SPARKLE_DIR_COUNT=0
+          for d in build/sparkle-*/; do
+            [ -d "$d" ] || continue
+            SPARKLE_DIR="${d%/}"
+            SPARKLE_DIR_COUNT=$((SPARKLE_DIR_COUNT + 1))
+          done
+          if [ "$SPARKLE_DIR_COUNT" -ne 1 ]; then
+            echo "::error::Generate appcast: expected exactly one build/sparkle-*/ directory, found $SPARKLE_DIR_COUNT -- app/build.sh's Sparkle fetch/cache may have changed."
+            exit 1
+          fi
+
           # --- Sign the zip and build the appcast ---------------------------
-          SIG="$(./build/sparkle-2.9.5/bin/sign_update -f "$RUNNER_TEMP/ed_key" "$ZIP_NAME")"
+          SIG="$("$SPARKLE_DIR/bin/sign_update" -f "$RUNNER_TEMP/ed_key" "$ZIP_NAME")"
           # sign_update (no -p) prints exactly:
           #   sparkle:edSignature="..." length="..."
           # -- the two attributes the <enclosure> tag needs, verified
           # against Sparkle 2.9.5's actual binary output (Task 7's cache).
 
           DOWNLOAD_URL="https://github.com/Fullex26/MacCleaner/releases/download/${VERSION}/${ZIP_NAME}"
+          RELEASE_NOTES_LINK="https://github.com/Fullex26/MacCleaner/releases/tag/${VERSION}"
 
           cat > "$RUNNER_TEMP/gen_appcast.py" <<'PY'
           import html
           import os
           import sys
 
-          short_version, url, sig = sys.argv[1], sys.argv[2], sys.argv[3]
+          short_version, url, sig, notes_link = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
           body = open("release_notes.md").read() if os.path.exists("release_notes.md") else ""
           body = body.replace("]]>", "]]&gt;")
+          # <description> is raw Markdown (release_notes.md), but Sparkle's
+          # update dialog renders it as HTML -- unescaped Markdown reads as a
+          # wall of literal #/*/`` characters to the user. sparkle:releaseNotesLink
+          # points Sparkle at the rendered GitHub release page instead; the
+          # CDATA body stays as a fallback for the rare client that ignores
+          # releaseNotesLink.
           print(f'''<?xml version="1.0" encoding="utf-8"?>
           <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
           <channel>
@@ -509,6 +545,7 @@ jobs:
           <title>Version {short_version}</title>
           <sparkle:version>{short_version}</sparkle:version>
           <sparkle:shortVersionString>{short_version}</sparkle:shortVersionString>
+          <sparkle:releaseNotesLink>{html.escape(notes_link)}</sparkle:releaseNotesLink>
           <description><![CDATA[{body}]]></description>
           <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
           <enclosure url="{html.escape(url)}" {sig} type="application/octet-stream"/>
@@ -516,11 +553,16 @@ jobs:
           </channel>
           </rss>''')
           PY
-          python3 "$RUNNER_TEMP/gen_appcast.py" "$SHORT_VERSION" "$DOWNLOAD_URL" "$SIG" > appcast.xml
+          python3 "$RUNNER_TEMP/gen_appcast.py" "$SHORT_VERSION" "$DOWNLOAD_URL" "$SIG" "$RELEASE_NOTES_LINK" > appcast.xml
 
           xmllint --noout appcast.xml
           echo "appcast_generated=true" >> "$GITHUB_OUTPUT"
           echo "✅ appcast.xml generated and validated"
+
+      - name: Warn if this release ships without an appcast
+        if: steps.appcast.outputs.appcast_generated != 'true'
+        run: |
+          echo "::warning::This release (${{ steps.version.outputs.version }}) is shipping WITHOUT appcast.xml (signing enabled=${{ steps.signing.outputs.enabled }}, SPARKLE_ED_PRIVATE_KEY present=${{ steps.signing.outputs.sparkle_key_present }}). Consequence: because this becomes the 'latest' release, its appcast.xml release asset does not exist, so <feed-url>/releases/latest/download/appcast.xml now 404s for EVERY installed app's Sparkle update check -- not just 'stale', fully broken -- until the NEXT tag is released with both the Developer ID signing secrets AND SPARKLE_ED_PRIVATE_KEY configured. If this was unintentional, add the missing secret(s) and cut a follow-up signed release promptly."
 
       - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v2

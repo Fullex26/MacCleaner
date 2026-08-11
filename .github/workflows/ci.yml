@@ -74,3 +74,13 @@ jobs:
           test -x build/MacCleaner.app/Contents/MacOS/MacCleaner
           test -f build/MacCleaner.app/Contents/Info.plist
           test -f build/MacCleaner.app/Contents/Resources/cleaner.py
+
+      - name: Verify Sparkle actually embedded
+        run: |
+          # build.sh only falls back to -DSPARKLE_DISABLED outside CI (its
+          # own [ -n "${CI:-}" ] check) -- GitHub Actions always sets CI=true,
+          # so on this job a missing/unlinked Sparkle.framework means the
+          # fetch-or-fatal contract silently regressed. Fail loudly instead
+          # of shipping a CI-green app that can't self-update.
+          test -f build/MacCleaner.app/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle
+          otool -L build/MacCleaner.app/Contents/MacOS/MacCleaner | grep -q Sparkle.framework

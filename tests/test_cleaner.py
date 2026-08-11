@@ -9,6 +9,7 @@ import datetime
 import io
 import json
 import os
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -76,6 +77,37 @@ class TestConfig(unittest.TestCase):
         cleaner.cmd_config_set_key(cfg, "delete_mode", "trash")
         reloaded = json.loads(cleaner.CONFIG_PATH.read_text())
         self.assertEqual(reloaded["delete_mode"], "trash")
+
+    def test_corrupt_config_loads_as_defaults_with_warning(self):
+        """A1: a torn write (crash mid-save, two Settings clicks racing before
+        save_config became atomic) can leave invalid JSON on disk. load_config
+        must never traceback -- it should warn on stderr and fall back to
+        DEFAULT_CONFIG (with known_categories stamped, same as the fresh-
+        install path) instead of propagating json.JSONDecodeError."""
+        cleaner.CONFIG_PATH.write_text('{"broken')
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            cfg = cleaner.load_config()
+        self.assertEqual(cfg["enabled_categories"], cleaner.ALL_CATEGORIES)
+        self.assertEqual(cfg["delete_mode"], "rm")
+        self.assertEqual(cfg["known_categories"], list(cleaner.ALL_CATEGORIES))
+        self.assertIn("corrupt", buf.getvalue().lower())
+
+    def test_save_config_is_atomic(self):
+        """A1: save_config must write via temp-file + os.replace() (the same
+        pattern as _atomic_write_json, already used for report.log/
+        snapshots.log) rather than truncating the file in place -- so a
+        concurrent reader (or a crash mid-write) never sees a partial file.
+        We can't easily interrupt os.replace() mid-flight in a unit test, but
+        we can assert the observable contract: no leftover temp file, and the
+        file on disk parses cleanly and round-trips the data after save."""
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg["log_threshold_mb"] = 42
+        cleaner.save_config(cfg)
+        leftover = list(self.tmp.glob(".config.json.*.tmp"))
+        self.assertEqual(leftover, [], "atomic write must not leave a temp file behind")
+        reloaded = json.loads(cleaner.CONFIG_PATH.read_text())
+        self.assertEqual(reloaded["log_threshold_mb"], 42)
 
 
 class TestTargets(unittest.TestCase):
@@ -409,6 +441,22 @@ class TestCLIIntegration(unittest.TestCase):
                         "size_bytes", "size_human", "safe", "exists"]:
                 self.assertIn(key, t)
 
+    def test_disk_string_agrees_with_disk_stats(self):
+        """A3 regression: the legacy `disk` string used to come from `df -h /`
+        (the read-only system volume) while `disk_stats` uses shutil on the
+        data volume -- two different numbers in the same payload. `disk` must
+        now be derived from disk_stats() so the used/total bytes it reports
+        match, not just look plausible independently."""
+        r = self.run_cli("scan", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        ds = data["disk_stats"]
+        expected = (f"Used: {cleaner.fmt_size(ds['used_bytes'])} / "
+                    f"{cleaner.fmt_size(ds['total_bytes'])} "
+                    f"({ds['percent_used']:.0f}%)")
+        self.assertEqual(data["disk"], expected,
+                         "disk string must be derived from disk_stats, not a separate df call")
+
     def test_legacy_bare_json_is_scan(self):
         """The menu bar app contract: `cleaner.py --json` = scan --json."""
         r = self.run_cli("--json")
@@ -593,6 +641,52 @@ class TestDoctorSchedule(unittest.TestCase):
         sched = next(c for c in data["checks"] if c["name"] == "Schedule")
         self.assertTrue(sched["ok"])
         self.assertIn("not scheduled", sched["status"].lower())
+
+    def _write_app_info_plist(self, version):
+        app_contents = self.home / "Applications" / "MacCleaner.app" / "Contents"
+        app_contents.mkdir(parents=True)
+        with open(app_contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleShortVersionString": version}, f)
+
+    def test_engine_app_version_mismatch_warns(self):
+        """A6: Sparkle updates the app bundle but never the installed engine
+        at ~/mac-cleaner/cleaner.py. doctor must compare this engine's
+        VERSION against the app's CFBundleShortVersionString and flag a
+        mismatch with the re-run-install.sh remedy."""
+        self._write_app_info_plist("0.0.1")
+        r = self.run_doctor()
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        c = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNotNone(c, "a version mismatch must produce an Engine/App version check")
+        self.assertFalse(c["ok"])
+        self.assertIn("install.sh", c["status"])
+        self.assertFalse(data["ok"], "a version mismatch must fail the overall doctor check")
+
+    def test_engine_app_version_match_is_silent(self):
+        self._write_app_info_plist(cleaner.VERSION)
+        r = self.run_doctor()
+        data = json.loads(r.stdout)
+        c = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNone(c, "matching versions must not add a warning row")
+
+    def test_engine_app_version_check_absent_without_app(self):
+        # No Info.plist at all (app not installed) -- must degrade silently,
+        # not raise or add a spurious check.
+        r = self.run_doctor()
+        data = json.loads(r.stdout)
+        c = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNone(c)
+
+    def test_engine_app_version_check_absent_with_unreadable_plist(self):
+        app_contents = self.home / "Applications" / "MacCleaner.app" / "Contents"
+        app_contents.mkdir(parents=True)
+        (app_contents / "Info.plist").write_text("not a plist")
+        r = self.run_doctor()
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        c = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNone(c, "an unparseable Info.plist must degrade silently, not crash doctor")
 
 
 class TestNewTargetsV21(unittest.TestCase):
@@ -3573,6 +3667,31 @@ class TestScannerScoping(unittest.TestCase):
                              "never fall through to a full safe auto-clean")
             self.assertTrue((Path(env["HOME"]) / ".npm" / "_cacache").exists(),
                             "npm-cache must survive a garbage --targets clean")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_empty_string_targets_yes_deletes_nothing(self):
+        """A2 regression: argparse gives args.targets == "" for an explicitly
+        empty `--targets ""`, distinct from None when the flag is absent
+        entirely. Pre-fix the downstream gate was `if raw_targets:` (falsy for
+        ""), so this fell through to "no --targets given" and performed a
+        full safe auto-clean -- exactly the bug CHANGELOG claimed was fixed.
+        The gate must be `raw_targets is not None` so an explicitly-empty
+        value still counts as "targets were given" and filters to nothing."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            env = self._sandbox(tmp_dir)
+            r = subprocess.run(
+                [sys.executable, str(REPO / "cleaner.py"),
+                 "clean", "--targets", "", "--yes", "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            data = json.loads(r.stdout)
+            self.assertEqual(data["items"], [],
+                             "clean --targets '' must clean nothing, "
+                             "never fall through to a full safe auto-clean")
+            self.assertTrue((Path(env["HOME"]) / ".npm" / "_cacache").exists(),
+                            "npm-cache must survive a clean --targets '' run")
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
