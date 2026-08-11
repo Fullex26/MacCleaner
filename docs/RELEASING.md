@@ -9,7 +9,9 @@ is the source of truth; the skill should track it, not the other way around.
 It covers: the five signing secrets, what ships when they're absent, the
 release steps (including a step the skill currently omits), publishing the
 Homebrew tap once notarization is live, bumping the cask after each release,
-and which `brew audit` invocation is the actual correctness gate.
+which `brew audit` invocation is the actual correctness gate, and (new in
+v2.6.0) the Sparkle appcast — the sixth secret, the key-correspondence gate,
+the stable feed URL, and the framework signing order.
 
 ## 1. Signing secrets
 
@@ -246,6 +248,15 @@ Remove the placeholder comment above `sha256` once a real hash is in place.
 Commit and push to `Fullex26/homebrew-tap`. No CI write-token touches the
 tap — this step runs locally under the maintainer's own credentials.
 
+`Casks/maccleaner.rb` also sets `auto_updates true` — since v2.6.0 the app
+updates itself in place via Sparkle (see §7 below), so Homebrew shouldn't
+expect `brew upgrade --cask` to be the only way a user's installed copy ever
+moves forward. `auto_updates true` doesn't change what this bump procedure
+does (you still bump `version`/`sha256` here so a *fresh* `brew install`
+pulls the current release); it only tells `brew outdated --cask` and `brew
+upgrade --cask` not to nag about a version drift that Sparkle itself is
+already handling for existing installs. Leave it set on every future bump.
+
 ## 6. Why `brew audit --cask --new` is not the gate
 
 `brew audit --cask --new` (run from inside a tap — both `audit` and `style`
@@ -299,3 +310,93 @@ rm -rf /tmp/scratch-tap
 Use `brew audit --cask --new` (and expect the download/version/`verified`
 noise) only once an actual tagged release exists to audit against, not as a
 merge gate on this branch.
+
+## 7. The Sparkle appcast
+
+New in v2.6.0. Installed apps check `SUFeedURL` (`app/Info.plist`) —
+`https://github.com/Fullex26/MacCleaner/releases/latest/download/appcast.xml`
+— on a daily background timer and whenever the user picks "Check for
+Updates…" in Settings. `release.yml` generates and publishes that feed as
+part of every tag push, but only when signing is fully set up; there is
+nothing to configure beyond the one secret below once §1's five signing
+secrets are already in place.
+
+### The secret
+
+| Secret | Shape | Notes |
+|---|---|---|
+| `SPARKLE_ED_PRIVATE_KEY` | Base64 of a 32-byte Ed25519 seed (44 base64 characters) | Generate with `openssl genpkey -algorithm ed25519`, extract the raw 32-byte seed, base64-encode it. Corresponds to the public key already committed in `app/Info.plist`'s `SUPublicEDKey` (`pozlfRIcd9s0JQwteBAhzxg8A2Ex0/YeZK3su9IDe9k=`) |
+
+`release.yml`'s `Detect signing credentials` step probes this the same way
+it probes `MACOS_CERTIFICATE_P12` — via `env:`, publishing a
+`sparkle_key_present` boolean output, since secrets can't be referenced
+directly in a step `if:`. The `Generate appcast` step only runs when
+**both** `steps.signing.outputs.enabled == 'true'` (the app was actually
+Developer-ID signed and notarized) **and** `sparkle_key_present == 'true'`.
+An ad-hoc-signed build never gets an appcast entry — Sparkle would just
+reject its signature on every install, so there's no point advertising an
+update nobody could apply.
+
+### The key-correspondence gate
+
+Before generating anything, the step re-derives the Ed25519 **public** key
+from the `SPARKLE_ED_PRIVATE_KEY` seed (pure-Python stdlib, no `openssl`
+Ed25519 support on the macOS runner's system LibreSSL) and compares it,
+byte for byte, against `SUPublicEDKey` read straight out of the just-built
+`build/MacCleaner.app/Contents/Info.plist` via `PlistBuddy`. If they don't
+match, the job fails immediately (`::error::`) — before signing the zip or
+touching the GitHub Release — instead of silently publishing an appcast
+whose signature no installed app could ever verify. This is the check that
+would catch a rotated `SPARKLE_ED_PRIVATE_KEY` secret that `app/Info.plist`
+wasn't updated to match, or vice versa; either half changing without the
+other is a shipped-update outage, not a cosmetic mismatch.
+
+### The `releases/latest/download/appcast.xml` contract
+
+`SUFeedURL` doesn't point at a specific tag — it points at GitHub's
+"latest release" redirect (`.../releases/latest/download/<asset>`), which
+always resolves to whatever release GitHub currently considers latest
+(newest non-prerelease, non-draft tag). `release.yml` uploads `appcast.xml`
+as a release asset on every signed, appcast-eligible tag push, so an
+installed app's daily check always fetches the newest one without needing
+to know its own current version's tag ahead of time. The appcast itself
+(`gen_appcast.py`, inline in the workflow) contains exactly one `<item>` —
+the version being released — not a rolling history; each new release's
+appcast simply supersedes the previous one at that same stable URL. The
+`<enclosure>` inside it points at that release's
+`MacCleaner-vX.Y.Z-macos-universal.zip` (the same asset §5 hashes for the
+cask) and carries the `sparkle:edSignature` produced by `sign_update`
+against `SPARKLE_ED_PRIVATE_KEY`. A prerelease tag (one containing `-`,
+e.g. `v2.6.0-rc1`) still runs this step — nothing in `release.yml` special-
+cases prereleases here — but GitHub's `/releases/latest` redirect skips
+prereleases by definition, so a prerelease's appcast is generated and
+uploaded yet never actually reached by `SUFeedURL` until a real release
+supersedes it.
+
+### Inside-out framework signing
+
+Sparkle ships as `Sparkle.framework`, embedded by `app/build.sh` (checksum-
+verified fetch of the pinned upstream release — see the top of that
+script). A framework is nested code, and Apple's guidance is to sign nested
+code first, then the container, **without** `--deep` (which doesn't
+propagate signing options correctly to nested code — this is the same
+`--deep` caveat `docs/RELEASING.md` §1 already carries for the outer app,
+now sharper because there's something nested to get wrong). The `Sign,
+notarize, and staple` step in `release.yml` therefore signs, strictly
+bottom-up, before ever touching `MacCleaner.app` itself:
+
+1. Any `.xpc` bundles under `Sparkle.framework/Versions/B/XPCServices/`
+2. `Sparkle.framework/Versions/B/Autoupdate` and
+   `.../Versions/B/Updater.app`
+3. `Sparkle.framework` itself
+4. `MacCleaner.app` (the outer bundle, as before)
+
+`xattr -cr` runs on the framework immediately beforehand — a freshly
+downloaded/extracted framework can carry resource forks or provenance
+extended attributes that `codesign --verify --deep --strict` (and
+Gatekeeper) reject as "resource fork, Finder information, or similar
+detritus not allowed", and stripping them only at the outer-bundle step
+would be too late for the nested pieces. This whole block is gated on
+`[ -d "$FRAMEWORK" ]`; a non-CI build (or one where the Sparkle fetch fell
+back to `-DSPARKLE_DISABLED` — see `app/build.sh`) simply has nothing to
+sign here and proceeds straight to step 4.

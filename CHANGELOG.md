@@ -7,6 +7,55 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.6.0] — 2026-08-12
+
+Glass & Sparkle: a full visual overhaul of the menu bar app, plus self-updating
+installs.
+
+### Added
+- Complete app redesign — sidebar navigation replaces the tab bar, glass
+  panels, monospaced sizes, per-category color dots, and a cyan accent, all
+  driven from one design system so light and dark mode stay in sync instead
+  of drifting independently
+- Rich menu bar popover replaces the plain text menu — a disk-usage ring,
+  a reclaimable-space hero number, your top 3 categories, and a one-click
+  "Clean safe items" action with a self-expiring "freed" confirmation
+- Select All / None on the Projects tab, and All / None / Safe only on the
+  Dashboard — closes the bulk-selection gap reported after the v2.5 UI
+- Live per-item progress during cleans — items show a spinner while running
+  and settle into their real per-item result, instead of the UI freezing
+  until the whole run finishes
+- Sparkle auto-updates for installed apps: a daily background check with an
+  in-app prompt showing the release notes, plus "Check for Updates…" in
+  Settings. Releases are signed with an EdDSA key and publish a
+  `releases/latest/download/appcast.xml` feed; see `docs/RELEASING.md`
+  "Sparkle appcast" for the mechanics. Homebrew-cask users keep using
+  `brew upgrade` as before — Sparkle is additive, not a replacement
+
+### Changed
+- Dynamic scanners (`tmp`, `simulators`) are now skipped when a `--targets`
+  or `--category` selection can't possibly include them — a targeted clean
+  no longer pays the `simctl` + `/private/tmp` walk latency for scanners it
+  was never going to use
+
+### Fixed
+- The app's History tab (and the menu bar's background refresh) tolerates a
+  malformed history entry instead of failing to decode the whole run list
+- `clean --targets` with a whitespace-only or empty value (e.g. `" , "`)
+  is now correctly a no-op, not a full safe auto-clean — it was silently
+  falling through to "no `--targets` given" and cleaning everything
+
+### Notes
+- This is the first release with Sparkle wired up. The signing key,
+  appcast generation, and framework-signing order were built and verified
+  locally against a throwaway keypair (see `docs/RELEASING.md`), but the
+  live self-update path — an installed 2.6.0 app discovering and applying
+  a real signed update — can only be proven end-to-end starting with the
+  *next* tagged release
+- 22 categories, unchanged from v2.5.0
+
+---
+
 ## [2.5.0] — 2026-08-09
 
 AI-era cleanup: two new dynamic scanners for the mess coding agents and
