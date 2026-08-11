@@ -58,7 +58,7 @@ else
         echo "→ Cached Sparkle $SPARKLE_VERSION found but not checksum-verified (missing/mismatched marker) — re-fetching"
         rm -rf "$SPARKLE_CACHE_DIR"
     fi
-    echo "→ Fetching Sparkle $SPARKLE_VERSION…"
+    echo "→ Fetching Sparkle ${SPARKLE_VERSION}…"
     SPARKLE_ARCHIVE="$BUILD_DIR/Sparkle-$SPARKLE_VERSION.tar.xz"
     SPARKLE_FETCH_OK=1
 
