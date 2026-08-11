@@ -2782,13 +2782,14 @@ def main():
     # scan / clean share target selection
     categories = parse_categories(getattr(args, "category", None))
     target_ids = None
-    # targets_given tracks whether --targets was supplied at all (RAW string
-    # truthiness), independent of whether it parsed to anything: a garbage
-    # value like " , " parses to an empty target_ids set, but the downstream
-    # filter/explicit gate must still key off "was --targets supplied",
-    # exactly like the pre-2.6 `if args.targets:` check did -- otherwise an
-    # empty parsed set reads as "no --targets given", the filter is skipped,
-    # and --yes performs a full safe auto-clean instead of a no-op.
+    # targets_given tracks whether --targets was SUPPLIED at all (presence,
+    # via `is not None` -- argparse leaves the attribute None when the flag is
+    # absent and "" when it is passed empty), independent of whether the value
+    # parsed to anything. A garbage value like " , " or an explicit "" parses
+    # to an empty target_ids set, but the downstream filter/explicit gate must
+    # still key off "was --targets supplied" -- otherwise an empty parsed set
+    # reads as "no --targets given", the filter is skipped, and --yes performs
+    # a full safe auto-clean instead of the no-op the user asked for.
     targets_given = False
     if args.command == "clean":
         raw_targets = getattr(args, "targets", None)
