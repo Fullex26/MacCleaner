@@ -90,6 +90,15 @@ struct MenuBarPanel: View {
                 )
                 .rotationEffect(.degrees(-90))
                 .animation(Motion.standard, value: percentUsed)
+            // Deliberately not `.metaCaption`: that token is `.caption`
+            // (~10pt regular) sized for row/list text, not a 44pt ring with
+            // only a ~34pt clear interior once the 5pt stroke is subtracted —
+            // at that size a regular weight loses contrast against the
+            // gradient stroke right behind it. This keeps the same
+            // monospaced *design* the token uses (digits don't jitter) but
+            // pins an explicit size + semibold weight for legibility, same
+            // rationale as `ReviewBadge` layering a custom weight on a shared
+            // token rather than reusing it unmodified.
             Text("\(Int(percentUsed * 100))%")
                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
         }
@@ -127,41 +136,69 @@ struct MenuBarPanel: View {
     }
 
     // MARK: - Action
+    //
+    // The CTA must never permanently disappear: `bridge.lastClean` is shared,
+    // process-lifetime state (Dashboard's footer reads it too) that is never
+    // reset after a clean, and this is an `LSUIElement` app that can run for
+    // weeks without a relaunch. So the button always stays put; only a
+    // *transient* confirmation caption appears below it, gated on freshness
+    // rather than mere presence of a result.
 
-    @ViewBuilder
     private var actionArea: some View {
-        if bridge.isCleaning {
-            HStack(spacing: 8) {
-                ProgressView()
-                    .controlSize(.small)
-                Text("Cleaning…")
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .center)
-        } else if let result = bridge.lastClean {
-            HStack(spacing: 6) {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                Text("Freed \(result.freed_human) \u{2713}")
-                    .foregroundStyle(.green)
-            }
-            .animation(Motion.standard, value: result.freed_human)
-            .frame(maxWidth: .infinity, alignment: .center)
-        } else {
+        VStack(spacing: 6) {
             Button {
                 confirmAndCleanSafe()
             } label: {
-                Text("Clean safe items")
-                    .frame(maxWidth: .infinity)
+                HStack(spacing: 6) {
+                    if bridge.isCleaning {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Text(bridge.isCleaning ? "Cleaning…" : "Clean safe items")
+                }
+                .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .tint(.accentCyan)
+            .disabled(bridge.isCleaning)
+
+            freshCleanCaption
+        }
+    }
+
+    /// Shown only while the last clean is "fresh" (finished in roughly the
+    /// last 2 minutes) — never a permanent replacement for the button above.
+    /// Freshness is derived from `bridge.lastCleanedAt` (the last logged run
+    /// timestamp, refreshed after every clean) rather than mere presence of
+    /// `bridge.lastClean`, which — being shared with Dashboard — is never
+    /// cleared and would otherwise make this caption stick around forever.
+    /// `TimelineView` re-evaluates once a minute while the popover is open,
+    /// and picks the right answer immediately whenever it's freshly opened;
+    /// this deliberately never mutates `bridge.lastClean` itself.
+    private var freshCleanCaption: some View {
+        TimelineView(.periodic(from: .now, by: 60)) { context in
+            if let result = bridge.lastClean,
+               let cleanedAt = bridge.lastCleanedAt,
+               context.date.timeIntervalSince(cleanedAt) < 120 {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("Freed \(result.freed_human) \u{2713}")
+                        .foregroundStyle(.green)
+                }
+                .animation(Motion.standard, value: result.freed_human)
+                .frame(maxWidth: .infinity, alignment: .center)
+            }
         }
     }
 
     /// The exact confirm flow from the old `MenuBarContent`'s "Auto-Clean Safe
     /// Items…" button, moved across verbatim (including the applicationIcon
     /// line) — only the trigger changed, from a menu item to this button.
+    /// `.window`-style `MenuBarExtra` panels are non-activating, so without
+    /// explicitly activating first, `runModal()` can render the alert behind
+    /// the frontmost app — an invisible hang. Mirrors the footer's "Open
+    /// MacCleaner" button, which already does this before showing the window.
     private func confirmAndCleanSafe() {
         let alert = NSAlert()
         alert.messageText = "Auto-Clean Safe Items?"
@@ -170,6 +207,7 @@ struct MenuBarPanel: View {
         alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
         alert.icon = NSApplication.shared.applicationIconImage
+        NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn {
             Task { await bridge.autoCleanSafe() }
         }
