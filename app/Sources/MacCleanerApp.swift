@@ -107,6 +107,9 @@ struct MainView: View {
             // the periodic timer once the real value comes back. Memoized —
             // joins the menu bar's load if that already kicked one off.
             bridge.ensureSettingsLoaded()
+            // Memoized (finding B1) — joins the menu bar's subscription if
+            // that already fired first.
+            bridge.observeUpdater()
             if bridge.report == nil {
                 await bridge.scan()
             }

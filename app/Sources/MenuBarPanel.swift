@@ -9,6 +9,7 @@ import AppKit
 struct MenuBarPanel: View {
     @EnvironmentObject var bridge: CleanerBridge
     @Environment(\.openWindow) private var openWindow
+    @ObservedObject private var updater = UpdaterManager.shared
 
     private static let panelWidth: CGFloat = 300
 
@@ -37,6 +38,7 @@ struct MenuBarPanel: View {
             } else {
                 emptyState
             }
+            updateAvailableRow
             Divider()
             footer
         }
@@ -49,8 +51,41 @@ struct MenuBarPanel: View {
             // can post a banner (finding I4). Memoized, so this is a
             // no-op on every later menu open.
             bridge.ensureSettingsLoaded()
+            bridge.observeUpdater()
             await bridge.lightRefresh()
             await bridge.fullRefreshIfStale()
+        }
+    }
+
+    // MARK: - Update available (B1)
+
+    /// Discoverable affordance for a scheduled update Sparkle found but
+    /// couldn't put in front of the user itself (see `UpdaterManager`'s
+    /// `standardUserDriverWillHandleShowingUpdate`) — this is the
+    /// menu-bar-first surface most users will actually see, since the app
+    /// has no Dock icon. Tapping re-invokes Sparkle as a user-initiated
+    /// check, which shows its alert normally.
+    @ViewBuilder
+    private var updateAvailableRow: some View {
+        if let version = updater.pendingUpdateVersion {
+            Button {
+                updater.checkForUpdates()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .foregroundStyle(Color.accentCyan)
+                    Text("Update to \(version) available")
+                        .font(.rowLabel)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .glassPanel(cornerRadius: 8)
+            }
+            .buttonStyle(.plain)
         }
     }
 
@@ -94,11 +129,15 @@ struct MenuBarPanel: View {
             // (~10pt regular) sized for row/list text, not a 44pt ring with
             // only a ~34pt clear interior once the 5pt stroke is subtracted —
             // at that size a regular weight loses contrast against the
-            // gradient stroke right behind it. This keeps the same
-            // monospaced *design* the token uses (digits don't jitter) but
-            // pins an explicit size + semibold weight for legibility, same
-            // rationale as `ReviewBadge` layering a custom weight on a shared
-            // token rather than reusing it unmodified.
+            // gradient stroke right behind it. Same size/weight as
+            // `Font.sectionLabel` (10pt semibold), but SwiftUI's `Font` has
+            // no API to bolt a monospaced *design* onto an existing token
+            // after the fact, and digits jittering as the percentage changes
+            // reads worse here than the duplication — so this stays a
+            // one-off `.system(...)` call with `design: .monospaced` added,
+            // same rationale as `ReviewBadge` (pre-`Font.sectionLabel`)
+            // layering a custom weight on a shared token rather than reusing
+            // it unmodified.
             Text("\(Int(percentUsed * 100))%")
                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
         }
@@ -121,7 +160,7 @@ struct MenuBarPanel: View {
                     Circle()
                         .fill(categoryColor(entry.category))
                         .frame(width: 7, height: 7)
-                    Text(entry.category.capitalized)
+                    Text(categoryDisplayName(entry.category))
                         .font(.rowLabel)
                     Spacer()
                     Text(ByteCountFormatter.string(fromByteCount: Int64(entry.bytes), countStyle: .file))
@@ -166,18 +205,35 @@ struct MenuBarPanel: View {
         }
     }
 
-    /// Shown only while the last clean is "fresh" (finished in roughly the
-    /// last 2 minutes) — never a permanent replacement for the button above.
-    /// Freshness is derived from `bridge.lastCleanedAt` (the last logged run
-    /// timestamp, refreshed after every clean) rather than mere presence of
-    /// `bridge.lastClean`, which — being shared with Dashboard — is never
-    /// cleared and would otherwise make this caption stick around forever.
-    /// `TimelineView` re-evaluates once a minute while the popover is open,
-    /// and picks the right answer immediately whenever it's freshly opened;
-    /// this deliberately never mutates `bridge.lastClean` itself.
+    /// Shown only while the last clean result is "fresh" (finished in
+    /// roughly the last 2 minutes) — never a permanent replacement for the
+    /// button above. Freshness is derived from `bridge.lastCleanedAt`
+    /// (success) / `bridge.lastCleanFailedAt` (failure) rather than mere
+    /// presence of `bridge.lastClean`/`lastCleanFailed`, which — being
+    /// shared with Dashboard — are never cleared on their own and would
+    /// otherwise make this caption stick around forever. `TimelineView`
+    /// re-evaluates once a minute while the popover is open, and picks the
+    /// right answer immediately whenever it's freshly opened; this
+    /// deliberately never mutates bridge state itself.
+    ///
+    /// B2: `bridge.lastClean` is set to `nil` in the catch block of every
+    /// clean path, so a failed clean can never fall through to the success
+    /// branch below and render as if the previous run's result was still
+    /// current — it renders its own error state instead.
     private var freshCleanCaption: some View {
         TimelineView(.periodic(from: .now, by: 60)) { context in
-            if let result = bridge.lastClean,
+            if let failure = bridge.lastCleanFailed,
+               let failedAt = bridge.lastCleanFailedAt,
+               context.date.timeIntervalSince(failedAt) < 120 {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                    Text(failure)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+            } else if let result = bridge.lastClean,
                let cleanedAt = bridge.lastCleanedAt,
                context.date.timeIntervalSince(cleanedAt) < 120 {
                 HStack(spacing: 6) {
@@ -218,7 +274,7 @@ struct MenuBarPanel: View {
     @ViewBuilder
     private var emptyState: some View {
         VStack(spacing: 10) {
-            if bridge.isBusy {
+            if bridge.isScanning {
                 ProgressView("Scanning…")
             } else {
                 Text("No scan yet")

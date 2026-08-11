@@ -4,6 +4,12 @@ struct DashboardView: View {
     @EnvironmentObject var bridge: CleanerBridge
     @State private var selection = Set<String>()
     @State private var confirmClean = false
+    /// Snapshot of `selection` taken the moment the confirmation dialog is
+    /// raised (finding B6) — a background refresh can reseed `selection`
+    /// between raising the dialog and the user tapping confirm, so both the
+    /// dialog's own text and the actual destructive action read from this
+    /// frozen copy instead of the live, possibly-changed `selection`.
+    @State private var pendingIDs: [String] = []
 
     private var targets: [ScanTarget] {
         bridge.report?.targets.filter { ($0.exists ?? true) && ($0.size_bytes > 0 || $0.safe) } ?? []
@@ -20,6 +26,14 @@ struct DashboardView: View {
 
     private var selectedBytes: Int {
         targets.filter { selection.contains($0.id) }.reduce(0) { $0 + $1.size_bytes }
+    }
+
+    /// Bytes for the frozen `pendingIDs` snapshot (B6), not the live
+    /// `selection` — used by the confirmation dialog's own title/action so
+    /// they always agree with each other and with what the user first saw.
+    private var pendingBytes: Int {
+        let ids = Set(pendingIDs)
+        return targets.filter { ids.contains($0.id) }.reduce(0) { $0 + $1.size_bytes }
     }
 
     var body: some View {
@@ -49,9 +63,9 @@ struct DashboardView: View {
                 Button {
                     Task { await bridge.scan() }
                 } label: {
-                    Label(bridge.isBusy ? "Scanning…" : "Scan", systemImage: "arrow.clockwise")
+                    Label(bridge.isScanning ? "Scanning…" : "Scan", systemImage: "arrow.clockwise")
                 }
-                .disabled(bridge.isBusy || bridge.isCleaning)
+                .disabled(bridge.isScanning || bridge.isCleaning)
             }
             if let stats = bridge.report?.disk_stats {
                 Text(diskMetaText(stats))
@@ -83,7 +97,7 @@ struct DashboardView: View {
     private var content: some View {
         if bridge.report == nil {
             Spacer()
-            if bridge.isBusy {
+            if bridge.isScanning {
                 ProgressView("Scanning your Mac…")
             } else {
                 Text("Press Scan to see what can be cleaned.")
@@ -101,7 +115,7 @@ struct DashboardView: View {
                         }
                     } header: {
                         HStack {
-                            Text(group.category.capitalized)
+                            Text(categoryDisplayName(group.category))
                             Spacer()
                             let bytes = group.items.reduce(0) { $0 + $1.size_bytes }
                             Text(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))
@@ -135,32 +149,29 @@ struct DashboardView: View {
 
     private var footer: some View {
         HStack {
-            if bridge.isCleaning {
-                ProgressView()
-                    .controlSize(.small)
-                Text("Cleaning…")
-            } else if let result = bridge.lastClean {
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                Text("Freed \(result.freed_human) (\(result.items.filter { $0.status != "skipped" }.count) items)")
-            } else {
-                Text("\(selection.count) selected — \(ByteCountFormatter.string(fromByteCount: Int64(selectedBytes), countStyle: .file))")
-                    .foregroundStyle(.secondary)
-            }
+            footerStatus
             Spacer()
             Button {
+                // B6: freeze the selection the dialog will describe and act
+                // on — a background refresh (seedSelection() on a fresh
+                // scan) can reseed `selection` while the dialog is open, and
+                // without this snapshot the eventual delete would silently
+                // act on whatever `selection` had become by the time the
+                // user tapped confirm, not the count/bytes they read.
+                pendingIDs = Array(selection)
                 confirmClean = true
             } label: {
                 Label("Clean Selected", systemImage: "trash")
             }
             .buttonStyle(.borderedProminent)
             .keyboardShortcut(.defaultAction)
-            .disabled(selection.isEmpty || bridge.isCleaning || bridge.isBusy)
+            .disabled(selection.isEmpty || bridge.isCleaning || bridge.isScanning)
             .confirmationDialog(
-                "Delete \(selection.count) items (\(ByteCountFormatter.string(fromByteCount: Int64(selectedBytes), countStyle: .file)))?",
+                "Delete \(pendingIDs.count) items (\(ByteCountFormatter.string(fromByteCount: Int64(pendingBytes), countStyle: .file)))?",
                 isPresented: $confirmClean
             ) {
                 Button(bridge.deleteMode == "trash" ? "Move to Trash" : "Delete", role: .destructive) {
-                    Task { await bridge.clean(ids: Array(selection)) }
+                    Task { await bridge.clean(ids: pendingIDs) }
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
@@ -170,6 +181,42 @@ struct DashboardView: View {
             }
         }
         .padding()
+    }
+
+    /// B5: the exact staleness bug Task 6 already fixed in the menu bar
+    /// popover ("Freed X" stuck forever after the session's first clean) —
+    /// this footer had the same unconditional `if let result = bridge.lastClean`
+    /// check. Applies the same freshness-gate idiom (fresh success / fresh
+    /// failure / live selection readout as the fallback) so both surfaces
+    /// agree, and adds the B2 error state so a failed clean never shows as a
+    /// stale success here either.
+    @ViewBuilder
+    private var footerStatus: some View {
+        TimelineView(.periodic(from: .now, by: 30)) { context in
+            if bridge.isCleaning {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Cleaning…")
+                }
+            } else if let failure = bridge.lastCleanFailed,
+                      let failedAt = bridge.lastCleanFailedAt,
+                      context.date.timeIntervalSince(failedAt) < 120 {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                    Text(failure).foregroundStyle(.red).lineLimit(1)
+                }
+            } else if let result = bridge.lastClean,
+                      let cleanedAt = bridge.lastCleanedAt,
+                      context.date.timeIntervalSince(cleanedAt) < 120 {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text("Freed \(result.freed_human) (\(result.items.filter { $0.status != "skipped" }.count) items)")
+                }
+            } else {
+                Text("\(selection.count) selected — \(ByteCountFormatter.string(fromByteCount: Int64(selectedBytes), countStyle: .file))")
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 
     private func binding(for id: String) -> Binding<Bool> {

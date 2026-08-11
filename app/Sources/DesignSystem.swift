@@ -108,6 +108,46 @@ private let categoryPalette: [String: (light: String, dark: String)] = [
     "simulators": ("#BE185D", "#F472B6"), // pink
 ]
 
+/// Display names for the 22 known categories (`ALL_CATEGORIES` in
+/// cleaner.py), kept beside `categoryPalette` above since both are
+/// per-category presentation. Plain `.capitalized` on the raw kebab-case id
+/// mangles acronyms and short ids into "Ai", "Ide", "Vms", "Php", "Tmp" —
+/// visibly broken in the app's two most-seen surfaces, the menu bar panel
+/// and the Dashboard (finding B4).
+private let categoryDisplayNames: [String: String] = [
+    "xcode":      "Xcode",
+    "docker":     "Docker",
+    "node":       "Node",
+    "python":     "Python",
+    "caches":     "Caches",
+    "logs":       "Logs",
+    "homebrew":   "Homebrew",
+    "go":         "Go",
+    "rust":       "Rust",
+    "ruby":       "Ruby",
+    "cocoapods":  "CocoaPods",
+    "gradle":     "Gradle",
+    "maven":      "Maven",
+    "ai":         "AI",
+    "ide":        "IDE",
+    "browsers":   "Browsers",
+    "system":     "System",
+    "flutter":    "Flutter",
+    "php":        "PHP",
+    "vms":        "VMs",
+    "tmp":        "Temp files",
+    "simulators": "Simulators",
+]
+
+/// Presentation name for a category id. Known categories get an explicit
+/// entry from `categoryDisplayNames` above; anything else (a future
+/// category added to `ALL_CATEGORIES` before this table is updated) falls
+/// back to `.capitalized`, same graceful-degradation shape as
+/// `categoryColor`'s hash-derived fallback.
+func categoryDisplayName(_ name: String) -> String {
+    categoryDisplayNames[name] ?? name.capitalized
+}
+
 /// Stable, appearance-aware color for a category dot. The 22 known
 /// categories get a hand-picked entry from `categoryPalette` above; any
 /// other name (a future category added to `ALL_CATEGORIES` before this
@@ -146,6 +186,12 @@ extension Font {
     /// Small meta text (timestamps, byte counts, captions) — monospaced so
     /// digits don't jitter as values change.
     static let metaCaption = Font.system(.caption, design: .monospaced)
+
+    /// Uppercase section-caption recipe (10pt semibold) shared by
+    /// `SettingsSection`'s title, `ReviewBadge`'s text, and any other small
+    /// all-caps tracked label — a single named token instead of each call
+    /// site hand-inlining `.system(size: 10, weight: .semibold)`.
+    static let sectionLabel = Font.system(size: 10, weight: .semibold)
 }
 
 // MARK: - Motion
@@ -223,7 +269,7 @@ struct ReviewBadge: View {
 
     var body: some View {
         Text(text)
-            .font(.system(size: 10, weight: .semibold))
+            .font(.sectionLabel)
             .tracking(0.5)
             .foregroundStyle(Color.reviewAmber)
             .padding(.horizontal, 8)

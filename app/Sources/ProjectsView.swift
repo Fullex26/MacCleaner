@@ -4,6 +4,12 @@ struct ProjectsView: View {
     @EnvironmentObject var bridge: CleanerBridge
     @State private var selection = Set<String>()
     @State private var confirmClean = false
+    /// Snapshot of `selection` (intersected with still-present artifacts)
+    /// taken when the confirmation dialog is raised — same B6 fix as
+    /// DashboardView: the dialog's own text and the actual removal must
+    /// agree with each other and with what the user first saw, not with
+    /// whatever `selection` has drifted to by the time they confirm.
+    @State private var pendingIDs: [String] = []
 
     private var artifacts: [ProjectArtifact] {
         bridge.projects?.artifacts ?? []
@@ -11,6 +17,11 @@ struct ProjectsView: View {
 
     private var selectedBytes: Int {
         artifacts.filter { selection.contains($0.id) }.reduce(0) { $0 + $1.size_bytes }
+    }
+
+    private var pendingBytes: Int {
+        let ids = Set(pendingIDs)
+        return artifacts.filter { ids.contains($0.id) }.reduce(0) { $0 + $1.size_bytes }
     }
 
     var body: some View {
@@ -43,9 +54,9 @@ struct ProjectsView: View {
             Button {
                 Task { await bridge.scanProjects() }
             } label: {
-                Label(bridge.isBusy ? "Scanning…" : "Scan Projects", systemImage: "arrow.clockwise")
+                Label(bridge.isScanningProjects ? "Scanning…" : "Scan Projects", systemImage: "arrow.clockwise")
             }
-            .disabled(bridge.isBusy || bridge.isCleaning)
+            .disabled(bridge.isScanningProjects || bridge.isCleaning)
         }
         .padding()
     }
@@ -54,7 +65,7 @@ struct ProjectsView: View {
     private var content: some View {
         if bridge.projects == nil {
             Spacer()
-            if bridge.isBusy {
+            if bridge.isScanningProjects {
                 ProgressView("Scanning project folders…")
             } else {
                 Text("Press Scan Projects to look for stale build artifacts.")
@@ -73,6 +84,14 @@ struct ProjectsView: View {
                 ArtifactRow(artifact: artifact, isSelected: binding(for: artifact.id))
             }
             .listStyle(.inset)
+            .onChange(of: artifacts.map(\.id)) { newIDs in
+                // "Also fix": a re-scan can drop artifacts that no longer
+                // exist (already cleaned some other way, or aged back out of
+                // the window) — without this, a stale id lingering in
+                // `selection` risks the destructive action operating on an
+                // id the current artifact list doesn't even recognize.
+                selection.formIntersection(Set(newIDs))
+            }
         }
     }
 
@@ -104,21 +123,25 @@ struct ProjectsView: View {
             }
             Spacer()
             Button {
+                // B6: freeze the selection the dialog will describe and act
+                // on (also intersected with artifacts still present, so a
+                // re-scan that dropped one mid-confirm can't leave a
+                // dangling id in the snapshot either).
+                pendingIDs = Array(selection.intersection(Set(artifacts.map(\.id))))
                 confirmClean = true
             } label: {
                 Label("Remove Selected", systemImage: "trash")
             }
             .buttonStyle(.borderedProminent)
             .keyboardShortcut(.defaultAction)
-            .disabled(selection.isEmpty || bridge.isCleaning || bridge.isBusy)
+            .disabled(selection.isEmpty || bridge.isCleaning || bridge.isScanningProjects)
             .confirmationDialog(
-                "Remove \(selection.count) artifacts (\(ByteCountFormatter.string(fromByteCount: Int64(selectedBytes), countStyle: .file)))?",
+                "Remove \(pendingIDs.count) artifacts (\(ByteCountFormatter.string(fromByteCount: Int64(pendingBytes), countStyle: .file)))?",
                 isPresented: $confirmClean
             ) {
                 Button(bridge.deleteMode == "trash" ? "Move to Trash" : "Delete", role: .destructive) {
-                    let ids = Array(selection)
-                    selection.removeAll()
-                    Task { await bridge.cleanProjects(ids: ids) }
+                    selection.subtract(pendingIDs)
+                    Task { await bridge.cleanProjects(ids: pendingIDs) }
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {

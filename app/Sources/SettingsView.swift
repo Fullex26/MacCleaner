@@ -46,7 +46,7 @@ struct SettingsView: View {
                             set: { on in Task { await bridge.setCategory(category.name, enabled: on) } }
                         )) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(category.name.capitalized)
+                                Text(categoryDisplayName(category.name))
                                 Text(category.description)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
@@ -141,7 +141,26 @@ struct SettingsView: View {
             SettingsSection(title: "Updates") {
                 LabeledContent("Version", value: currentVersion)
                 Toggle("Automatically check for updates", isOn: $updater.automaticChecks)
+                if let version = updater.pendingUpdateVersion {
+                    // B1: a scheduled (non-user-initiated) check found an
+                    // update whose alert Sparkle can't reliably put in front
+                    // of the user in this LSUIElement app — mirrors the
+                    // MenuBarPanel row so Settings shows the same thing.
+                    HStack(spacing: 8) {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .foregroundStyle(Color.accentCyan)
+                        Text("Update to \(version) available")
+                        Spacer()
+                        Button("Review…") { updater.checkForUpdates() }
+                    }
+                }
                 Button("Check for Updates…") { updater.checkForUpdates() }
+                    // "Also fix": mirrors SPUStandardUpdaterController's own
+                    // menu-item validation behavior (disable while a check
+                    // can't be made) via the KVO-compliant
+                    // `canCheckForUpdates` — stub build's `canCheck` is a
+                    // fixed `false`.
+                    .disabled(!updater.canCheck)
             }
         } else {
             SettingsSection(title: "Updates") {
@@ -173,10 +192,10 @@ struct SettingsView: View {
 }
 
 /// One named glass panel in the Settings list — an uppercase, tracked
-/// caption above a `.glassPanel()` card. The caption reuses the same
-/// typographic recipe `ReviewBadge` uses (size 10, semibold, 0.5 tracking)
-/// so "label" text reads consistently across the app; unlike the badge this
-/// is a plain heading, not a capsule.
+/// caption above a `.glassPanel()` card. The caption reuses `Font.sectionLabel`,
+/// the same typographic recipe `ReviewBadge` uses (size 10, semibold, 0.5
+/// tracking), so "label" text reads consistently across the app; unlike the
+/// badge this is a plain heading, not a capsule.
 private struct SettingsSection<Content: View>: View {
     let title: String
     @ViewBuilder var content: Content
@@ -184,7 +203,7 @@ private struct SettingsSection<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(title.uppercased())
-                .font(.system(size: 10, weight: .semibold))
+                .font(.sectionLabel)
                 .tracking(0.5)
                 .foregroundStyle(.secondary)
 
