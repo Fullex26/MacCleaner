@@ -67,25 +67,29 @@ struct ProjectsView: View {
                 .foregroundStyle(.secondary)
             Spacer()
         } else {
+            bulkBar
+            Divider()
             List(artifacts) { artifact in
-                HStack(spacing: 10) {
-                    Toggle("", isOn: binding(for: artifact.id))
-                        .labelsHidden()
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("\(artifact.kind) — \((artifact.project as NSString).abbreviatingWithTildeInPath)")
-                        Text("Untouched for \(artifact.age_days) days")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Text(ByteCountFormatter.string(fromByteCount: Int64(artifact.size_bytes), countStyle: .file))
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.vertical, 2)
+                ArtifactRow(artifact: artifact, isSelected: binding(for: artifact.id))
             }
             .listStyle(.inset)
         }
+    }
+
+    /// Bulk-select bar above the artifact list: All / None, plus a running
+    /// "N of M" count. Styled identically to Dashboard's bulk bar, minus
+    /// "Safe only" — project artifacts have no safe/review distinction.
+    private var bulkBar: some View {
+        HStack(spacing: 12) {
+            Text("Select:").font(.metaCaption).foregroundStyle(.secondary)
+            Button("All")  { selection = Set(artifacts.map(\.id)) }
+            Button("None") { selection.removeAll() }
+            Spacer()
+            Text("\(selection.count) of \(artifacts.count)")
+                .font(.metaCaption).monospacedDigit().foregroundStyle(.secondary)
+        }
+        .buttonStyle(.link)
+        .padding(.horizontal).padding(.vertical, 6)
     }
 
     private var footer: some View {
@@ -104,6 +108,8 @@ struct ProjectsView: View {
             } label: {
                 Label("Remove Selected", systemImage: "trash")
             }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
             .disabled(selection.isEmpty || bridge.isCleaning || bridge.isBusy)
             .confirmationDialog(
                 "Remove \(selection.count) artifacts (\(ByteCountFormatter.string(fromByteCount: Int64(selectedBytes), countStyle: .file)))?",
@@ -129,5 +135,73 @@ struct ProjectsView: View {
                 if on { selection.insert(id) } else { selection.remove(id) }
             }
         )
+    }
+}
+
+/// Maps an artifact's `kind` (a raw directory name like `node_modules` or
+/// `.venv`) to the palette key `categoryColor` recognizes, so the dot reads
+/// as "this is a Node artifact" rather than a color keyed to the literal
+/// folder name. Anything not called out explicitly (`.nuxt`, `.turbo`,
+/// `.pytest_cache`, a future manifest kind, …) falls through to
+/// `categoryColor`'s own hash-derived fallback, keyed on the raw kind string
+/// so it's still stable and distinct across launches.
+private func artifactDotColor(for kind: String) -> Color {
+    switch kind {
+    case "node_modules", ".next", "dist", "build":
+        return categoryColor("node")
+    case ".venv", "venv":
+        return categoryColor("python")
+    case "target":
+        return categoryColor("rust")
+    case "Pods":
+        return categoryColor("cocoapods")
+    default:
+        return categoryColor(kind)
+    }
+}
+
+struct ArtifactRow: View {
+    let artifact: ProjectArtifact
+    @Binding var isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Toggle("", isOn: $isSelected)
+                .labelsHidden()
+            Circle()
+                .fill(artifactDotColor(for: artifact.kind))
+                .frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(artifact.kind) — \((artifact.project as NSString).abbreviatingWithTildeInPath)")
+                    .font(.rowLabel)
+                Text("Untouched for \(artifact.age_days) days")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            gitChips
+            Text(ByteCountFormatter.string(fromByteCount: Int64(artifact.size_bytes), countStyle: .file))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 70, alignment: .trailing)
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// Outline-amber chips for uncommitted/unpushed work — the same
+    /// `ReviewBadge` capsule the Dashboard uses for review-only targets,
+    /// just with different text, so it's never a second hand-rolled capsule.
+    @ViewBuilder
+    private var gitChips: some View {
+        if let git = artifact.git {
+            HStack(spacing: 4) {
+                if git.dirty {
+                    ReviewBadge(text: "DIRTY")
+                }
+                if git.unpushed {
+                    ReviewBadge(text: "UNPUSHED")
+                }
+            }
+        }
     }
 }

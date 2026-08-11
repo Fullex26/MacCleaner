@@ -213,11 +213,16 @@ struct GradientBar: View {
     }
 }
 
-/// Outline amber "REVIEW" capsule badge for review-only (`safe: false`)
-/// targets — replaces the plain text label previously used.
+/// Outline amber capsule badge — "REVIEW" by default for review-only
+/// (`safe: false`) targets, replacing the plain text label previously used.
+/// `text` is overridable so the same outline-amber chip styling covers other
+/// flags without duplicating the capsule (e.g. Projects' "DIRTY"/"UNPUSHED"
+/// git-status chips).
 struct ReviewBadge: View {
+    var text: String = "REVIEW"
+
     var body: some View {
-        Text("REVIEW")
+        Text(text)
             .font(.system(size: 10, weight: .semibold))
             .tracking(0.5)
             .foregroundStyle(Color.reviewAmber)

@@ -46,6 +46,14 @@ struct CleanResult: Codable {
     let items: [CleanItem]
 }
 
+/// `null` when git status couldn't be determined (not a repo, `git` missing,
+/// any git failure, or `project_git_check` disabled); otherwise the two
+/// signals `projects --json` reports per AGENTS.md §"projects --json".
+struct GitInfo: Codable, Hashable {
+    let dirty: Bool
+    let unpushed: Bool
+}
+
 struct ProjectArtifact: Codable, Identifiable, Hashable {
     let id: String
     let path: String
@@ -53,6 +61,7 @@ struct ProjectArtifact: Codable, Identifiable, Hashable {
     let project: String
     let age_days: Int
     let size_bytes: Int
+    let git: GitInfo?
 }
 
 struct ProjectsReport: Codable {
@@ -67,6 +76,7 @@ struct HistoryRun: Codable, Identifiable {
     let total_freed_bytes: Int
     let total_freed_human: String
     let disk_after: String
+    let items: [CleanItem]
     var id: String { timestamp }
 }
 
