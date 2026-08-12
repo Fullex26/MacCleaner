@@ -3696,5 +3696,70 @@ class TestScannerScoping(unittest.TestCase):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+class TestDockerEstimateParsing(unittest.TestCase):
+    """`docker system df`'s TYPE column has two-word entries ("Local
+    Volumes", "Build Cache"), which shifts naive whitespace-split column
+    indices. Real output observed in the field (see fix commit) showed the
+    old parser silently reading the SIZE column instead of RECLAIMABLE for
+    single-word rows, and dropping two-word rows entirely -- so the
+    "Docker unused data" target perpetually reported ~total image size as
+    "reclaimable" no matter how many times the safe prune command ran."""
+
+    REAL_OUTPUT = (
+        "TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\n"
+        "Images          10        1         4.202GB   660.3MB (15%)\n"
+        "Containers      1         1         0B        0B\n"
+        "Local Volumes   8         0         2.84GB    2.84GB (100%)\n"
+        "Build Cache     14        0         440.6MB   1.116MB\n"
+    )
+
+    def test_sums_reclaimable_column_not_size_column(self):
+        # Images RECLAIMABLE is 660.3MB, not the 4.202GB SIZE column the
+        # old buggy parser read.
+        result = cleaner._parse_docker_estimate(self.REAL_OUTPUT)
+        self.assertLess(result, 1024 ** 3,
+                         "must not count Images' total SIZE as reclaimable")
+
+    def test_excludes_local_volumes(self):
+        # docker-prune's cmd never passes --volumes (removing volumes can
+        # destroy real data, e.g. database volumes) -- the safe target must
+        # never advertise volume space as something it can reclaim, or the
+        # badge stays stuck at the volumes' size forever after cleaning.
+        result = cleaner._parse_docker_estimate(self.REAL_OUTPUT)
+        self.assertLess(result, 1024 ** 3,
+                         "2.84GB of Local Volumes must not be counted")
+
+    def test_includes_images_containers_and_build_cache_reclaimable(self):
+        # 660.3MB + 0B + 1.116MB, each within float-precision of fmt_size's
+        # own unit math.
+        result = cleaner._parse_docker_estimate(self.REAL_OUTPUT)
+        expected = int(660.3 * 1024**2) + 0 + int(1.116 * 1024**2)
+        self.assertAlmostEqual(result, expected, delta=1024)  # rounding slack
+
+    def test_two_word_type_names_do_not_break_single_word_rows(self):
+        # Containers (single word, 0B) must still parse as 0, not silently
+        # skip or throw, regardless of neighboring two-word rows.
+        only_containers = (
+            "TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\n"
+            "Containers      3         1         120MB     45MB (37%)\n"
+        )
+        self.assertEqual(cleaner._parse_docker_estimate(only_containers),
+                          int(45 * 1024**2))
+
+    def test_empty_output_is_zero(self):
+        self.assertEqual(cleaner._parse_docker_estimate(""), 0)
+
+    def test_header_only_is_zero(self):
+        header = "TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\n"
+        self.assertEqual(cleaner._parse_docker_estimate(header), 0)
+
+    def test_unrecognized_row_is_ignored_not_fatal(self):
+        # A future Docker version adding a new TYPE row must degrade to
+        # "ignored", never raise.
+        weird = self.REAL_OUTPUT + "Future Thing    1         0         5MB       5MB (100%)\n"
+        # Should not raise, and should equal the known-rows-only total.
+        cleaner._parse_docker_estimate(weird)
+
+
 if __name__ == "__main__":
     unittest.main()

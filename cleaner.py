@@ -345,15 +345,32 @@ def _parse_brew_estimate(output):
     return int(val * {"KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}[unit])
 
 
+# `docker system df`'s TYPE column has multi-word entries ("Local Volumes",
+# "Build Cache"), which shifts a naive whitespace-split column index -- the
+# old parser read SIZE instead of RECLAIMABLE for one-word rows and dropped
+# two-word rows entirely. Local Volumes is deliberately excluded here even
+# once parsed correctly: docker-prune's cmd never passes --volumes (volumes
+# commonly hold real data, e.g. databases, so removing them isn't "safe"),
+# so counting volume space as reclaimable would advertise bytes this
+# specific safe target can never actually free.
+_DOCKER_DF_RECLAIMABLE_TYPES = ("Images", "Containers", "Build Cache")
+
+
 def _parse_docker_estimate(output):
     total = 0
     for line in output.strip().splitlines()[1:]:
-        parts = line.split()
-        if len(parts) >= 4:
-            m = re.match(r'([0-9.]+)(B|KB|MB|GB|TB)', parts[3])
-            if m:
-                val, unit = float(m.group(1)), m.group(2)
-                total += int(val * {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}[unit])
+        line = line.strip()
+        type_name = next((t for t in _DOCKER_DF_RECLAIMABLE_TYPES if line.startswith(t)), None)
+        if type_name is None:
+            continue
+        rest = line[len(type_name):].split()
+        # rest = [TOTAL, ACTIVE, SIZE, RECLAIMABLE, ...optional "(NN%)"]
+        if len(rest) < 4:
+            continue
+        m = re.match(r'([0-9.]+)(B|KB|MB|GB|TB)', rest[3])
+        if m:
+            val, unit = float(m.group(1)), m.group(2)
+            total += int(val * {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}[unit])
     return total
 
 
