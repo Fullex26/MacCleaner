@@ -7,6 +7,14 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.6.1] — 2026-08-12
+
+### Fixed
+- `docker system df`'s estimator was reading the wrong table column and silently dropping rows whose TYPE name has two words ("Local Volumes", "Build Cache") — reporting 4.2 GB reclaimable for "Docker unused data" when only 660 MB actually was, and the number barely moved after cleaning since it was really tracking total image size rather than what's stale. `Local Volumes` is now deliberately excluded from the estimate too: the safe `docker-prune` target's command never removes volumes (they commonly hold real data), so counting volume space as reclaimable would advertise bytes that specific safe, one-click target can never free.
+- `doctor`'s "Menu bar app" / "Engine/App version" checks hardcoded the literal `/Applications` path with no test-isolation seam, so their tests silently depended on whether the *real* machine happened to have an app installed there. New `MACCLEANER_SYSTEM_APPLICATIONS_DIR` override, matching the existing `MACCLEANER_TMP_ROOT`/`MACCLEANER_LAUNCH_AGENTS_DIR` pattern.
+
+---
+
 ## [2.6.0] — 2026-08-12
 
 Glass & Sparkle: a full visual overhaul of the menu bar app, plus self-updating
