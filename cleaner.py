@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -1835,7 +1835,8 @@ def run_doctor(config, json_mode=False):
     except Exception:
         pass
 
-    app_paths = [HOME / "Applications/MacCleaner.app", Path("/Applications/MacCleaner.app")]
+    system_apps_dir = Path(os.environ.get("MACCLEANER_SYSTEM_APPLICATIONS_DIR", "/Applications"))
+    app_paths = [HOME / "Applications/MacCleaner.app", system_apps_dir / "MacCleaner.app"]
     installed_app = next((p for p in app_paths if p.exists()), None)
     check("Menu bar app", f"installed at {installed_app}" if installed_app else "not installed")
 

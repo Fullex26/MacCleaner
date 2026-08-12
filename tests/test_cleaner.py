@@ -597,6 +597,12 @@ class TestDoctorSchedule(unittest.TestCase):
                     "MACCLEANER_CONFIG": str(self.cfg_path),
                     "MACCLEANER_LOG": str(self.tmp / "report.log"),
                     "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    # The dev machine may have a real MacCleaner.app in the
+                    # real /Applications (e.g. from a prior `--install`) --
+                    # without this override, "app not installed" assertions
+                    # would depend on the real machine's state instead of
+                    # this test's fabricated sandbox.
+                    "MACCLEANER_SYSTEM_APPLICATIONS_DIR": str(self.tmp / "sysapps"),
                     "PATH": f"{self.bindir}:{os.environ['PATH']}"}
         # A real crontab may exist on the dev machine; use a stub so this
         # test's outcome depends only on the fabricated LaunchAgents/launchctl.
