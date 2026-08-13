@@ -30,8 +30,8 @@ eq "no dupes offered"     "0"  "$(B 'maccleaner clean --targets npm-cache,' | gr
 eq "projects --targets is freeform, not cleanup ids" "0" "$(B 'maccleaner projects --targets ' | grep -cx 'npm-cache')"
 eq "projects --targets freeform w/ prefix"           "0" "$(B 'maccleaner projects --targets npm' | grep -cx 'npm-cache')"
 eq "config actions"       "show path enable disable set" "$(B 'maccleaner config ' | grep -v '^--' | tr '\n' ' ' | sed 's/ $//')"
-eq "config enable cats"   "22" "$(B 'maccleaner config enable ' | wc -l | tr -d ' ')"
-eq "engine down -> static" "22" "$(env MACCLEANER_ENGINE=/nope HOME=/tmp/nohome bash "$HERE/bashtest.sh" "$HERE/maccleaner.bash" 'maccleaner config enable ' | wc -l | tr -d ' ')"
+eq "config enable cats"   "23" "$(B 'maccleaner config enable ' | wc -l | tr -d ' ')"
+eq "engine down -> static" "23" "$(env MACCLEANER_ENGINE=/nope HOME=/tmp/nohome bash "$HERE/bashtest.sh" "$HERE/maccleaner.bash" 'maccleaner config enable ' | wc -l | tr -d ' ')"
 
 echo "Tier 2b: mclean/mpreview/mreport alias completion (each bakes in a subcommand)"
 eq "alias mclean flags"    "--yes --targets --category --min-size --trash --dry-run --notify --json --help" "$(B 'mclean ' | tr '\n' ' ' | sed 's/ $//')"
@@ -50,8 +50,8 @@ eq "zsh schedule action"  "monthly off status weekly" "$(Z 'maccleaner schedule 
 eq "zsh targets 1st"      "80" "$(Z 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
 eq "zsh targets 2nd"      "79" "$(Z 'maccleaner clean --targets npm-cache,' | wc -l | tr -d ' ')"
 eq "zsh targets 3rd"      "78" "$(Z 'maccleaner clean --targets npm-cache,pip-cache,' | wc -l | tr -d ' ')"
-eq "zsh config set keys"  "14" "$(Z 'maccleaner config set ' | wc -l | tr -d ' ')"
-eq "zsh engine down"      "22" "$(env MACCLEANER_ENGINE=/nope HOME=/tmp/nohome "$HERE/capture.zsh" "$HERE" 'maccleaner config enable ' | wc -l | tr -d ' ')"
+eq "zsh config set keys"  "15" "$(Z 'maccleaner config set ' | wc -l | tr -d ' ')"
+eq "zsh engine down"      "23" "$(env MACCLEANER_ENGINE=/nope HOME=/tmp/nohome "$HERE/capture.zsh" "$HERE" 'maccleaner config enable ' | wc -l | tr -d ' ')"
 
 echo "Tier 3b: mclean/mpreview/mreport alias completion (zsh)"
 eq "zsh alias mclean flags" "--category --dry-run --help --json --min-size --notify --targets --trash --yes -h" "$(Z 'mclean ' | tr '\n' ' ' | sed 's/ $//')"
