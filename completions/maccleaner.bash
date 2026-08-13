@@ -22,7 +22,7 @@ _maccleaner_run_capped() {
 }
 
 _MACCLEANER_STATIC_CATEGORIES="xcode docker node python caches logs homebrew go
-rust ruby cocoapods gradle maven ai ide browsers system flutter php vms tmp simulators"
+rust ruby cocoapods gradle maven ai ide browsers system flutter php vms tmp simulators leftovers"
 
 # Populate $_MACCLEANER_CATS / $_MACCLEANER_TGTS for $1 = categories|targets.
 # Layer 1: per-shell memo. Layer 2: disk cache keyed on engine mtime.
@@ -268,7 +268,8 @@ categories schedule disk-check install-deps --help --version" -- "$cur") )
                             COMPREPLY=( $(compgen -W "enabled_categories skip_paths \
 log_threshold_mb auto_approve delete_mode project_roots project_min_age_days \
 project_git_check notifications low_disk_alerts low_disk_threshold_gb \
-full_refresh_hours tmp_min_age_days simulator_stale_days" -- "$cur") )
+full_refresh_hours tmp_min_age_days simulator_stale_days \
+app_leftover_min_age_days" -- "$cur") )
                         else
                             COMPREPLY=()
                         fi ;;

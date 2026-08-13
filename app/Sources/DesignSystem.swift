@@ -77,7 +77,7 @@ extension Color {
 
 // MARK: - Category palette
 
-/// Fixed palette for the 22 known categories (`ALL_CATEGORIES` in
+/// Fixed palette for the 23 known categories (`ALL_CATEGORIES` in
 /// cleaner.py). Each entry is a light/dark hex pair — brighter, more
 /// saturated in dark mode to read against glass panels; deeper/darker in
 /// light mode for contrast against white. Kept as literal hex pairs (not
@@ -106,9 +106,12 @@ private let categoryPalette: [String: (light: String, dark: String)] = [
     "vms":        ("#52525B", "#A1A1AA"), // zinc
     "tmp":        ("#6D28D9", "#A78BFA"), // violet
     "simulators": ("#BE185D", "#F472B6"), // pink
+    "leftovers":  ("#2E7A1F", "#6DDB57"), // moss — the widest open hue gap
+    // (~110°) left in the wheel, roughly midway between browsers' lime
+    // (~84°) and node's green (~142°); distinct from both at a glance.
 ]
 
-/// Display names for the 22 known categories (`ALL_CATEGORIES` in
+/// Display names for the 23 known categories (`ALL_CATEGORIES` in
 /// cleaner.py), kept beside `categoryPalette` above since both are
 /// per-category presentation. Plain `.capitalized` on the raw kebab-case id
 /// mangles acronyms and short ids into "Ai", "Ide", "Vms", "Php", "Tmp" —
@@ -137,6 +140,7 @@ private let categoryDisplayNames: [String: String] = [
     "vms":        "VMs",
     "tmp":        "Temp files",
     "simulators": "Simulators",
+    "leftovers":  "Leftovers",
 ]
 
 /// Presentation name for a category id. Known categories get an explicit
@@ -148,7 +152,7 @@ func categoryDisplayName(_ name: String) -> String {
     categoryDisplayNames[name] ?? name.capitalized
 }
 
-/// Stable, appearance-aware color for a category dot. The 22 known
+/// Stable, appearance-aware color for a category dot. The 23 known
 /// categories get a hand-picked entry from `categoryPalette` above; any
 /// other name (a future category added to `ALL_CATEGORIES` before this
 /// palette is updated) gets a deterministic hash-derived hue instead of a

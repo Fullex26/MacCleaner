@@ -1,6 +1,6 @@
 # AGENTS.md — MacCleaner machine interface
 
-MacCleaner is a macOS developer storage cleanup tool: it scans 80+ known cache/artifact locations across 22 categories (Xcode, Docker, npm, pip, Homebrew, AI model caches, Flutter, PHP, VMs, ...) plus stale per-project build artifacts, stale build litter left under `/private/tmp`, and unused iOS simulator devices/runtimes, reports sizes, and deletes what you select. The engine is a single stdlib-only Python 3 script. Entry point: `python3 cleaner.py` from a repo checkout, or `maccleaner` (shell alias) / `python3 ~/mac-cleaner/cleaner.py` after `install.sh`. Every data command takes `--json`; that JSON interface is the contract this document specifies (the bundled macOS app is just another client of it). Current version: 2.6.1. As of 2.4.0, `install.sh` also wires up zsh/bash shell completions (`completions/_maccleaner`, `completions/maccleaner.bash`) and the CLI tarball ships them too — a human-facing convenience only, it doesn't change any of the JSON below.
+MacCleaner is a macOS developer storage cleanup tool: it scans 80+ known cache/artifact locations across 23 categories (Xcode, Docker, npm, pip, Homebrew, AI model caches, Flutter, PHP, VMs, ...) plus stale per-project build artifacts, stale build litter left under `/private/tmp`, unused iOS simulator devices/runtimes, and orphaned per-app leftovers under `~/Library` from apps you've already uninstalled, reports sizes, and deletes what you select. The engine is a single stdlib-only Python 3 script. Entry point: `python3 cleaner.py` from a repo checkout, or `maccleaner` (shell alias) / `python3 ~/mac-cleaner/cleaner.py` after `install.sh`. Every data command takes `--json`; that JSON interface is the contract this document specifies (the bundled macOS app is just another client of it). Current version: 2.7.0. As of 2.4.0, `install.sh` also wires up zsh/bash shell completions (`completions/_maccleaner`, `completions/maccleaner.bash`) and the CLI tarball ships them too — a human-facing convenience only, it doesn't change any of the JSON below.
 
 ## 1. Quick recipes
 
@@ -88,7 +88,7 @@ Abbreviated but field-accurate examples. All JSON is pretty-printed to stdout.
 
 ```json
 {
-  "version": "2.6.1",
+  "version": "2.7.0",
   "timestamp": "2026-07-14T09:12:03.481920",
   "disk": "Used: 380Gi / 460Gi (85%)",
   "disk_stats": {
@@ -130,7 +130,7 @@ Targets are sorted by `size_bytes` descending. Command-based targets (docker/bre
 
 ```json
 {
-  "version": "2.6.1",
+  "version": "2.7.0",
   "timestamp": "2026-07-14T09:14:55.102331",
   "delete_mode": "rm",
   "freed_bytes": 14495514624,
@@ -150,7 +150,7 @@ Targets are sorted by `size_bytes` descending. Command-based targets (docker/bre
 
 ```json
 {
-  "version": "2.6.1",
+  "version": "2.7.0",
   "timestamp": "2026-07-14T09:14:55.102331",
   "dry_run": true,
   "delete_mode": "rm",
@@ -185,7 +185,7 @@ Same envelope shape as `clean --json` (`delete_mode`, `freed_bytes`, `disk_after
 
 ```json
 {
-  "version": "2.6.1",
+  "version": "2.7.0",
   "timestamp": "2026-07-14T09:16:12.000000",
   "roots": ["/Users/you/Documents", "/Users/you/Code"],
   "min_age_days": 30,
@@ -210,7 +210,7 @@ Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets`
 
 ```json
 {
-  "version": "2.6.1",
+  "version": "2.7.0",
   "ok": true,
   "checks": [
     { "name": "Python",       "status": "3.12.4", "ok": true },
@@ -231,7 +231,7 @@ The `Schedule paths` check (new in 2.3.0) is separate from `Schedule` above and 
 
 ```json
 {
-  "version": "2.6.1",
+  "version": "2.7.0",
   "free_bytes": 8321499136,
   "free_human": "7.8 GB",
   "threshold_bytes": 10737418240,
@@ -248,7 +248,7 @@ New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`month
 
 ```json
 {
-  "version": "2.6.1",
+  "version": "2.7.0",
   "schedule": "weekly",
   "agents": [
     { "label": "com.fullex.maccleaner.clean",     "plist_present": true, "loaded": true },
@@ -266,7 +266,7 @@ New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`month
 
 **Exit codes**: `status` and `off` always exit `0`, even when nothing is scheduled. `weekly`/`monthly` exit `1` if either agent failed to load with `launchctl` (the plist is still written to disk either way, and the stderr output includes the manual `launchctl bootstrap` command to load it); they exit `0` when both agents loaded. An unrecognized `action` is an argparse usage error, exit `2`, before any of this runs.
 
-`weekly`/`monthly --json` have one more exit path that does **not** follow the common envelope above: if no usable, non-virtualenv `python3` interpreter can be resolved for `ProgramArguments[0]` (see `_agent_python()`), nothing is written — no plist, no `launchctl` call — and the command exits `1` printing only `{"version": "2.6.1", "error": "<message>"}`. This response has no `schedule`, `agents`, or `legacy_cron` keys at all; a strict external decoder expecting the common shape on every `weekly`/`monthly` call should check for `"error"` first.
+`weekly`/`monthly --json` have one more exit path that does **not** follow the common envelope above: if no usable, non-virtualenv `python3` interpreter can be resolved for `ProgramArguments[0]` (see `_agent_python()`), nothing is written — no plist, no `launchctl` call — and the command exits `1` printing only `{"version": "2.7.0", "error": "<message>"}`. This response has no `schedule`, `agents`, or `legacy_cron` keys at all; a strict external decoder expecting the common shape on every `weekly`/`monthly` call should check for `"error"` first.
 
 Honors `MACCLEANER_LAUNCH_AGENTS_DIR` (default `~/Library/LaunchAgents`) for both reading and writing agent plists — see §5.
 
@@ -274,7 +274,7 @@ Honors `MACCLEANER_LAUNCH_AGENTS_DIR` (default `~/Library/LaunchAgents`) for bot
 
 ```json
 {
-  "version": "2.6.1",
+  "version": "2.7.0",
   "categories": [
     {
       "name": "xcode",
@@ -295,7 +295,7 @@ Lists **all** categories and targets regardless of the enabled_categories config
 
 ```json
 {
-  "version": "2.6.1",
+  "version": "2.7.0",
   "runs": [
     {
       "timestamp": "2026-07-13T09:00:04.120394",
@@ -327,7 +327,7 @@ Lists **all** categories and targets regardless of the enabled_categories config
 }
 ```
 
-Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 50 runs. With no history: `{"version": "2.6.1", "runs": [], "disk_history": {...}}` (`disk_history` is present either way).
+Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 50 runs. With no history: `{"version": "2.7.0", "runs": [], "disk_history": {...}}` (`disk_history` is present either way).
 
 `disk_history` is **additive** (new in 2.1.0) and always present, even with no cleanup history. `current` is today's `disk_stats()` snapshot. `snapshots` is the full contents of `snapshots.log` (append-only, capped at the most recent 365 entries; a snapshot recorded on the same calendar day as the previous one replaces it instead of adding a new entry — so a machine scanned any number of times a day, including every few minutes by the menu bar app's auto-refresh, accumulates at most one entry per day, giving 365 entries roughly a year of history). Every `scan` and every real `clean`/`projects --clean` run (not `--dry-run`) records one snapshot. `reclaimable_bytes` and `categories` (a map of category → bytes) are `null` unless the run covers the **full, unscoped target list** — a plain `scan`, or a plain `clean` with no `--category`/`--min-size`/`--targets` (this doesn't depend on `--yes`: an unscoped interactive `clean` counts too). The sums span every measured target regardless of `safe` — review targets (e.g. all of `ai`, and `system`'s `trash`/`ios-backups`) are folded into `categories` too, not excluded; for `clean` the sum is taken after the run, over whatever remains uncleaned (targets not deleted/trashed this pass, including any review target skipped or declined). They're `null` for `scan --category …`, `scan --min-size …`, any `clean` scoped by `--targets`/`--category`/`--min-size`, and *every* `projects --clean` run (project artifacts aren't part of the regular category sweep, and it never records full scope) — in all of those cases only `disk_total_bytes`/`disk_free_bytes` are trustworthy. Use `MACCLEANER_SNAPSHOTS` to point the engine at a different snapshots file (see §5).
 
@@ -336,7 +336,7 @@ Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 5
 - Every target has a **stable kebab-case ID** (e.g. `xcode-derived-data`, `npm-cache`, `huggingface-hub`, `brew-cleanup`). IDs are the agent-facing selector for `clean --targets` and will not be renamed within a major version; new targets only add IDs.
 - Two ID families are **dynamic** (derived from what's on disk, still deterministic per machine): `log-<folder-slug>` for oversized folders under `~/Library/Logs`, and `project-<home-relative-path-slug>` for stale project artifacts. Enumerate them fresh via `scan --json` / `projects --json` before cleaning; don't hardcode them.
 - **New in 2.5.0** — a third dynamic family, `tmp-<slug>` (category `tmp`), one ID per stale build-artifact or repo-clone directory found directly under `/private/tmp` (Xcode-style DerivedData layouts, or a `.git` clone with a manifest and a build-artifact dir). Always review-only. Like `project-*`, these IDs are **not** enumerated by `categories --json` — they only appear in `scan --json` / `clean --json` / `clean --dry-run --json` when the `tmp` category is enabled. Two more IDs, `simulator-stale-devices` and `simulator-unused-runtimes` (category `simulators`), are fixed (not per-item) but **conditional**: each appears only when `xcrun simctl` actually has something stale/unused to report, and both are also absent from `categories --json` for the same reason (they come from a scanner, not the static target table). Deletion for both goes through `simctl` rather than direct filesystem removal.
-- Enumerate the full static ID space with `categories --json` (all 22 categories: `xcode docker node python caches logs homebrew go rust ruby cocoapods gradle maven ai ide browsers system flutter php vms tmp simulators`) — note that `tmp` and `simulators` themselves list zero *static* targets there, since every target in those two categories is one of the dynamic/conditional IDs above. `scan --json` shows only targets in enabled categories, with live sizes.
+- Enumerate the full static ID space with `categories --json` (all 23 categories: `xcode docker node python caches logs homebrew go rust ruby cocoapods gradle maven ai ide browsers system flutter php vms tmp simulators leftovers`) — note that `tmp`, `simulators`, and `leftovers` themselves list zero *static* targets there, since every target in those three categories is dynamic: `tmp`/`simulators` are the dynamic/conditional IDs above, and `leftovers` is the `leftover-<slug>` family described in §6 below. `scan --json` shows only targets in enabled categories, with live sizes.
 - **New in 2.1.0** — 17 targets across 3 new categories: `flutter` (`dart-pub-cache`), `php` (`composer-cache`), `vms` (`colima-vm`, `vagrant-boxes`, `minikube-cache`); plus, in existing categories, `xcode-doc-cache`, `yarn-global-cache`, `npm-logs`, `conda-clean`, `sccache-cache`, `lm-studio-models`, `whisper-models`, `cypress-cache`, `teams-cache`, `zoom-updater`, `terraform-plugin-cache`, `expo-cache`. All additive — no existing IDs changed.
 - **New in 2.5.0** — 2 new categories (`tmp`, `simulators`, both dynamic-only — see above) plus 2 new static targets in the existing `ai` category: `codex-sessions` and `codex-archived-sessions` (OpenAI Codex CLI conversation history under `~/.codex/`). All additive — no existing IDs changed.
 - **Safe vs. review** (`"safe": true/false`):
@@ -363,6 +363,8 @@ Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 5
 | `MACCLEANER_LAUNCH_AGENTS_DIR` | Directory `schedule` reads/writes launchd agent plists in (default: `~/Library/LaunchAgents`) — new in 2.3.0, used by tests |
 | `MACCLEANER_TMP_ROOT` | Root directory the `tmp` category scans for stale build artifacts (default: `/private/tmp`) — new in 2.5.0, exists so tests (and anyone diagnosing the scanner) can point it at a throwaway directory instead of the real system tmp |
 | `MACCLEANER_SYSTEM_APPLICATIONS_DIR` | Directory `doctor`'s "Menu bar app" / "Engine/App version" checks treat as the system-wide Applications folder, alongside `~/Applications` (default: `/Applications`) — new in 2.6.1, exists so tests can sandbox away a real system-wide install |
+| `MACCLEANER_INSTALLED_APPS_DIRS` | Colon-separated list of directories the `leftovers` scanner treats as app roots when building its installed-bundle-ID set (default: `/Applications:~/Applications:/System/Applications`) — new in 2.7.0, exists so tests can sandbox away the real Applications folders |
+| `MACCLEANER_LEFTOVER_LIBRARY_ROOT` | Root directory the `leftovers` scanner treats as `~/Library` when looking for orphaned per-app data (default: `~/Library`) — new in 2.7.0, exists so tests (and anyone diagnosing the scanner) can point it at a throwaway directory instead of the real one |
 
 `MACCLEANER_ENGINE` is read by the macOS app only (points it at a development `cleaner.py`); the engine itself ignores it.
 
@@ -371,6 +373,8 @@ Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 5
 **New config keys in 2.2.0** — `notifications` (default `true`): whether `clean --notify` and the app post a notification after a clean; `low_disk_alerts` (default `true`): whether `disk-check` posts a low-disk warning; `low_disk_threshold_gb` (default `10`): the free-space threshold `disk-check` warns below; `full_refresh_hours` (default `6`, app-side only — the engine never reads it): how often the macOS app runs a full `scan` between its lightweight 60-second `report` ticks. `notifications` and `low_disk_alerts` are independent switches — disabling one has no effect on the other.
 
 **New config keys in 2.5.0** — `tmp_min_age_days` (default `3`): directories directly under `/private/tmp` younger than this (by mtime) are never offered, regardless of what they contain. `simulator_stale_days` (default `30`): a simulator device not booted (or, on older `simctl`, not "used") in this many days counts as stale. Both are plain `config set` keys like any other. `config show` also always includes a `known_categories` key — the set of category names this install's `enabled_categories` has already been migrated against. Every `load_config()` call auto-appends any category in `ALL_CATEGORIES` that isn't yet in `known_categories` to `enabled_categories` (so a category added in a new release, like `tmp`/`simulators` in 2.5.0, shows up enabled for existing installs instead of silently staying off), then stamps `known_categories` to the current full list. It's bookkeeping, not a user-facing setting: `config set known_categories ...` is rejected as an unknown key, same as any other name not in `DEFAULT_CONFIG`. If you hand-write or hand-edit a `config.json` (e.g. for a fleet/scripted install), keep its `known_categories` key intact — a config that lacks it gets every category added since 2.4 re-enabled the next time it's loaded, which is the documented upgrade migration working as intended, not a bug.
+
+**New config key in 2.7.0** — `app_leftover_min_age_days` (default `7`): orphaned per-app data under `~/Library` (see the `leftovers` category / §6 below) younger than this (by mtime) is never offered, regardless of which of the five scanned locations it's in. A plain `config set` key like any other; the same `known_categories` auto-enable migration described above covers `leftovers` too.
 
 **Scheduling (new in 2.2.0; the `schedule` subcommand and `MACCLEANER_LAUNCH_AGENTS_DIR` are new in 2.3.0)**: `maccleaner schedule weekly|monthly` (equivalently `scheduler.sh weekly|monthly`, now a thin wrapper that `exec`s into `schedule weekly|monthly`) installs two launchd agents — `com.fullex.maccleaner.clean` (a `StartCalendarInterval` job: Monday 9am for `weekly`, the 1st at 9am for `monthly`; runs `clean --yes --notify`) and `com.fullex.maccleaner.diskwatch` (a `StartInterval` job, every 3600 seconds; runs `disk-check`). Both agents get an explicit `EnvironmentVariables.PATH` (Homebrew + standard dirs) so cmd-based targets don't silently no-op under launchd's minimal default PATH, and both log to `cron.log` beside `report.log`. launchd, unlike cron, runs a job whose scheduled time passed while the Mac was asleep as soon as it wakes, instead of silently skipping it. `schedule status` / `scheduler.sh status` is read-only — it asks `launchctl list <label>` for each installed agent, so a plist that's merely present but not actually loaded is reported distinctly from one launchd has genuinely loaded, and both are distinct from nothing installed at all; it also reports a legacy cron line if one is still present. `schedule off` / `scheduler.sh remove` unloads both agents and strips any legacy cron line, exiting `0` either way. Cron is legacy: an existing crontab entry referencing the canonical `mac-cleaner/cleaner.py` install path is removed the first time `weekly`/`monthly` runs (an unanchored match would risk deleting an unrelated user cron job, e.g. `db-cleaner.py`). The cadence that gets installed is always the one you asked for (`weekly` or `monthly`) — the old cron line's own cadence is detected and reported for visibility only, never used to override your request, so migrating never produces two contradictory schedule installs. Full JSON shapes are in §3 above; `doctor`'s Schedule check (§3) is backed by the same state helper, so it also honors `MACCLEANER_LAUNCH_AGENTS_DIR`.
 
@@ -384,6 +388,9 @@ Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 5
 - **`tmp` scanner is conservative** (new in 2.5.0): only the top level of the tmp scan root is scanned, no recursion. A directory is classified as cleanup-worthy purely by its *contents* — an Xcode-style DerivedData layout, or a `.git` clone with a recognized manifest file and a known build-artifact subdirectory — never by name (AI-coding-session scratch dirs are named after whatever project they're working on and won't generalize across users). Symlinks are never followed or classified. Directories owned by another user are skipped. Active AI-coding-session scratch dirs (any name prefixed `claude-`) are always skipped regardless of age. A minimum age gate (`tmp_min_age_days`, default 3 days by mtime) applies on top of all of the above. All hits are review-level (`tmp-*` IDs), and deletion for them is additionally scoped by the home-only carve-out above.
 - **Command-based targets** run fixed, non-destructive-by-design tool commands: `docker system prune -f --filter 'until=168h'`, `brew cleanup --prune=all`, `brew autoremove`, `pnpm store prune`, `gem cleanup`, `conda clean --all --yes`, `xcrun simctl delete unavailable`. No user input is interpolated into them.
 - **`simulators` scanner** (new in 2.5.0): stale-device and unused-runtime detection reads `xcrun simctl list devices -j` / `xcrun simctl runtime list -j`; deletion is delegated to `simctl` itself, as a command-based target, rather than the deleter's own filesystem logic (raw `rm` on a device's data directory would corrupt simctl's registry). Every device UDID / runtime identifier taken from simctl's JSON is validated against a strict shape before it's allowed into the shell command string `delete_target` runs; anything that doesn't match that shape is silently dropped from the target rather than ever reaching a shell — simctl's own output is treated as untrusted input. A device counts as stale after `simulator_stale_days` (default 30) since it was last booted/used; a currently booted device is never offered. Both hits are review-level, fixed-ID, and only appear at all when there's something to report (`simulator-stale-devices`, `simulator-unused-runtimes`).
+- **`leftovers` scanner** (new in 2.7.0): looks for orphaned per-app data — entries under five bundle-ID-keyed `~/Library` subdirectories (`Caches`, `Preferences`, `Saved Application State`, `HTTPStorages`, `WebKit`) whose bundle ID has no matching installed app. An installed-bundle-ID set is built by reading `CFBundleIdentifier` out of every top-level `.app`'s `Info.plist` under the configured app-root directories (`MACCLEANER_INSTALLED_APPS_DIRS`, default `/Applications:~/Applications:/System/Applications`), PLUS one level into any non-`.app` wrapper folder found there (bounded, no further recursion) — some vendors (Adobe and others) ship their `.app` one directory level deep instead of at the app-root top level, and this second pass is what catches those; a broken or unreadable bundle is skipped, never fatal. A symlinked `.app` (at either level — e.g. macOS's own `Safari.app` under a Cryptexes redirect, or a Nix/home-manager-style symlinked install) still counts as installed: unlike the leftover-scanning/deletion path below, this is read-only `Info.plist` enumeration, so refusing to follow the symlink here would only manufacture false positives, never protect anything; a symlinked non-`.app` *wrapper* folder is still never followed, since that's structural traversal, not a deletion. Each of the five roots has its own real on-disk shape — `Caches`/`WebKit` are bare-name directories, `Preferences` is `<bundle-id>.plist` files, `Saved Application State` is `<bundle-id>.savedState` directories, and `HTTPStorages` is either a bare-name directory or a `<bundle-id>.binarycookies` file — and an entry that doesn't match its root's expected shape (wrong type, or missing/wrong suffix) is skipped outright rather than misread; an unhandled root name (should `LEFTOVER_ROOTS` ever grow a 6th entry without updating this shape logic) also produces no candidates rather than silently inheriting the wrong rule. Only entries whose (suffix-stripped) name is *shaped* like a reverse-DNS bundle ID are considered — never a fuzzy or substring match. Excluded regardless of installed state: Apple's own `com.apple.*` prefix (including its `group.com.apple.*` app-group variant, e.g. `group.com.apple.mail`) and MacCleaner's own bundle ID (`com.fullex.maccleaner`); excluded when it matches an installed app: an exact bundle-ID match, or a candidate that is a strict sub-domain of one (e.g. `com.hnc.discord.shipit` under installed `com.hnc.discord` — Squirrel.Mac's `.ShipIt` updater domain and similar vendor sub-domain patterns are still genuinely owned by the installed app; this is still exact-prefix matching against real installed IDs, never fuzzy — `com.example.appfoo` is not considered a sub-domain of `com.example.app`). In the leftover-scanning path itself, symlinks are still never followed (a `~/Library` entry that's a symlink is always skipped, unconditionally — this is the deletion-adjacent guard, unchanged from before). `skip_paths` is honored the same way the `tmp` scanner honors it (see §347). A minimum age gate (`app_leftover_min_age_days`, default 7 days by mtime, taken as the newest mtime across all of a bundle ID's matched paths) applies on top of all of the above, so an app removed moments ago (whose leftovers might still be mid-write, or whose reinstall is imminent) is never offered. Every root scanned here (`MACCLEANER_LEFTOVER_LIBRARY_ROOT`, default `~/Library`) is already strictly inside `$HOME`, so no new home-only carve-out is needed. All hits are review-level, one `leftover-<bundle-id-slug>` ID per orphaned bundle ID (category `leftovers`), and deletion is a normal multi-path filesystem delete — no command-based target involved. `Application Support`, `Containers`, and `LaunchAgents` are deliberately out of scope (not reliably bundle-ID-keyed by Apple's own conventions). As a final gate, every candidate the directory walk didn't already recognize as installed is also checked against Spotlight (`_mdfind_confirms_installed()`, 3rd whole-branch review): a single batched, case-insensitive `mdfind "kMDItemCFBundleIdentifier == '<id>'c" || ...` query for all remaining candidates at once (never one subprocess call per candidate), and any candidate Spotlight reports as having a real `.app` bundle *anywhere* on disk — regardless of location, depth, or nesting inside a wrapper folder — is excluded too. This closes the gap the bounded directory walk structurally cannot: real vendor installs verified on the dev machine include Adobe Creative Cloud four directories deep (`/Applications/Utilities/Adobe Creative Cloud/ACC/Creative Cloud.app`), several Adobe helper daemons under `/Library/Application Support/Adobe/...`, a Brother printer utility under `/Library/Printers/Brother/Utilities`, and a Steam-bundled game under `~/Library/Application Support/Steam/steamapps/common/...`. The Spotlight check is additive, not a replacement — the directory walk is still the floor and runs first; `_mdfind_confirms_installed()` degrades to an empty set on any failure (mdfind missing, Spotlight disabled, timeout, non-zero exit, empty candidate list) and never blocks or crashes the scanner.
+
+Matching is bundle-ID-precise rather than fuzzy, but it still isn't an absolute guarantee against every false positive. The true residual after the Spotlight pass is bundle IDs with no `.app` anywhere Spotlight has indexed: helper/updater/shared-framework preference domains that have no `.app` of their own at all (e.g. a shared vendor settings domain like `com.microsoft.shared`, or a system framework domain like `org.cups.printingprefs`); genuinely orphaned data with no matching app anywhere; and, confirmed empirically on the dev machine, `.app` bundles nested *inside another app's own `Contents/` folder* — Spotlight's own application importer does not index those as independent items (verified: Alfred 5's internal preferences helper, `/Applications/Alfred 5.app/Contents/Preferences/Alfred Preferences.app`, is unreachable by both the directory walk — nesting depth and a hyphenated, non-sub-domain bundle ID rule it out — and by `mdfind`, even after a forced `mdimport` reindex). Spotlight indexing can also simply lag or be disabled per-volume. None of these are guessed around — every hit still stays `safe: false` and review-level rather than auto-cleaned, which is the actual backstop, not either signal being perfect.
 - **Git-aware projects** (new in 2.1.0): when `project_git_check` is enabled (default), every project artifact's parent directory is checked with `git status --porcelain` (dirty) and `git rev-list --count --branches --not --remotes` (unpushed — a repo with no remotes at all counts as unpushed). These git invocations pass `--no-optional-locks` (so a concurrent `git add`/`git commit` by the user is never blocked by the scan taking `.git/index.lock`) and `-c core.fsmonitor=` (so a repo-local fsmonitor hook can't execute code during a read-only scan). Any git failure — not a repo, `git` not installed, a 2-second timeout — degrades to `"git": null` rather than blocking the scan. `projects --clean --yes` and `projects --dry-run` / `projects --clean --dry-run`, without `--targets`, both skip dirty/unpushed projects and both list them on stderr; naming one via `--targets` cleans (or previews) it anyway.
 - **`--dry-run`** (new in 2.1.0, on `clean` and `projects`): resolves and reports the exact concrete paths/sizes (or command) a real run would act on, deletes nothing, prompts for nothing, and writes no `report.log` or `snapshots.log` entry.
 - **`disk-check`** (new in 2.2.0) never deletes, measures, or scans — it's a single `shutil.disk_usage` call plus, at most, a notification and a write to `alerts.json` (its own throttle-state file, distinct from `report.log`/`snapshots.log`). It always exits 0, whether or not it's below the threshold or a warning was posted.

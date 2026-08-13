@@ -59,7 +59,7 @@ class TestConfig(unittest.TestCase):
         cleaner.CONFIG_PATH.write_text('{"enabled_categories": ["node"]}')
         cfg = cleaner.load_config()
         # Pre-v2.5 configs get new categories auto-enabled
-        self.assertEqual(cfg["enabled_categories"], ["node", "tmp", "simulators"])
+        self.assertEqual(cfg["enabled_categories"], ["node", "tmp", "simulators", "leftovers"])
         self.assertIn("project_roots", cfg)
         self.assertEqual(cfg["log_threshold_mb"], 100)
 
@@ -496,6 +496,16 @@ class TestCLIIntegration(unittest.TestCase):
         names = [c["name"] for c in data["categories"]]
         self.assertEqual(names, cleaner.ALL_CATEGORIES)
 
+    def test_categories_json_includes_leftovers_with_zero_targets(self):
+        # leftovers is entirely dynamic (like tmp/simulators) -- categories
+        # deliberately calls get_targets() alone, so it must be listed with
+        # zero targets, never with unstable per-run leftover-<id> entries.
+        r = self.run_cli("categories", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        cat = next(c for c in data["categories"] if c["name"] == "leftovers")
+        self.assertEqual(cat["targets"], [])
+
     def test_report_after_clean(self):
         r = self.run_cli("report", "--json")
         self.assertEqual(r.returncode, 0)
@@ -577,6 +587,90 @@ class TestTmpE2E(unittest.TestCase):
         item = next(i for i in clean_data["items"] if i["id"] == target_id)
         self.assertEqual(item["status"], "deleted")
         self.assertFalse(self.derived.exists(), "explicitly-targeted clean must delete it")
+
+
+class TestLeftoverE2E(unittest.TestCase):
+    """The only end-to-end round trip for the app-leftover scanner + clean
+    path, mirroring TestTmpE2E: everything else exercising
+    MACCLEANER_LEFTOVER_LIBRARY_ROOT does so via direct in-process calls to
+    scan_app_leftovers()/collect_targets() -- nothing else drives it through
+    a real subprocess and main()'s dynamic-id selection."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.apps_dir = self.tmp / "Applications"
+        self.apps_dir.mkdir()
+        # Must live under $HOME: delete_target/run_dry_run's home-only
+        # safety check (_safe_to_delete) would otherwise reject every path
+        # here, since the leftover scanner has no carve-out (unlike tmp) --
+        # every real root it scans is already strictly inside $HOME.
+        self.lib_root = self.home / "Library"
+        self.lib_root.mkdir()
+        self.orphan = self.lib_root / "Caches" / "com.example.gonezo"
+        self.orphan.mkdir(parents=True)
+        old = time.time() - 10 * 86400
+        os.utime(self.orphan, (old, old))
+        cfg = {"enabled_categories": ["leftovers"],
+               "known_categories": list(cleaner.ALL_CATEGORIES),
+               "app_leftover_min_age_days": 7}
+        self.cfg_path = self.tmp / "config.json"
+        self.cfg_path.write_text(json.dumps(cfg))
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_INSTALLED_APPS_DIRS": str(self.apps_dir),
+                    "MACCLEANER_LEFTOVER_LIBRARY_ROOT": str(self.lib_root)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_scan_json_surfaces_leftover_target(self):
+        r = self.run_cli("scan", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        hits = [t for t in data["targets"] if t["id"].startswith("leftover-")]
+        self.assertEqual(len(hits), 1, "the fabricated orphan must surface exactly once")
+        self.assertFalse(hits[0]["safe"], "leftover targets are review-only")
+
+    def test_dry_run_json_surfaces_leftover_target(self):
+        # A bare `clean --dry-run` only previews safe targets (leftovers are
+        # review-only), same rule TestBareDryRun pins for tmp/other review
+        # categories -- so name it explicitly via --targets, same pattern as
+        # test_targets_dry_run_previews_named_review_target.
+        scan = self.run_cli("scan", "--json")
+        target_id = next(t["id"] for t in json.loads(scan.stdout)["targets"]
+                          if t["id"].startswith("leftover-"))
+        r = self.run_cli("clean", "--dry-run", "--targets", target_id, "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        hits = [i for i in data["items"] if i["id"] == target_id]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["status"], "would-delete")
+        self.assertTrue(hits[0]["paths"])
+        self.assertTrue(self.orphan.exists(), "dry run must not delete anything")
+
+    def test_bare_clean_yes_never_touches_leftovers(self):
+        r = self.run_cli("clean", "--yes", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.orphan.exists(),
+                        "unscoped clean --yes must never sweep a review-only leftover target")
+
+    def test_targeted_clean_deletes_leftover(self):
+        scan = self.run_cli("scan", "--json")
+        target_id = next(t["id"] for t in json.loads(scan.stdout)["targets"]
+                          if t["id"].startswith("leftover-"))
+        r = self.run_cli("clean", "--targets", target_id, "--yes", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        item = next(i for i in json.loads(r.stdout)["items"] if i["id"] == target_id)
+        self.assertEqual(item["status"], "deleted")
+        self.assertFalse(self.orphan.exists())
 
 
 class TestDoctorSchedule(unittest.TestCase):
@@ -1622,7 +1716,7 @@ class TestNotify(unittest.TestCase):
             cleaner.CONFIG_PATH.write_text('{"enabled_categories": ["node"]}')
             cfg = cleaner.load_config()
             # Pre-v2.5 configs get new categories auto-enabled
-            self.assertEqual(cfg["enabled_categories"], ["node", "tmp", "simulators"])
+            self.assertEqual(cfg["enabled_categories"], ["node", "tmp", "simulators", "leftovers"])
             self.assertTrue(cfg["low_disk_alerts"])
             self.assertEqual(cfg["low_disk_threshold_gb"], 10)
         finally:
@@ -2905,6 +2999,14 @@ class TestCategoryMigration(unittest.TestCase):
         self.assertNotIn("tmp", cfg2["enabled_categories"])
         self.assertIn("known_categories", cfg2)
 
+    def test_leftovers_category_present(self):
+        self.assertIn("leftovers", cleaner.ALL_CATEGORIES)
+
+    def test_leftovers_auto_enabled_for_pre27_config(self):
+        cfg = self._load_with({"enabled_categories": list(cleaner.ALL_CATEGORIES[:-1]),
+                                "known_categories": cleaner.ALL_CATEGORIES[:-1]})
+        self.assertIn("leftovers", cfg["enabled_categories"])
+
 
 class TestCompletions(unittest.TestCase):
     """The completion files are hand-written, so they can drift from the
@@ -3536,6 +3638,18 @@ class TestScannerScoping(unittest.TestCase):
         sim = mock.patch.object(cleaner, "scan_simulator_targets", return_value=[])
         return tmp, sim
 
+    def test_leftovers_scanner_scoped_out_by_category(self):
+        leftover = mock.patch.object(cleaner, "scan_app_leftovers", return_value=[])
+        with leftover as mleft:
+            cleaner.collect_targets(self.cfg, categories={"node"})
+        mleft.assert_not_called()
+
+    def test_leftovers_scanner_runs_when_category_included(self):
+        leftover = mock.patch.object(cleaner, "scan_app_leftovers", return_value=[])
+        with leftover as mleft:
+            cleaner.collect_targets(self.cfg, categories={"leftovers"})
+        mleft.assert_called_once()
+
     def test_unscoped_runs_both(self):
         tmp, sim = self._patched()
         with tmp as mtmp, sim as msim:
@@ -3765,6 +3879,538 @@ class TestDockerEstimateParsing(unittest.TestCase):
         weird = self.REAL_OUTPUT + "Future Thing    1         0         5MB       5MB (100%)\n"
         # Should not raise, and should equal the known-rows-only total.
         cleaner._parse_docker_estimate(weird)
+
+
+class TestInstalledAppsEnumeration(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.apps_dir = self.tmp / "Applications"
+        self.apps_dir.mkdir()
+        self._patch = mock.patch.dict(
+            os.environ, {"MACCLEANER_INSTALLED_APPS_DIRS": str(self.apps_dir)})
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_app(self, name, bundle_id, plist_bytes=None):
+        contents = self.apps_dir / name / "Contents"
+        contents.mkdir(parents=True)
+        plist_path = contents / "Info.plist"
+        if plist_bytes is not None:
+            plist_path.write_bytes(plist_bytes)
+        else:
+            with open(plist_path, "wb") as f:
+                plistlib.dump({"CFBundleIdentifier": bundle_id}, f)
+
+    def test_reads_bundle_identifier(self):
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        app_path = self.apps_dir / "Slack.app"
+        self.assertEqual(cleaner._app_bundle_identifier(app_path),
+                          "com.tinyspeck.slackmacgap")
+
+    def test_identifier_lowercased(self):
+        self._make_app("Weird.app", "Com.Example.WeirdCasing")
+        app_path = self.apps_dir / "Weird.app"
+        self.assertEqual(cleaner._app_bundle_identifier(app_path),
+                          "com.example.weirdcasing")
+
+    def test_missing_plist_returns_none(self):
+        (self.apps_dir / "Broken.app" / "Contents").mkdir(parents=True)
+        self.assertIsNone(
+            cleaner._app_bundle_identifier(self.apps_dir / "Broken.app"))
+
+    def test_malformed_plist_returns_none(self):
+        contents = self.apps_dir / "Malformed.app" / "Contents"
+        contents.mkdir(parents=True)
+        (contents / "Info.plist").write_text("not a plist")
+        self.assertIsNone(
+            cleaner._app_bundle_identifier(self.apps_dir / "Malformed.app"))
+
+    def test_missing_key_returns_none(self):
+        contents = self.apps_dir / "NoKey.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleName": "NoKey"}, f)
+        self.assertIsNone(
+            cleaner._app_bundle_identifier(self.apps_dir / "NoKey.app"))
+
+    def test_enumeration_collects_all_installed_ids(self):
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        self._make_app("Docker.app", "com.docker.docker")
+        self.assertEqual(cleaner.installed_bundle_ids(),
+                          {"com.tinyspeck.slackmacgap", "com.docker.docker"})
+
+    def test_enumeration_skips_broken_bundles_not_fatal(self):
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        (self.apps_dir / "Broken.app" / "Contents").mkdir(parents=True)
+        self.assertEqual(cleaner.installed_bundle_ids(),
+                          {"com.tinyspeck.slackmacgap"})
+
+    def test_missing_root_dir_skipped_not_fatal(self):
+        with mock.patch.dict(os.environ, {
+                "MACCLEANER_INSTALLED_APPS_DIRS":
+                str(self.tmp / "does-not-exist")}):
+            self.assertEqual(cleaner.installed_bundle_ids(), set())
+
+    def test_multiple_roots_colon_separated(self):
+        second_dir = self.tmp / "SystemApplications"
+        second_dir.mkdir()
+        finder_contents = second_dir / "Finder.app" / "Contents"
+        finder_contents.mkdir(parents=True)
+        with open(finder_contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.apple.finder"}, f)
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        with mock.patch.dict(os.environ, {
+                "MACCLEANER_INSTALLED_APPS_DIRS":
+                "%s:%s" % (self.apps_dir, second_dir)}):
+            self.assertEqual(cleaner.installed_bundle_ids(),
+                              {"com.tinyspeck.slackmacgap", "com.apple.finder"})
+
+    def test_nested_vendor_folder_app_found(self):
+        # Finding 2: some vendors (Adobe et al.) ship the .app one level
+        # inside a wrapper folder instead of directly at the app-root top
+        # level -- installed_bundle_ids() must still find it.
+        contents = (self.apps_dir / "Adobe Vendor Folder" / "Adobe App.app"
+                    / "Contents")
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.adobe.someapp"}, f)
+        self.assertEqual(cleaner.installed_bundle_ids(), {"com.adobe.someapp"})
+
+    def test_nested_scan_finds_multiple_apps_in_one_wrapper(self):
+        contents1 = (self.apps_dir / "Adobe Vendor Folder" / "First.app" / "Contents")
+        contents1.mkdir(parents=True)
+        with open(contents1 / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.adobe.first"}, f)
+        contents2 = (self.apps_dir / "Adobe Vendor Folder" / "Second.app" / "Contents")
+        contents2.mkdir(parents=True)
+        with open(contents2 / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.adobe.second"}, f)
+        self.assertEqual(cleaner.installed_bundle_ids(),
+                          {"com.adobe.first", "com.adobe.second"})
+
+    def test_nesting_bounded_to_one_level(self):
+        # Two levels deep must not be found -- exactly one extra level
+        # beyond the app-root top level is scanned, no further recursion.
+        contents = (self.apps_dir / "Wrapper" / "Nested" / "Deep.app" / "Contents")
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.deep"}, f)
+        self.assertEqual(cleaner.installed_bundle_ids(), set())
+
+    def test_nested_symlink_wrapper_not_followed(self):
+        real = self.tmp / "real-wrapper"
+        contents = real / "Deep.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.deep"}, f)
+        (self.apps_dir / "LinkWrapper").symlink_to(real)
+        self.assertEqual(cleaner.installed_bundle_ids(), set())
+
+    def test_symlinked_app_bundle_still_counts_as_installed(self):
+        # Finding I4 (2nd whole-branch review round): "never follow
+        # symlinks" is a DELETION safety rule that belongs to the
+        # leftover-scanning/deletion path (test_nested_symlink_wrapper_not_
+        # followed above still enforces it there for a symlinked WRAPPER
+        # folder). It must NOT gate this read-only enumeration of what's
+        # installed -- e.g. a symlinked top-level "*.app" (as macOS itself
+        # ships for Safari.app under a Cryptexes redirect, or a Nix/
+        # home-manager-style symlinked install) is a real installed app.
+        # Refusing to follow the symlink here only ever creates MORE false
+        # positives downstream in scan_app_leftovers, never protects
+        # anything.
+        real = self.tmp / "real-app-location"
+        contents = real / "Real.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.symlinked"}, f)
+        (self.apps_dir / "Real.app").symlink_to(real / "Real.app")
+        self.assertEqual(cleaner.installed_bundle_ids(), {"com.example.symlinked"})
+
+    def test_non_app_file_at_top_level_does_not_crash_nested_scan(self):
+        # A stray non-directory file (not a wrapper folder, not a .app)
+        # sitting at the app-root top level must be skipped cleanly.
+        (self.apps_dir / "ReadMe.txt").write_text("x")
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        self.assertEqual(cleaner.installed_bundle_ids(),
+                          {"com.tinyspeck.slackmacgap"})
+
+
+class TestTargetPathsMultiPath(unittest.TestCase):
+    def test_paths_branch_returns_list_verbatim(self):
+        p1, p2 = Path("/tmp/a"), Path("/tmp/b")
+        t = {"paths": [p1, p2], "path": None, "glob": None}
+        self.assertEqual(cleaner._target_paths(t), [p1, p2])
+
+    def test_path_branch_unchanged_when_no_paths_key(self):
+        p = Path("/tmp/a")
+        t = {"path": p, "glob": None}
+        self.assertEqual(cleaner._target_paths(t), [p])
+
+    def test_glob_branch_takes_priority_over_paths(self):
+        # glob is checked first in the existing function; paths targets
+        # never set glob, but pin the priority order as documented.
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "x.txt"
+            f.write_text("x")
+            t = {"glob": str(Path(td) / "*.txt"), "skip": [], "paths": [Path("/should/not/appear")]}
+            self.assertEqual(cleaner._target_paths(t), [f])
+
+    def test_empty_paths_list_returns_empty(self):
+        t = {"paths": [], "path": None, "glob": None}
+        self.assertEqual(cleaner._target_paths(t), [])
+
+
+class TestAppLeftoverScanner(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.apps_dir = self.tmp / "Applications"
+        self.apps_dir.mkdir()
+        self.lib_root = self.tmp / "Library"
+        self.lib_root.mkdir()
+        self.env = {
+            "MACCLEANER_INSTALLED_APPS_DIRS": str(self.apps_dir),
+            "MACCLEANER_LEFTOVER_LIBRARY_ROOT": str(self.lib_root),
+        }
+        self._patch = mock.patch.dict(os.environ, self.env)
+        self._patch.start()
+        self.cfg = {"app_leftover_min_age_days": 7}
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _age(self, p, days=10):
+        old = time.time() - days * 86400
+        os.utime(p, (old, old))
+
+    def _leftover_dir(self, root_name, bundle_id, days=10):
+        d = self.lib_root / root_name / bundle_id
+        d.mkdir(parents=True)
+        self._age(d, days)
+        return d
+
+    def _leftover_file(self, root_name, filename, days=10):
+        root = self.lib_root / root_name
+        root.mkdir(parents=True, exist_ok=True)
+        f = root / filename
+        f.write_text("x")
+        self._age(f, days)
+        return f
+
+    def test_orphaned_bundle_id_is_a_hit(self):
+        self._leftover_dir("Caches", "com.example.gonezo")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_installed_app_is_never_a_hit(self):
+        contents = self.apps_dir / "Still.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.still"}, f)
+        self._leftover_dir("Caches", "com.example.still")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_subdomain_of_installed_bundle_id_is_never_a_hit(self):
+        # Finding I3 (2nd whole-branch review round): a candidate that is a
+        # strict sub-domain of an installed bundle ID (e.g. Squirrel.Mac's
+        # ".ShipIt" updater domain, or iTerm2's ".private" domain) is still
+        # genuinely owned by the installed app -- just not an exact
+        # bundle-ID match. Confirmed on the real dev machine: 8 such hits
+        # (com.hnc.discord.shipit under installed com.hnc.discord,
+        # com.googlecode.iterm2.private under installed com.googlecode.
+        # iterm2, etc.) This is still exact-prefix matching against real
+        # installed IDs, not fuzzy matching.
+        contents = self.apps_dir / "Example.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.app"}, f)
+        self._leftover_dir("Caches", "com.example.app.shipit")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_similarly_prefixed_but_not_subdomain_still_a_hit(self):
+        # Guard against an overly-broad fix: "com.example.appfoo" is NOT a
+        # sub-domain of installed "com.example.app" (no dot boundary), so
+        # it must still surface as a hit.
+        contents = self.apps_dir / "Example.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.app"}, f)
+        self._leftover_dir("Caches", "com.example.appfoo")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.appfoo"])
+
+    def test_com_apple_never_a_hit_even_if_not_installed(self):
+        # Defense in depth: excluded unconditionally, not just via the
+        # installed-set check.
+        self._leftover_dir("Caches", "com.apple.somethingobscure")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_self_never_a_hit(self):
+        self._leftover_dir("Caches", "com.fullex.maccleaner")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_group_com_apple_never_a_hit_even_if_not_installed(self):
+        # Finding C1 (2nd whole-branch review round): Apple's app-group
+        # preference domains are named "group.com.apple.<x>" (e.g. Mail,
+        # Notes, Calendar) -- that prefix doesn't start with "com.apple.",
+        # so the plain startswith check let these slip through even though
+        # AGENTS.md/CHANGELOG.md promise com.apple.* is "always excluded
+        # regardless of installed state". Mirrors
+        # test_com_apple_never_a_hit_even_if_not_installed: excluded
+        # unconditionally, not just via the installed-set check.
+        self._leftover_dir("Caches", "group.com.apple.mail")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_preferences_plist_suffix_stripped_for_matching(self):
+        self._leftover_file("Preferences", "com.example.gonezo.plist")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_non_bundle_id_shaped_name_ignored(self):
+        self._leftover_dir("Caches", "just-a-random-folder")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_symlink_never_followed_or_matched(self):
+        real = self.tmp / "real-target"
+        real.mkdir()
+        link = self.lib_root / "Caches" / "com.example.gonezo"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(real)
+        # Age the symlink itself (not just its real target) so the min-age
+        # gate can't discard it before the symlink-skip guard ever runs --
+        # otherwise this test would pass even without that guard.
+        old = time.time() - 30 * 86400
+        os.utime(link, (old, old), follow_symlinks=False)
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_survives_only_if_all_locations_are_old(self):
+        # One matched location aged 30 days, one aged 1 day (younger than
+        # the 7-day default gate), same bundle ID -- the bundle must NOT
+        # appear as a hit, because aggregation uses max() (newest wins)
+        # across locations, not min().
+        self._leftover_dir("Caches", "com.example.gonezo", days=30)
+        self._leftover_file("Preferences", "com.example.gonezo.plist", days=1)
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_young_leftover_skipped(self):
+        self._leftover_dir("Caches", "com.example.gonezo", days=1)
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_multiple_locations_grouped_into_one_hit(self):
+        self._leftover_dir("Caches", "com.example.gonezo")
+        self._leftover_file("Preferences", "com.example.gonezo.plist")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(len(hits[0]["paths"]), 2)
+        self.assertEqual(set(hits[0]["locations"]), {"Caches", "Preferences"})
+
+    def test_missing_library_root_returns_empty_not_fatal(self):
+        with mock.patch.dict(os.environ, {
+                "MACCLEANER_LEFTOVER_LIBRARY_ROOT":
+                str(self.tmp / "does-not-exist")}):
+            self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_targets_are_review_only_no_carve_out_marker(self):
+        self._leftover_dir("Caches", "com.example.gonezo")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        targets = cleaner.app_leftovers_to_targets(hits)
+        self.assertEqual(len(targets), 1)
+        t = targets[0]
+        self.assertFalse(t["safe"])
+        self.assertEqual(t["category"], "leftovers")
+        self.assertEqual(t["id"], "leftover-com-example-gonezo")
+        self.assertNotIn("tmp_scan", t)
+
+    def test_target_id_dedup_suffix_on_collision(self):
+        # slugify collapses case/punctuation the same way tmp_to_targets'
+        # collision handling does; construct two hits that slugify equal.
+        hits = [
+            {"bundle_id": "com.example.Dup", "paths": [Path("/x")],
+             "locations": ["Caches"], "mtime": 0},
+            {"bundle_id": "com.example.dup", "paths": [Path("/y")],
+             "locations": ["Caches"], "mtime": 0},
+        ]
+        targets = cleaner.app_leftovers_to_targets(hits)
+        self.assertEqual(len({t["id"] for t in targets}), 2)
+
+    def _install_app(self, name, bundle_id):
+        contents = self.apps_dir / name / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": bundle_id}, f)
+
+    # -- Finding 1 + 3: real macOS naming shapes per root, with a type check
+    # so a wrong-shaped entry is skipped, never misclassified. -------------
+
+    def test_saved_application_state_suffix_stripped_installed_excluded(self):
+        # Real shape: a DIRECTORY named "<bundle-id>.savedState", not the
+        # bare bundle id. Before the fix this suffix was never stripped, so
+        # an installed app's saved state always looked orphaned.
+        self._install_app("Slack.app", "com.tinyspeck.slackmacgap")
+        self._leftover_dir("Saved Application State",
+                            "com.tinyspeck.slackmacgap.savedState")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [],
+                         "installed app's .savedState dir must not be a false positive")
+
+    def test_saved_application_state_suffix_stripped_orphan_included(self):
+        self._leftover_dir("Saved Application State",
+                            "com.example.gonezo.savedState")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_httpstorages_binarycookies_suffix_stripped_installed_excluded(self):
+        # Real shape: a FILE named "<bundle-id>.binarycookies".
+        self._install_app("Slack.app", "com.tinyspeck.slackmacgap")
+        self._leftover_file("HTTPStorages", "com.tinyspeck.slackmacgap.binarycookies")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [],
+                         "installed app's .binarycookies file must not be a false positive")
+
+    def test_httpstorages_binarycookies_suffix_stripped_orphan_included(self):
+        self._leftover_file("HTTPStorages", "com.example.gonezo.binarycookies")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_httpstorages_directory_shape_still_matches(self):
+        # HTTPStorages also legitimately has a directory shape (bare bundle
+        # id, no suffix) -- fixing the suffix bug must not regress this.
+        self._leftover_dir("HTTPStorages", "com.example.gonezo")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_non_directory_file_under_caches_skipped_not_misclassified(self):
+        # Finding 3: Caches expects a directory; a stray plain file there
+        # must be skipped, not treated as a valid candidate.
+        self._leftover_file("Caches", "com.example.gonezo")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_non_plist_file_under_preferences_skipped(self):
+        self._leftover_file("Preferences", "com.example.gonezo.txt")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_directory_under_preferences_skipped(self):
+        # Preferences expects .plist FILES; a directory shaped like one
+        # must not be misread as a candidate either.
+        self._leftover_dir("Preferences", "com.example.gonezo.plist")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_file_under_saved_application_state_skipped(self):
+        self._leftover_file("Saved Application State",
+                             "com.example.gonezo.savedState")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    # -- Finding 2: one-level-deep vendor installs -------------------------
+
+    def test_nested_vendor_folder_app_counts_as_installed(self):
+        # Some vendors (Adobe et al.) ship the .app one level inside a
+        # wrapper folder instead of directly at the app-root top level.
+        contents = (self.apps_dir / "Adobe Vendor Folder" / "Adobe App.app"
+                    / "Contents")
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.adobe.someapp"}, f)
+        self._leftover_dir("Caches", "com.adobe.someapp")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [],
+                         "a one-level-deep vendor install must not false-positive")
+
+    # -- Finding 4: skip_paths ----------------------------------------------
+
+    def test_skip_paths_excludes_configured_path(self):
+        d = self._leftover_dir("Caches", "com.example.gonezo")
+        cfg = dict(self.cfg)
+        cfg["skip_paths"] = [str(d)]
+        self.assertEqual(cleaner.scan_app_leftovers(cfg), [])
+
+    # -- 3rd whole-branch review: Spotlight (mdfind) as a second, more
+    # thorough confirmation signal layered on top of the directory walk. ---
+
+    def test_mdfind_confirmed_candidate_excluded_even_if_not_in_directory_walk(self):
+        # Real machine: Adobe Creative Cloud, Alfred's nested preferences
+        # helper, a Brother printer utility, and several Adobe daemons live
+        # outside the 3 hardcoded app roots (and/or nested more than one
+        # level deep, or nested inside another .app) -- the directory walk
+        # structurally cannot reach them, but Spotlight's index knows about
+        # them regardless of location/depth/nesting. Mock the confirmation
+        # signal directly (mirrors the simulator scanner's
+        # mock.patch.object(cleaner, "_simctl_json", ...) pattern) so this
+        # test doesn't depend on real Spotlight/machine state.
+        self._leftover_dir("Caches", "com.adobe.acc.adobecreativecloud")
+        with mock.patch.object(cleaner, "_mdfind_confirms_installed",
+                                return_value={"com.adobe.acc.adobecreativecloud"}):
+            self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [],
+                              "an mdfind-confirmed installed app must not be a false positive")
+
+    def test_unconfirmed_by_either_signal_still_surfaces(self):
+        # Regression guard against over-exclusion: a candidate mdfind does
+        # NOT confirm (and the directory walk doesn't know about either)
+        # must still surface as a normal hit.
+        self._leftover_dir("Caches", "com.example.gonezo")
+        with mock.patch.object(cleaner, "_mdfind_confirms_installed",
+                                return_value=set()):
+            hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_directory_walk_installed_check_still_works_independent_of_mdfind(self):
+        # The existing installed_bundle_ids() check must be left completely
+        # untouched by this addition -- an app the directory walk already
+        # finds is still excluded even when mdfind confirms nothing extra.
+        self._install_app("Still.app", "com.example.still")
+        self._leftover_dir("Caches", "com.example.still")
+        with mock.patch.object(cleaner, "_mdfind_confirms_installed",
+                                return_value=set()):
+            self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+
+class TestMdfindConfirmsInstalled(unittest.TestCase):
+    """_mdfind_confirms_installed in isolation -- a single batched mdfind
+    call, graceful degradation on any failure, never one subprocess call
+    per candidate."""
+
+    def test_empty_candidates_short_circuits_without_calling_subprocess(self):
+        with mock.patch.object(cleaner.subprocess, "run") as run:
+            self.assertEqual(cleaner._mdfind_confirms_installed([]), set())
+            run.assert_not_called()
+
+    def test_single_batched_call_not_one_per_candidate(self):
+        candidates = ["com.example.one", "com.example.two", "com.example.three"]
+        with mock.patch.object(cleaner.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["mdfind"], returncode=0, stdout="", stderr="")
+            cleaner._mdfind_confirms_installed(candidates)
+            self.assertEqual(run.call_count, 1)
+
+    def test_subprocess_raising_degrades_to_empty_set(self):
+        # e.g. mdfind missing entirely, or the call times out.
+        with mock.patch.object(cleaner.subprocess, "run",
+                                side_effect=OSError("mdfind not found")):
+            self.assertEqual(
+                cleaner._mdfind_confirms_installed(["com.example.gonezo"]), set())
+
+    def test_nonzero_returncode_degrades_to_empty_set(self):
+        with mock.patch.object(cleaner.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["mdfind"], returncode=1, stdout="", stderr="error")
+            self.assertEqual(
+                cleaner._mdfind_confirms_installed(["com.example.gonezo"]), set())
+
+    def test_confirmed_paths_resolved_to_lowercase_bundle_ids(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            contents = tmp / "Found.app" / "Contents"
+            contents.mkdir(parents=True)
+            with open(contents / "Info.plist", "wb") as f:
+                plistlib.dump({"CFBundleIdentifier": "Com.Example.Found"}, f)
+            app_path = tmp / "Found.app"
+            with mock.patch.object(cleaner.subprocess, "run") as run:
+                run.return_value = subprocess.CompletedProcess(
+                    args=["mdfind"], returncode=0,
+                    stdout=str(app_path) + "\n", stderr="")
+                result = cleaner._mdfind_confirms_installed(["com.example.found"])
+            self.assertEqual(result, {"com.example.found"})
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
