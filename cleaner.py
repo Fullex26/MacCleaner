@@ -146,6 +146,7 @@ ALL_CATEGORIES = [
     "ai", "ide", "browsers", "system",
     "flutter", "php", "vms",
     "tmp", "simulators",
+    "leftovers",
 ]
 
 # Frozen snapshot of the category list as of v2.4 — the baseline for the
@@ -184,6 +185,7 @@ CATEGORY_DESCRIPTIONS = {
     "vms":       "VM disks and container runtimes (Colima, Vagrant, minikube) — review carefully",
     "tmp":       "Stale build artifacts in /private/tmp left by tools and AI coding sessions — review carefully",
     "simulators": "Stale iOS simulator devices and unused runtime images (via simctl) — review carefully",
+    "leftovers": "Cache, preference, and saved-state files left behind by apps you've already deleted — review carefully",
 }
 
 DEFAULT_CONFIG = {
@@ -197,6 +199,7 @@ DEFAULT_CONFIG = {
     "project_git_check": True,
     "tmp_min_age_days": 3,           # /tmp dirs younger than this are never offered
     "simulator_stale_days": 30,      # simulators not booted for this long count as stale
+    "app_leftover_min_age_days": 7,  # orphaned app data younger than this is never offered
     "notifications": True,           # notify when a scheduled clean finishes
     "low_disk_alerts": True,         # warn when free space drops below the threshold
     "low_disk_threshold_gb": 10,     # the low-disk warning threshold
@@ -719,6 +722,8 @@ def collect_targets(config, all_categories=False, categories=None, target_ids=No
         targets += tmp_to_targets(scan_tmp_artifacts(config))
     if _wanted("simulators", "simulator-"):
         targets += scan_simulator_targets(config)
+    if _wanted("leftovers", "leftover-"):
+        targets += app_leftovers_to_targets(scan_app_leftovers(config))
     return targets
 
 

@@ -59,7 +59,7 @@ class TestConfig(unittest.TestCase):
         cleaner.CONFIG_PATH.write_text('{"enabled_categories": ["node"]}')
         cfg = cleaner.load_config()
         # Pre-v2.5 configs get new categories auto-enabled
-        self.assertEqual(cfg["enabled_categories"], ["node", "tmp", "simulators"])
+        self.assertEqual(cfg["enabled_categories"], ["node", "tmp", "simulators", "leftovers"])
         self.assertIn("project_roots", cfg)
         self.assertEqual(cfg["log_threshold_mb"], 100)
 
@@ -1622,7 +1622,7 @@ class TestNotify(unittest.TestCase):
             cleaner.CONFIG_PATH.write_text('{"enabled_categories": ["node"]}')
             cfg = cleaner.load_config()
             # Pre-v2.5 configs get new categories auto-enabled
-            self.assertEqual(cfg["enabled_categories"], ["node", "tmp", "simulators"])
+            self.assertEqual(cfg["enabled_categories"], ["node", "tmp", "simulators", "leftovers"])
             self.assertTrue(cfg["low_disk_alerts"])
             self.assertEqual(cfg["low_disk_threshold_gb"], 10)
         finally:
@@ -2905,6 +2905,14 @@ class TestCategoryMigration(unittest.TestCase):
         self.assertNotIn("tmp", cfg2["enabled_categories"])
         self.assertIn("known_categories", cfg2)
 
+    def test_leftovers_category_present(self):
+        self.assertIn("leftovers", cleaner.ALL_CATEGORIES)
+
+    def test_leftovers_auto_enabled_for_pre27_config(self):
+        cfg = self._load_with({"enabled_categories": list(cleaner.ALL_CATEGORIES[:-1]),
+                                "known_categories": cleaner.ALL_CATEGORIES[:-1]})
+        self.assertIn("leftovers", cfg["enabled_categories"])
+
 
 class TestCompletions(unittest.TestCase):
     """The completion files are hand-written, so they can drift from the
@@ -3535,6 +3543,18 @@ class TestScannerScoping(unittest.TestCase):
         tmp = mock.patch.object(cleaner, "scan_tmp_artifacts", return_value=[])
         sim = mock.patch.object(cleaner, "scan_simulator_targets", return_value=[])
         return tmp, sim
+
+    def test_leftovers_scanner_scoped_out_by_category(self):
+        leftover = mock.patch.object(cleaner, "scan_app_leftovers", return_value=[])
+        with leftover as mleft:
+            cleaner.collect_targets(self.cfg, categories={"node"})
+        mleft.assert_not_called()
+
+    def test_leftovers_scanner_runs_when_category_included(self):
+        leftover = mock.patch.object(cleaner, "scan_app_leftovers", return_value=[])
+        with leftover as mleft:
+            cleaner.collect_targets(self.cfg, categories={"leftovers"})
+        mleft.assert_called_once()
 
     def test_unscoped_runs_both(self):
         tmp, sim = self._patched()
