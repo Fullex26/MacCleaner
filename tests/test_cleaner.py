@@ -3955,6 +3955,20 @@ class TestAppLeftoverScanner(unittest.TestCase):
         link = self.lib_root / "Caches" / "com.example.gonezo"
         link.parent.mkdir(parents=True, exist_ok=True)
         link.symlink_to(real)
+        # Age the symlink itself (not just its real target) so the min-age
+        # gate can't discard it before the symlink-skip guard ever runs --
+        # otherwise this test would pass even without that guard.
+        old = time.time() - 30 * 86400
+        os.utime(link, (old, old), follow_symlinks=False)
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_survives_only_if_all_locations_are_old(self):
+        # One matched location aged 30 days, one aged 1 day (younger than
+        # the 7-day default gate), same bundle ID -- the bundle must NOT
+        # appear as a hit, because aggregation uses max() (newest wins)
+        # across locations, not min().
+        self._leftover_dir("Caches", "com.example.gonezo", days=30)
+        self._leftover_file("Preferences", "com.example.gonezo.plist", days=1)
         self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
 
     def test_young_leftover_skipped(self):
