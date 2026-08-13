@@ -1788,12 +1788,21 @@ def _app_bundle_identifier(app_path):
 
 
 def _collect_app_bundle_id(entry, ids):
-    """If `entry` is a real (non-symlink) directory named "*.app", read its
-    bundle ID into `ids`. Broken/unreadable bundles are skipped, not fatal."""
+    """If `entry` is a directory named "*.app" (symlink or not), read its
+    bundle ID into `ids`. Broken/unreadable bundles are skipped, not fatal.
+
+    Unlike the leftover-scanning/deletion path (which never follows
+    symlinks -- that's a deletion-safety rule protecting real data), this
+    is read-only enumeration of what's currently INSTALLED. Refusing to
+    follow a symlinked "*.app" here (e.g. macOS's own Safari.app under a
+    Cryptexes redirect, or a Nix/home-manager-style symlinked install)
+    only ever drops a real app out of the installed set, which can only
+    ever manufacture MORE false positives downstream -- never protect
+    anything. So this check follows symlinks (finding I4)."""
     if not entry.name.endswith(".app"):
         return
     try:
-        if not entry.is_dir(follow_symlinks=False):
+        if not entry.is_dir():
             return
     except OSError:
         return
@@ -1810,7 +1819,11 @@ def installed_bundle_ids():
     at the app-root top level (finding F2). Bounded to exactly one extra
     level, no further recursion. A missing root, a broken individual
     bundle, or an unreadable wrapper folder is skipped, never fatal to
-    enumeration; symlinks are never followed at either level."""
+    enumeration. A symlinked non-.app WRAPPER folder is never followed
+    (deletion-adjacent structural traversal); a symlinked "*.app" itself
+    IS followed, at either level, since reading its Info.plist here is
+    read-only enumeration, not deletion (finding I4 -- see
+    _collect_app_bundle_id)."""
     ids = set()
     for root in _installed_apps_dirs():
         try:
@@ -1837,7 +1850,10 @@ def _leftover_library_root():
 
 
 LEFTOVER_ROOTS = ("Caches", "Preferences", "Saved Application State", "HTTPStorages", "WebKit")
-LEFTOVER_EXCLUDE_PREFIXES = ("com.apple.",)
+# "group.com.apple." covers Apple's app-group preference domains (e.g.
+# group.com.apple.mail, group.com.apple.notes) -- a plain "com.apple."
+# prefix check doesn't catch these since they don't start with it.
+LEFTOVER_EXCLUDE_PREFIXES = ("com.apple.", "group.com.apple.")
 LEFTOVER_EXCLUDE_EXACT = {"com.fullex.maccleaner"}
 _BUNDLE_ID_SHAPE = re.compile(r'^[a-z0-9]+(\.[a-z0-9-]+)+$')
 
@@ -1850,6 +1866,20 @@ def _leftover_excluded(bundle_id):
     if bundle_id in LEFTOVER_EXCLUDE_EXACT:
         return True
     return any(bundle_id.startswith(p) for p in LEFTOVER_EXCLUDE_PREFIXES)
+
+
+def _owned_by_installed(candidate, installed):
+    """True if `candidate` IS an installed bundle ID, or is a strict
+    sub-domain of one (e.g. "com.hnc.discord.shipit" under installed
+    "com.hnc.discord" -- Squirrel.Mac's ".ShipIt" updater domain and
+    similar vendor sub-domain patterns are still genuinely owned by the
+    installed app, just not an exact bundle-ID match). Still exact-prefix
+    matching against real installed IDs, never fuzzy: a dot boundary is
+    required, so "com.example.appfoo" is NOT considered owned by installed
+    "com.example.app"."""
+    if candidate in installed:
+        return True
+    return any(candidate.startswith(i + ".") for i in installed)
 
 
 def _leftover_candidate(root_name, entry):
@@ -1894,9 +1924,17 @@ def _leftover_candidate(root_name, entry):
         if is_file and name.endswith(".binarycookies"):
             return name[:-len(".binarycookies")]
         return None
-    # Caches, WebKit: directory, bare bundle id.
-    if is_dir:
-        return name
+    if root_name in ("Caches", "WebKit"):
+        # Caches, WebKit: directory, bare bundle id.
+        if is_dir:
+            return name
+        return None
+    # Finding M3: an explicit, named fallthrough rather than an implicit
+    # "anything else" branch -- if a 6th root is ever added to
+    # LEFTOVER_ROOTS without a matching clause here, it must produce NO
+    # candidates (fail loudly/silently-safe) rather than silently inherit
+    # Caches/WebKit's rule, which could be the wrong shape entirely. This
+    # function must be kept in lockstep with LEFTOVER_ROOTS.
     return None
 
 
@@ -1914,7 +1952,10 @@ def scan_app_leftovers(config):
     library_root = _leftover_library_root()
     min_age = config.get("app_leftover_min_age_days", 7)
     cutoff = time.time() - min_age * 86400
-    skip = [Path(os.path.expanduser(p)) for p in config.get("skip_paths", [])]
+    # Resolved once up front (not per-candidate, finding M2): this scanner
+    # walks ~2900 entries across 5 roots, vs. scan_tmp_artifacts' single
+    # shallow root, so re-resolving on every iteration is a real cost here.
+    skip = [Path(os.path.expanduser(p)).resolve() for p in config.get("skip_paths", [])]
 
     by_id = {}
     for root_name in LEFTOVER_ROOTS:
@@ -1932,17 +1973,17 @@ def scan_app_leftovers(config):
                 continue
             if _leftover_excluded(candidate):
                 continue
-            if candidate in installed:
+            if _owned_by_installed(candidate, installed):
                 continue
             try:
                 is_symlink = e.is_symlink()
                 if is_symlink:
                     continue
                 st = e.stat(follow_symlinks=False)
+                resolved = Path(e.path).resolve()
             except OSError:
                 continue
-            resolved = Path(e.path).resolve()
-            if any(resolved == s.resolve() or str(resolved).startswith(str(s.resolve()) + os.sep)
+            if any(resolved == s or str(resolved).startswith(str(s) + os.sep)
                    for s in skip):
                 continue
             entry = by_id.setdefault(candidate, {"bundle_id": candidate, "paths": [],

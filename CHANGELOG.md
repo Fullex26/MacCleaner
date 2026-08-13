@@ -19,16 +19,23 @@ app the normal way (drag to Trash), without ever guessing.
   or preference-file name is shaped like a reverse-DNS bundle ID (e.g.
   `com.example.app`) *and* that exact bundle ID has no matching installed
   app under `/Applications`, `~/Applications`, or `/System/Applications`
-  (including one level inside a vendor wrapper folder, e.g. Adobe apps).
-  Apple's own bundle ID (and anything under `com.apple.*`) is always
-  excluded, so MacCleaner can never flag itself or the OS. Matching is
-  bundle-ID-precise, not name- or fuzzy-based, so an installed app whose
-  `.app` is enumerated correctly is never flagged. The one residual risk
-  category inherent to bundle-ID matching itself: helper/XPC bundle IDs
-  that never correspond to a top-level `.app` (e.g. `com.electron.dockerdesktop`)
-  aren't in the installed set either way, so their leftovers can still
-  surface even though the parent app is installed — hence every hit stays
-  `safe: false` and review-only rather than auto-cleaned.
+  (including one level inside a vendor wrapper folder, e.g. Adobe apps, and
+  a symlinked `.app` — some vendors and Nix/home-manager-style installs use
+  one). Apple's own bundle ID, anything under `com.apple.*` (including its
+  `group.com.apple.*` app-group variant, e.g. `group.com.apple.mail`), and
+  any candidate that's a strict sub-domain of an installed bundle ID (e.g.
+  Squirrel.Mac's `.ShipIt` updater domain under an installed app) are always
+  excluded, so MacCleaner can never flag itself, the OS, or an installed
+  app's own updater/helper domains. Matching is bundle-ID-precise, not name-
+  or fuzzy-based, so an installed app whose `.app` is enumerated correctly
+  is never flagged. The residual risk category inherent to bundle-ID
+  matching itself: helper, updater, and shared/framework preference domains
+  that have no `.app` of their own (e.g. a Squirrel/ShipIt updater domain
+  with no matching installed sub-domain, a shared vendor settings domain
+  like `com.microsoft.shared`, or a system framework domain like
+  `org.cups.printingprefs`) aren't in the installed set either way, so their
+  leftovers can still surface — hence every hit stays `safe: false` and
+  review-only rather than auto-cleaned.
 - Five locations are scanned, each one Apple already keys by bundle ID:
   `~/Library/Caches`, `~/Library/Preferences`, `~/Library/Saved Application
   State`, `~/Library/HTTPStorages`, and `~/Library/WebKit`.

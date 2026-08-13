@@ -4009,6 +4009,26 @@ class TestInstalledAppsEnumeration(unittest.TestCase):
         (self.apps_dir / "LinkWrapper").symlink_to(real)
         self.assertEqual(cleaner.installed_bundle_ids(), set())
 
+    def test_symlinked_app_bundle_still_counts_as_installed(self):
+        # Finding I4 (2nd whole-branch review round): "never follow
+        # symlinks" is a DELETION safety rule that belongs to the
+        # leftover-scanning/deletion path (test_nested_symlink_wrapper_not_
+        # followed above still enforces it there for a symlinked WRAPPER
+        # folder). It must NOT gate this read-only enumeration of what's
+        # installed -- e.g. a symlinked top-level "*.app" (as macOS itself
+        # ships for Safari.app under a Cryptexes redirect, or a Nix/
+        # home-manager-style symlinked install) is a real installed app.
+        # Refusing to follow the symlink here only ever creates MORE false
+        # positives downstream in scan_app_leftovers, never protects
+        # anything.
+        real = self.tmp / "real-app-location"
+        contents = real / "Real.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.symlinked"}, f)
+        (self.apps_dir / "Real.app").symlink_to(real / "Real.app")
+        self.assertEqual(cleaner.installed_bundle_ids(), {"com.example.symlinked"})
+
     def test_non_app_file_at_top_level_does_not_crash_nested_scan(self):
         # A stray non-directory file (not a wrapper folder, not a .app)
         # sitting at the app-root top level must be skipped cleanly.
@@ -4093,6 +4113,35 @@ class TestAppLeftoverScanner(unittest.TestCase):
         self._leftover_dir("Caches", "com.example.still")
         self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
 
+    def test_subdomain_of_installed_bundle_id_is_never_a_hit(self):
+        # Finding I3 (2nd whole-branch review round): a candidate that is a
+        # strict sub-domain of an installed bundle ID (e.g. Squirrel.Mac's
+        # ".ShipIt" updater domain, or iTerm2's ".private" domain) is still
+        # genuinely owned by the installed app -- just not an exact
+        # bundle-ID match. Confirmed on the real dev machine: 8 such hits
+        # (com.hnc.discord.shipit under installed com.hnc.discord,
+        # com.googlecode.iterm2.private under installed com.googlecode.
+        # iterm2, etc.) This is still exact-prefix matching against real
+        # installed IDs, not fuzzy matching.
+        contents = self.apps_dir / "Example.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.app"}, f)
+        self._leftover_dir("Caches", "com.example.app.shipit")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_similarly_prefixed_but_not_subdomain_still_a_hit(self):
+        # Guard against an overly-broad fix: "com.example.appfoo" is NOT a
+        # sub-domain of installed "com.example.app" (no dot boundary), so
+        # it must still surface as a hit.
+        contents = self.apps_dir / "Example.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.app"}, f)
+        self._leftover_dir("Caches", "com.example.appfoo")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.appfoo"])
+
     def test_com_apple_never_a_hit_even_if_not_installed(self):
         # Defense in depth: excluded unconditionally, not just via the
         # installed-set check.
@@ -4101,6 +4150,18 @@ class TestAppLeftoverScanner(unittest.TestCase):
 
     def test_self_never_a_hit(self):
         self._leftover_dir("Caches", "com.fullex.maccleaner")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_group_com_apple_never_a_hit_even_if_not_installed(self):
+        # Finding C1 (2nd whole-branch review round): Apple's app-group
+        # preference domains are named "group.com.apple.<x>" (e.g. Mail,
+        # Notes, Calendar) -- that prefix doesn't start with "com.apple.",
+        # so the plain startswith check let these slip through even though
+        # AGENTS.md/CHANGELOG.md promise com.apple.* is "always excluded
+        # regardless of installed state". Mirrors
+        # test_com_apple_never_a_hit_even_if_not_installed: excluded
+        # unconditionally, not just via the installed-set check.
+        self._leftover_dir("Caches", "group.com.apple.mail")
         self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
 
     def test_preferences_plist_suffix_stripped_for_matching(self):
