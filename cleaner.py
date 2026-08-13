@@ -1761,6 +1761,49 @@ def _app_bundle_version(app_path: Path):
         return None
 
 
+INSTALLED_APPS_DIRS_DEFAULT = "/Applications:%s:/System/Applications" % (HOME / "Applications")
+
+
+def _installed_apps_dirs():
+    raw = os.environ.get("MACCLEANER_INSTALLED_APPS_DIRS", INSTALLED_APPS_DIRS_DEFAULT)
+    return [Path(p) for p in raw.split(":") if p]
+
+
+def _app_bundle_identifier(app_path):
+    """CFBundleIdentifier from an app bundle's Info.plist, lowercased, or
+    None if the bundle/plist/key is missing or unreadable. Never raises."""
+    try:
+        with open(app_path / "Contents" / "Info.plist", "rb") as f:
+            bundle_id = plistlib.load(f).get("CFBundleIdentifier")
+        return bundle_id.lower() if bundle_id else None
+    except Exception:
+        return None
+
+
+def installed_bundle_ids():
+    """Bundle IDs of every top-level .app in the configured app-root
+    directories (MACCLEANER_INSTALLED_APPS_DIRS). A missing root or a
+    broken individual bundle is skipped, never fatal to enumeration."""
+    ids = set()
+    for root in _installed_apps_dirs():
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            continue
+        for e in entries:
+            if not e.name.endswith(".app"):
+                continue
+            try:
+                if not e.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            bundle_id = _app_bundle_identifier(Path(e.path))
+            if bundle_id:
+                ids.add(bundle_id)
+    return ids
+
+
 def run_doctor(config, json_mode=False):
     checks = []
 

@@ -3767,5 +3767,93 @@ class TestDockerEstimateParsing(unittest.TestCase):
         cleaner._parse_docker_estimate(weird)
 
 
+class TestInstalledAppsEnumeration(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.apps_dir = self.tmp / "Applications"
+        self.apps_dir.mkdir()
+        self._patch = mock.patch.dict(
+            os.environ, {"MACCLEANER_INSTALLED_APPS_DIRS": str(self.apps_dir)})
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_app(self, name, bundle_id, plist_bytes=None):
+        contents = self.apps_dir / name / "Contents"
+        contents.mkdir(parents=True)
+        plist_path = contents / "Info.plist"
+        if plist_bytes is not None:
+            plist_path.write_bytes(plist_bytes)
+        else:
+            with open(plist_path, "wb") as f:
+                plistlib.dump({"CFBundleIdentifier": bundle_id}, f)
+
+    def test_reads_bundle_identifier(self):
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        app_path = self.apps_dir / "Slack.app"
+        self.assertEqual(cleaner._app_bundle_identifier(app_path),
+                          "com.tinyspeck.slackmacgap")
+
+    def test_identifier_lowercased(self):
+        self._make_app("Weird.app", "Com.Example.WeirdCasing")
+        app_path = self.apps_dir / "Weird.app"
+        self.assertEqual(cleaner._app_bundle_identifier(app_path),
+                          "com.example.weirdcasing")
+
+    def test_missing_plist_returns_none(self):
+        (self.apps_dir / "Broken.app" / "Contents").mkdir(parents=True)
+        self.assertIsNone(
+            cleaner._app_bundle_identifier(self.apps_dir / "Broken.app"))
+
+    def test_malformed_plist_returns_none(self):
+        contents = self.apps_dir / "Malformed.app" / "Contents"
+        contents.mkdir(parents=True)
+        (contents / "Info.plist").write_text("not a plist")
+        self.assertIsNone(
+            cleaner._app_bundle_identifier(self.apps_dir / "Malformed.app"))
+
+    def test_missing_key_returns_none(self):
+        contents = self.apps_dir / "NoKey.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleName": "NoKey"}, f)
+        self.assertIsNone(
+            cleaner._app_bundle_identifier(self.apps_dir / "NoKey.app"))
+
+    def test_enumeration_collects_all_installed_ids(self):
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        self._make_app("Docker.app", "com.docker.docker")
+        self.assertEqual(cleaner.installed_bundle_ids(),
+                          {"com.tinyspeck.slackmacgap", "com.docker.docker"})
+
+    def test_enumeration_skips_broken_bundles_not_fatal(self):
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        (self.apps_dir / "Broken.app" / "Contents").mkdir(parents=True)
+        self.assertEqual(cleaner.installed_bundle_ids(),
+                          {"com.tinyspeck.slackmacgap"})
+
+    def test_missing_root_dir_skipped_not_fatal(self):
+        with mock.patch.dict(os.environ, {
+                "MACCLEANER_INSTALLED_APPS_DIRS":
+                str(self.tmp / "does-not-exist")}):
+            self.assertEqual(cleaner.installed_bundle_ids(), set())
+
+    def test_multiple_roots_colon_separated(self):
+        second_dir = self.tmp / "SystemApplications"
+        second_dir.mkdir()
+        finder_contents = second_dir / "Finder.app" / "Contents"
+        finder_contents.mkdir(parents=True)
+        with open(finder_contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.apple.finder"}, f)
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        with mock.patch.dict(os.environ, {
+                "MACCLEANER_INSTALLED_APPS_DIRS":
+                "%s:%s" % (self.apps_dir, second_dir)}):
+            self.assertEqual(cleaner.installed_bundle_ids(),
+                              {"com.tinyspeck.slackmacgap", "com.apple.finder"})
+
+
 if __name__ == "__main__":
     unittest.main()
