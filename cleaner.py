@@ -731,6 +731,8 @@ def _target_paths(t):
         skip = t.get("skip", [])
         return [Path(p) for p in sorted(globmod.glob(t["glob"]))
                 if not any(p.startswith(s) for s in skip)]
+    if t.get("paths"):
+        return t["paths"]
     if t.get("path"):
         return [t["path"]]
     return []

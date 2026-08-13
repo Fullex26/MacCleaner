@@ -3855,5 +3855,30 @@ class TestInstalledAppsEnumeration(unittest.TestCase):
                               {"com.tinyspeck.slackmacgap", "com.apple.finder"})
 
 
+class TestTargetPathsMultiPath(unittest.TestCase):
+    def test_paths_branch_returns_list_verbatim(self):
+        p1, p2 = Path("/tmp/a"), Path("/tmp/b")
+        t = {"paths": [p1, p2], "path": None, "glob": None}
+        self.assertEqual(cleaner._target_paths(t), [p1, p2])
+
+    def test_path_branch_unchanged_when_no_paths_key(self):
+        p = Path("/tmp/a")
+        t = {"path": p, "glob": None}
+        self.assertEqual(cleaner._target_paths(t), [p])
+
+    def test_glob_branch_takes_priority_over_paths(self):
+        # glob is checked first in the existing function; paths targets
+        # never set glob, but pin the priority order as documented.
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "x.txt"
+            f.write_text("x")
+            t = {"glob": str(Path(td) / "*.txt"), "skip": [], "paths": [Path("/should/not/appear")]}
+            self.assertEqual(cleaner._target_paths(t), [f])
+
+    def test_empty_paths_list_returns_empty(self):
+        t = {"paths": [], "path": None, "glob": None}
+        self.assertEqual(cleaner._target_paths(t), [])
+
+
 if __name__ == "__main__":
     unittest.main()
