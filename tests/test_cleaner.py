@@ -3880,5 +3880,124 @@ class TestTargetPathsMultiPath(unittest.TestCase):
         self.assertEqual(cleaner._target_paths(t), [])
 
 
+class TestAppLeftoverScanner(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.apps_dir = self.tmp / "Applications"
+        self.apps_dir.mkdir()
+        self.lib_root = self.tmp / "Library"
+        self.lib_root.mkdir()
+        self.env = {
+            "MACCLEANER_INSTALLED_APPS_DIRS": str(self.apps_dir),
+            "MACCLEANER_LEFTOVER_LIBRARY_ROOT": str(self.lib_root),
+        }
+        self._patch = mock.patch.dict(os.environ, self.env)
+        self._patch.start()
+        self.cfg = {"app_leftover_min_age_days": 7}
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _age(self, p, days=10):
+        old = time.time() - days * 86400
+        os.utime(p, (old, old))
+
+    def _leftover_dir(self, root_name, bundle_id, days=10):
+        d = self.lib_root / root_name / bundle_id
+        d.mkdir(parents=True)
+        self._age(d, days)
+        return d
+
+    def _leftover_file(self, root_name, filename, days=10):
+        root = self.lib_root / root_name
+        root.mkdir(parents=True, exist_ok=True)
+        f = root / filename
+        f.write_text("x")
+        self._age(f, days)
+        return f
+
+    def test_orphaned_bundle_id_is_a_hit(self):
+        self._leftover_dir("Caches", "com.example.gonezo")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_installed_app_is_never_a_hit(self):
+        contents = self.apps_dir / "Still.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.still"}, f)
+        self._leftover_dir("Caches", "com.example.still")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_com_apple_never_a_hit_even_if_not_installed(self):
+        # Defense in depth: excluded unconditionally, not just via the
+        # installed-set check.
+        self._leftover_dir("Caches", "com.apple.somethingobscure")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_self_never_a_hit(self):
+        self._leftover_dir("Caches", "com.fullex.maccleaner")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_preferences_plist_suffix_stripped_for_matching(self):
+        self._leftover_file("Preferences", "com.example.gonezo.plist")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_non_bundle_id_shaped_name_ignored(self):
+        self._leftover_dir("Caches", "just-a-random-folder")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_symlink_never_followed_or_matched(self):
+        real = self.tmp / "real-target"
+        real.mkdir()
+        link = self.lib_root / "Caches" / "com.example.gonezo"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(real)
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_young_leftover_skipped(self):
+        self._leftover_dir("Caches", "com.example.gonezo", days=1)
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_multiple_locations_grouped_into_one_hit(self):
+        self._leftover_dir("Caches", "com.example.gonezo")
+        self._leftover_file("Preferences", "com.example.gonezo.plist")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(len(hits[0]["paths"]), 2)
+        self.assertEqual(set(hits[0]["locations"]), {"Caches", "Preferences"})
+
+    def test_missing_library_root_returns_empty_not_fatal(self):
+        with mock.patch.dict(os.environ, {
+                "MACCLEANER_LEFTOVER_LIBRARY_ROOT":
+                str(self.tmp / "does-not-exist")}):
+            self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_targets_are_review_only_no_carve_out_marker(self):
+        self._leftover_dir("Caches", "com.example.gonezo")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        targets = cleaner.app_leftovers_to_targets(hits)
+        self.assertEqual(len(targets), 1)
+        t = targets[0]
+        self.assertFalse(t["safe"])
+        self.assertEqual(t["category"], "leftovers")
+        self.assertEqual(t["id"], "leftover-com-example-gonezo")
+        self.assertNotIn("tmp_scan", t)
+
+    def test_target_id_dedup_suffix_on_collision(self):
+        # slugify collapses case/punctuation the same way tmp_to_targets'
+        # collision handling does; construct two hits that slugify equal.
+        hits = [
+            {"bundle_id": "com.example.Dup", "paths": [Path("/x")],
+             "locations": ["Caches"], "mtime": 0},
+            {"bundle_id": "com.example.dup", "paths": [Path("/y")],
+             "locations": ["Caches"], "mtime": 0},
+        ]
+        targets = cleaner.app_leftovers_to_targets(hits)
+        self.assertEqual(len({t["id"] for t in targets}), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
