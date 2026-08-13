@@ -1,6 +1,6 @@
 cask "maccleaner" do
-  version "2.6.1"
-  sha256 "b0fa6cb68cbf1cd7cbac794128de4bc9f5213a3829ca9fee6c04539cacd9d4d7"
+  version "2.7.0"
+  sha256 "87f21180405671b60e7044f2b7583c930e967d9efe89d07fb02c3a56871023c1"
 
   url "https://github.com/Fullex26/MacCleaner/releases/download/v#{version}/MacCleaner-v#{version}-macos-universal.zip",
       verified: "github.com/Fullex26/MacCleaner/"
@@ -13,13 +13,7 @@ cask "maccleaner" do
     strategy :github_latest
   end
 
-  # auto_updates is deliberately NOT set: Homebrew skips upgrading an
-  # auto_updates cask on the assumption the app updates itself, but the
-  # currently-shipping 2.5.0 build predates Sparkle and can't self-update --
-  # setting auto_updates true would strand every existing cask user at
-  # 2.5.0 forever (neither `brew upgrade` nor the app itself would ever move
-  # them forward). Re-add it once a Sparkle-bearing build (2.6.0+) is what
-  # cask users are actually running -- see docs/RELEASING.md §5.
+  auto_updates true
   depends_on macos: :ventura
 
   app "MacCleaner.app"
