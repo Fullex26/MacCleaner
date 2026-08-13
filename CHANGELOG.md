@@ -18,11 +18,17 @@ app the normal way (drag to Trash), without ever guessing.
   it. Detection is never fuzzy — an entry only surfaces when its directory
   or preference-file name is shaped like a reverse-DNS bundle ID (e.g.
   `com.example.app`) *and* that exact bundle ID has no matching installed
-  app under `/Applications`, `~/Applications`, or `/System/Applications`.
+  app under `/Applications`, `~/Applications`, or `/System/Applications`
+  (including one level inside a vendor wrapper folder, e.g. Adobe apps).
   Apple's own bundle ID (and anything under `com.apple.*`) is always
-  excluded, so MacCleaner can never flag itself or the OS. A live, installed
-  app's data is therefore structurally unreachable by this scanner — there's
-  no name-matching heuristic that could misfire.
+  excluded, so MacCleaner can never flag itself or the OS. Matching is
+  bundle-ID-precise, not name- or fuzzy-based, so an installed app whose
+  `.app` is enumerated correctly is never flagged. The one residual risk
+  category inherent to bundle-ID matching itself: helper/XPC bundle IDs
+  that never correspond to a top-level `.app` (e.g. `com.electron.dockerdesktop`)
+  aren't in the installed set either way, so their leftovers can still
+  surface even though the parent app is installed — hence every hit stays
+  `safe: false` and review-only rather than auto-cleaned.
 - Five locations are scanned, each one Apple already keys by bundle ID:
   `~/Library/Caches`, `~/Library/Preferences`, `~/Library/Saved Application
   State`, `~/Library/HTTPStorages`, and `~/Library/WebKit`.

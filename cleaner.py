@@ -1787,10 +1787,30 @@ def _app_bundle_identifier(app_path):
         return None
 
 
+def _collect_app_bundle_id(entry, ids):
+    """If `entry` is a real (non-symlink) directory named "*.app", read its
+    bundle ID into `ids`. Broken/unreadable bundles are skipped, not fatal."""
+    if not entry.name.endswith(".app"):
+        return
+    try:
+        if not entry.is_dir(follow_symlinks=False):
+            return
+    except OSError:
+        return
+    bundle_id = _app_bundle_identifier(Path(entry.path))
+    if bundle_id:
+        ids.add(bundle_id)
+
+
 def installed_bundle_ids():
     """Bundle IDs of every top-level .app in the configured app-root
-    directories (MACCLEANER_INSTALLED_APPS_DIRS). A missing root or a
-    broken individual bundle is skipped, never fatal to enumeration."""
+    directories (MACCLEANER_INSTALLED_APPS_DIRS), PLUS .app bundles nested
+    exactly one level inside a non-.app wrapper folder -- some vendors
+    (Adobe and others) ship that way instead of placing the .app directly
+    at the app-root top level (finding F2). Bounded to exactly one extra
+    level, no further recursion. A missing root, a broken individual
+    bundle, or an unreadable wrapper folder is skipped, never fatal to
+    enumeration; symlinks are never followed at either level."""
     ids = set()
     for root in _installed_apps_dirs():
         try:
@@ -1798,16 +1818,17 @@ def installed_bundle_ids():
         except OSError:
             continue
         for e in entries:
-            if not e.name.endswith(".app"):
+            if e.name.endswith(".app"):
+                _collect_app_bundle_id(e, ids)
                 continue
             try:
                 if not e.is_dir(follow_symlinks=False):
                     continue
+                sub_entries = list(os.scandir(e.path))
             except OSError:
                 continue
-            bundle_id = _app_bundle_identifier(Path(e.path))
-            if bundle_id:
-                ids.add(bundle_id)
+            for se in sub_entries:
+                _collect_app_bundle_id(se, ids)
     return ids
 
 
@@ -1831,6 +1852,54 @@ def _leftover_excluded(bundle_id):
     return any(bundle_id.startswith(p) for p in LEFTOVER_EXCLUDE_PREFIXES)
 
 
+def _leftover_candidate(root_name, entry):
+    """Return the bundle-id-shaped candidate stem for a Library subdirectory
+    entry, or None if the entry doesn't match this root's real-world shape
+    (finding F3: a wrong-shaped entry -- e.g. a plain file where a directory
+    is expected -- must be skipped outright, never misinterpreted). Also
+    centralizes suffix-stripping per root (finding F1): only Preferences
+    used to strip a suffix before matching, so Saved Application State
+    (".savedState" DIRECTORIES) and HTTPStorages (".binarycookies" FILES)
+    never matched an installed app's real bundle ID at all.
+
+    Real shapes per root:
+      Caches                  -- directory, bare bundle id
+      Preferences              -- file, "<bundle-id>.plist"
+      Saved Application State  -- directory, "<bundle-id>.savedState"
+      HTTPStorages              -- EITHER a directory (bare bundle id) OR a
+                                    file, "<bundle-id>.binarycookies"
+      WebKit                    -- directory, bare bundle id
+
+    entry.is_dir()/is_file() with follow_symlinks=False also means a
+    symlink (of either shape) never yields a candidate here -- symlinks are
+    never followed."""
+    name = entry.name
+    try:
+        is_dir = entry.is_dir(follow_symlinks=False)
+        is_file = entry.is_file(follow_symlinks=False)
+    except OSError:
+        return None
+
+    if root_name == "Preferences":
+        if is_file and name.endswith(".plist"):
+            return name[:-len(".plist")]
+        return None
+    if root_name == "Saved Application State":
+        if is_dir and name.endswith(".savedState"):
+            return name[:-len(".savedState")]
+        return None
+    if root_name == "HTTPStorages":
+        if is_dir and not name.endswith(".binarycookies"):
+            return name
+        if is_file and name.endswith(".binarycookies"):
+            return name[:-len(".binarycookies")]
+        return None
+    # Caches, WebKit: directory, bare bundle id.
+    if is_dir:
+        return name
+    return None
+
+
 def scan_app_leftovers(config):
     """Top-level scan of five bundle-ID-keyed ~/Library subdirectories for
     entries whose bundle ID has no matching installed app. Never fuzzy --
@@ -1838,11 +1907,14 @@ def scan_app_leftovers(config):
     the locations Apple's own conventions key by bundle ID (see the v2.7
     design doc for why Application Support/Containers/LaunchAgents are
     deliberately out of scope). No new home-only carve-out is needed: every
-    root here is already strictly inside $HOME."""
+    root here is already strictly inside $HOME. skip_paths is honored the
+    same way scan_tmp_artifacts honors it (finding F4) -- AGENTS.md already
+    promises "Cleaning respects enabled_categories and skip_paths"."""
     installed = installed_bundle_ids()
     library_root = _leftover_library_root()
     min_age = config.get("app_leftover_min_age_days", 7)
     cutoff = time.time() - min_age * 86400
+    skip = [Path(os.path.expanduser(p)) for p in config.get("skip_paths", [])]
 
     by_id = {}
     for root_name in LEFTOVER_ROOTS:
@@ -1852,13 +1924,9 @@ def scan_app_leftovers(config):
         except OSError:
             continue
         for e in entries:
-            name = e.name
-            if root_name == "Preferences":
-                if not name.endswith(".plist"):
-                    continue
-                candidate = name[:-len(".plist")]
-            else:
-                candidate = name
+            candidate = _leftover_candidate(root_name, e)
+            if candidate is None:
+                continue
             candidate = candidate.lower()
             if not _looks_like_bundle_id(candidate):
                 continue
@@ -1872,6 +1940,10 @@ def scan_app_leftovers(config):
                     continue
                 st = e.stat(follow_symlinks=False)
             except OSError:
+                continue
+            resolved = Path(e.path).resolve()
+            if any(resolved == s.resolve() or str(resolved).startswith(str(s.resolve()) + os.sep)
+                   for s in skip):
                 continue
             entry = by_id.setdefault(candidate, {"bundle_id": candidate, "paths": [],
                                                   "locations": [], "mtime": 0.0})
@@ -1896,7 +1968,7 @@ def app_leftovers_to_targets(hits):
             "id": tid,
             "category": "leftovers",
             "label": "App leftovers: %s" % h["bundle_id"],
-            "description": "Found in: %s — orphaned since the app was removed"
+            "description": "Found in: %s — no installed app matches this bundle ID; review before deleting"
                            % ", ".join(h["locations"]),
             "path": None,
             "paths": h["paths"],

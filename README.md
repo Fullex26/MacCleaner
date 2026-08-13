@@ -9,12 +9,13 @@
 
 MacCleaner finds and removes the developer detritus that accumulates silently — Xcode DerivedData, Docker layers, package manager caches, downloaded AI models, stale `node_modules` in projects you abandoned months ago. A single command can reclaim tens of gigabytes.
 
-- **CLI** — `scan`, `clean`, `projects`, `report`, `doctor`, `config`. 80+ cleanup targets across 22 categories. Interactive checklist or fully unattended.
+- **CLI** — `scan`, `clean`, `projects`, `report`, `doctor`, `config`. 80+ cleanup targets across 23 categories. Interactive checklist or fully unattended.
 - **macOS app, redesigned in v2.6** — sidebar navigation, glass panels, and a rich menu bar popover (disk ring, reclaimable hero number, top categories, one-click "Clean safe items") over the same engine and config as the CLI.
 - **Agent-ready** — every command speaks `--json`, every target has a stable ID, exit codes are documented. Point your AI agent at [AGENTS.md](AGENTS.md) and it can operate the whole tool.
 - **Safe by design** — deletes only inside your home directory, never follows symlinks, and can move things to the Trash instead of deleting.
 - **Know before you act** — `--dry-run` previews the exact paths and sizes a clean would touch with zero side effects, `report` tracks disk-space trends over time, and `projects` automatically skips repos with uncommitted or unpushed work.
 - **AI-era cleanup** — finds stale build/clone litter that AI coding sessions leave under `/private/tmp` (classified by contents, never by name, and always review-only), plus unused iOS simulator devices and runtime images via `simctl`.
+- **App Uninstaller** — the `leftovers` category finds cache, preference, and saved-state files an app left behind under `~/Library` after you removed it, matched by bundle ID (never by name or fuzzy guessing) against every currently-installed app. Always review-only, never auto-cleaned.
 - **Stay in the loop** — a notification when a scheduled clean finishes, a low-disk warning if free space drops below a configurable threshold (10 GB by default), and a menu bar that shows free space and "last cleaned" without opening the app.
 - **Updates itself** — the app checks for new versions daily via Sparkle and prompts with release notes when one's available (or check manually from Settings); installed via Homebrew? `brew upgrade` still works as before. Sparkle only updates the app bundle, not the installed CLI engine at `~/mac-cleaner/cleaner.py` — re-run `bash install.sh` to update that too (`maccleaner doctor` flags a version mismatch between the two).
 
@@ -107,7 +108,7 @@ python3 ~/mac-cleaner/cleaner.py clean --targets npm-cache,pip-cache,xcode-deriv
 
 ## What It Cleans
 
-22 categories, 80+ targets. Enable or disable any category via `maccleaner config enable|disable <category>`; run `maccleaner categories` to list every target and its ID.
+23 categories, 80+ targets. Enable or disable any category via `maccleaner config enable|disable <category>`; run `maccleaner categories` to list every target and its ID.
 
 | Category | What's in it |
 |----------|--------------|
@@ -133,6 +134,7 @@ python3 ~/mac-cleaner/cleaner.py clean --targets npm-cache,pip-cache,xcode-deriv
 | **vms** | VM disks and container runtimes — Colima, Vagrant, minikube (review carefully) |
 | **tmp** | Stale build/clone artifacts left in `/private/tmp` by tools and AI coding sessions, classified by contents not name — review carefully |
 | **simulators** | Stale iOS simulator devices and unused runtime images, via `simctl` — review carefully |
+| **leftovers** | Cache, preference, and saved-state files left behind by apps you've already deleted, matched by bundle ID — review carefully |
 
 ---
 
