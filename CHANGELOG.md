@@ -28,14 +28,29 @@ app the normal way (drag to Trash), without ever guessing.
   excluded, so MacCleaner can never flag itself, the OS, or an installed
   app's own updater/helper domains. Matching is bundle-ID-precise, not name-
   or fuzzy-based, so an installed app whose `.app` is enumerated correctly
-  is never flagged. The residual risk category inherent to bundle-ID
-  matching itself: helper, updater, and shared/framework preference domains
-  that have no `.app` of their own (e.g. a Squirrel/ShipIt updater domain
-  with no matching installed sub-domain, a shared vendor settings domain
-  like `com.microsoft.shared`, or a system framework domain like
-  `org.cups.printingprefs`) aren't in the installed set either way, so their
-  leftovers can still surface — hence every hit stays `safe: false` and
-  review-only rather than auto-cleaned.
+  is never flagged. As a second, more thorough confirmation pass (3rd
+  whole-branch review), every remaining candidate is also checked against
+  Spotlight — a single batched, case-insensitive `mdfind` query for all
+  candidates at once, never one call per candidate — and excluded if
+  Spotlight reports a real `.app` bundle anywhere on disk with that exact
+  bundle ID, regardless of location, depth, or wrapper-folder nesting. This
+  is additive on top of the directory walk, not a replacement for it, and
+  degrades to a no-op on any failure (mdfind missing, Spotlight disabled,
+  timeout). Confirmed on the real dev machine: Adobe Creative Cloud four
+  directories deep, several Adobe helper daemons, a Brother printer
+  utility, and a Steam-bundled game — none reachable by the bounded
+  directory walk alone — are now correctly recognized as installed. The
+  true residual after this pass: helper, updater, and shared/framework
+  preference domains that have no `.app` of their own anywhere (e.g. a
+  shared vendor settings domain like `com.microsoft.shared`, or a system
+  framework domain like `org.cups.printingprefs`); genuinely orphaned data;
+  `.app` bundles nested *inside another app's own `Contents/` folder*,
+  which Spotlight's application importer does not index as independent
+  items even after a forced reindex (confirmed with Alfred 5's internal
+  preferences helper); and ordinary Spotlight indexing lag or a per-volume
+  index that's disabled. None of these are guessed around — every hit
+  stays `safe: false` and review-only rather than auto-cleaned regardless
+  of how either signal performs.
 - Five locations are scanned, each one Apple already keys by bundle ID:
   `~/Library/Caches`, `~/Library/Preferences`, `~/Library/Saved Application
   State`, `~/Library/HTTPStorages`, and `~/Library/WebKit`.

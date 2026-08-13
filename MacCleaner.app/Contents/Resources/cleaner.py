@@ -1787,10 +1787,43 @@ def _app_bundle_identifier(app_path):
         return None
 
 
+def _collect_app_bundle_id(entry, ids):
+    """If `entry` is a directory named "*.app" (symlink or not), read its
+    bundle ID into `ids`. Broken/unreadable bundles are skipped, not fatal.
+
+    Unlike the leftover-scanning/deletion path (which never follows
+    symlinks -- that's a deletion-safety rule protecting real data), this
+    is read-only enumeration of what's currently INSTALLED. Refusing to
+    follow a symlinked "*.app" here (e.g. macOS's own Safari.app under a
+    Cryptexes redirect, or a Nix/home-manager-style symlinked install)
+    only ever drops a real app out of the installed set, which can only
+    ever manufacture MORE false positives downstream -- never protect
+    anything. So this check follows symlinks (finding I4)."""
+    if not entry.name.endswith(".app"):
+        return
+    try:
+        if not entry.is_dir():
+            return
+    except OSError:
+        return
+    bundle_id = _app_bundle_identifier(Path(entry.path))
+    if bundle_id:
+        ids.add(bundle_id)
+
+
 def installed_bundle_ids():
     """Bundle IDs of every top-level .app in the configured app-root
-    directories (MACCLEANER_INSTALLED_APPS_DIRS). A missing root or a
-    broken individual bundle is skipped, never fatal to enumeration."""
+    directories (MACCLEANER_INSTALLED_APPS_DIRS), PLUS .app bundles nested
+    exactly one level inside a non-.app wrapper folder -- some vendors
+    (Adobe and others) ship that way instead of placing the .app directly
+    at the app-root top level (finding F2). Bounded to exactly one extra
+    level, no further recursion. A missing root, a broken individual
+    bundle, or an unreadable wrapper folder is skipped, never fatal to
+    enumeration. A symlinked non-.app WRAPPER folder is never followed
+    (deletion-adjacent structural traversal); a symlinked "*.app" itself
+    IS followed, at either level, since reading its Info.plist here is
+    read-only enumeration, not deletion (finding I4 -- see
+    _collect_app_bundle_id)."""
     ids = set()
     for root in _installed_apps_dirs():
         try:
@@ -1798,17 +1831,70 @@ def installed_bundle_ids():
         except OSError:
             continue
         for e in entries:
-            if not e.name.endswith(".app"):
+            if e.name.endswith(".app"):
+                _collect_app_bundle_id(e, ids)
                 continue
             try:
                 if not e.is_dir(follow_symlinks=False):
                     continue
+                sub_entries = list(os.scandir(e.path))
             except OSError:
                 continue
-            bundle_id = _app_bundle_identifier(Path(e.path))
-            if bundle_id:
-                ids.add(bundle_id)
+            for se in sub_entries:
+                _collect_app_bundle_id(se, ids)
     return ids
+
+
+def _mdfind_confirms_installed(candidates):
+    """Best-effort second confirmation signal, layered on top of (never
+    replacing) installed_bundle_ids()'s directory walk: returns the subset
+    of `candidates` (an iterable of lowercase bundle-ID strings, already
+    shape-validated by _looks_like_bundle_id before they ever reach here --
+    no shell-injection risk from the quoted query values) that Spotlight's
+    metadata index reports as having a real .app bundle ANYWHERE on disk
+    with that exact CFBundleIdentifier -- regardless of location, directory
+    depth, or nesting inside another .app. This is authoritative in a way
+    no hardcoded set of directory roots can be: vendors ship apps in
+    arbitrarily deep/unusual locations (Adobe Creative Cloud four
+    directories deep, printer utilities under /Library/Printers, Steam-
+    bundled games under ~/Library/Application Support/Steam, ...) that
+    installed_bundle_ids()'s bounded top-level-plus-one-wrapper-level walk
+    structurally cannot reach.
+
+    A single batched mdfind call handles every candidate at once (an
+    OR'd query) -- never one subprocess call per candidate, which would be
+    far too slow against the 60-90 candidates a real run can produce. The
+    'c' suffix after each quoted value makes the comparison case-
+    insensitive: CFBundleIdentifier is stored on disk in whatever case the
+    vendor wrote it (e.g. "com.adobe.acc.AdobeCreativeCloud"), while our
+    candidates are always lowercased, so a case-sensitive '==' would silently
+    fail to match real hits.
+
+    Any failure (mdfind missing, Spotlight disabled/not-yet-indexed,
+    timeout, non-zero exit, empty candidate list) returns an empty set --
+    this check only ever narrows the hit list further, it never blocks or
+    crashes the scanner if Spotlight is unavailable."""
+    candidates = [c for c in candidates if c]
+    if not candidates:
+        return set()
+    query = " || ".join(
+        "kMDItemCFBundleIdentifier == '%s'c" % c for c in candidates)
+    try:
+        result = subprocess.run(
+            ["mdfind", query], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return set()
+    if result.returncode != 0:
+        return set()
+    confirmed = set()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        bid = _app_bundle_identifier(Path(line))
+        if bid:
+            confirmed.add(bid)
+    return confirmed
 
 
 def _leftover_library_root():
@@ -1816,7 +1902,10 @@ def _leftover_library_root():
 
 
 LEFTOVER_ROOTS = ("Caches", "Preferences", "Saved Application State", "HTTPStorages", "WebKit")
-LEFTOVER_EXCLUDE_PREFIXES = ("com.apple.",)
+# "group.com.apple." covers Apple's app-group preference domains (e.g.
+# group.com.apple.mail, group.com.apple.notes) -- a plain "com.apple."
+# prefix check doesn't catch these since they don't start with it.
+LEFTOVER_EXCLUDE_PREFIXES = ("com.apple.", "group.com.apple.")
 LEFTOVER_EXCLUDE_EXACT = {"com.fullex.maccleaner"}
 _BUNDLE_ID_SHAPE = re.compile(r'^[a-z0-9]+(\.[a-z0-9-]+)+$')
 
@@ -1831,6 +1920,76 @@ def _leftover_excluded(bundle_id):
     return any(bundle_id.startswith(p) for p in LEFTOVER_EXCLUDE_PREFIXES)
 
 
+def _owned_by_installed(candidate, installed):
+    """True if `candidate` IS an installed bundle ID, or is a strict
+    sub-domain of one (e.g. "com.hnc.discord.shipit" under installed
+    "com.hnc.discord" -- Squirrel.Mac's ".ShipIt" updater domain and
+    similar vendor sub-domain patterns are still genuinely owned by the
+    installed app, just not an exact bundle-ID match). Still exact-prefix
+    matching against real installed IDs, never fuzzy: a dot boundary is
+    required, so "com.example.appfoo" is NOT considered owned by installed
+    "com.example.app"."""
+    if candidate in installed:
+        return True
+    return any(candidate.startswith(i + ".") for i in installed)
+
+
+def _leftover_candidate(root_name, entry):
+    """Return the bundle-id-shaped candidate stem for a Library subdirectory
+    entry, or None if the entry doesn't match this root's real-world shape
+    (finding F3: a wrong-shaped entry -- e.g. a plain file where a directory
+    is expected -- must be skipped outright, never misinterpreted). Also
+    centralizes suffix-stripping per root (finding F1): only Preferences
+    used to strip a suffix before matching, so Saved Application State
+    (".savedState" DIRECTORIES) and HTTPStorages (".binarycookies" FILES)
+    never matched an installed app's real bundle ID at all.
+
+    Real shapes per root:
+      Caches                  -- directory, bare bundle id
+      Preferences              -- file, "<bundle-id>.plist"
+      Saved Application State  -- directory, "<bundle-id>.savedState"
+      HTTPStorages              -- EITHER a directory (bare bundle id) OR a
+                                    file, "<bundle-id>.binarycookies"
+      WebKit                    -- directory, bare bundle id
+
+    entry.is_dir()/is_file() with follow_symlinks=False also means a
+    symlink (of either shape) never yields a candidate here -- symlinks are
+    never followed."""
+    name = entry.name
+    try:
+        is_dir = entry.is_dir(follow_symlinks=False)
+        is_file = entry.is_file(follow_symlinks=False)
+    except OSError:
+        return None
+
+    if root_name == "Preferences":
+        if is_file and name.endswith(".plist"):
+            return name[:-len(".plist")]
+        return None
+    if root_name == "Saved Application State":
+        if is_dir and name.endswith(".savedState"):
+            return name[:-len(".savedState")]
+        return None
+    if root_name == "HTTPStorages":
+        if is_dir and not name.endswith(".binarycookies"):
+            return name
+        if is_file and name.endswith(".binarycookies"):
+            return name[:-len(".binarycookies")]
+        return None
+    if root_name in ("Caches", "WebKit"):
+        # Caches, WebKit: directory, bare bundle id.
+        if is_dir:
+            return name
+        return None
+    # Finding M3: an explicit, named fallthrough rather than an implicit
+    # "anything else" branch -- if a 6th root is ever added to
+    # LEFTOVER_ROOTS without a matching clause here, it must produce NO
+    # candidates (fail loudly/silently-safe) rather than silently inherit
+    # Caches/WebKit's rule, which could be the wrong shape entirely. This
+    # function must be kept in lockstep with LEFTOVER_ROOTS.
+    return None
+
+
 def scan_app_leftovers(config):
     """Top-level scan of five bundle-ID-keyed ~/Library subdirectories for
     entries whose bundle ID has no matching installed app. Never fuzzy --
@@ -1838,11 +1997,17 @@ def scan_app_leftovers(config):
     the locations Apple's own conventions key by bundle ID (see the v2.7
     design doc for why Application Support/Containers/LaunchAgents are
     deliberately out of scope). No new home-only carve-out is needed: every
-    root here is already strictly inside $HOME."""
+    root here is already strictly inside $HOME. skip_paths is honored the
+    same way scan_tmp_artifacts honors it (finding F4) -- AGENTS.md already
+    promises "Cleaning respects enabled_categories and skip_paths"."""
     installed = installed_bundle_ids()
     library_root = _leftover_library_root()
     min_age = config.get("app_leftover_min_age_days", 7)
     cutoff = time.time() - min_age * 86400
+    # Resolved once up front (not per-candidate, finding M2): this scanner
+    # walks ~2900 entries across 5 roots, vs. scan_tmp_artifacts' single
+    # shallow root, so re-resolving on every iteration is a real cost here.
+    skip = [Path(os.path.expanduser(p)).resolve() for p in config.get("skip_paths", [])]
 
     by_id = {}
     for root_name in LEFTOVER_ROOTS:
@@ -1852,26 +2017,26 @@ def scan_app_leftovers(config):
         except OSError:
             continue
         for e in entries:
-            name = e.name
-            if root_name == "Preferences":
-                if not name.endswith(".plist"):
-                    continue
-                candidate = name[:-len(".plist")]
-            else:
-                candidate = name
+            candidate = _leftover_candidate(root_name, e)
+            if candidate is None:
+                continue
             candidate = candidate.lower()
             if not _looks_like_bundle_id(candidate):
                 continue
             if _leftover_excluded(candidate):
                 continue
-            if candidate in installed:
+            if _owned_by_installed(candidate, installed):
                 continue
             try:
                 is_symlink = e.is_symlink()
                 if is_symlink:
                     continue
                 st = e.stat(follow_symlinks=False)
+                resolved = Path(e.path).resolve()
             except OSError:
+                continue
+            if any(resolved == s or str(resolved).startswith(str(s) + os.sep)
+                   for s in skip):
                 continue
             entry = by_id.setdefault(candidate, {"bundle_id": candidate, "paths": [],
                                                   "locations": [], "mtime": 0.0})
@@ -1879,7 +2044,15 @@ def scan_app_leftovers(config):
             entry["locations"].append(root_name)
             entry["mtime"] = max(entry["mtime"], st.st_mtime)
 
-    hits = [h for h in by_id.values() if h["mtime"] <= cutoff]
+    # Spotlight second-opinion pass (3rd whole-branch review): the
+    # directory walk above is the fast primary signal and is left
+    # completely untouched; this only ever narrows the candidate set
+    # further, for bundle IDs the walk couldn't place but Spotlight's index
+    # (unbounded by location/depth/nesting) can still confirm are installed.
+    mdfind_confirmed = _mdfind_confirms_installed(by_id.keys())
+
+    hits = [h for h in by_id.values()
+            if h["mtime"] <= cutoff and h["bundle_id"] not in mdfind_confirmed]
     hits.sort(key=lambda h: h["bundle_id"])
     return hits
 
@@ -1896,7 +2069,7 @@ def app_leftovers_to_targets(hits):
             "id": tid,
             "category": "leftovers",
             "label": "App leftovers: %s" % h["bundle_id"],
-            "description": "Found in: %s — orphaned since the app was removed"
+            "description": "Found in: %s — no installed app matches this bundle ID; review before deleting"
                            % ", ".join(h["locations"]),
             "path": None,
             "paths": h["paths"],

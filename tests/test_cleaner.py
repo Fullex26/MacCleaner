@@ -4323,6 +4323,95 @@ class TestAppLeftoverScanner(unittest.TestCase):
         cfg["skip_paths"] = [str(d)]
         self.assertEqual(cleaner.scan_app_leftovers(cfg), [])
 
+    # -- 3rd whole-branch review: Spotlight (mdfind) as a second, more
+    # thorough confirmation signal layered on top of the directory walk. ---
+
+    def test_mdfind_confirmed_candidate_excluded_even_if_not_in_directory_walk(self):
+        # Real machine: Adobe Creative Cloud, Alfred's nested preferences
+        # helper, a Brother printer utility, and several Adobe daemons live
+        # outside the 3 hardcoded app roots (and/or nested more than one
+        # level deep, or nested inside another .app) -- the directory walk
+        # structurally cannot reach them, but Spotlight's index knows about
+        # them regardless of location/depth/nesting. Mock the confirmation
+        # signal directly (mirrors the simulator scanner's
+        # mock.patch.object(cleaner, "_simctl_json", ...) pattern) so this
+        # test doesn't depend on real Spotlight/machine state.
+        self._leftover_dir("Caches", "com.adobe.acc.adobecreativecloud")
+        with mock.patch.object(cleaner, "_mdfind_confirms_installed",
+                                return_value={"com.adobe.acc.adobecreativecloud"}):
+            self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [],
+                              "an mdfind-confirmed installed app must not be a false positive")
+
+    def test_unconfirmed_by_either_signal_still_surfaces(self):
+        # Regression guard against over-exclusion: a candidate mdfind does
+        # NOT confirm (and the directory walk doesn't know about either)
+        # must still surface as a normal hit.
+        self._leftover_dir("Caches", "com.example.gonezo")
+        with mock.patch.object(cleaner, "_mdfind_confirms_installed",
+                                return_value=set()):
+            hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_directory_walk_installed_check_still_works_independent_of_mdfind(self):
+        # The existing installed_bundle_ids() check must be left completely
+        # untouched by this addition -- an app the directory walk already
+        # finds is still excluded even when mdfind confirms nothing extra.
+        self._install_app("Still.app", "com.example.still")
+        self._leftover_dir("Caches", "com.example.still")
+        with mock.patch.object(cleaner, "_mdfind_confirms_installed",
+                                return_value=set()):
+            self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+
+class TestMdfindConfirmsInstalled(unittest.TestCase):
+    """_mdfind_confirms_installed in isolation -- a single batched mdfind
+    call, graceful degradation on any failure, never one subprocess call
+    per candidate."""
+
+    def test_empty_candidates_short_circuits_without_calling_subprocess(self):
+        with mock.patch.object(cleaner.subprocess, "run") as run:
+            self.assertEqual(cleaner._mdfind_confirms_installed([]), set())
+            run.assert_not_called()
+
+    def test_single_batched_call_not_one_per_candidate(self):
+        candidates = ["com.example.one", "com.example.two", "com.example.three"]
+        with mock.patch.object(cleaner.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["mdfind"], returncode=0, stdout="", stderr="")
+            cleaner._mdfind_confirms_installed(candidates)
+            self.assertEqual(run.call_count, 1)
+
+    def test_subprocess_raising_degrades_to_empty_set(self):
+        # e.g. mdfind missing entirely, or the call times out.
+        with mock.patch.object(cleaner.subprocess, "run",
+                                side_effect=OSError("mdfind not found")):
+            self.assertEqual(
+                cleaner._mdfind_confirms_installed(["com.example.gonezo"]), set())
+
+    def test_nonzero_returncode_degrades_to_empty_set(self):
+        with mock.patch.object(cleaner.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["mdfind"], returncode=1, stdout="", stderr="error")
+            self.assertEqual(
+                cleaner._mdfind_confirms_installed(["com.example.gonezo"]), set())
+
+    def test_confirmed_paths_resolved_to_lowercase_bundle_ids(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            contents = tmp / "Found.app" / "Contents"
+            contents.mkdir(parents=True)
+            with open(contents / "Info.plist", "wb") as f:
+                plistlib.dump({"CFBundleIdentifier": "Com.Example.Found"}, f)
+            app_path = tmp / "Found.app"
+            with mock.patch.object(cleaner.subprocess, "run") as run:
+                run.return_value = subprocess.CompletedProcess(
+                    args=["mdfind"], returncode=0,
+                    stdout=str(app_path) + "\n", stderr="")
+                result = cleaner._mdfind_confirms_installed(["com.example.found"])
+            self.assertEqual(result, {"com.example.found"})
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

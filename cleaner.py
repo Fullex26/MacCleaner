@@ -1845,6 +1845,58 @@ def installed_bundle_ids():
     return ids
 
 
+def _mdfind_confirms_installed(candidates):
+    """Best-effort second confirmation signal, layered on top of (never
+    replacing) installed_bundle_ids()'s directory walk: returns the subset
+    of `candidates` (an iterable of lowercase bundle-ID strings, already
+    shape-validated by _looks_like_bundle_id before they ever reach here --
+    no shell-injection risk from the quoted query values) that Spotlight's
+    metadata index reports as having a real .app bundle ANYWHERE on disk
+    with that exact CFBundleIdentifier -- regardless of location, directory
+    depth, or nesting inside another .app. This is authoritative in a way
+    no hardcoded set of directory roots can be: vendors ship apps in
+    arbitrarily deep/unusual locations (Adobe Creative Cloud four
+    directories deep, printer utilities under /Library/Printers, Steam-
+    bundled games under ~/Library/Application Support/Steam, ...) that
+    installed_bundle_ids()'s bounded top-level-plus-one-wrapper-level walk
+    structurally cannot reach.
+
+    A single batched mdfind call handles every candidate at once (an
+    OR'd query) -- never one subprocess call per candidate, which would be
+    far too slow against the 60-90 candidates a real run can produce. The
+    'c' suffix after each quoted value makes the comparison case-
+    insensitive: CFBundleIdentifier is stored on disk in whatever case the
+    vendor wrote it (e.g. "com.adobe.acc.AdobeCreativeCloud"), while our
+    candidates are always lowercased, so a case-sensitive '==' would silently
+    fail to match real hits.
+
+    Any failure (mdfind missing, Spotlight disabled/not-yet-indexed,
+    timeout, non-zero exit, empty candidate list) returns an empty set --
+    this check only ever narrows the hit list further, it never blocks or
+    crashes the scanner if Spotlight is unavailable."""
+    candidates = [c for c in candidates if c]
+    if not candidates:
+        return set()
+    query = " || ".join(
+        "kMDItemCFBundleIdentifier == '%s'c" % c for c in candidates)
+    try:
+        result = subprocess.run(
+            ["mdfind", query], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return set()
+    if result.returncode != 0:
+        return set()
+    confirmed = set()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        bid = _app_bundle_identifier(Path(line))
+        if bid:
+            confirmed.add(bid)
+    return confirmed
+
+
 def _leftover_library_root():
     return Path(os.environ.get("MACCLEANER_LEFTOVER_LIBRARY_ROOT", str(HOME / "Library")))
 
@@ -1992,7 +2044,15 @@ def scan_app_leftovers(config):
             entry["locations"].append(root_name)
             entry["mtime"] = max(entry["mtime"], st.st_mtime)
 
-    hits = [h for h in by_id.values() if h["mtime"] <= cutoff]
+    # Spotlight second-opinion pass (3rd whole-branch review): the
+    # directory walk above is the fast primary signal and is left
+    # completely untouched; this only ever narrows the candidate set
+    # further, for bundle IDs the walk couldn't place but Spotlight's index
+    # (unbounded by location/depth/nesting) can still confirm are installed.
+    mdfind_confirmed = _mdfind_confirms_installed(by_id.keys())
+
+    hits = [h for h in by_id.values()
+            if h["mtime"] <= cutoff and h["bundle_id"] not in mdfind_confirmed]
     hits.sort(key=lambda h: h["bundle_id"])
     return hits
 
