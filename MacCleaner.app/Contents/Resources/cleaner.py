@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.6.1"
+VERSION = "2.7.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -146,6 +146,7 @@ ALL_CATEGORIES = [
     "ai", "ide", "browsers", "system",
     "flutter", "php", "vms",
     "tmp", "simulators",
+    "leftovers",
 ]
 
 # Frozen snapshot of the category list as of v2.4 — the baseline for the
@@ -184,6 +185,7 @@ CATEGORY_DESCRIPTIONS = {
     "vms":       "VM disks and container runtimes (Colima, Vagrant, minikube) — review carefully",
     "tmp":       "Stale build artifacts in /private/tmp left by tools and AI coding sessions — review carefully",
     "simulators": "Stale iOS simulator devices and unused runtime images (via simctl) — review carefully",
+    "leftovers": "Cache, preference, and saved-state files left behind by apps you've already deleted — review carefully",
 }
 
 DEFAULT_CONFIG = {
@@ -197,6 +199,7 @@ DEFAULT_CONFIG = {
     "project_git_check": True,
     "tmp_min_age_days": 3,           # /tmp dirs younger than this are never offered
     "simulator_stale_days": 30,      # simulators not booted for this long count as stale
+    "app_leftover_min_age_days": 7,  # orphaned app data younger than this is never offered
     "notifications": True,           # notify when a scheduled clean finishes
     "low_disk_alerts": True,         # warn when free space drops below the threshold
     "low_disk_threshold_gb": 10,     # the low-disk warning threshold
@@ -719,6 +722,8 @@ def collect_targets(config, all_categories=False, categories=None, target_ids=No
         targets += tmp_to_targets(scan_tmp_artifacts(config))
     if _wanted("simulators", "simulator-"):
         targets += scan_simulator_targets(config)
+    if _wanted("leftovers", "leftover-"):
+        targets += app_leftovers_to_targets(scan_app_leftovers(config))
     return targets
 
 
@@ -731,6 +736,8 @@ def _target_paths(t):
         skip = t.get("skip", [])
         return [Path(p) for p in sorted(globmod.glob(t["glob"]))
                 if not any(p.startswith(s) for s in skip)]
+    if t.get("paths"):
+        return t["paths"]
     if t.get("path"):
         return [t["path"]]
     return []
@@ -1759,6 +1766,149 @@ def _app_bundle_version(app_path: Path):
             return plistlib.load(f).get("CFBundleShortVersionString")
     except Exception:
         return None
+
+
+INSTALLED_APPS_DIRS_DEFAULT = "/Applications:%s:/System/Applications" % (HOME / "Applications")
+
+
+def _installed_apps_dirs():
+    raw = os.environ.get("MACCLEANER_INSTALLED_APPS_DIRS", INSTALLED_APPS_DIRS_DEFAULT)
+    return [Path(p) for p in raw.split(":") if p]
+
+
+def _app_bundle_identifier(app_path):
+    """CFBundleIdentifier from an app bundle's Info.plist, lowercased, or
+    None if the bundle/plist/key is missing or unreadable. Never raises."""
+    try:
+        with open(app_path / "Contents" / "Info.plist", "rb") as f:
+            bundle_id = plistlib.load(f).get("CFBundleIdentifier")
+        return bundle_id.lower() if bundle_id else None
+    except Exception:
+        return None
+
+
+def installed_bundle_ids():
+    """Bundle IDs of every top-level .app in the configured app-root
+    directories (MACCLEANER_INSTALLED_APPS_DIRS). A missing root or a
+    broken individual bundle is skipped, never fatal to enumeration."""
+    ids = set()
+    for root in _installed_apps_dirs():
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            continue
+        for e in entries:
+            if not e.name.endswith(".app"):
+                continue
+            try:
+                if not e.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            bundle_id = _app_bundle_identifier(Path(e.path))
+            if bundle_id:
+                ids.add(bundle_id)
+    return ids
+
+
+def _leftover_library_root():
+    return Path(os.environ.get("MACCLEANER_LEFTOVER_LIBRARY_ROOT", str(HOME / "Library")))
+
+
+LEFTOVER_ROOTS = ("Caches", "Preferences", "Saved Application State", "HTTPStorages", "WebKit")
+LEFTOVER_EXCLUDE_PREFIXES = ("com.apple.",)
+LEFTOVER_EXCLUDE_EXACT = {"com.fullex.maccleaner"}
+_BUNDLE_ID_SHAPE = re.compile(r'^[a-z0-9]+(\.[a-z0-9-]+)+$')
+
+
+def _looks_like_bundle_id(name):
+    return _BUNDLE_ID_SHAPE.match(name.lower()) is not None
+
+
+def _leftover_excluded(bundle_id):
+    if bundle_id in LEFTOVER_EXCLUDE_EXACT:
+        return True
+    return any(bundle_id.startswith(p) for p in LEFTOVER_EXCLUDE_PREFIXES)
+
+
+def scan_app_leftovers(config):
+    """Top-level scan of five bundle-ID-keyed ~/Library subdirectories for
+    entries whose bundle ID has no matching installed app. Never fuzzy --
+    only names shaped like a reverse-DNS bundle ID are considered, and only
+    the locations Apple's own conventions key by bundle ID (see the v2.7
+    design doc for why Application Support/Containers/LaunchAgents are
+    deliberately out of scope). No new home-only carve-out is needed: every
+    root here is already strictly inside $HOME."""
+    installed = installed_bundle_ids()
+    library_root = _leftover_library_root()
+    min_age = config.get("app_leftover_min_age_days", 7)
+    cutoff = time.time() - min_age * 86400
+
+    by_id = {}
+    for root_name in LEFTOVER_ROOTS:
+        root = library_root / root_name
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            continue
+        for e in entries:
+            name = e.name
+            if root_name == "Preferences":
+                if not name.endswith(".plist"):
+                    continue
+                candidate = name[:-len(".plist")]
+            else:
+                candidate = name
+            candidate = candidate.lower()
+            if not _looks_like_bundle_id(candidate):
+                continue
+            if _leftover_excluded(candidate):
+                continue
+            if candidate in installed:
+                continue
+            try:
+                is_symlink = e.is_symlink()
+                if is_symlink:
+                    continue
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            entry = by_id.setdefault(candidate, {"bundle_id": candidate, "paths": [],
+                                                  "locations": [], "mtime": 0.0})
+            entry["paths"].append(Path(e.path))
+            entry["locations"].append(root_name)
+            entry["mtime"] = max(entry["mtime"], st.st_mtime)
+
+    hits = [h for h in by_id.values() if h["mtime"] <= cutoff]
+    hits.sort(key=lambda h: h["bundle_id"])
+    return hits
+
+
+def app_leftovers_to_targets(hits):
+    targets, seen = [], set()
+    for h in hits:
+        base = "leftover-" + slugify(h["bundle_id"])
+        tid, n = base, 2
+        while tid in seen:
+            tid, n = "%s-%d" % (base, n), n + 1
+        seen.add(tid)
+        targets.append({
+            "id": tid,
+            "category": "leftovers",
+            "label": "App leftovers: %s" % h["bundle_id"],
+            "description": "Found in: %s — orphaned since the app was removed"
+                           % ", ".join(h["locations"]),
+            "path": None,
+            "paths": h["paths"],
+            "glob": None,
+            "skip": [],
+            "safe": False,
+            "cmd": None,
+            "estimate_cmd": None,
+            "estimate_parser": None,
+            "empty_only": False,
+        })
+    return targets
 
 
 def run_doctor(config, json_mode=False):

@@ -7,6 +7,60 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.7.0] — 2026-08-13
+
+App Uninstaller: find orphaned app leftovers left behind after you delete an
+app the normal way (drag to Trash), without ever guessing.
+
+### Added
+- New `leftovers` category: a bundle-ID-precise scanner for cache/preference/
+  saved-state files an app left behind under `~/Library` after you removed
+  it. Detection is never fuzzy — an entry only surfaces when its directory
+  or preference-file name is shaped like a reverse-DNS bundle ID (e.g.
+  `com.example.app`) *and* that exact bundle ID has no matching installed
+  app under `/Applications`, `~/Applications`, or `/System/Applications`.
+  Apple's own bundle ID (and anything under `com.apple.*`) is always
+  excluded, so MacCleaner can never flag itself or the OS. A live, installed
+  app's data is therefore structurally unreachable by this scanner — there's
+  no name-matching heuristic that could misfire.
+- Five locations are scanned, each one Apple already keys by bundle ID:
+  `~/Library/Caches`, `~/Library/Preferences`, `~/Library/Saved Application
+  State`, `~/Library/HTTPStorages`, and `~/Library/WebKit`.
+- New config key `app_leftover_min_age_days` (default `7`) — orphaned data
+  younger than this is never offered, so an app you just uninstalled a
+  minute ago (or reinstalled under a new name) doesn't show up as an
+  immediate false alarm.
+- Two new env overrides, `MACCLEANER_INSTALLED_APPS_DIRS` and
+  `MACCLEANER_LEFTOVER_LIBRARY_ROOT`, so both the installed-app enumeration
+  and the `~/Library` scan root can be sandboxed in tests (and for anyone
+  scripting their own dry runs) — same pattern as `MACCLEANER_TMP_ROOT`.
+- Like the `tmp` and `simulators` categories, every `leftover-*` target is
+  dynamic (`categories --json` never lists one) and always `safe: false` —
+  it needs an explicit `--targets leftover-<id> --yes` or interactive
+  confirmation; an unattended `clean --yes` never touches it.
+
+### Deliberately out of scope for v1
+Three other bundle-ID-adjacent locations are **not** scanned yet:
+- **Containers** — still precisely bundle-ID-matched, but a materially
+  bigger blast radius per target since sandboxed apps can keep substantial
+  persistent data there. A reasonable v1.1 addition once the base scanner
+  has field experience.
+- **Application Support** — keyed by an app's *display name*, not its
+  bundle ID. No reliable identifier survives app deletion, so matching it
+  would mean guessing — the exact imprecision bundle-ID matching was chosen
+  to avoid.
+- **LaunchAgents** — a leftover agent plist is inert on its own, but a
+  helper daemon could in theory still be loaded even after its parent app
+  is gone; safely handling that needs `launchctl` interaction this release
+  doesn't take on.
+
+A future version could snapshot a bundle-ID → display-name map while apps
+are still installed (e.g. during `scan`), which would let a later release
+match Application Support by name even after the app's gone — real new
+statefulness, so it's noted here as a deliberate boundary, not an oversight.
+
+---
+
 ## [2.6.1] — 2026-08-12
 
 ### Fixed
