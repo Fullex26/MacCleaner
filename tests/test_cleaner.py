@@ -4517,5 +4517,140 @@ class TestSwapUsageParsing(unittest.TestCase):
             self.assertIsNone(cleaner._swap_usage())
 
 
+class TestHeldOpenDeletedParsing(unittest.TestCase):
+    """When a process holds a deleted file open, its blocks stay allocated
+    until that process exits -- space no cleaner can reclaim and no
+    directory walk can even see. Report-only for exactly that reason."""
+
+    # Trimmed from real `lsof -nPw +c 0 +L1` output. NODE 195277532 appears
+    # under THREE processes (one shared inode) and NODE 195277705 appears
+    # TWICE under one process (txt + fd 22u). Both are the real
+    # double-counting traps this parser exists to avoid -- on the machine
+    # this was captured from, naive summing overstated the total by 65%.
+    REAL_OUTPUT = (
+        "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NLINK NODE NAME\n"
+        "UserEventAgent 115 jordanfuller txt REG 1,18 56216 0 195277532 /a/.plist-cache\n"
+        "SpringBoard 119 jordanfuller txt REG 1,18 56216 0 195277532 /a/.plist-cache\n"
+        "logd 120 jordanfuller txt REG 1,18 56216 0 195277532 /a/.plist-cache\n"
+        "SpringBoard 119 jordanfuller txt REG 1,18 6389760 0 195277705 /a/Poster\n"
+        "SpringBoard 119 jordanfuller 22u REG 1,18 6389760 0 195277705 /a/Poster\n"
+        "diskimages-helper 456 jordanfuller 5u REG 1,18 3221225472 0 999001 /a/symbols.dmg\n"
+    )
+
+    def test_dedupes_one_inode_shared_by_several_processes(self):
+        r = cleaner._parse_held_open_deleted(self.REAL_OUTPUT)
+        self.assertEqual(r["total_bytes"], 56216 + 6389760 + 3221225472)
+
+    def test_dedupes_several_fds_on_one_inode(self):
+        r = cleaner._parse_held_open_deleted(self.REAL_OUTPUT)
+        self.assertEqual(dict(r["by_command"])["SpringBoard"], 6389760)
+
+    def test_per_command_totals_sum_to_grand_total(self):
+        r = cleaner._parse_held_open_deleted(self.REAL_OUTPUT)
+        self.assertEqual(sum(b for _, b in r["by_command"]), r["total_bytes"])
+
+    def test_largest_holder_sorts_first(self):
+        r = cleaner._parse_held_open_deleted(self.REAL_OUTPUT)
+        self.assertEqual(r["by_command"][0][0], "diskimages-helper")
+
+    def test_ignores_non_regular_files_and_offset_rows(self):
+        out = ("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NLINK NODE NAME\n"
+               "someproc 1 u 3u DIR 1,18 1024 0 111 /d\n"
+               "someproc 1 u 4u REG 1,18 0t4096 0 222 /f\n")
+        self.assertEqual(cleaner._parse_held_open_deleted(out)["total_bytes"], 0)
+
+    def test_unescapes_spaces_in_command_names(self):
+        # `+c 0` renders embedded spaces as a literal \x20 escape.
+        out = ("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NLINK NODE NAME\n"
+               "Spotify\\x20Helper 7 u 3u REG 1,18 1048576 0 333 /f\n")
+        r = cleaner._parse_held_open_deleted(out)
+        self.assertEqual(r["by_command"][0][0], "Spotify Helper")
+
+    def test_empty_output_is_zero(self):
+        self.assertEqual(cleaner._parse_held_open_deleted("")["total_bytes"], 0)
+
+    def test_collector_degrades_when_lsof_missing(self):
+        with mock.patch.object(cleaner.subprocess, "run",
+                               side_effect=OSError("no lsof")):
+            self.assertIsNone(cleaner._held_open_deleted())
+
+    def test_collector_degrades_on_empty_output(self):
+        # lsof exits non-zero with no output when nothing matches +L1.
+        fake = mock.Mock(returncode=1, stdout="")
+        with mock.patch.object(cleaner.subprocess, "run", return_value=fake):
+            self.assertIsNone(cleaner._held_open_deleted())
+
+
+class TestDoctorPressureChecks(unittest.TestCase):
+    def _checks(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cleaner.run_doctor(json.loads(json.dumps(cleaner.DEFAULT_CONFIG)),
+                               json_mode=True)
+        return {c["name"]: c for c in json.loads(buf.getvalue())["checks"]}
+
+    def test_swap_ok_when_low(self):
+        with mock.patch.object(cleaner, "_swap_usage",
+                               return_value={"total_bytes": 2 * 1024 ** 3,
+                                             "used_bytes": 512 * 1024 ** 2,
+                                             "percent": 25.0}), \
+             mock.patch.object(cleaner, "_held_open_deleted", return_value=None):
+            checks = self._checks()
+        self.assertTrue(checks["Swap"]["ok"])
+
+    def test_swap_flags_high_usage(self):
+        with mock.patch.object(cleaner, "_swap_usage",
+                               return_value={"total_bytes": 16 * 1024 ** 3,
+                                             "used_bytes": 15 * 1024 ** 3,
+                                             "percent": 93.8}), \
+             mock.patch.object(cleaner, "_held_open_deleted", return_value=None):
+            checks = self._checks()
+        self.assertFalse(checks["Swap"]["ok"])
+
+    def test_swap_reports_unknown_rather_than_failing(self):
+        with mock.patch.object(cleaner, "_swap_usage", return_value=None), \
+             mock.patch.object(cleaner, "_held_open_deleted", return_value=None):
+            checks = self._checks()
+        self.assertTrue(checks["Swap"]["ok"])
+
+    def test_held_open_omitted_below_threshold(self):
+        with mock.patch.object(cleaner, "_swap_usage", return_value=None), \
+             mock.patch.object(cleaner, "_held_open_deleted",
+                               return_value={"total_bytes": 5 * 1024 ** 2,
+                                             "by_command": [("foo", 5 * 1024 ** 2)]}):
+            checks = self._checks()
+        self.assertNotIn("Held-open files", checks)
+
+    def test_held_open_flags_and_names_process_above_threshold(self):
+        with mock.patch.object(cleaner, "_swap_usage", return_value=None), \
+             mock.patch.object(cleaner, "_held_open_deleted",
+                               return_value={"total_bytes": 3 * 1024 ** 3,
+                                             "by_command": [("diskimages-helper",
+                                                             3 * 1024 ** 3)]}):
+            checks = self._checks()
+        self.assertFalse(checks["Held-open files"]["ok"])
+        self.assertIn("diskimages-helper", checks["Held-open files"]["status"])
+
+    def test_held_open_names_biggest_when_none_clear_per_process_floor(self):
+        many = [("p%d" % i, 6 * 1024 ** 2) for i in range(100)]
+        with mock.patch.object(cleaner, "_swap_usage", return_value=None), \
+             mock.patch.object(cleaner, "_held_open_deleted",
+                               return_value={"total_bytes": 600 * 1024 ** 2,
+                                             "by_command": many}):
+            checks = self._checks()
+        self.assertIn("Held-open files", checks)
+        self.assertIn("p0", checks["Held-open files"]["status"])
+
+    def test_doctor_still_exits_zero_with_failing_checks(self):
+        # run_doctor returns all_ok but main() deliberately discards it, so
+        # `doctor` always exits 0. CI's smoke test runs bare
+        # `python3 cleaner.py doctor` -- wiring these new ok=False checks to
+        # an exit code would break the build.
+        env = dict(os.environ, MACCLEANER_CONFIG=str(Path(tempfile.mkdtemp()) / "c.json"))
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"), "doctor"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

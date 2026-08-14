@@ -2139,6 +2139,58 @@ def _swap_usage():
     return _parse_swap_usage(result.stdout)
 
 
+HELD_OPEN_WARN_BYTES = 500 * 1024 ** 2
+HELD_OPEN_PROC_FLOOR_BYTES = 10 * 1024 ** 2
+HELD_OPEN_MAX_NAMED = 3
+
+
+def _parse_held_open_deleted(output):
+    """Parse `lsof -nPw +c 0 +L1` into deleted-but-still-open regular files.
+
+    Columns: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NLINK NODE NAME.
+
+    Dedupes by (DEVICE, NODE): one deleted inode shows up once per holding
+    process AND once per fd within a process, so a naive per-line sum
+    massively overstates the total (measured 7778 MB vs a true 4717 MB on a
+    real machine). Each inode is attributed to the first command seen
+    holding it, so per-command figures sum exactly to total_bytes."""
+    seen = {}
+    for line in output.splitlines():
+        f = line.split()
+        if len(f) < 10 or f[4] != "REG":
+            continue
+        command, dev, size, nlink, node = f[0], f[5], f[6], f[7], f[8]
+        # SIZE/OFF holds an offset ("0t4096") for some fds -- only real sizes.
+        if not size.isdigit() or nlink != "0":
+            continue
+        key = (dev, node)
+        if key in seen:
+            continue
+        # `+c 0` keeps full command names but escapes spaces as \x20.
+        seen[key] = (command.replace("\\x20", " "), int(size))
+    per = {}
+    for command, size in seen.values():
+        per[command] = per.get(command, 0) + size
+    return {
+        "total_bytes": sum(b for _, b in seen.values()),
+        "by_command": sorted(per.items(), key=lambda kv: (-kv[1], kv[0])),
+    }
+
+
+def _held_open_deleted():
+    """Deleted-but-still-open file usage, or None when lsof can't answer."""
+    try:
+        result = subprocess.run(["lsof", "-nPw", "+c", "0", "+L1"],
+                                capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    # lsof exits non-zero when it merely found nothing (or couldn't probe
+    # some mount) while still printing usable rows -- judge by output.
+    if not result.stdout:
+        return None
+    return _parse_held_open_deleted(result.stdout)
+
+
 def run_doctor(config, json_mode=False):
     checks = []
 
@@ -2260,6 +2312,27 @@ def run_doctor(config, json_mode=False):
         check("Swap",
               f"{fmt_size(swap['used_bytes'])} of {fmt_size(swap['total_bytes'])} used "
               f"({swap['percent']}%)")
+
+    # Deleted-but-still-open files (2.8.0). Report-only: the space returns by
+    # itself the moment the holding process exits, and killing someone's
+    # process is not a cleanup action this tool should take.
+    held = _held_open_deleted()
+    if held and held["total_bytes"] >= HELD_OPEN_WARN_BYTES:
+        named = [(c, b) for c, b in held["by_command"]
+                 if b >= HELD_OPEN_PROC_FLOOR_BYTES]
+        # Many small holders can clear the total threshold while no single
+        # one clears the per-process floor -- still name the biggest.
+        if not named:
+            named = held["by_command"]
+        shown = named[:HELD_OPEN_MAX_NAMED]
+        detail = ", ".join(f"{c} ({fmt_size(b)})" for c, b in shown)
+        rest = len(named) - len(shown)
+        if rest > 0:
+            detail += f" +{rest} more process{'es' if rest > 1 else ''}"
+        check("Held-open files",
+              f"{fmt_size(held['total_bytes'])} of deleted files still held open by "
+              f"{detail} — the space frees itself when they exit",
+              ok=False)
 
     all_ok = all(c["ok"] for c in checks)
 
