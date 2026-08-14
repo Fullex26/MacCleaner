@@ -21,9 +21,9 @@ eq "prefix filter 'sc'"   "scan schedule" "$(B 'maccleaner sc' | tr '\n' ' ' | s
 eq "schedule actions"     "status weekly monthly off" "$(B 'maccleaner schedule ' | grep -v '^--' | tr '\n' ' ' | sed 's/ $//')"
 eq "schedule after action" "--json --help" "$(B 'maccleaner schedule weekly ' | tr '\n' ' ' | sed 's/ $//')"
 eq "clean flags"          "9"  "$(B 'maccleaner clean --' | wc -l | tr -d ' ')"
-eq "targets 1st value"    "80" "$(B 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
-eq "targets 2nd value"    "79" "$(B 'maccleaner clean --targets npm-cache,' | wc -l | tr -d ' ')"
-eq "targets 3rd value"    "78" "$(B 'maccleaner clean --targets npm-cache,pip-cache,' | wc -l | tr -d ' ')"
+eq "targets 1st value"    "83" "$(B 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
+eq "targets 2nd value"    "82" "$(B 'maccleaner clean --targets npm-cache,' | wc -l | tr -d ' ')"
+eq "targets 3rd value"    "81" "$(B 'maccleaner clean --targets npm-cache,pip-cache,' | wc -l | tr -d ' ')"
 eq "comma keeps prefix"   "npm-cache,pip-cache" "$(B 'maccleaner clean --targets npm-cache,pip')"
 eq "equals form"          "npm-cache,pip-cache" "$(B 'maccleaner clean --targets=npm-cache,pip')"
 eq "no dupes offered"     "0"  "$(B 'maccleaner clean --targets npm-cache,' | grep -cx 'npm-cache')"
@@ -40,16 +40,16 @@ eq "alias mpreview flags"  "--category --min-size --all --json --help" "$(B 'mpr
 eq "alias mpreview --a"    "--all " "$(B 'mpreview --a')"
 eq "alias mreport flags"   "-n --limit --json --help" "$(B 'mreport ' | tr '\n' ' ' | sed 's/ $//')"
 eq "alias mreport --l"     "--limit " "$(B 'mreport --l')"
-eq "alias mclean --targets" "80" "$(B 'mclean --targets ' | wc -l | tr -d ' ')"
+eq "alias mclean --targets" "83" "$(B 'mclean --targets ' | wc -l | tr -d ' ')"
 
 echo "Tier 3: zsh behaviour (zpty + compadd -O capture)"
 Z(){ "$HERE/capture.zsh" "$HERE" "$1"; }
 eq "zsh subcommands"      "10" "$(Z 'maccleaner ' | wc -l | tr -d ' ')"
 eq "zsh prefix 'sc'"      "scan schedule" "$(Z 'maccleaner sc' | tr '\n' ' ' | sed 's/ $//')"
 eq "zsh schedule action"  "monthly off status weekly" "$(Z 'maccleaner schedule ' | tr '\n' ' ' | sed 's/ $//')"
-eq "zsh targets 1st"      "80" "$(Z 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
-eq "zsh targets 2nd"      "79" "$(Z 'maccleaner clean --targets npm-cache,' | wc -l | tr -d ' ')"
-eq "zsh targets 3rd"      "78" "$(Z 'maccleaner clean --targets npm-cache,pip-cache,' | wc -l | tr -d ' ')"
+eq "zsh targets 1st"      "83" "$(Z 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
+eq "zsh targets 2nd"      "82" "$(Z 'maccleaner clean --targets npm-cache,' | wc -l | tr -d ' ')"
+eq "zsh targets 3rd"      "81" "$(Z 'maccleaner clean --targets npm-cache,pip-cache,' | wc -l | tr -d ' ')"
 eq "zsh config set keys"  "15" "$(Z 'maccleaner config set ' | wc -l | tr -d ' ')"
 eq "zsh engine down"      "23" "$(env MACCLEANER_ENGINE=/nope HOME=/tmp/nohome "$HERE/capture.zsh" "$HERE" 'maccleaner config enable ' | wc -l | tr -d ' ')"
 
@@ -65,11 +65,11 @@ eq "zsh alias mreport --l"  "--limit" "$(Z 'mreport --l' | tr '\n' ' ' | sed 's/
 # join-to-scalar actually loses structure. These reproduce the parity numbers
 # checked by hand against the non-alias path (`maccleaner clean --targets ...`).
 eq "zsh alias mclean --targets (multi-word tail)" \
-   "79" "$(Z 'mclean --targets npm-cache,' | wc -l | tr -d ' ')"
+   "82" "$(Z 'mclean --targets npm-cache,' | wc -l | tr -d ' ')"
 eq "zsh alias mclean --yes --targets (3-word tail)" \
-   "79" "$(Z 'mclean --yes --targets npm-cache,' | wc -l | tr -d ' ')"
+   "82" "$(Z 'mclean --yes --targets npm-cache,' | wc -l | tr -d ' ')"
 eq "zsh non-alias parity for the same case" \
-   "79" "$(Z 'maccleaner clean --targets npm-cache,' | wc -l | tr -d ' ')"
+   "82" "$(Z 'maccleaner clean --targets npm-cache,' | wc -l | tr -d ' ')"
 
 echo "Tier 3c: real inserted text (buffer_capture drives an actual TAB press,"
 echo "not just the candidate set -- this is what catches C1/I2-class bugs)"

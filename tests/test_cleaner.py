@@ -4413,5 +4413,45 @@ class TestMdfindConfirmsInstalled(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestNewTargetsV28(unittest.TestCase):
+    def setUp(self):
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        self.targets = {t["id"]: t
+                        for t in cleaner.get_targets(self.cfg, all_categories=True)}
+
+    def test_xcodebuildmcp_target(self):
+        t = self.targets["xcodebuildmcp-workspaces"]
+        self.assertEqual(t["category"], "xcode")
+        self.assertTrue(t["safe"])
+        self.assertIsNone(t["glob"])
+        self.assertTrue(str(t["path"]).endswith("Library/Developer/XcodeBuildMCP"))
+
+    def test_chrome_model_store_target(self):
+        t = self.targets["chrome-optimization-model-store"]
+        self.assertEqual(t["category"], "caches")
+        self.assertTrue(t["safe"])
+        self.assertIsNone(t["glob"])
+        self.assertTrue(str(t["path"]).endswith("optimization_guide_model_store"))
+
+    def test_chrome_hint_cache_is_per_profile_glob(self):
+        # Chrome keeps one of these per profile (Default, Profile 1,
+        # Profile 3, ...), so this target must be a glob like the existing
+        # firefox-cache target -- a fixed path would only ever match one
+        # profile.
+        t = self.targets["chrome-optimization-hint-cache"]
+        self.assertEqual(t["category"], "caches")
+        self.assertTrue(t["safe"])
+        self.assertIsNone(t["path"])
+        self.assertIn("*", t["glob"])
+        self.assertTrue(t["glob"].endswith("optimization_guide_hint_cache_store"))
+
+    def test_new_targets_respect_skip_paths(self):
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg["skip_paths"] = ["~/Library/Developer/XcodeBuildMCP"]
+        ids = {t["id"] for t in cleaner.get_targets(cfg, all_categories=True)}
+        self.assertNotIn("xcodebuildmcp-workspaces", ids)
+        self.assertIn("chrome-optimization-model-store", ids)
+
+
 if __name__ == "__main__":
     unittest.main()

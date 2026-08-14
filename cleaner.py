@@ -470,6 +470,9 @@ def get_targets(config, all_categories=False):
     # Xcode (v2.1 addition — place with the other xcode adds)
     add("xcode", "xcode-doc-cache", "Xcode documentation cache", "~/Library/Developer/Xcode/DocumentationCache",
         desc="Downloaded documentation indexes; re-fetched on demand")
+    add("xcode", "xcodebuildmcp-workspaces", "XcodeBuildMCP workspaces",
+        "~/Library/Developer/XcodeBuildMCP",
+        desc="Workspace scratch data written by the XcodeBuildMCP tool; regenerated on next build")
 
     # Docker
     add("docker", "docker-prune", "Docker unused data", None,
@@ -571,6 +574,12 @@ def get_targets(config, all_categories=False):
         desc="Cursor editor cache")
     add("caches", "chrome-cache", "Chrome cache", "~/Library/Application Support/Google/Chrome/Default/Cache",
         desc="Chrome default-profile web cache")
+    add("caches", "chrome-optimization-model-store", "Chrome on-device models",
+        "~/Library/Application Support/Google/Chrome/optimization_guide_model_store",
+        desc="Chrome's downloaded on-device ML prediction models; re-downloaded on demand")
+    add("caches", "chrome-optimization-hint-cache", "Chrome optimization hints",
+        "~/Library/Application Support/Google/Chrome/*/optimization_guide_hint_cache_store",
+        desc="Chrome's per-profile page-optimization hint cache; regenerated on demand")
     add("caches", "spotify-cache", "Spotify cache", "~/Library/Application Support/Spotify/Data",
         desc="Spotify streamed-audio cache")
     add("caches", "slack-cache", "Slack cache", "~/Library/Application Support/Slack/Cache",
