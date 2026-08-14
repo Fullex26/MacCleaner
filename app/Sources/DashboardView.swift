@@ -106,12 +106,20 @@ struct DashboardView: View {
                     }
                 }
                 .frame(maxHeight: 240)
-            } else {
+            } else if bridge.storageInsights != nil {
                 // Only reached once a scan has actually succeeded and
-                // returned zero qualifying entries.
+                // returned zero qualifying entries — gated on
+                // `storageInsights != nil` so this is literally true; see
+                // the trailing `else` below for the pre-scan case.
                 Text("No files ≥100 MB found in Documents, Downloads, or Desktop.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            } else {
+                // Brief initial-render flash before the `.task` below has
+                // started the first scan (storageInsights/storageInsightsError
+                // both still nil and isScanningStorageInsights hasn't flipped
+                // true yet) — render nothing rather than a misleading state.
+                EmptyView()
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -120,8 +128,17 @@ struct DashboardView: View {
         .task {
             // Fetch once: don't re-walk the filesystem every time the
             // Dashboard reappears (e.g. switching sidebar sections and
-            // back) when data or an error is already present.
-            if bridge.storageInsights == nil && bridge.storageInsightsError == nil {
+            // back) when data or an error is already present, AND don't
+            // start a second concurrent walk if one is already in flight.
+            // The `isScanningStorageInsights` check matters because this
+            // view is torn down and recreated every time the user switches
+            // sidebar sections and back (see the `switch` in
+            // MacCleanerApp.swift) — `storageInsights`/`storageInsightsError`
+            // both stay nil for the whole multi-second duration of a scan,
+            // so without this check, switching away and back mid-scan would
+            // re-enter this `.task` and kick off a second filesystem walk.
+            if bridge.storageInsights == nil && bridge.storageInsightsError == nil
+                && !bridge.isScanningStorageInsights {
                 await bridge.scanStorageInsights()
             }
         }
@@ -139,7 +156,17 @@ struct DashboardView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button {
-                    Task { await bridge.scan() }
+                    // Manual refresh covers both the main reclaimable-targets
+                    // report AND the Large Files panel — otherwise the panel,
+                    // which the `.task` above only ever fetches once, would
+                    // have no way to refresh for the entire app session (e.g.
+                    // after the user downloads a new large file, or after
+                    // fixing whatever caused a prior scan error). Sequential
+                    // is fine here — this isn't performance-critical.
+                    Task {
+                        await bridge.scan()
+                        await bridge.scanStorageInsights()
+                    }
                 } label: {
                     Label(bridge.isScanning ? "Scanning…" : "Scan", systemImage: "arrow.clockwise")
                 }
