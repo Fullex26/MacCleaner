@@ -1338,6 +1338,60 @@ TMP_CLONE_ARTIFACTS = {
     "dist", ".next", "Pods", ".venv", "venv",
 }
 
+# ── Storage Insights (read-only, never wired into the delete pipeline) ────────
+STORAGE_INSIGHTS_MIN_BYTES = 100 * 1024 * 1024
+STORAGE_INSIGHTS_MAX_RESULTS = 50
+STORAGE_INSIGHTS_ROOTS_DEFAULT = f"{HOME}/Documents:{HOME}/Downloads:{HOME}/Desktop"
+_STORAGE_INSIGHTS_SKIP_DIRS = set(ARTIFACT_MANIFESTS) | TMP_CLONE_ARTIFACTS
+
+
+def _storage_insights_roots():
+    raw = os.environ.get("MACCLEANER_STORAGE_INSIGHTS_ROOTS", STORAGE_INSIGHTS_ROOTS_DEFAULT)
+    return [Path(p) for p in raw.split(":") if p]
+
+
+def scan_storage_insights(config):
+    """Read-only scan of the configured roots (default ~/Documents,
+    ~/Downloads, ~/Desktop) for files >= STORAGE_INSIGHTS_MIN_BYTES.
+
+    stat()-only -- never opens file contents, so it can never trigger an
+    iCloud download of an evicted file. Skips known dev-artifact
+    directories (the same names scan_projects treats as noise) and never
+    descends into a .app bundle. Never follows symlinks -- both symlinked
+    directories and symlinked files are skipped entirely. Iterative
+    (explicit stack), not recursive, so an unusually deep directory tree
+    can't hit Python's recursion limit. Returns up to
+    STORAGE_INSIGHTS_MAX_RESULTS entries, largest first.
+
+    This function is architecturally outside the delete pipeline: no
+    `safe` field, no category, no target id, never passed to
+    get_targets()/collect_targets()/delete_target()."""
+    hits = []
+    stack = [r for r in _storage_insights_roots() if r.is_dir()]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink():
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    if e.name in _STORAGE_INSIGHTS_SKIP_DIRS or e.name.endswith(".app"):
+                        continue
+                    stack.append(Path(e.path))
+                elif e.is_file(follow_symlinks=False):
+                    st = e.stat(follow_symlinks=False)
+                    if st.st_size >= STORAGE_INSIGHTS_MIN_BYTES:
+                        hits.append({"path": Path(e.path), "size_bytes": st.st_size,
+                                     "mtime": st.st_mtime})
+            except OSError:
+                continue
+    hits.sort(key=lambda h: h["size_bytes"], reverse=True)
+    return hits[:STORAGE_INSIGHTS_MAX_RESULTS]
+
 # ── Simulator dynamic targets ─────────────────────────────────────────────────
 # Device UDIDs and runtime identifiers from `simctl ... -j` output end up
 # interpolated into shell cmd strings (delete_target runs cmd targets with

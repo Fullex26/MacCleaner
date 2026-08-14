@@ -4990,5 +4990,114 @@ class TestDoctorPressureChecks(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestStorageInsightsScanner(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.docs = self.tmp / "Documents"
+        self.downloads = self.tmp / "Downloads"
+        self.desktop = self.tmp / "Desktop"
+        for d in (self.docs, self.downloads, self.desktop):
+            d.mkdir()
+        self._patch = mock.patch.dict(os.environ, {
+            "MACCLEANER_STORAGE_INSIGHTS_ROOTS":
+                f"{self.docs}:{self.downloads}:{self.desktop}"
+        })
+        self._patch.start()
+        self.cfg = {}
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_file(self, root, name, mb):
+        p = root / name
+        p.write_bytes(b"\0" * (mb * 1024 * 1024))
+        return p
+
+    def test_finds_file_above_floor(self):
+        self._make_file(self.docs, "big.mov", 150)
+        hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["path"], self.docs / "big.mov")
+        self.assertEqual(hits[0]["size_bytes"], 150 * 1024 * 1024)
+
+    def test_excludes_file_below_floor(self):
+        self._make_file(self.docs, "small.pdf", 50)
+        self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
+
+    def test_scans_all_three_roots(self):
+        self._make_file(self.docs, "a.mov", 120)
+        self._make_file(self.downloads, "b.dmg", 130)
+        self._make_file(self.desktop, "c.zip", 140)
+        hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual({h["path"].name for h in hits}, {"a.mov", "b.dmg", "c.zip"})
+
+    def test_sorted_largest_first(self):
+        self._make_file(self.docs, "small.mov", 110)
+        self._make_file(self.docs, "big.mov", 500)
+        hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual([h["path"].name for h in hits], ["big.mov", "small.mov"])
+
+    def test_caps_at_max_results(self):
+        for i in range(cleaner.STORAGE_INSIGHTS_MAX_RESULTS + 5):
+            self._make_file(self.docs, f"f{i}.bin", 101)
+        hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual(len(hits), cleaner.STORAGE_INSIGHTS_MAX_RESULTS)
+
+    def test_skips_dev_artifact_directory(self):
+        nm = self.docs / "some-project" / "node_modules"
+        nm.mkdir(parents=True)
+        self._make_file(nm, "bundle.js", 120)
+        self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
+
+    def test_skips_app_bundle_contents(self):
+        app_contents = self.docs / "SomeApp.app" / "Contents" / "MacOS"
+        app_contents.mkdir(parents=True)
+        self._make_file(app_contents, "SomeApp", 200)
+        self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
+
+    def test_symlinked_directory_not_followed(self):
+        real = self.tmp / "real_outside"
+        real.mkdir()
+        self._make_file(real, "huge.bin", 300)
+        link = self.docs / "linked"
+        link.symlink_to(real)
+        self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
+
+    def test_symlinked_file_not_reported(self):
+        real_file = self._make_file(self.tmp, "real.bin", 200)
+        link = self.docs / "link.bin"
+        link.symlink_to(real_file)
+        self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
+
+    def test_missing_root_not_fatal(self):
+        with mock.patch.dict(os.environ, {
+                "MACCLEANER_STORAGE_INSIGHTS_ROOTS":
+                str(self.tmp / "does-not-exist")}):
+            self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
+
+    def test_never_opens_file_contents(self):
+        # The entire iCloud-eviction-safety guarantee rests on this: the
+        # scanner must never call open() on anything it scans. Patching
+        # builtins.open to raise proves it by construction rather than by
+        # inspection.
+        self._make_file(self.docs, "big.mov", 150)
+        with mock.patch("builtins.open", side_effect=AssertionError(
+                "scan_storage_insights must never open file contents")):
+            hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual(len(hits), 1)
+
+    def test_default_roots_env_unset(self):
+        # Without the override, the function must fall back to the real
+        # ~/Documents:~/Downloads:~/Desktop default -- verify the default
+        # string is built correctly rather than raising or returning None.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MACCLEANER_STORAGE_INSIGHTS_ROOTS", None)
+            roots = cleaner._storage_insights_roots()
+        self.assertEqual(roots, [cleaner.HOME / "Documents",
+                                  cleaner.HOME / "Downloads",
+                                  cleaner.HOME / "Desktop"])
+
+
 if __name__ == "__main__":
     unittest.main()
