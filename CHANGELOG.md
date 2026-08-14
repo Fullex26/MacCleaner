@@ -7,6 +7,51 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.8.0] — 2026-08-14
+
+Three new safe cleanup targets, plus two report-only `doctor` checks that
+explain disk and memory pressure MacCleaner deliberately does not act on.
+
+### Added
+- Three new `safe` cleanup targets in existing categories (no new categories,
+  no changed IDs — purely additive):
+  - `xcodebuildmcp-workspaces` (`xcode`) — `~/Library/Developer/XcodeBuildMCP`,
+    workspace scratch data written by the XcodeBuildMCP tool. Regenerated on
+    the next build. Measured 1.0 GB on the dev machine.
+  - `chrome-optimization-model-store` (`caches`) — `~/Library/Application
+    Support/Google/Chrome/optimization_guide_model_store`, Chrome's downloaded
+    on-device ML prediction models. Re-downloaded on demand.
+  - `chrome-optimization-hint-cache` (`caches`) — `~/Library/Application
+    Support/Google/Chrome/*/optimization_guide_hint_cache_store`, Chrome's
+    per-profile page-optimization hint cache. Globbed across every profile
+    (`Default`, `Profile 1`, …) and regenerated on demand.
+- `doctor` gained a **`Swap`** check (report-only). Reads `sysctl
+  vm.swapusage` and reports used-of-total with a percentage, flagging
+  `ok: false` at 75% or more. This check **reclaims nothing and offers no
+  cleanup action**: macOS owns the swap file and shrinks it on its own as
+  memory pressure drops, so there is nothing here MacCleaner could safely
+  delete. It exists to explain disk usage you'd otherwise go hunting for.
+  Zero total swap reports "not in use".
+- `doctor` gained a **`Held-open files`** check (report-only, and shown only
+  when the total reaches 500 MB). Runs `lsof -nPw +c 0 +L1` to find files
+  that have been deleted but are still held open by a running process, and
+  names the largest holders. **It reports; it does not act** — and
+  deliberately so: that space comes back by itself the moment the holding
+  process exits, so the fix is to quit or restart that process, not to
+  delete anything. MacCleaner will never kill a process on your behalf. The
+  sum dedupes by device+inode, so one deleted file held by several processes
+  (or several file descriptors) is counted once rather than multiplied.
+
+### Notes
+- Both new checks are best-effort. If `sysctl` or `lsof` is missing, exits
+  non-zero, times out, or prints something unparseable, the check degrades
+  quietly — `Swap` reports "could not determine swap usage" and `Held-open
+  files` is omitted entirely. Neither can fail a `doctor` run.
+- `doctor` still always exits `0`, including when either new check reports
+  `ok: false`. Parse the JSON `ok` field rather than the exit status.
+- Both thresholds (75% swap; 500 MB held-open) are hardcoded. No new
+  `config.json` keys were added in this release.
+
 ## [2.7.0] — 2026-08-13
 
 App Uninstaller: find orphaned app leftovers left behind after you delete an

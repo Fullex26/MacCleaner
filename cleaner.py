@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [

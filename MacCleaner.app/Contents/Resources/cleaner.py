@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -470,6 +470,9 @@ def get_targets(config, all_categories=False):
     # Xcode (v2.1 addition — place with the other xcode adds)
     add("xcode", "xcode-doc-cache", "Xcode documentation cache", "~/Library/Developer/Xcode/DocumentationCache",
         desc="Downloaded documentation indexes; re-fetched on demand")
+    add("xcode", "xcodebuildmcp-workspaces", "XcodeBuildMCP workspaces",
+        "~/Library/Developer/XcodeBuildMCP",
+        desc="Workspace scratch data written by the XcodeBuildMCP tool; regenerated on next build")
 
     # Docker
     add("docker", "docker-prune", "Docker unused data", None,
@@ -571,6 +574,12 @@ def get_targets(config, all_categories=False):
         desc="Cursor editor cache")
     add("caches", "chrome-cache", "Chrome cache", "~/Library/Application Support/Google/Chrome/Default/Cache",
         desc="Chrome default-profile web cache")
+    add("caches", "chrome-optimization-model-store", "Chrome on-device models",
+        "~/Library/Application Support/Google/Chrome/optimization_guide_model_store",
+        desc="Chrome's downloaded on-device ML prediction models; re-downloaded on demand")
+    add("caches", "chrome-optimization-hint-cache", "Chrome optimization hints",
+        "~/Library/Application Support/Google/Chrome/*/optimization_guide_hint_cache_store",
+        desc="Chrome's per-profile page-optimization hint cache; regenerated on demand")
     add("caches", "spotify-cache", "Spotify cache", "~/Library/Application Support/Spotify/Data",
         desc="Spotify streamed-audio cache")
     add("caches", "slack-cache", "Slack cache", "~/Library/Application Support/Slack/Cache",
@@ -2084,6 +2093,104 @@ def app_leftovers_to_targets(hits):
     return targets
 
 
+# ── Doctor: system-pressure signals (2.8.0) ────────────────────────────────────
+SWAP_WARN_PERCENT = 75
+
+_SWAP_UNITS = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+
+
+def _parse_swap_usage(output):
+    """Parse `sysctl vm.swapusage` into {total_bytes, used_bytes, percent},
+    or None if the text can't be read. Real format:
+
+        vm.swapusage: total = 16384.00M  used = 15571.88M  free = 812.12M  (encrypted)
+
+    Never raises -- doctor reports "could not determine" rather than failing
+    the whole run."""
+    fields = {}
+    for name in ("total", "used"):
+        m = re.search(r"\b%s\s*=\s*([0-9.]+)([BKMGT])" % name, output)
+        if not m:
+            return None
+        try:
+            fields[name] = float(m.group(1)) * _SWAP_UNITS[m.group(2)]
+        except ValueError:
+            # `[0-9.]+` also matches non-numbers like "1.2.3" or ".". Real
+            # sysctl can't emit those (the kernel uses a fixed %.2f), but the
+            # parser must degrade to None rather than raise -- _swap_usage()
+            # calls it outside its own try, so a raise here would escape
+            # run_doctor() and break doctor's exit-0 guarantee.
+            return None
+    total, used = int(fields["total"]), int(fields["used"])
+    # Swap disabled / freshly booted reports 0.00M total -- don't divide by it.
+    percent = round(used / total * 100, 1) if total else 0.0
+    return {"total_bytes": total, "used_bytes": used, "percent": percent}
+
+
+def _swap_usage():
+    """Current swap usage, or None when sysctl can't answer."""
+    try:
+        result = subprocess.run(["sysctl", "vm.swapusage"],
+                                capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_swap_usage(result.stdout)
+
+
+HELD_OPEN_WARN_BYTES = 500 * 1024 ** 2
+HELD_OPEN_PROC_FLOOR_BYTES = 10 * 1024 ** 2
+HELD_OPEN_MAX_NAMED = 3
+
+
+def _parse_held_open_deleted(output):
+    """Parse `lsof -nPw +c 0 +L1` into deleted-but-still-open regular files.
+
+    Columns: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NLINK NODE NAME.
+
+    Dedupes by (DEVICE, NODE): one deleted inode shows up once per holding
+    process AND once per fd within a process, so a naive per-line sum
+    massively overstates the total (measured 7778 MB vs a true 4717 MB on a
+    real machine). Each inode is attributed to the first command seen
+    holding it, so per-command figures sum exactly to total_bytes."""
+    seen = {}
+    for line in output.splitlines():
+        f = line.split()
+        if len(f) < 10 or f[4] != "REG":
+            continue
+        command, dev, size, nlink, node = f[0], f[5], f[6], f[7], f[8]
+        # SIZE/OFF holds an offset ("0t4096") for some fds -- only real sizes.
+        if not size.isdigit() or nlink != "0":
+            continue
+        key = (dev, node)
+        if key in seen:
+            continue
+        # `+c 0` keeps full command names but escapes spaces as \x20.
+        seen[key] = (command.replace("\\x20", " "), int(size))
+    per = {}
+    for command, size in seen.values():
+        per[command] = per.get(command, 0) + size
+    return {
+        "total_bytes": sum(b for _, b in seen.values()),
+        "by_command": sorted(per.items(), key=lambda kv: (-kv[1], kv[0])),
+    }
+
+
+def _held_open_deleted():
+    """Deleted-but-still-open file usage, or None when lsof can't answer."""
+    try:
+        result = subprocess.run(["lsof", "-nPw", "+c", "0", "+L1"],
+                                capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    # lsof exits non-zero when it merely found nothing (or couldn't probe
+    # some mount) while still printing usable rows -- judge by output.
+    if not result.stdout:
+        return None
+    return _parse_held_open_deleted(result.stdout)
+
+
 def run_doctor(config, json_mode=False):
     checks = []
 
@@ -2187,6 +2294,45 @@ def run_doctor(config, json_mode=False):
 
     ds = disk_stats()
     check("Disk", f"{fmt_size(ds['free_bytes'])} free of {fmt_size(ds['total_bytes'])} ({ds['percent_used']}% used)")
+
+    # Swap pressure (2.8.0). Report-only: macOS manages swap entirely, and it
+    # shrinks on its own as memory pressure drops -- there is nothing here a
+    # cleaner could safely delete, so this never becomes a target.
+    swap = _swap_usage()
+    if swap is None:
+        check("Swap", "could not determine swap usage")
+    elif swap["total_bytes"] == 0:
+        check("Swap", "not in use")
+    elif swap["percent"] >= SWAP_WARN_PERCENT:
+        check("Swap",
+              f"{fmt_size(swap['used_bytes'])} of {fmt_size(swap['total_bytes'])} used "
+              f"({swap['percent']}%) — high; close memory-heavy apps or restart to free it",
+              ok=False)
+    else:
+        check("Swap",
+              f"{fmt_size(swap['used_bytes'])} of {fmt_size(swap['total_bytes'])} used "
+              f"({swap['percent']}%)")
+
+    # Deleted-but-still-open files (2.8.0). Report-only: the space returns by
+    # itself the moment the holding process exits, and killing someone's
+    # process is not a cleanup action this tool should take.
+    held = _held_open_deleted()
+    if held and held["total_bytes"] >= HELD_OPEN_WARN_BYTES:
+        named = [(c, b) for c, b in held["by_command"]
+                 if b >= HELD_OPEN_PROC_FLOOR_BYTES]
+        # Many small holders can clear the total threshold while no single
+        # one clears the per-process floor -- still name the biggest.
+        if not named:
+            named = held["by_command"]
+        shown = named[:HELD_OPEN_MAX_NAMED]
+        detail = ", ".join(f"{c} ({fmt_size(b)})" for c, b in shown)
+        rest = len(named) - len(shown)
+        if rest > 0:
+            detail += f" +{rest} more process{'es' if rest > 1 else ''}"
+        check("Held-open files",
+              f"{fmt_size(held['total_bytes'])} of deleted files still held open by "
+              f"{detail} — the space frees itself when they exit",
+              ok=False)
 
     all_ok = all(c["ok"] for c in checks)
 
