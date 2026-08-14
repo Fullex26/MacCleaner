@@ -9,48 +9,77 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [2.8.0] — 2026-08-14
 
-Three new safe cleanup targets, plus two report-only `doctor` checks that
-explain disk and memory pressure MacCleaner deliberately does not act on.
+Three new cleanup targets, plus two report-only `doctor` checks that account
+for disk space MacCleaner deliberately refuses to touch.
+
+**Neither new check reclaims a single byte.** They exist to explain storage
+you'd otherwise go hunting for, and the tool deliberately declines to act on
+either condition — so both are marked `advisory` and are excluded from
+`doctor`'s top-level `ok`.
 
 ### Added
-- Three new `safe` cleanup targets in existing categories (no new categories,
-  no changed IDs — purely additive):
-  - `xcodebuildmcp-workspaces` (`xcode`) — `~/Library/Developer/XcodeBuildMCP`,
-    workspace scratch data written by the XcodeBuildMCP tool. Regenerated on
-    the next build. Measured 1.0 GB on the dev machine.
-  - `chrome-optimization-model-store` (`caches`) — `~/Library/Application
-    Support/Google/Chrome/optimization_guide_model_store`, Chrome's downloaded
-    on-device ML prediction models. Re-downloaded on demand.
-  - `chrome-optimization-hint-cache` (`caches`) — `~/Library/Application
-    Support/Google/Chrome/*/optimization_guide_hint_cache_store`, Chrome's
-    per-profile page-optimization hint cache. Globbed across every profile
-    (`Default`, `Profile 1`, …) and regenerated on demand.
-- `doctor` gained a **`Swap`** check (report-only). Reads `sysctl
-  vm.swapusage` and reports used-of-total with a percentage, flagging
-  `ok: false` at 75% or more. This check **reclaims nothing and offers no
-  cleanup action**: macOS owns the swap file and shrinks it on its own as
-  memory pressure drops, so there is nothing here MacCleaner could safely
-  delete. It exists to explain disk usage you'd otherwise go hunting for.
-  Zero total swap reports "not in use".
-- `doctor` gained a **`Held-open files`** check (report-only, and shown only
-  when the total reaches 500 MB). Runs `lsof -nPw +c 0 +L1` to find files
-  that have been deleted but are still held open by a running process, and
-  names the largest holders. **It reports; it does not act** — and
-  deliberately so: that space comes back by itself the moment the holding
-  process exits, so the fix is to quit or restart that process, not to
-  delete anything. MacCleaner will never kill a process on your behalf. The
-  sum dedupes by device+inode, so one deleted file held by several processes
-  (or several file descriptors) is counted once rather than multiplied.
+- Three new cleanup targets in existing categories (no new categories, no
+  changed IDs — purely additive; the static target table goes to 83):
+  - `xcodebuildmcp-workspaces` (`xcode`, **safe**) —
+    `~/Library/Developer/XcodeBuildMCP`, workspace scratch data written by the
+    XcodeBuildMCP tool. Regenerated on the next build. Measured 1.0 GB on the
+    dev machine.
+  - `chrome-optimization-hint-cache` (`caches`, **safe**) — `~/Library/
+    Application Support/Google/Chrome/*/optimization_guide_hint_cache_store`,
+    Chrome's per-profile page-optimization hint cache. Globbed across every
+    profile (`Default`, `Profile 1`, …) and regenerated on demand.
+  - `chrome-optimization-model-store` (`caches`, **review-only**) —
+    `~/Library/Application Support/Google/Chrome/
+    optimization_guide_model_store`, Chrome's downloaded on-device ML
+    prediction models. Marked `safe: false`, so `--yes` never touches it and
+    it must be selected deliberately: Chrome indexes these models in its
+    `Local State` file, which MacCleaner does not touch, so "Chrome just
+    re-downloads them" is an assumption we could not verify — and we won't
+    auto-delete on an unverified recovery path.
+- `doctor` gained a **`Swap`** check (report-only, advisory, always present).
+  Reads `sysctl vm.swapusage` and reports **how much disk the swapfiles
+  consume** — `total` there is exactly the size of the swapfiles macOS has
+  materialised under `/System/Volumes/VM`, which is the only swap number a
+  disk tool has any business reporting. Flags `ok: false` at **8 GiB or more
+  of swapfiles on disk**. The used/total *percentage* is reported as
+  informational text only and triggers nothing: it is not monotonic in disk
+  consumed (a healthy machine sits at 90–94% for weeks; a laptop that swapped
+  800 MB exactly once reads 78%), so it is useless as a threshold. **This
+  check reclaims nothing and offers no cleanup action** — macOS owns the
+  swapfiles and grows and reclaims them on its own. There is no "restart to
+  free it" advice, because that would be misleading: the swapfiles come back
+  within minutes. Zero total reports "no swapfiles on disk".
+- `doctor` gained a **`Held-open files`** check (report-only, advisory, and
+  shown only when the total reaches 500 MB). Runs `lsof -b -nPw +c 0 +L1` to
+  find files that have been deleted but are still held open by a running
+  process, and names the largest holders. **It reports; it does not act** —
+  and deliberately so: that space returns only once *every* process holding
+  the inode exits, and MacCleaner will never kill a process on your behalf.
+  The sum dedupes by device+inode, so one deleted file held by several
+  processes (or several file descriptors) is counted once rather than
+  multiplied; when the total spans more than one mounted volume the status
+  says so, since `doctor`'s `Disk` row covers the startup volume only.
+- **`advisory` key on `doctor` JSON checks.** A `checks[]` entry may now
+  carry `"advisory": true`. It marks a report-only observation MacCleaner
+  refuses to act on and offers no remedy for. The key is emitted **only when
+  true**, so every pre-existing check entry is byte-identical — purely
+  additive, per the JSON contract. **Advisory checks are excluded from the
+  top-level `ok` aggregate**: an advisory check reporting `ok: false` does
+  not flip `ok`. That keeps `ok` meaning "there is a MacCleaner-owned problem
+  with a fix" rather than "something is unhealthy but nothing can be done".
+  Both new 2.8.0 checks are advisory in every branch; no pre-2.8.0 check is.
 
 ### Notes
 - Both new checks are best-effort. If `sysctl` or `lsof` is missing, exits
   non-zero, times out, or prints something unparseable, the check degrades
   quietly — `Swap` reports "could not determine swap usage" and `Held-open
-  files` is omitted entirely. Neither can fail a `doctor` run.
+  files` is omitted entirely. Neither can fail a `doctor` run, and neither
+  parser can raise out of it.
 - `doctor` still always exits `0`, including when either new check reports
   `ok: false`. Parse the JSON `ok` field rather than the exit status.
-- Both thresholds (75% swap; 500 MB held-open) are hardcoded. No new
-  `config.json` keys were added in this release.
+- All thresholds (8 GiB of swapfiles; 500 MB held-open total, 10 MB
+  per-process naming floor) are hardcoded. No new `config.json` keys were
+  added in this release.
 
 ## [2.7.0] — 2026-08-13
 
