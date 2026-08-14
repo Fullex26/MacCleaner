@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct DashboardView: View {
     @EnvironmentObject var bridge: CleanerBridge
@@ -42,11 +43,52 @@ struct DashboardView: View {
             DiskTrendView()
                 .padding(.horizontal)
                 .padding(.bottom, 8)
+            largeFilesSection
+                .padding(.horizontal)
+                .padding(.bottom, 8)
             Divider()
             content
             Divider()
             footer
         }
+    }
+
+    /// Self-contained widget, same shape as `DiskTrendView` above it: it
+    /// fetches its own data (`storage-insights --json`, independent of the
+    /// main reclaimable-targets `scan`) and renders regardless of whether
+    /// `bridge.report` has ever been loaded. Read-only — "Reveal in Finder"
+    /// is the only action, never a delete/clean path.
+    private var largeFilesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Same uppercase/tracked-caption recipe as `SettingsSection`'s
+            // title (`Font.sectionLabel`) — the app's one named "section
+            // heading" token; there is no separate `DesignSystem.Typography`
+            // namespace.
+            Text("Large Files".uppercased())
+                .font(.sectionLabel)
+                .tracking(0.5)
+                .foregroundStyle(.secondary)
+
+            if let entries = bridge.storageInsights?.entries, !entries.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(entries) { entry in
+                        LargeFileRow(entry: entry)
+                    }
+                }
+            } else if bridge.isScanningStorageInsights {
+                ProgressView()
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 8)
+            } else {
+                Text("No files ≥100 MB found in Documents, Downloads, or Desktop.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .glassPanel()
+        .task { await bridge.scanStorageInsights() }
     }
 
     private var header: some View {
@@ -300,5 +342,49 @@ struct TargetRow: View {
                 .foregroundStyle(.secondary)
                 .frame(minWidth: 70, alignment: .trailing)
         }
+    }
+}
+
+/// One row in the "Large Files" section — read-only, no selection/checkbox
+/// (unlike `TargetRow`/`ArtifactRow`, this list isn't part of any clean
+/// workflow). Styling otherwise mirrors those rows: `.rowLabel` primary
+/// text, a `.caption`/`.secondary` meta line, and a trailing
+/// `.monospacedDigit()` size at the same `minWidth: 70` used everywhere else
+/// on the Dashboard so byte counts stay aligned across sections.
+struct LargeFileRow: View {
+    let entry: StorageInsightEntry
+
+    private var relativeModified: String {
+        let date = Date(timeIntervalSince1970: entry.mtime)
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text((entry.path as NSString).lastPathComponent)
+                    .font(.rowLabel)
+                Text("\((entry.path as NSString).abbreviatingWithTildeInPath) · modified \(relativeModified)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            Text(entry.size_human)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 70, alignment: .trailing)
+            Button {
+                NSWorkspace.shared.selectFile(entry.path, inFileViewerRootedAtPath: "")
+            } label: {
+                Image(systemName: "magnifyingglass")
+            }
+            .buttonStyle(.borderless)
+            .help("Reveal in Finder")
+        }
+        .padding(.vertical, 2)
     }
 }

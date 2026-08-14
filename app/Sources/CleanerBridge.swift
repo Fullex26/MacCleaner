@@ -150,6 +150,18 @@ struct CategoriesReport: Codable {
     let categories: [CategoryInfo]
 }
 
+struct StorageInsightEntry: Codable, Identifiable {
+    let path: String
+    let size_bytes: Int
+    let size_human: String
+    let mtime: Double
+    var id: String { path }
+}
+
+struct StorageInsightsReport: Codable {
+    let entries: [StorageInsightEntry]
+}
+
 struct AgentStatus: Codable, Identifiable {
     let label: String
     let plist_present: Bool
@@ -203,6 +215,7 @@ final class PipeBuffer: @unchecked Sendable {
 final class CleanerBridge: ObservableObject {
     @Published var report: ScanReport?
     @Published var projects: ProjectsReport?
+    @Published var storageInsights: StorageInsightsReport?
     @Published var history: [HistoryRun] = []
     @Published var categories: [CategoryInfo] = []
     @Published var deleteMode: String = "rm"
@@ -236,6 +249,7 @@ final class CleanerBridge: ObservableObject {
     /// still watches both — see its guard below.
     @Published var isScanning = false
     @Published var isScanningProjects = false
+    @Published var isScanningStorageInsights = false
     @Published var isCleaning = false
     @Published var statusMessage: String?
     @Published var lastClean: CleanResult?
@@ -581,6 +595,16 @@ final class CleanerBridge: ObservableObject {
             statusMessage = nil
         } catch {
             statusMessage = "Project scan failed: \(error.localizedDescription)"
+        }
+    }
+
+    func scanStorageInsights() async {
+        isScanningStorageInsights = true
+        defer { isScanningStorageInsights = false }
+        do {
+            storageInsights = try await run(StorageInsightsReport.self, ["storage-insights", "--json"])
+        } catch {
+            statusMessage = "Storage insights scan failed: \(error.localizedDescription)"
         }
     }
 
