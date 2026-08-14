@@ -267,6 +267,14 @@ final class CleanerBridge: ObservableObject {
     /// already work.
     @Published var lastCleanFailed: String?
     @Published var lastCleanFailedAt: Date?
+    /// Dedicated error channel for `scanStorageInsights()`, mirroring why
+    /// `lastCleanFailed` exists instead of reusing `statusMessage`: this
+    /// fetch runs concurrently with the app's own startup `scan()` (see
+    /// `MacCleanerApp.swift`), so a shared field would let either call
+    /// silently erase the other's failure banner. Cleared on success,
+    /// set on failure, and `storageInsights` itself is left untouched on
+    /// failure so a transient error never wipes out prior good data.
+    @Published var storageInsightsError: String?
     @Published var freeBytes: Int?
     @Published var diskSnapshots: [DiskSnapshot] = []
     /// Live per-item clean progress, for Dashboard row spinners/checks (and
@@ -603,9 +611,12 @@ final class CleanerBridge: ObservableObject {
         defer { isScanningStorageInsights = false }
         do {
             storageInsights = try await run(StorageInsightsReport.self, ["storage-insights", "--json"])
-            statusMessage = nil
+            storageInsightsError = nil
         } catch {
-            statusMessage = "Storage insights scan failed: \(error.localizedDescription)"
+            // Deliberately does not touch `storageInsights` (prior successful
+            // data, if any, survives a transient failure) or the shared
+            // `statusMessage` (see `storageInsightsError`'s declaration).
+            storageInsightsError = error.localizedDescription
         }
     }
 

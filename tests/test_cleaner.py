@@ -5103,6 +5103,18 @@ class TestStorageInsightsScanner(unittest.TestCase):
             hits = cleaner.scan_storage_insights(self.cfg)
         self.assertEqual(len(hits), 1)
 
+    def test_hit_shape_is_not_target_shaped(self):
+        # Pins the spec's core non-goal: entries from this scanner must
+        # never look like get_targets()/collect_targets() targets (no
+        # "id", "safe", or "category" key), since no delete/target
+        # mechanism exists for this data. A future refactor accidentally
+        # adding one of those keys would silently make an entry look
+        # actionable to the delete pipeline's shape expectations.
+        self._make_file(self.docs, "big.mov", 150)
+        hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(set(hits[0].keys()), {"path", "size_bytes", "mtime"})
+
     def test_default_roots_env_unset(self):
         # Without the override, the function must fall back to the real
         # ~/Documents:~/Downloads:~/Desktop default -- verify the default
@@ -5153,7 +5165,10 @@ class TestStorageInsightsCommand(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             cleaner.show_storage_insights({}, json_mode=False)
-        self.assertIn("100 MB", buf.getvalue())
+        # Derived from STORAGE_INSIGHTS_MIN_BYTES via fmt_size(), not a
+        # hardcoded "100 MB" literal -- fmt_size renders with one decimal
+        # place ("100.0 MB"), so the floor text must match that exactly.
+        self.assertIn(cleaner.fmt_size(cleaner.STORAGE_INSIGHTS_MIN_BYTES), buf.getvalue())
 
     def test_cli_json_end_to_end(self):
         (self.docs / "big.mov").write_bytes(b"\0" * 150 * 1024 * 1024)

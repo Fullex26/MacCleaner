@@ -52,6 +52,7 @@ maccleaner scan             # what's reclaimable, and how much
 maccleaner clean            # interactive checklist — pick what goes
 maccleaner clean --yes      # auto-clean everything marked safe (unattended mode)
 maccleaner projects         # find stale build artifacts in old projects
+maccleaner storage-insights # read-only: largest files sitting in Documents/Downloads/Desktop
 maccleaner doctor           # health-check your environment and install
 ```
 
@@ -81,7 +82,7 @@ Useful extras: `--category xcode` to scope a run, `--min-size 500` to ignore sma
 A SwiftUI app (macOS 13+) that's a thin client over the CLI — same engine, same config, no separate logic. Redesigned in v2.6 ("Glass & Sparkle"): sidebar navigation, glass panels, monospaced sizes, per-category color dots, and one design system driving both light and dark mode.
 
 - **Menu bar popover**: a disk-usage ring, your reclaimable space as a hero number, your top 3 categories, and a one-click "Clean safe items" button with a self-expiring "freed" confirmation — no need to open the full window for a quick clean. No Dock icon. Refreshes lightly every minute, with a full rescan on a longer interval, on wake, and whenever you open the popover.
-- **Dashboard window**: sidebar-navigated — **Dashboard** (targets grouped by category with checkboxes, All/None/Safe-only selection, clean in-app with live per-item progress, plus a free-space trend chart built from your scan history), **Projects** (stale artifact finder with Select All/None), **History** (past runs), **Settings** (category toggles and delete mode, shared with the CLI's `config.json`; the cleanup schedule, which lives in launchd plists managed via the CLI's `schedule` subcommand, not in `config.json`; and "Check for Updates…", backed by Sparkle).
+- **Dashboard window**: sidebar-navigated — **Dashboard** (a free-space trend chart and a "Large Files" panel surfacing the biggest files in Documents/Downloads/Desktop with one-click Reveal in Finder, both above the targets grouped by category with checkboxes, All/None/Safe-only selection, and clean in-app with live per-item progress), **Projects** (stale artifact finder with Select All/None), **History** (past runs), **Settings** (category toggles and delete mode, shared with the CLI's `config.json`; the cleanup schedule, which lives in launchd plists managed via the CLI's `schedule` subcommand, not in `config.json`; and "Check for Updates…", backed by Sparkle).
 
 `install.sh` builds the app from source whenever Swift's toolchain (`swiftc`, from Xcode or the Command Line Tools) is available, so the installed app is never older than your checkout; it falls back to the committed pre-built copy only when `swiftc` isn't found. No Xcode project needed either way:
 

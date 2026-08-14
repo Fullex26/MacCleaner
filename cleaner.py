@@ -1437,8 +1437,15 @@ def show_storage_insights(config, json_mode=False):
             ],
         }, indent=2))
         return
+    floor_human = fmt_size(STORAGE_INSIGHTS_MIN_BYTES)
+    roots_overridden = "MACCLEANER_STORAGE_INSIGHTS_ROOTS" in os.environ
+    roots_text = (
+        ", ".join(str(r) for r in _storage_insights_roots())
+        if roots_overridden
+        else "~/Documents, ~/Downloads, or ~/Desktop"
+    )
     if not hits:
-        print("No files found at or above 100 MB in ~/Documents, ~/Downloads, or ~/Desktop.")
+        print(f"No files found at or above {floor_human} in {roots_text}.")
         return
     if RICH:
         table = Table(title="Large Files", show_lines=False)
@@ -1450,7 +1457,7 @@ def show_storage_insights(config, json_mode=False):
         console.print(table)
     else:
         print(f"\n{'='*60}")
-        print("Large Files (>=100 MB)")
+        print(f"Large Files (>={floor_human})")
         print(f"{'='*60}")
         for h in hits:
             print(f"  {fmt_size(h['size_bytes']):>10}  {_relative_days(h['mtime']):>12}  {h['path']}")

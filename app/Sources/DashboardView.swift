@@ -53,11 +53,15 @@ struct DashboardView: View {
         }
     }
 
-    /// Self-contained widget, same shape as `DiskTrendView` above it: it
-    /// fetches its own data (`storage-insights --json`, independent of the
-    /// main reclaimable-targets `scan`) and renders regardless of whether
-    /// `bridge.report` has ever been loaded. Read-only — "Reveal in Finder"
-    /// is the only action, never a delete/clean path.
+    /// Self-contained widget: it fetches its own data (`storage-insights
+    /// --json`, independent of the main reclaimable-targets `scan`) and
+    /// renders regardless of whether `bridge.report` has ever been loaded.
+    /// Unlike `DiskTrendView` above it — which issues no subprocess call at
+    /// all and just renders `bridge.diskSnapshots` from the shared refresh
+    /// path — this section owns a real filesystem walk, so its `.task`
+    /// below is guarded to fetch once rather than on every appearance.
+    /// Read-only — "Reveal in Finder" is the only action, never a
+    /// delete/clean path.
     private var largeFilesSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             // Same uppercase/tracked-caption recipe as `SettingsSection`'s
@@ -69,7 +73,23 @@ struct DashboardView: View {
                 .tracking(0.5)
                 .foregroundStyle(.secondary)
 
-            if let entries = bridge.storageInsights?.entries, !entries.isEmpty {
+            if bridge.isScanningStorageInsights {
+                ProgressView()
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 8)
+            } else if let error = bridge.storageInsightsError {
+                // Distinct from the genuine-empty state below: a scan
+                // failure must never be presented as "no large files
+                // found". The installed engine predating this subcommand
+                // (argparse's "invalid choice" usage error) gets a
+                // specific, actionable message; anything else falls back
+                // to a generic one that still surfaces the real error text.
+                Text(error.contains("invalid choice") && error.contains("storage-insights")
+                     ? "Requires engine 2.9.0+ — re-run install.sh to update."
+                     : "Large files scan failed: \(error)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let entries = bridge.storageInsights?.entries, !entries.isEmpty {
                 // Bounded + scrollable (finding: unbounded VStack could push
                 // the category list and "Clean Selected" footer off-screen
                 // with enough qualifying files — up to
@@ -86,11 +106,9 @@ struct DashboardView: View {
                     }
                 }
                 .frame(maxHeight: 240)
-            } else if bridge.isScanningStorageInsights {
-                ProgressView()
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.vertical, 8)
             } else {
+                // Only reached once a scan has actually succeeded and
+                // returned zero qualifying entries.
                 Text("No files ≥100 MB found in Documents, Downloads, or Desktop.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -99,7 +117,14 @@ struct DashboardView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
         .glassPanel()
-        .task { await bridge.scanStorageInsights() }
+        .task {
+            // Fetch once: don't re-walk the filesystem every time the
+            // Dashboard reappears (e.g. switching sidebar sections and
+            // back) when data or an error is already present.
+            if bridge.storageInsights == nil && bridge.storageInsightsError == nil {
+                await bridge.scanStorageInsights()
+            }
+        }
     }
 
     private var header: some View {
