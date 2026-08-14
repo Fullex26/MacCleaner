@@ -1357,11 +1357,30 @@ def scan_storage_insights(config):
     stat()-only -- never opens file contents, so it can never trigger an
     iCloud download of an evicted file. Skips known dev-artifact
     directories (the same names scan_projects treats as noise) and never
-    descends into a .app bundle. Never follows symlinks -- both symlinked
-    directories and symlinked files are skipped entirely. Iterative
-    (explicit stack), not recursive, so an unusually deep directory tree
-    can't hit Python's recursion limit. Returns up to
-    STORAGE_INSIGHTS_MAX_RESULTS entries, largest first.
+    descends into a .app bundle. Iterative (explicit stack), not
+    recursive, so an unusually deep directory tree can't hit Python's
+    recursion limit. Returns up to STORAGE_INSIGHTS_MAX_RESULTS entries,
+    largest first.
+
+    Symlink handling deliberately draws a line between trusted entry
+    points and untrusted discovered paths, the same distinction
+    _safe_to_delete draws between a resolved parent and an unresolved
+    leaf:
+      - Configured roots (the 3 defaults, or whatever
+        MACCLEANER_STORAGE_INSIGHTS_ROOTS names) are trusted, user/test
+        -controlled entry points and ARE followed if they are themselves
+        symlinks -- via the plain `r.is_dir()` filter below, which
+        follows symlinks by default. This is required for macOS's
+        "Desktop & Documents Folders" iCloud sync, which replaces
+        ~/Documents and ~/Desktop with symlinks into
+        ~/Library/Mobile Documents/com~apple~CloudDocs/...; without
+        following the root symlink the scanner would silently return
+        nothing for the most common way people use those folders.
+      - Everything discovered DURING the walk (any directory or file
+        found via os.scandir while traversing) is untrusted and is never
+        followed -- both symlinked directories and symlinked files hit
+        during the walk are skipped entirely (`e.is_symlink()` checked
+        first, before any other classification, for every entry).
 
     This function is architecturally outside the delete pipeline: no
     `safe` field, no category, no target id, never passed to

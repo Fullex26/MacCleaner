@@ -5070,6 +5070,22 @@ class TestStorageInsightsScanner(unittest.TestCase):
         link.symlink_to(real_file)
         self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
 
+    def test_symlinked_root_is_followed(self):
+        # Configured roots are trusted entry points (this is what makes the
+        # scanner work for macOS's iCloud Desktop & Documents sync, which
+        # replaces ~/Documents and ~/Desktop with symlinks) -- unlike a
+        # symlink discovered mid-walk, a symlinked ROOT is followed.
+        real_docs = self.tmp / "real_icloud_documents"
+        real_docs.mkdir()
+        self._make_file(real_docs, "big.mov", 150)
+        docs_link = self.tmp / "Documents_symlinked_root"
+        docs_link.symlink_to(real_docs)
+        with mock.patch.dict(os.environ, {
+                "MACCLEANER_STORAGE_INSIGHTS_ROOTS": str(docs_link)}):
+            hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["path"].name, "big.mov")
+
     def test_missing_root_not_fatal(self):
         with mock.patch.dict(os.environ, {
                 "MACCLEANER_STORAGE_INSIGHTS_ROOTS":
