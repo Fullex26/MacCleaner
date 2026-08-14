@@ -104,19 +104,19 @@ RZ(){ env MACCLEANER_ENGINE="$REAL_ENGINE" "$HERE/capture.zsh" "$HERE" "$1"; }
 rm -f "${TMPDIR:-/tmp}"/.maccleaner-comp-* 2>/dev/null
 eq "real engine bash: --targets returns real target ids" \
    "1" "$(RB 'maccleaner clean --targets ' | grep -cx 'npm-cache')"
-# The live target count has a static floor of 80 (v2.5) but the `logs`
+# The live target count has a static floor of 83 (v2.8) but the `logs`
 # category adds one dynamic target per ~/Library/Logs folder over the size
 # threshold, so the exact count is environment-dependent. Assert the floor,
 # not equality — an == here flakes on any dev machine with a fat log dir.
 ge(){ [ "$3" -ge "$2" ] 2>/dev/null && ok "$1" || no "$1" ">=$2" "$3"; }
 ge "real engine bash: --targets count reaches the static floor" \
-   "80" "$(RB 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
+   "83" "$(RB 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
 eq "real engine bash: --category reflects the live engine, not the static list" \
    "1" "$(RB 'maccleaner config enable ' | grep -cx 'xcode')"
 eq "real engine zsh: --targets returns real target ids" \
    "1" "$(RZ 'maccleaner clean --targets ' | grep -cx 'npm-cache')"
 ge "real engine zsh: --targets count reaches the static floor" \
-   "80" "$(RZ 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
+   "83" "$(RZ 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
 eq "real engine zsh: --category reflects the live engine, not the static list" \
    "1" "$(RZ 'maccleaner config enable ' | grep -cx 'xcode')"
 rm -f "${TMPDIR:-/tmp}"/.maccleaner-comp-* 2>/dev/null

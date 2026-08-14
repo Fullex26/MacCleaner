@@ -4914,8 +4914,13 @@ class TestDoctorPressureChecks(unittest.TestCase):
                                capture_output=True, text=True, env=env)
             self.assertEqual(r.returncode, 0, r.stderr)
             data = json.loads(r.stdout)
-            self.assertTrue(any(not c["ok"] for c in data["checks"]),
-                            "the fixture must actually produce a failing check")
+            # Assert on the fixture's OWN row, not on "any failing row" -- the
+            # two advisory checks (Swap, Held-open files) fail on plenty of
+            # real machines, so an any() guard would be satisfied by them and
+            # go green even if the invalid-config fixture stopped working.
+            config_check = next(c for c in data["checks"] if c["name"] == "Config")
+            self.assertFalse(config_check["ok"],
+                             "the fixture must actually produce a failing check")
             # …and the plain (non-JSON) path exits 0 too, which is the exact
             # invocation CI smoke-tests.
             r2 = subprocess.run([sys.executable, str(REPO / "cleaner.py"), "doctor"],
