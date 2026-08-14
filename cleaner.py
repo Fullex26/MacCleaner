@@ -1411,6 +1411,51 @@ def scan_storage_insights(config):
     hits.sort(key=lambda h: h["size_bytes"], reverse=True)
     return hits[:STORAGE_INSIGHTS_MAX_RESULTS]
 
+
+def _relative_days(mtime):
+    """Coarse relative-time bucket for a stat() mtime -- 'today',
+    'yesterday', or 'N days ago'. Deliberately simple (no weeks/months):
+    this is only used for the plain-text CLI table; the app formats the
+    raw mtime its own JSON carries with RelativeDateTimeFormatter."""
+    days = (time.time() - mtime) / 86400
+    if days < 1:
+        return "today"
+    if days < 2:
+        return "yesterday"
+    return f"{int(days)} days ago"
+
+
+def show_storage_insights(config, json_mode=False):
+    hits = scan_storage_insights(config)
+    if json_mode:
+        print(json.dumps({
+            "version": VERSION,
+            "entries": [
+                {"path": str(h["path"]), "size_bytes": h["size_bytes"],
+                 "size_human": fmt_size(h["size_bytes"]), "mtime": h["mtime"]}
+                for h in hits
+            ],
+        }, indent=2))
+        return
+    if not hits:
+        print("No files found at or above 100 MB in ~/Documents, ~/Downloads, or ~/Desktop.")
+        return
+    if RICH:
+        table = Table(title="Large Files", show_lines=False)
+        table.add_column("Size", style="green", justify="right")
+        table.add_column("Path", style="cyan")
+        table.add_column("Modified", style="yellow")
+        for h in hits:
+            table.add_row(fmt_size(h["size_bytes"]), str(h["path"]), _relative_days(h["mtime"]))
+        console.print(table)
+    else:
+        print(f"\n{'='*60}")
+        print("Large Files (>=100 MB)")
+        print(f"{'='*60}")
+        for h in hits:
+            print(f"  {fmt_size(h['size_bytes']):>10}  {_relative_days(h['mtime']):>12}  {h['path']}")
+        print(f"{'='*60}\n")
+
 # ── Simulator dynamic targets ─────────────────────────────────────────────────
 # Device UDIDs and runtime identifiers from `simctl ... -j` output end up
 # interpolated into shell cmd strings (delete_target runs cmd targets with
@@ -3301,6 +3346,10 @@ def build_parser():
                             help="Warn when free space is below the configured threshold (cheap; for launchd)")
     p_disk.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    p_storage = sub.add_parser("storage-insights",
+                               help="Read-only: largest files in Documents/Downloads/Desktop (never deletes)")
+    p_storage.add_argument("--json", action="store_true", help="Machine-readable output")
+
     p_sched = sub.add_parser("schedule",
                              help="Manage the launchd cleanup schedule (weekly/monthly/off/status)")
     p_sched.add_argument("action", choices=["status", "weekly", "monthly", "off"])
@@ -3358,6 +3407,10 @@ def main():
 
     if args.command == "disk-check":
         run_disk_check(config, json_mode=args.json)
+        return
+
+    if args.command == "storage-insights":
+        show_storage_insights(config, json_mode=args.json)
         return
 
     if args.command == "report":

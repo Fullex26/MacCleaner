@@ -5115,5 +5115,70 @@ class TestStorageInsightsScanner(unittest.TestCase):
                                   cleaner.HOME / "Desktop"])
 
 
+class TestStorageInsightsCommand(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.docs = self.tmp / "Documents"
+        self.docs.mkdir()
+        self._patch = mock.patch.dict(os.environ, {
+            "MACCLEANER_STORAGE_INSIGHTS_ROOTS": str(self.docs)
+        })
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_relative_days_buckets(self):
+        now = time.time()
+        self.assertEqual(cleaner._relative_days(now), "today")
+        self.assertEqual(cleaner._relative_days(now - 86400 * 1.5), "yesterday")
+        self.assertEqual(cleaner._relative_days(now - 86400 * 5), "5 days ago")
+
+    def test_json_output_shape(self):
+        (self.docs / "big.mov").write_bytes(b"\0" * 150 * 1024 * 1024)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cleaner.show_storage_insights({}, json_mode=True)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["version"], cleaner.VERSION)
+        self.assertEqual(len(data["entries"]), 1)
+        entry = data["entries"][0]
+        self.assertEqual(entry["path"], str(self.docs / "big.mov"))
+        self.assertEqual(entry["size_bytes"], 150 * 1024 * 1024)
+        self.assertEqual(entry["size_human"], cleaner.fmt_size(150 * 1024 * 1024))
+        self.assertIn("mtime", entry)
+
+    def test_plain_output_no_crash_when_empty(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cleaner.show_storage_insights({}, json_mode=False)
+        self.assertIn("100 MB", buf.getvalue())
+
+    def test_cli_json_end_to_end(self):
+        (self.docs / "big.mov").write_bytes(b"\0" * 150 * 1024 * 1024)
+        env = dict(os.environ)
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "storage-insights", "--json"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual(len(data["entries"]), 1)
+
+    def test_no_yes_or_targets_flag_exists(self):
+        # This subcommand must never grow a delete-adjacent flag -- it has
+        # nothing to confirm or preview.
+        import argparse
+        parser = cleaner.build_parser()
+        sub_action = next(a for a in parser._actions
+                          if isinstance(a, argparse._SubParsersAction))
+        storage_parser = sub_action.choices["storage-insights"]
+        flags = {opt for action in storage_parser._actions
+                 for opt in action.option_strings}
+        self.assertNotIn("--yes", flags)
+        self.assertNotIn("--targets", flags)
+        self.assertNotIn("--dry-run", flags)
+
+
 if __name__ == "__main__":
     unittest.main()
