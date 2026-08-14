@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.8.1"
+VERSION = "2.9.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -1337,6 +1337,124 @@ TMP_CLONE_ARTIFACTS = {
     "build", "Build", ".build", "DerivedData", "node_modules", "target",
     "dist", ".next", "Pods", ".venv", "venv",
 }
+
+# ── Storage Insights (read-only, never wired into the delete pipeline) ────────
+STORAGE_INSIGHTS_MIN_BYTES = 100 * 1024 * 1024
+STORAGE_INSIGHTS_MAX_RESULTS = 50
+STORAGE_INSIGHTS_ROOTS_DEFAULT = f"{HOME}/Documents:{HOME}/Downloads:{HOME}/Desktop"
+_STORAGE_INSIGHTS_SKIP_DIRS = set(ARTIFACT_MANIFESTS) | TMP_CLONE_ARTIFACTS
+
+
+def _storage_insights_roots():
+    raw = os.environ.get("MACCLEANER_STORAGE_INSIGHTS_ROOTS", STORAGE_INSIGHTS_ROOTS_DEFAULT)
+    return [Path(p) for p in raw.split(":") if p]
+
+
+def scan_storage_insights(config):
+    """Read-only scan of the configured roots (default ~/Documents,
+    ~/Downloads, ~/Desktop) for files >= STORAGE_INSIGHTS_MIN_BYTES.
+
+    stat()-only -- never opens file contents, so it can never trigger an
+    iCloud download of an evicted file. Skips known dev-artifact
+    directories (the same names scan_projects treats as noise) and never
+    descends into a .app bundle. Iterative (explicit stack), not
+    recursive, so an unusually deep directory tree can't hit Python's
+    recursion limit. Returns up to STORAGE_INSIGHTS_MAX_RESULTS entries,
+    largest first.
+
+    Symlink handling deliberately draws a line between trusted entry
+    points and untrusted discovered paths, the same distinction
+    _safe_to_delete draws between a resolved parent and an unresolved
+    leaf:
+      - Configured roots (the 3 defaults, or whatever
+        MACCLEANER_STORAGE_INSIGHTS_ROOTS names) are trusted, user/test
+        -controlled entry points and ARE followed if they are themselves
+        symlinks -- via the plain `r.is_dir()` filter below, which
+        follows symlinks by default. This is required for macOS's
+        "Desktop & Documents Folders" iCloud sync, which replaces
+        ~/Documents and ~/Desktop with symlinks into
+        ~/Library/Mobile Documents/com~apple~CloudDocs/...; without
+        following the root symlink the scanner would silently return
+        nothing for the most common way people use those folders.
+      - Everything discovered DURING the walk (any directory or file
+        found via os.scandir while traversing) is untrusted and is never
+        followed -- both symlinked directories and symlinked files hit
+        during the walk are skipped entirely (`e.is_symlink()` checked
+        first, before any other classification, for every entry).
+
+    This function is architecturally outside the delete pipeline: no
+    `safe` field, no category, no target id, never passed to
+    get_targets()/collect_targets()/delete_target()."""
+    hits = []
+    stack = [r for r in _storage_insights_roots() if r.is_dir()]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink():
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    if e.name in _STORAGE_INSIGHTS_SKIP_DIRS or e.name.endswith(".app"):
+                        continue
+                    stack.append(Path(e.path))
+                elif e.is_file(follow_symlinks=False):
+                    st = e.stat(follow_symlinks=False)
+                    if st.st_size >= STORAGE_INSIGHTS_MIN_BYTES:
+                        hits.append({"path": Path(e.path), "size_bytes": st.st_size,
+                                     "mtime": st.st_mtime})
+            except OSError:
+                continue
+    hits.sort(key=lambda h: h["size_bytes"], reverse=True)
+    return hits[:STORAGE_INSIGHTS_MAX_RESULTS]
+
+
+def _relative_days(mtime):
+    """Coarse relative-time bucket for a stat() mtime -- 'today',
+    'yesterday', or 'N days ago'. Deliberately simple (no weeks/months):
+    this is only used for the plain-text CLI table; the app formats the
+    raw mtime its own JSON carries with RelativeDateTimeFormatter."""
+    days = (time.time() - mtime) / 86400
+    if days < 1:
+        return "today"
+    if days < 2:
+        return "yesterday"
+    return f"{int(days)} days ago"
+
+
+def show_storage_insights(config, json_mode=False):
+    hits = scan_storage_insights(config)
+    if json_mode:
+        print(json.dumps({
+            "version": VERSION,
+            "entries": [
+                {"path": str(h["path"]), "size_bytes": h["size_bytes"],
+                 "size_human": fmt_size(h["size_bytes"]), "mtime": h["mtime"]}
+                for h in hits
+            ],
+        }, indent=2))
+        return
+    if not hits:
+        print("No files found at or above 100 MB in ~/Documents, ~/Downloads, or ~/Desktop.")
+        return
+    if RICH:
+        table = Table(title="Large Files", show_lines=False)
+        table.add_column("Size", style="green", justify="right")
+        table.add_column("Path", style="cyan")
+        table.add_column("Modified", style="yellow")
+        for h in hits:
+            table.add_row(fmt_size(h["size_bytes"]), str(h["path"]), _relative_days(h["mtime"]))
+        console.print(table)
+    else:
+        print(f"\n{'='*60}")
+        print("Large Files (>=100 MB)")
+        print(f"{'='*60}")
+        for h in hits:
+            print(f"  {fmt_size(h['size_bytes']):>10}  {_relative_days(h['mtime']):>12}  {h['path']}")
+        print(f"{'='*60}\n")
 
 # ── Simulator dynamic targets ─────────────────────────────────────────────────
 # Device UDIDs and runtime identifiers from `simctl ... -j` output end up
@@ -3228,6 +3346,10 @@ def build_parser():
                             help="Warn when free space is below the configured threshold (cheap; for launchd)")
     p_disk.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    p_storage = sub.add_parser("storage-insights",
+                               help="Read-only: largest files in Documents/Downloads/Desktop (never deletes)")
+    p_storage.add_argument("--json", action="store_true", help="Machine-readable output")
+
     p_sched = sub.add_parser("schedule",
                              help="Manage the launchd cleanup schedule (weekly/monthly/off/status)")
     p_sched.add_argument("action", choices=["status", "weekly", "monthly", "off"])
@@ -3285,6 +3407,10 @@ def main():
 
     if args.command == "disk-check":
         run_disk_check(config, json_mode=args.json)
+        return
+
+    if args.command == "storage-insights":
+        show_storage_insights(config, json_mode=args.json)
         return
 
     if args.command == "report":
