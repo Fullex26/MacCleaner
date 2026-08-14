@@ -4453,5 +4453,69 @@ class TestNewTargetsV28(unittest.TestCase):
         self.assertIn("chrome-optimization-model-store", ids)
 
 
+class TestSwapUsageParsing(unittest.TestCase):
+    """macOS keeps swap on the data volume, so heavy swapping is also a
+    disk-space story -- but it is entirely OS-managed and nothing here is
+    deletable, which is why this surfaces as a doctor check rather than a
+    cleanup target."""
+
+    # Verbatim from `sysctl vm.swapusage` on a real machine.
+    REAL_OUTPUT = ("vm.swapusage: total = 16384.00M  used = 15571.88M  "
+                   "free = 812.12M  (encrypted)\n")
+
+    def test_parses_real_sysctl_output(self):
+        s = cleaner._parse_swap_usage(self.REAL_OUTPUT)
+        self.assertEqual(s["total_bytes"], int(16384.00 * 1024 ** 2))
+        self.assertEqual(s["used_bytes"], int(15571.88 * 1024 ** 2))
+        self.assertAlmostEqual(s["percent"], 95.0, delta=0.5)
+
+    def test_high_usage_is_at_or_above_threshold(self):
+        self.assertGreaterEqual(cleaner._parse_swap_usage(self.REAL_OUTPUT)["percent"],
+                                cleaner.SWAP_WARN_PERCENT)
+
+    def test_low_usage_is_below_threshold(self):
+        out = ("vm.swapusage: total = 2048.00M  used = 100.00M  "
+               "free = 1948.00M  (encrypted)\n")
+        self.assertLess(cleaner._parse_swap_usage(out)["percent"],
+                        cleaner.SWAP_WARN_PERCENT)
+
+    def test_gigabyte_units(self):
+        out = "vm.swapusage: total = 4.00G  used = 2.00G  free = 2.00G  (encrypted)\n"
+        s = cleaner._parse_swap_usage(out)
+        self.assertEqual(s["total_bytes"], 4 * 1024 ** 3)
+        self.assertEqual(s["percent"], 50.0)
+
+    def test_zero_total_does_not_divide_by_zero(self):
+        # A Mac with swap disabled (or freshly booted) reports 0.00M total.
+        out = "vm.swapusage: total = 0.00M  used = 0.00M  free = 0.00M\n"
+        s = cleaner._parse_swap_usage(out)
+        self.assertEqual(s["total_bytes"], 0)
+        self.assertEqual(s["percent"], 0.0)
+
+    def test_unparseable_returns_none(self):
+        self.assertIsNone(cleaner._parse_swap_usage("nonsense"))
+        self.assertIsNone(cleaner._parse_swap_usage(""))
+
+    def test_malformed_number_returns_none_instead_of_raising(self):
+        # `[0-9.]+` happily matches non-numbers. Real sysctl can't emit these,
+        # but the parser is contractually non-raising: _swap_usage() calls it
+        # outside its own try/except, so a ValueError here would escape
+        # run_doctor() and break doctor's exit-0 guarantee.
+        for bad in ("vm.swapusage: total = 1.2.3M  used = 1.00M  free = 0.00M",
+                    "vm.swapusage: total = .M  used = 1.00M  free = 0.00M",
+                    "vm.swapusage: total = 4.00G  used = ...G  free = 0.00G"):
+            self.assertIsNone(cleaner._parse_swap_usage(bad), bad)
+
+    def test_collector_degrades_when_sysctl_missing(self):
+        with mock.patch.object(cleaner.subprocess, "run",
+                               side_effect=OSError("no sysctl")):
+            self.assertIsNone(cleaner._swap_usage())
+
+    def test_collector_degrades_on_nonzero_exit(self):
+        fake = mock.Mock(returncode=1, stdout="")
+        with mock.patch.object(cleaner.subprocess, "run", return_value=fake):
+            self.assertIsNone(cleaner._swap_usage())
+
+
 if __name__ == "__main__":
     unittest.main()

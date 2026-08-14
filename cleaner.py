@@ -2093,6 +2093,52 @@ def app_leftovers_to_targets(hits):
     return targets
 
 
+# ── Doctor: system-pressure signals (2.8.0) ────────────────────────────────────
+SWAP_WARN_PERCENT = 75
+
+_SWAP_UNITS = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+
+
+def _parse_swap_usage(output):
+    """Parse `sysctl vm.swapusage` into {total_bytes, used_bytes, percent},
+    or None if the text can't be read. Real format:
+
+        vm.swapusage: total = 16384.00M  used = 15571.88M  free = 812.12M  (encrypted)
+
+    Never raises -- doctor reports "could not determine" rather than failing
+    the whole run."""
+    fields = {}
+    for name in ("total", "used"):
+        m = re.search(r"\b%s\s*=\s*([0-9.]+)([BKMGT])" % name, output)
+        if not m:
+            return None
+        try:
+            fields[name] = float(m.group(1)) * _SWAP_UNITS[m.group(2)]
+        except ValueError:
+            # `[0-9.]+` also matches non-numbers like "1.2.3" or ".". Real
+            # sysctl can't emit those (the kernel uses a fixed %.2f), but the
+            # parser must degrade to None rather than raise -- _swap_usage()
+            # calls it outside its own try, so a raise here would escape
+            # run_doctor() and break doctor's exit-0 guarantee.
+            return None
+    total, used = int(fields["total"]), int(fields["used"])
+    # Swap disabled / freshly booted reports 0.00M total -- don't divide by it.
+    percent = round(used / total * 100, 1) if total else 0.0
+    return {"total_bytes": total, "used_bytes": used, "percent": percent}
+
+
+def _swap_usage():
+    """Current swap usage, or None when sysctl can't answer."""
+    try:
+        result = subprocess.run(["sysctl", "vm.swapusage"],
+                                capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_swap_usage(result.stdout)
+
+
 def run_doctor(config, json_mode=False):
     checks = []
 
@@ -2196,6 +2242,24 @@ def run_doctor(config, json_mode=False):
 
     ds = disk_stats()
     check("Disk", f"{fmt_size(ds['free_bytes'])} free of {fmt_size(ds['total_bytes'])} ({ds['percent_used']}% used)")
+
+    # Swap pressure (2.8.0). Report-only: macOS manages swap entirely, and it
+    # shrinks on its own as memory pressure drops -- there is nothing here a
+    # cleaner could safely delete, so this never becomes a target.
+    swap = _swap_usage()
+    if swap is None:
+        check("Swap", "could not determine swap usage")
+    elif swap["total_bytes"] == 0:
+        check("Swap", "not in use")
+    elif swap["percent"] >= SWAP_WARN_PERCENT:
+        check("Swap",
+              f"{fmt_size(swap['used_bytes'])} of {fmt_size(swap['total_bytes'])} used "
+              f"({swap['percent']}%) — high; close memory-heavy apps or restart to free it",
+              ok=False)
+    else:
+        check("Swap",
+              f"{fmt_size(swap['used_bytes'])} of {fmt_size(swap['total_bytes'])} used "
+              f"({swap['percent']}%)")
 
     all_ok = all(c["ok"] for c in checks)
 
