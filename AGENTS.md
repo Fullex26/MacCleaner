@@ -59,6 +59,7 @@ maccleaner doctor    [--json]
 maccleaner config    show | path | enable CAT | disable CAT | set KEY VALUE
 maccleaner categories [--json]
 maccleaner disk-check [--json]    # cheap; for launchd's hourly diskwatch agent
+maccleaner storage-insights [--json]   # read-only: largest files in Documents/Downloads/Desktop (never deletes)
 maccleaner schedule  status | weekly | monthly | off [--json]   # manage the launchd schedule
 maccleaner install-deps          # pip-installs 'rich' (optional, cosmetic only)
 maccleaner --version
@@ -287,6 +288,25 @@ Both 2.8.0 checks use hardcoded thresholds (8 GiB of swapfiles on disk; 500 MB h
 
 New in 2.2.0. Deliberately cheap: one `shutil.disk_usage` call — no `du` measurement pass over targets, and it neither records a `snapshots.log` entry nor a `report.log` run (this is a monitor, not a scan or a clean). `below_threshold` compares `free_bytes` against config `low_disk_threshold_gb` (default 10 GB) converted to bytes. `notified` is `true` only if a notification was actually posted this run — posting is throttled to at most once per 24 hours while free space stays below the threshold (state lives in `alerts.json`, see §5), and skipped entirely (with `notified: false`, but `below_threshold` still accurate) when config `low_disk_alerts` is `false`. A malformed `low_disk_threshold_gb` (non-numeric, `NaN`, or infinite) falls back to the 10 GB default and prints a warning to stderr; the command still succeeds. **`disk-check` always exits 0** — it's a monitor meant to run unattended every hour via the `com.fullex.maccleaner.diskwatch` launchd agent, not a check that should ever fail a script.
 
+### `storage-insights --json`
+
+```json
+{
+  "version": "2.8.1",
+  "entries": [
+    { "path": "/Users/you/Downloads/large-export.dmg", "size_bytes": 2147483648, "size_human": "2.0 GB", "mtime": 1752393600.0 }
+  ]
+}
+```
+
+New in 2.9.0. Read-only, iterative (non-recursive-call) scan of three default roots — `~/Documents`, `~/Downloads`, `~/Desktop` — for files at or above a **100 MB floor** (`STORAGE_INSIGHTS_MIN_BYTES = 100 * 1024 * 1024`), returning up to a **50-entry cap** (`STORAGE_INSIGHTS_MAX_RESULTS = 50`), largest first. Both numbers are hardcoded constants in `cleaner.py` — there is no `config.json` key for either, and no flag overrides them. The roots list itself can be overridden with `MACCLEANER_STORAGE_INSIGHTS_ROOTS` (colon-separated absolute paths, same convention as `MACCLEANER_TMP_ROOT`); unset, it defaults to the three paths above.
+
+Each entry is `{"path": str, "size_bytes": int, "size_human": str, "mtime": float}` — `mtime` is the raw `os.stat` modification time (seconds since epoch, as a float), left for the caller to format. Known-noise directories (dev artifact dirs such as `node_modules`, `.venv`, `Pods`, project manifests' sibling build dirs — the same skip set `scan_projects`/`scan_tmp_artifacts` treat as artifact noise) and anything ending in `.app` are never descended into. Symlinks encountered *during* the walk (both directories and files) are always skipped; the configured roots themselves are followed if they are symlinks, since macOS's "Desktop & Documents Folders" iCloud sync replaces `~/Documents`/`~/Desktop` with symlinks into `~/Library/Mobile Documents/com~apple~CloudDocs/...`, and refusing to follow the root would silently return nothing for the most common real-world setup.
+
+**No delete/target mechanism exists for this data, at all.** Entries carry no `id` field and no `safe` field — they are not targets in the `get_targets()`/`collect_targets()` sense. No other subcommand accepts a `storage-insights` entry as input: `clean --targets` does not recognize a path or ID from this output, and there is no `storage-insights --clean` or equivalent. An agent that wants to act on a large file this command surfaces has exactly one option: operate on the reported filesystem path directly, outside MacCleaner (e.g. `rm`, moving it, or asking the user) — MacCleaner's own delete pipeline has no notion of these entries at all.
+
+**Stat-only — never opens file contents.** The scan calls `os.scandir`/`os.stat` exclusively; it never reads a file's bytes. This makes it safe to point at a directory containing iCloud-evicted ("Optimize Mac Storage") placeholder files without triggering a download of their content — a stat call reports the placeholder's size without materializing it locally.
+
 ### `schedule status|weekly|monthly|off --json`
 
 New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`monthly`/`off` each add one action-specific key on top of the common envelope:
@@ -442,4 +462,4 @@ Matching is bundle-ID-precise rather than fuzzy, but it still isn't an absolute 
 - **`disk-check`** (new in 2.2.0) never deletes, measures, or scans — it's a single `shutil.disk_usage` call plus, at most, a notification and a write to `alerts.json` (its own throttle-state file, distinct from `report.log`/`snapshots.log`). It always exits 0, whether or not it's below the threshold or a warning was posted.
 - **`schedule`** (new in 2.3.0) never touches anything inside `$HOME`'s data — it only writes/removes launchd plists (under `MACCLEANER_LAUNCH_AGENTS_DIR`, default `~/Library/LaunchAgents`), calls `launchctl`, and edits the crontab to strip a legacy MacCleaner line. It writes nothing to `report.log`, `snapshots.log`, or `alerts.json`. The agents it installs (`clean --yes --notify`, `disk-check`) are themselves bound by every safety guarantee above.
 - **`doctor`'s 2.8.0 system-pressure checks** (`Swap`, `Held-open files`) are strictly **read-only reporting**. `Swap` runs one `sysctl vm.swapusage`; `Held-open files` runs one `lsof -b -nPw +c 0 +L1`. Neither deletes a byte, neither creates a target ID, neither offers or accepts a cleanup action, and MacCleaner will never kill a process, unlink a held-open inode, or touch `/System/Volumes/VM`. They exist purely to explain disk space the tool has deliberately decided not to reclaim — which is also why both are `advisory` and excluded from top-level `ok` (§3).
-- `scan`, `projects` (without `--clean`), `doctor`, `report`, `categories`, and `config show|path` never delete anything. `scan` and every real `clean`/`projects --clean` run (not `--dry-run`) also record a disk-usage entry to `snapshots.log`; `clean` and `projects --clean` (but not `--dry-run`) additionally append a run entry to `report.log`. `--dry-run` writes to neither log.
+- `scan`, `projects` (without `--clean`), `doctor`, `report`, `categories`, `config show|path`, and `storage-insights` never delete anything. `scan` and every real `clean`/`projects --clean` run (not `--dry-run`) also record a disk-usage entry to `snapshots.log`; `clean` and `projects --clean` (but not `--dry-run`) additionally append a run entry to `report.log`. `--dry-run` writes to neither log. `storage-insights` writes to no log at all — no `report.log`, `snapshots.log`, or `alerts.json` entry, ever.
