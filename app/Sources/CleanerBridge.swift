@@ -603,6 +603,7 @@ final class CleanerBridge: ObservableObject {
         defer { isScanningStorageInsights = false }
         do {
             storageInsights = try await run(StorageInsightsReport.self, ["storage-insights", "--json"])
+            statusMessage = nil
         } catch {
             statusMessage = "Storage insights scan failed: \(error.localizedDescription)"
         }

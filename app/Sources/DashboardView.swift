@@ -70,11 +70,22 @@ struct DashboardView: View {
                 .foregroundStyle(.secondary)
 
             if let entries = bridge.storageInsights?.entries, !entries.isEmpty {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(entries) { entry in
-                        LargeFileRow(entry: entry)
+                // Bounded + scrollable (finding: unbounded VStack could push
+                // the category list and "Clean Selected" footer off-screen
+                // with enough qualifying files — up to
+                // STORAGE_INSIGHTS_MAX_RESULTS=50 in cleaner.py). 240pt shows
+                // roughly 4-5 rows before scrolling, matching this card's
+                // visual weight as one of several on the Dashboard rather
+                // than becoming the dominant element. This cap holds
+                // regardless of entry count (0 to 50).
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(entries) { entry in
+                            LargeFileRow(entry: entry)
+                        }
                     }
                 }
+                .frame(maxHeight: 240)
             } else if bridge.isScanningStorageInsights {
                 ProgressView()
                     .frame(maxWidth: .infinity, alignment: .center)
