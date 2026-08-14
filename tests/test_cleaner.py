@@ -4426,12 +4426,21 @@ class TestNewTargetsV28(unittest.TestCase):
         self.assertIsNone(t["glob"])
         self.assertTrue(str(t["path"]).endswith("Library/Developer/XcodeBuildMCP"))
 
-    def test_chrome_model_store_target(self):
+    def test_chrome_model_store_target_is_review_only(self):
+        # Chrome indexes these models in ~/Library/Application Support/Google/
+        # Chrome/Local State, which MacCleaner never touches -- deleting the
+        # store leaves a live index pointing at missing model directories and
+        # nothing verified Chrome recovers cleanly. Matches how the other
+        # downloaded-model targets (ollama-models, huggingface-hub) are rated.
         t = self.targets["chrome-optimization-model-store"]
         self.assertEqual(t["category"], "caches")
-        self.assertTrue(t["safe"])
+        self.assertFalse(t["safe"])
         self.assertIsNone(t["glob"])
         self.assertTrue(str(t["path"]).endswith("optimization_guide_model_store"))
+
+    def test_other_two_new_targets_stay_safe(self):
+        self.assertTrue(self.targets["xcodebuildmcp-workspaces"]["safe"])
+        self.assertTrue(self.targets["chrome-optimization-hint-cache"]["safe"])
 
     def test_chrome_hint_cache_is_per_profile_glob(self):
         # Chrome keeps one of these per profile (Default, Profile 1,
@@ -4469,15 +4478,35 @@ class TestSwapUsageParsing(unittest.TestCase):
         self.assertEqual(s["used_bytes"], int(15571.88 * 1024 ** 2))
         self.assertAlmostEqual(s["percent"], 95.0, delta=0.5)
 
-    def test_high_usage_is_at_or_above_threshold(self):
-        self.assertGreaterEqual(cleaner._parse_swap_usage(self.REAL_OUTPUT)["percent"],
-                                cleaner.SWAP_WARN_PERCENT)
+    def test_threshold_is_absolute_disk_consumed_not_a_ratio(self):
+        # sysctl's `total` IS the disk the swapfiles occupy under
+        # /System/Volumes/VM, which is the only swap quantity a storage tool
+        # has any business thresholding on. The used/total ratio was rejected
+        # as a signal: it is non-monotonic in disk consumed.
+        self.assertEqual(cleaner.SWAP_WARN_BYTES, 8 * 1024 ** 3)
+        self.assertFalse(hasattr(cleaner, "SWAP_WARN_PERCENT"),
+                         "the ratio threshold must be gone, not merely unused")
 
-    def test_low_usage_is_below_threshold(self):
-        out = ("vm.swapusage: total = 2048.00M  used = 100.00M  "
-               "free = 1948.00M  (encrypted)\n")
-        self.assertLess(cleaner._parse_swap_usage(out)["percent"],
-                        cleaner.SWAP_WARN_PERCENT)
+    def test_large_swapfiles_are_at_or_above_threshold(self):
+        # 16 GiB of swapfiles on disk -- over the 8 GiB line regardless of how
+        # much of it is currently paged in.
+        s = cleaner._parse_swap_usage(self.REAL_OUTPUT)
+        self.assertGreaterEqual(s["total_bytes"], cleaner.SWAP_WARN_BYTES)
+
+    def test_small_swapfiles_are_below_threshold_even_at_a_high_ratio(self):
+        # 2 GiB of swapfiles, 97% of it paged in. The old ratio rule would
+        # have alarmed on this; the disk-consumed rule correctly does not.
+        out = ("vm.swapusage: total = 2048.00M  used = 1990.00M  "
+               "free = 58.00M  (encrypted)\n")
+        s = cleaner._parse_swap_usage(out)
+        self.assertLess(s["total_bytes"], cleaner.SWAP_WARN_BYTES)
+        self.assertGreater(s["percent"], 90)
+
+    def test_percent_is_still_reported_as_informational_text(self):
+        # The ratio stays in the payload -- it is useful colour in the status
+        # line even though it no longer drives the threshold.
+        out = "vm.swapusage: total = 4.00G  used = 1.00G  free = 3.00G\n"
+        self.assertEqual(cleaner._parse_swap_usage(out)["percent"], 25.0)
 
     def test_gigabyte_units(self):
         out = "vm.swapusage: total = 4.00G  used = 2.00G  free = 2.00G  (encrypted)\n"
@@ -4506,6 +4535,16 @@ class TestSwapUsageParsing(unittest.TestCase):
                     "vm.swapusage: total = 4.00G  used = ...G  free = 0.00G"):
             self.assertIsNone(cleaner._parse_swap_usage(bad), bad)
 
+    def test_huge_digit_run_returns_none_instead_of_overflowing(self):
+        # `[0-9.]+` is unbounded and float("9"*400) returns inf WITHOUT
+        # raising, so int(inf) throws OverflowError -- which is NOT a
+        # ValueError and so escaped the guard above, escaped _swap_usage()
+        # (whose try only wraps subprocess.run), escaped run_doctor(), and
+        # made `doctor` traceback with a non-zero exit.
+        for bad in ("vm.swapusage: total = %sM  used = 1.00M  free = 0.00M" % ("9" * 400),
+                    "vm.swapusage: total = 1.00M  used = %sG  free = 0.00M" % ("8" * 500)):
+            self.assertIsNone(cleaner._parse_swap_usage(bad), bad)
+
     def test_collector_degrades_when_sysctl_missing(self):
         with mock.patch.object(cleaner.subprocess, "run",
                                side_effect=OSError("no sysctl")):
@@ -4515,6 +4554,19 @@ class TestSwapUsageParsing(unittest.TestCase):
         fake = mock.Mock(returncode=1, stdout="")
         with mock.patch.object(cleaner.subprocess, "run", return_value=fake):
             self.assertIsNone(cleaner._swap_usage())
+
+    def test_collector_argv_and_timeout_are_pinned(self):
+        # The parser's regex is written against `sysctl vm.swapusage`
+        # specifically; a bounded timeout is what keeps doctor responsive.
+        fake = mock.Mock(returncode=0, stdout=self.REAL_OUTPUT)
+        with mock.patch.object(cleaner.subprocess, "run",
+                               return_value=fake) as run:
+            cleaner._swap_usage()
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["sysctl", "vm.swapusage"])
+        self.assertEqual(kwargs["timeout"], 5)
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
 
 
 class TestHeldOpenDeletedParsing(unittest.TestCase):
@@ -4569,6 +4621,31 @@ class TestHeldOpenDeletedParsing(unittest.TestCase):
     def test_empty_output_is_zero(self):
         self.assertEqual(cleaner._parse_held_open_deleted("")["total_bytes"], 0)
 
+    def test_single_volume_reports_one_device(self):
+        self.assertEqual(
+            cleaner._parse_held_open_deleted(self.REAL_OUTPUT)["device_count"], 1)
+
+    # Rows on TWO different DEVICE values with a COLLIDING node number. Inode
+    # numbers are only unique per volume, so (DEVICE, NODE) must key on both
+    # halves -- the single-device fixture above never exercised DEVICE at all.
+    # doctor's Disk row covers the startup volume only, so a total spanning
+    # several mounts has to say so.
+    TWO_VOLUME_OUTPUT = (
+        "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NLINK NODE NAME\n"
+        "bootproc 10 u 3u REG 1,18 1048576 0 4242 /a/boot-file\n"
+        "extproc 11 u 3u REG 1,21 2097152 0 4242 /Volumes/Ext/other-file\n"
+    )
+
+    def test_same_node_on_different_devices_is_not_deduped(self):
+        r = cleaner._parse_held_open_deleted(self.TWO_VOLUME_OUTPUT)
+        self.assertEqual(r["total_bytes"], 1048576 + 2097152)
+        self.assertEqual(dict(r["by_command"]), {"bootproc": 1048576,
+                                                 "extproc": 2097152})
+
+    def test_counts_distinct_devices(self):
+        self.assertEqual(
+            cleaner._parse_held_open_deleted(self.TWO_VOLUME_OUTPUT)["device_count"], 2)
+
     def test_collector_degrades_when_lsof_missing(self):
         with mock.patch.object(cleaner.subprocess, "run",
                                side_effect=OSError("no lsof")):
@@ -4580,76 +4657,272 @@ class TestHeldOpenDeletedParsing(unittest.TestCase):
         with mock.patch.object(cleaner.subprocess, "run", return_value=fake):
             self.assertIsNone(cleaner._held_open_deleted())
 
+    def test_collector_argv_and_timeout_are_pinned(self):
+        # The parser depends contractually on these exact flags: `+L1` is what
+        # restricts output to deleted (NLINK 0) files, `+c 0` is what makes
+        # full command names (and the \x20 escape) show up, `-n`/`-P` keep the
+        # NAME column from being rewritten, and `-b` avoids blocking kernel
+        # calls on a wedged mount (`-w` suppresses the warnings that induces).
+        fake = mock.Mock(returncode=0, stdout=self.REAL_OUTPUT)
+        with mock.patch.object(cleaner.subprocess, "run",
+                               return_value=fake) as run:
+            cleaner._held_open_deleted()
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["lsof", "-b", "-nPw", "+c", "0", "+L1"])
+        self.assertEqual(kwargs["timeout"], 10)
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+
 
 class TestDoctorPressureChecks(unittest.TestCase):
-    def _checks(self):
+    def _doctor(self, swap=None, held=None):
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        with mock.patch.object(cleaner, "_swap_usage", return_value=swap), \
+             mock.patch.object(cleaner, "_held_open_deleted", return_value=held), \
+             contextlib.redirect_stdout(buf):
             cleaner.run_doctor(json.loads(json.dumps(cleaner.DEFAULT_CONFIG)),
                                json_mode=True)
-        return {c["name"]: c for c in json.loads(buf.getvalue())["checks"]}
+        return json.loads(buf.getvalue())
 
-    def test_swap_ok_when_low(self):
-        with mock.patch.object(cleaner, "_swap_usage",
-                               return_value={"total_bytes": 2 * 1024 ** 3,
-                                             "used_bytes": 512 * 1024 ** 2,
-                                             "percent": 25.0}), \
-             mock.patch.object(cleaner, "_held_open_deleted", return_value=None):
-            checks = self._checks()
+    def _checks(self, **kw):
+        return {c["name"]: c for c in self._doctor(**kw)["checks"]}
+
+    # ── Swap: absolute disk-consumed threshold ────────────────────────────
+    def test_swap_ok_when_swapfiles_are_small(self):
+        checks = self._checks(swap={"total_bytes": 2 * 1024 ** 3,
+                                    "used_bytes": 512 * 1024 ** 2,
+                                    "percent": 25.0})
         self.assertTrue(checks["Swap"]["ok"])
 
-    def test_swap_flags_high_usage(self):
-        with mock.patch.object(cleaner, "_swap_usage",
-                               return_value={"total_bytes": 16 * 1024 ** 3,
-                                             "used_bytes": 15 * 1024 ** 3,
-                                             "percent": 93.8}), \
-             mock.patch.object(cleaner, "_held_open_deleted", return_value=None):
-            checks = self._checks()
+    def test_swap_ok_when_ratio_is_high_but_swapfiles_are_small(self):
+        # THE regression this redesign exists for: 2 GiB of swapfiles that
+        # happen to be 97% paged in is not a storage problem, and the old
+        # ratio rule alarmed on exactly this shape.
+        checks = self._checks(swap={"total_bytes": 2 * 1024 ** 3,
+                                    "used_bytes": int(1.94 * 1024 ** 3),
+                                    "percent": 97.0})
+        self.assertTrue(checks["Swap"]["ok"])
+
+    def test_swap_flags_large_swapfiles_even_at_a_low_ratio(self):
+        # 13 GiB of real swapfiles on disk with only 40% paged in: the ratio
+        # rule stayed silent here; the disk-consumed rule correctly speaks up.
+        checks = self._checks(swap={"total_bytes": 13 * 1024 ** 3,
+                                    "used_bytes": int(5.2 * 1024 ** 3),
+                                    "percent": 40.0})
         self.assertFalse(checks["Swap"]["ok"])
 
-    def test_swap_reports_unknown_rather_than_failing(self):
-        with mock.patch.object(cleaner, "_swap_usage", return_value=None), \
-             mock.patch.object(cleaner, "_held_open_deleted", return_value=None):
-            checks = self._checks()
-        self.assertTrue(checks["Swap"]["ok"])
+    def test_swap_threshold_is_inclusive_at_the_boundary(self):
+        at = self._checks(swap={"total_bytes": cleaner.SWAP_WARN_BYTES,
+                                "used_bytes": 0, "percent": 0.0})
+        below = self._checks(swap={"total_bytes": cleaner.SWAP_WARN_BYTES - 1,
+                                   "used_bytes": 0, "percent": 0.0})
+        self.assertFalse(at["Swap"]["ok"])
+        self.assertTrue(below["Swap"]["ok"])
 
+    def test_swap_status_is_storage_framed_and_keeps_the_ratio(self):
+        checks = self._checks(swap={"total_bytes": 13 * 1024 ** 3,
+                                    "used_bytes": int(5.2 * 1024 ** 3),
+                                    "percent": 40.0})
+        status = checks["Swap"]["status"]
+        self.assertIn("swapfiles use", status)
+        self.assertIn("of disk", status)
+        self.assertIn("paged in", status)
+        self.assertIn("40.0%", status)
+        self.assertIn("macOS manages this", status)
+        # "restart to free it" is misleading remediation -- a restart frees
+        # the swapfiles for minutes, not durably.
+        self.assertNotIn("restart", status.lower())
+
+    def test_swap_reports_unknown_rather_than_failing(self):
+        self.assertTrue(self._checks(swap=None)["Swap"]["ok"])
+
+    def test_swap_zero_total_reported_without_dividing(self):
+        checks = self._checks(swap={"total_bytes": 0, "used_bytes": 0,
+                                    "percent": 0.0})
+        self.assertTrue(checks["Swap"]["ok"])
+        self.assertIn("no swapfiles", checks["Swap"]["status"])
+
+    # ── Held-open files: display logic ────────────────────────────────────
     def test_held_open_omitted_below_threshold(self):
-        with mock.patch.object(cleaner, "_swap_usage", return_value=None), \
-             mock.patch.object(cleaner, "_held_open_deleted",
-                               return_value={"total_bytes": 5 * 1024 ** 2,
-                                             "by_command": [("foo", 5 * 1024 ** 2)]}):
-            checks = self._checks()
+        checks = self._checks(held={"total_bytes": 5 * 1024 ** 2,
+                                    "by_command": [("foo", 5 * 1024 ** 2)],
+                                    "device_count": 1})
         self.assertNotIn("Held-open files", checks)
 
     def test_held_open_flags_and_names_process_above_threshold(self):
-        with mock.patch.object(cleaner, "_swap_usage", return_value=None), \
-             mock.patch.object(cleaner, "_held_open_deleted",
-                               return_value={"total_bytes": 3 * 1024 ** 3,
-                                             "by_command": [("diskimages-helper",
-                                                             3 * 1024 ** 3)]}):
-            checks = self._checks()
+        checks = self._checks(held={"total_bytes": 3 * 1024 ** 3,
+                                    "by_command": [("diskimages-helper", 3 * 1024 ** 3)],
+                                    "device_count": 1})
         self.assertFalse(checks["Held-open files"]["ok"])
         self.assertIn("diskimages-helper", checks["Held-open files"]["status"])
 
     def test_held_open_names_biggest_when_none_clear_per_process_floor(self):
         many = [("p%d" % i, 6 * 1024 ** 2) for i in range(100)]
-        with mock.patch.object(cleaner, "_swap_usage", return_value=None), \
-             mock.patch.object(cleaner, "_held_open_deleted",
-                               return_value={"total_bytes": 600 * 1024 ** 2,
-                                             "by_command": many}):
-            checks = self._checks()
+        checks = self._checks(held={"total_bytes": 600 * 1024 ** 2,
+                                    "by_command": many, "device_count": 1})
         self.assertIn("Held-open files", checks)
         self.assertIn("p0", checks["Held-open files"]["status"])
 
-    def test_doctor_still_exits_zero_with_failing_checks(self):
+    def test_held_open_more_count_includes_holders_below_the_naming_floor(self):
+        # Two holders clear the 10 MB naming floor; five do not. The suffix
+        # counted only the named-eligible ones, so every sub-floor holder was
+        # invisible in BOTH the names and the count -- "+0 more" on 5 hidden.
+        by_command = [("big1", 400 * 1024 ** 2), ("big2", 200 * 1024 ** 2)]
+        by_command += [("small%d" % i, 1024 ** 2) for i in range(5)]
+        checks = self._checks(held={"total_bytes": 605 * 1024 ** 2,
+                                    "by_command": by_command, "device_count": 1})
+        status = checks["Held-open files"]["status"]
+        self.assertIn("big1", status)
+        self.assertIn("big2", status)
+        self.assertNotIn("small0", status)
+        self.assertIn("+5 more processes", status)
+
+    def test_held_open_caps_named_processes_and_counts_the_rest(self):
+        by_command = [("p%d" % i, (50 - i) * 1024 ** 2) for i in range(6)]
+        checks = self._checks(held={"total_bytes": 600 * 1024 ** 2,
+                                    "by_command": by_command, "device_count": 1})
+        status = checks["Held-open files"]["status"]
+        self.assertEqual(cleaner.HELD_OPEN_MAX_NAMED, 3)
+        for named in ("p0", "p1", "p2"):
+            self.assertIn(named, status)
+        self.assertNotIn("p3 (", status)
+        self.assertIn("+3 more processes", status)
+
+    def test_held_open_more_suffix_is_singular_for_one_extra(self):
+        by_command = [("p%d" % i, 150 * 1024 ** 2) for i in range(4)]
+        checks = self._checks(held={"total_bytes": 600 * 1024 ** 2,
+                                    "by_command": by_command, "device_count": 1})
+        status = checks["Held-open files"]["status"]
+        self.assertIn("+1 more process", status)
+        self.assertNotIn("+1 more processes", status)
+
+    def test_held_open_no_suffix_when_everything_is_named(self):
+        by_command = [("p%d" % i, 300 * 1024 ** 2) for i in range(2)]
+        checks = self._checks(held={"total_bytes": 600 * 1024 ** 2,
+                                    "by_command": by_command, "device_count": 1})
+        self.assertNotIn("more process", checks["Held-open files"]["status"])
+
+    def test_held_open_flags_when_the_total_spans_several_volumes(self):
+        # doctor's Disk row above reports the startup volume only, so a total
+        # silently summed across mounts would read as boot-disk usage.
+        checks = self._checks(held={"total_bytes": 3 * 1024 ** 3,
+                                    "by_command": [("foo", 3 * 1024 ** 3)],
+                                    "device_count": 3})
+        self.assertIn("across 3 volumes", checks["Held-open files"]["status"])
+
+    def test_held_open_omits_volume_qualifier_on_a_single_volume(self):
+        checks = self._checks(held={"total_bytes": 3 * 1024 ** 3,
+                                    "by_command": [("foo", 3 * 1024 ** 3)],
+                                    "device_count": 1})
+        self.assertNotIn("volume", checks["Held-open files"]["status"])
+
+    def test_held_open_wording_does_not_overstate_attribution(self):
+        # Each deduped inode is attributed to the FIRST command seen holding
+        # it, but the blocks only come back when EVERY holder of that inode
+        # exits -- so the message must not promise the space returns when the
+        # named processes exit.
+        checks = self._checks(held={"total_bytes": 3 * 1024 ** 3,
+                                    "by_command": [("foo", 3 * 1024 ** 3)],
+                                    "device_count": 1})
+        status = checks["Held-open files"]["status"]
+        self.assertIn("every process holding them exits", status)
+        self.assertNotIn("frees itself when they exit", status)
+
+    # ── Advisory: report-only checks are excluded from top-level ok ───────
+    def _advisory_names(self, **kw):
+        return {c["name"] for c in self._doctor(**kw)["checks"] if c.get("advisory")}
+
+    def test_both_new_checks_are_marked_advisory(self):
+        names = self._advisory_names(
+            swap={"total_bytes": 13 * 1024 ** 3, "used_bytes": 1024 ** 3, "percent": 7.9},
+            held={"total_bytes": 3 * 1024 ** 3,
+                  "by_command": [("foo", 3 * 1024 ** 3)], "device_count": 1})
+        self.assertEqual(names, {"Swap", "Held-open files"})
+
+    def test_swap_is_advisory_in_every_branch(self):
+        self.assertIn("Swap", self._advisory_names(swap=None))
+        self.assertIn("Swap", self._advisory_names(
+            swap={"total_bytes": 0, "used_bytes": 0, "percent": 0.0}))
+        self.assertIn("Swap", self._advisory_names(
+            swap={"total_bytes": 1024 ** 3, "used_bytes": 0, "percent": 0.0}))
+        self.assertIn("Swap", self._advisory_names(
+            swap={"total_bytes": 13 * 1024 ** 3, "used_bytes": 0, "percent": 0.0}))
+
+    def test_advisory_key_never_appears_on_pre_existing_checks(self):
+        # Purely additive: the key must be absent (not False) everywhere else,
+        # so already-installed consumers see byte-identical entries.
+        doc = self._doctor(swap=None, held=None)
+        for c in doc["checks"]:
+            if c["name"] in ("Swap", "Held-open files"):
+                continue
+            self.assertNotIn("advisory", c, c["name"])
+        self.assertEqual(set(c["name"] for c in doc["checks"] if "advisory" in c),
+                         {"Swap"})
+
+    def test_failing_advisory_check_does_not_flip_top_level_ok(self):
+        # Compare a run where both advisory checks fail against one where
+        # neither is present. Anything else about this machine is identical
+        # between the two runs, so a difference could only come from the
+        # advisory entries.
+        clean = self._doctor(swap=None, held=None)
+        failing = self._doctor(
+            swap={"total_bytes": 13 * 1024 ** 3, "used_bytes": 1024 ** 3, "percent": 7.9},
+            held={"total_bytes": 3 * 1024 ** 3,
+                  "by_command": [("foo", 3 * 1024 ** 3)], "device_count": 1})
+        failed = [c for c in failing["checks"] if not c["ok"]]
+        self.assertEqual({c["name"] for c in failed} & {"Swap", "Held-open files"},
+                         {"Swap", "Held-open files"},
+                         "both advisory checks must actually be failing here")
+        self.assertEqual(failing["ok"], clean["ok"],
+                         "advisory failures must not move the aggregate")
+
+    def test_non_advisory_failing_check_still_flips_top_level_ok(self):
+        # The counterpart guarantee: `ok` still means "a MacCleaner-owned
+        # problem with a remedy". Invalid config JSON is exactly that.
+        tmp = tempfile.mkdtemp()
+        try:
+            bad = Path(tmp) / "config.json"
+            bad.write_text("{ not json")
+            env = dict(os.environ, MACCLEANER_CONFIG=str(bad))
+            r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                                "doctor", "--json"],
+                               capture_output=True, text=True, env=env)
+            data = json.loads(r.stdout)
+            cfg = next(c for c in data["checks"] if c["name"] == "Config")
+            self.assertFalse(cfg["ok"])
+            self.assertNotIn("advisory", cfg)
+            self.assertFalse(data["ok"],
+                             "a non-advisory failure must fail the aggregate")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_doctor_still_exits_zero_with_a_failing_check(self):
         # run_doctor returns all_ok but main() deliberately discards it, so
         # `doctor` always exits 0. CI's smoke test runs bare
-        # `python3 cleaner.py doctor` -- wiring these new ok=False checks to
-        # an exit code would break the build.
-        env = dict(os.environ, MACCLEANER_CONFIG=str(Path(tempfile.mkdtemp()) / "c.json"))
-        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"), "doctor"],
-                           capture_output=True, text=True, env=env)
-        self.assertEqual(r.returncode, 0, r.stderr)
+        # `python3 cleaner.py doctor` -- wiring ok=False to an exit code would
+        # break the build. Deterministically MAKE a check fail (invalid config
+        # JSON) and assert both halves: something really did fail, AND the
+        # exit code is still 0. Without the first half this test passed
+        # vacuously on an all-green machine.
+        tmp = tempfile.mkdtemp()
+        try:
+            bad = Path(tmp) / "config.json"
+            bad.write_text("{ this is not valid json")
+            env = dict(os.environ, MACCLEANER_CONFIG=str(bad))
+            r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                                "doctor", "--json"],
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            data = json.loads(r.stdout)
+            self.assertTrue(any(not c["ok"] for c in data["checks"]),
+                            "the fixture must actually produce a failing check")
+            # …and the plain (non-JSON) path exits 0 too, which is the exact
+            # invocation CI smoke-tests.
+            r2 = subprocess.run([sys.executable, str(REPO / "cleaner.py"), "doctor"],
+                                capture_output=True, text=True, env=env)
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
