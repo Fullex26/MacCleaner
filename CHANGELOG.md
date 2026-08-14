@@ -7,6 +7,13 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.8.1] — 2026-08-14
+
+### Fixed
+- `_safe_to_delete()` — the single guard every delete across every category routes through — checked path containment lexically (`Path.absolute()`), which never resolves symlinks. A target reaching its destination through a symlinked ANCESTOR directory (e.g. a glob match under a symlinked cache subdirectory) was lexically inside `$HOME` but could physically resolve outside it, and would have been deleted. Fixed by resolving the parent directory (not the leaf) before the containment check. The leaf is deliberately left unresolved: `_remove()` unlinks a symlink leaf rather than following it, so a symlink whose own directory entry is inside `$HOME` stays safe to remove even when it points elsewhere — only the link is ever removed, never its target. Also closes a narrower, currently-unreachable gap where a literal trailing `..` path component could resolve outside `$HOME` even with the parent fix in place. No current target — static, glob, or any dynamic scanner — is known to have produced a path that triggered this; found and fixed proactively via adversarial review of the core delete-safety invariant, not from a reported incident.
+
+---
+
 ## [2.8.0] — 2026-08-14
 
 Three new cleanup targets, plus two report-only `doctor` checks that account
