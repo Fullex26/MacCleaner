@@ -16,7 +16,7 @@ bash -n "$HERE/maccleaner.bash" && ok "bash -n maccleaner.bash" || no "bash -n m
 
 echo "Tier 2: bash behaviour (COMPREPLY assertions, runs on bash 3.2)"
 B(){ bash "$HERE/bashtest.sh" "$HERE/maccleaner.bash" "$1"; }
-eq "subcommands"          "10" "$(B 'maccleaner ' | grep -cv '^--')"
+eq "subcommands"          "11" "$(B 'maccleaner ' | grep -cv '^--')"
 eq "prefix filter 'sc'"   "scan schedule" "$(B 'maccleaner sc' | tr '\n' ' ' | sed 's/ $//')"
 eq "schedule actions"     "status weekly monthly off" "$(B 'maccleaner schedule ' | grep -v '^--' | tr '\n' ' ' | sed 's/ $//')"
 eq "schedule after action" "--json --help" "$(B 'maccleaner schedule weekly ' | tr '\n' ' ' | sed 's/ $//')"
@@ -44,7 +44,7 @@ eq "alias mclean --targets" "83" "$(B 'mclean --targets ' | wc -l | tr -d ' ')"
 
 echo "Tier 3: zsh behaviour (zpty + compadd -O capture)"
 Z(){ "$HERE/capture.zsh" "$HERE" "$1"; }
-eq "zsh subcommands"      "10" "$(Z 'maccleaner ' | wc -l | tr -d ' ')"
+eq "zsh subcommands"      "11" "$(Z 'maccleaner ' | wc -l | tr -d ' ')"
 eq "zsh prefix 'sc'"      "scan schedule" "$(Z 'maccleaner sc' | tr '\n' ' ' | sed 's/ $//')"
 eq "zsh schedule action"  "monthly off status weekly" "$(Z 'maccleaner schedule ' | tr '\n' ' ' | sed 's/ $//')"
 eq "zsh targets 1st"      "83" "$(Z 'maccleaner clean --targets ' | wc -l | tr -d ' ')"

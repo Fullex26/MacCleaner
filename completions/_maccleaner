@@ -203,6 +203,7 @@ _maccleaner() {
     'categories:List categories and their targets'
     'schedule:Manage the launchd cleanup schedule'
     'disk-check:Low-disk warning check (for launchd)'
+    'storage-insights:Largest files in Documents/Downloads/Desktop (read-only)'
     'install-deps:Install rich for prettier output'
   )
 
@@ -297,7 +298,7 @@ _maccleaner() {
               ;;
           esac
           ;;
-        doctor|categories|disk-check)
+        doctor|categories|disk-check|storage-insights)
           _arguments -s -S \
             '--json[machine-readable output]' \
             '(-h --help)'{-h,--help}'[show help]' && ret=0

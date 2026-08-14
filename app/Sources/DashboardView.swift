@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct DashboardView: View {
     @EnvironmentObject var bridge: CleanerBridge
@@ -42,10 +43,104 @@ struct DashboardView: View {
             DiskTrendView()
                 .padding(.horizontal)
                 .padding(.bottom, 8)
+            largeFilesSection
+                .padding(.horizontal)
+                .padding(.bottom, 8)
             Divider()
             content
             Divider()
             footer
+        }
+    }
+
+    /// Self-contained widget: it fetches its own data (`storage-insights
+    /// --json`, independent of the main reclaimable-targets `scan`) and
+    /// renders regardless of whether `bridge.report` has ever been loaded.
+    /// Unlike `DiskTrendView` above it — which issues no subprocess call at
+    /// all and just renders `bridge.diskSnapshots` from the shared refresh
+    /// path — this section owns a real filesystem walk, so its `.task`
+    /// below is guarded to fetch once rather than on every appearance.
+    /// Read-only — "Reveal in Finder" is the only action, never a
+    /// delete/clean path.
+    private var largeFilesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Same uppercase/tracked-caption recipe as `SettingsSection`'s
+            // title (`Font.sectionLabel`) — the app's one named "section
+            // heading" token; there is no separate `DesignSystem.Typography`
+            // namespace.
+            Text("Large Files".uppercased())
+                .font(.sectionLabel)
+                .tracking(0.5)
+                .foregroundStyle(.secondary)
+
+            if bridge.isScanningStorageInsights {
+                ProgressView()
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 8)
+            } else if let error = bridge.storageInsightsError {
+                // Distinct from the genuine-empty state below: a scan
+                // failure must never be presented as "no large files
+                // found". The installed engine predating this subcommand
+                // (argparse's "invalid choice" usage error) gets a
+                // specific, actionable message; anything else falls back
+                // to a generic one that still surfaces the real error text.
+                Text(error.contains("invalid choice") && error.contains("storage-insights")
+                     ? "Requires engine 2.9.0+ — re-run install.sh to update."
+                     : "Large files scan failed: \(error)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let entries = bridge.storageInsights?.entries, !entries.isEmpty {
+                // Bounded + scrollable (finding: unbounded VStack could push
+                // the category list and "Clean Selected" footer off-screen
+                // with enough qualifying files — up to
+                // STORAGE_INSIGHTS_MAX_RESULTS=50 in cleaner.py). 240pt shows
+                // roughly 4-5 rows before scrolling, matching this card's
+                // visual weight as one of several on the Dashboard rather
+                // than becoming the dominant element. This cap holds
+                // regardless of entry count (0 to 50).
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(entries) { entry in
+                            LargeFileRow(entry: entry)
+                        }
+                    }
+                }
+                .frame(maxHeight: 240)
+            } else if bridge.storageInsights != nil {
+                // Only reached once a scan has actually succeeded and
+                // returned zero qualifying entries — gated on
+                // `storageInsights != nil` so this is literally true; see
+                // the trailing `else` below for the pre-scan case.
+                Text("No files ≥100 MB found in Documents, Downloads, or Desktop.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                // Brief initial-render flash before the `.task` below has
+                // started the first scan (storageInsights/storageInsightsError
+                // both still nil and isScanningStorageInsights hasn't flipped
+                // true yet) — render nothing rather than a misleading state.
+                EmptyView()
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .glassPanel()
+        .task {
+            // Fetch once: don't re-walk the filesystem every time the
+            // Dashboard reappears (e.g. switching sidebar sections and
+            // back) when data or an error is already present, AND don't
+            // start a second concurrent walk if one is already in flight.
+            // The `isScanningStorageInsights` check matters because this
+            // view is torn down and recreated every time the user switches
+            // sidebar sections and back (see the `switch` in
+            // MacCleanerApp.swift) — `storageInsights`/`storageInsightsError`
+            // both stay nil for the whole multi-second duration of a scan,
+            // so without this check, switching away and back mid-scan would
+            // re-enter this `.task` and kick off a second filesystem walk.
+            if bridge.storageInsights == nil && bridge.storageInsightsError == nil
+                && !bridge.isScanningStorageInsights {
+                await bridge.scanStorageInsights()
+            }
         }
     }
 
@@ -61,7 +156,17 @@ struct DashboardView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button {
-                    Task { await bridge.scan() }
+                    // Manual refresh covers both the main reclaimable-targets
+                    // report AND the Large Files panel — otherwise the panel,
+                    // which the `.task` above only ever fetches once, would
+                    // have no way to refresh for the entire app session (e.g.
+                    // after the user downloads a new large file, or after
+                    // fixing whatever caused a prior scan error). Sequential
+                    // is fine here — this isn't performance-critical.
+                    Task {
+                        await bridge.scan()
+                        await bridge.scanStorageInsights()
+                    }
                 } label: {
                     Label(bridge.isScanning ? "Scanning…" : "Scan", systemImage: "arrow.clockwise")
                 }
@@ -300,5 +405,49 @@ struct TargetRow: View {
                 .foregroundStyle(.secondary)
                 .frame(minWidth: 70, alignment: .trailing)
         }
+    }
+}
+
+/// One row in the "Large Files" section — read-only, no selection/checkbox
+/// (unlike `TargetRow`/`ArtifactRow`, this list isn't part of any clean
+/// workflow). Styling otherwise mirrors those rows: `.rowLabel` primary
+/// text, a `.caption`/`.secondary` meta line, and a trailing
+/// `.monospacedDigit()` size at the same `minWidth: 70` used everywhere else
+/// on the Dashboard so byte counts stay aligned across sections.
+struct LargeFileRow: View {
+    let entry: StorageInsightEntry
+
+    private var relativeModified: String {
+        let date = Date(timeIntervalSince1970: entry.mtime)
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text((entry.path as NSString).lastPathComponent)
+                    .font(.rowLabel)
+                Text("\((entry.path as NSString).abbreviatingWithTildeInPath) · modified \(relativeModified)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            Text(entry.size_human)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 70, alignment: .trailing)
+            Button {
+                NSWorkspace.shared.selectFile(entry.path, inFileViewerRootedAtPath: "")
+            } label: {
+                Image(systemName: "magnifyingglass")
+            }
+            .buttonStyle(.borderless)
+            .help("Reveal in Finder")
+        }
+        .padding(.vertical, 2)
     }
 }

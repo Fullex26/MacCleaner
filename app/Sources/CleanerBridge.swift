@@ -150,6 +150,18 @@ struct CategoriesReport: Codable {
     let categories: [CategoryInfo]
 }
 
+struct StorageInsightEntry: Codable, Identifiable {
+    let path: String
+    let size_bytes: Int
+    let size_human: String
+    let mtime: Double
+    var id: String { path }
+}
+
+struct StorageInsightsReport: Codable {
+    let entries: [StorageInsightEntry]
+}
+
 struct AgentStatus: Codable, Identifiable {
     let label: String
     let plist_present: Bool
@@ -203,6 +215,7 @@ final class PipeBuffer: @unchecked Sendable {
 final class CleanerBridge: ObservableObject {
     @Published var report: ScanReport?
     @Published var projects: ProjectsReport?
+    @Published var storageInsights: StorageInsightsReport?
     @Published var history: [HistoryRun] = []
     @Published var categories: [CategoryInfo] = []
     @Published var deleteMode: String = "rm"
@@ -236,6 +249,7 @@ final class CleanerBridge: ObservableObject {
     /// still watches both — see its guard below.
     @Published var isScanning = false
     @Published var isScanningProjects = false
+    @Published var isScanningStorageInsights = false
     @Published var isCleaning = false
     @Published var statusMessage: String?
     @Published var lastClean: CleanResult?
@@ -253,6 +267,14 @@ final class CleanerBridge: ObservableObject {
     /// already work.
     @Published var lastCleanFailed: String?
     @Published var lastCleanFailedAt: Date?
+    /// Dedicated error channel for `scanStorageInsights()`, mirroring why
+    /// `lastCleanFailed` exists instead of reusing `statusMessage`: this
+    /// fetch runs concurrently with the app's own startup `scan()` (see
+    /// `MacCleanerApp.swift`), so a shared field would let either call
+    /// silently erase the other's failure banner. Cleared on success,
+    /// set on failure, and `storageInsights` itself is left untouched on
+    /// failure so a transient error never wipes out prior good data.
+    @Published var storageInsightsError: String?
     @Published var freeBytes: Int?
     @Published var diskSnapshots: [DiskSnapshot] = []
     /// Live per-item clean progress, for Dashboard row spinners/checks (and
@@ -581,6 +603,20 @@ final class CleanerBridge: ObservableObject {
             statusMessage = nil
         } catch {
             statusMessage = "Project scan failed: \(error.localizedDescription)"
+        }
+    }
+
+    func scanStorageInsights() async {
+        isScanningStorageInsights = true
+        defer { isScanningStorageInsights = false }
+        do {
+            storageInsights = try await run(StorageInsightsReport.self, ["storage-insights", "--json"])
+            storageInsightsError = nil
+        } catch {
+            // Deliberately does not touch `storageInsights` (prior successful
+            // data, if any, survives a transient failure) or the shared
+            // `statusMessage` (see `storageInsightsError`'s declaration).
+            storageInsightsError = error.localizedDescription
         }
     }
 
