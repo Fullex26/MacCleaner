@@ -305,6 +305,66 @@ class TestDeleteSafety(unittest.TestCase):
         self.assertTrue((base / "keep" / "cache2").exists(), "skip_paths must protect glob matches")
         self.assertFalse((base / "clean" / "cache2").exists())
 
+    def test_refuses_path_through_symlinked_intermediate_directory(self):
+        # The bug: _safe_to_delete used to check path.absolute() (lexical
+        # only), so a glob/path that is lexically inside $HOME but reaches
+        # its target through a symlinked ANCESTOR directory could smuggle a
+        # delete through to somewhere physically outside $HOME.
+        real_outside = self.tmp / "real_outside_data"
+        real_outside.mkdir()
+        (real_outside / "precious").write_text("keep me")
+        symlinked_ancestor = self.fake_home / "Library" / "Caches" / "Vendor"
+        symlinked_ancestor.parent.mkdir(parents=True)
+        symlinked_ancestor.symlink_to(real_outside)
+        # Lexically "~/Library/Caches/Vendor/precious" -- physically
+        # "<tmp>/real_outside_data/precious", outside fake_home.
+        victim = symlinked_ancestor / "precious"
+        self.assertFalse(cleaner._safe_to_delete(victim))
+        freed, err = cleaner.delete_target(self.target(victim))
+        self.assertIsNotNone(err)
+        self.assertIn("refused", err)
+        self.assertTrue((real_outside / "precious").exists(),
+                        "data reached through a symlinked ancestor must survive")
+
+    def test_glob_through_symlinked_intermediate_directory_refused(self):
+        # Same escape, but through the glob path -- the vector actually
+        # named in the finding ("a glob expansion whose intermediate
+        # directory is a symlink").
+        real_outside = self.tmp / "real_outside_profiles"
+        (real_outside / "p1" / "cache2").mkdir(parents=True)
+        (real_outside / "p1" / "cache2" / "f").write_text("x")
+        profiles_link = self.fake_home / "profiles"
+        profiles_link.symlink_to(real_outside)
+        t = self.target(None, glob=str(profiles_link / "*" / "cache2"))
+        freed, err = cleaner.delete_target(t)
+        self.assertIsNotNone(err)
+        self.assertIn("refused", err)
+        self.assertTrue((real_outside / "p1" / "cache2" / "f").exists(),
+                        "glob match reached through a symlinked ancestor must survive")
+
+    def test_refuses_literal_dotdot_leaf(self):
+        # p.name is left unresolved by design (see the leaf-symlink
+        # invariant test below), but a leaf that is literally ".." must
+        # still be caught explicitly -- p.parent.resolve() / ".." collapses
+        # right back to the parent's parent, which can walk straight out of
+        # $HOME (e.g. "<home>/Library/.." resolves to <home> itself, and
+        # "<home>/.." resolves to <home>'s parent).
+        self.assertFalse(cleaner._safe_to_delete(self.fake_home / "Library" / ".."))
+        self.assertFalse(cleaner._safe_to_delete(self.fake_home / ".."))
+
+    def test_leaf_symlink_outside_home_still_safe_to_delete(self):
+        # Pin the invariant the fix must NOT break: _remove() unlinks a
+        # symlink leaf rather than following it, so a symlink whose OWN
+        # directory entry is inside $HOME is always safe to remove even if
+        # it points somewhere outside $HOME -- only the link is removed,
+        # never the target. This is what test_symlink_unlinked_not_followed
+        # exercises end-to-end; this pins it at the _safe_to_delete unit.
+        real = self.tmp / "real_data"
+        real.mkdir()
+        link = self.fake_home / "link"
+        link.symlink_to(real)
+        self.assertTrue(cleaner._safe_to_delete(link))
+
     def test_trash_name_collisions_never_nest(self):
         for i in range(3):
             victim = self.fake_home / "cache"

@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.8.0"
+VERSION = "2.8.1"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -781,12 +781,25 @@ def measure_targets(targets):
 
 
 def _safe_to_delete(path: Path) -> bool:
-    """Only paths strictly inside the user's home are deletable."""
+    """Only paths strictly inside the user's home are deletable.
+
+    Resolves the PARENT directory (not the leaf) before the containment
+    check: path.absolute() alone is purely lexical, so a target that is
+    lexically inside $HOME but reaches its parent through a symlinked
+    ancestor (e.g. a glob match under a symlinked cache subdirectory) could
+    smuggle a delete through to somewhere physically outside $HOME. The
+    leaf itself is deliberately left unresolved -- _remove() unlinks a
+    symlink leaf rather than following it, so a symlink whose own directory
+    entry is inside $HOME stays safe to remove even if it points somewhere
+    outside $HOME; only the link is ever removed, never its target."""
     try:
-        rp = path.absolute()
+        p = Path(path)
+        if p.name in ("", ".."):
+            return False
+        rp = p.parent.resolve() / p.name
     except Exception:
         return False
-    home = HOME.absolute()
+    home = HOME.resolve()
     if str(rp).rstrip("/") in ("", "/", str(home).rstrip("/")):
         return False
     return str(rp).startswith(str(home) + os.sep)
