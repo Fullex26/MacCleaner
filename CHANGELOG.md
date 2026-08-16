@@ -7,6 +7,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.9.1] — 2026-08-16
+
+### Fixed
+- **Low-disk alert now shows the real MacCleaner icon when the app is running.** Every automatic notification (`disk-check`'s hourly low-disk warning, `clean --notify`'s scheduled-clean banner) is posted from a background helper process via `osascript "display notification"`, which has no way to attribute a notification to an app or give it a custom icon — macOS always shows a generic one. The SwiftUI app now performs its own low-disk check on its existing periodic tick and, when it's running, delivers the alert itself through the same in-process mechanism already used for the "cleanup finished" banner (which has always shown the real icon). `disk-check` gained a `--no-post` mode and a new `should_notify` JSON field so the app can ask "is an alert due right now" without the CLI's own `osascript` post firing — and both share the existing 24h throttle in `alerts.json`, so the app and the standalone launchd `diskwatch` agent never double-notify for the same dip. When the app isn't running, the launchd agent's own alert still fires exactly as before, with the generic icon, as the reliable fallback.
+- An earlier version of this fix tried `terminal-notifier` (an optional Homebrew tool with a `-sender` flag that can post as another app's identity) instead. It was reverted after testing showed it hangs indefinitely — not merely fails — when triggered the same way MacCleaner's own alerts are actually triggered: from a background launchd job with no active foreground session. Confirmed with a real, temporary LaunchAgent invoking it directly, not just from a script. No code from that approach shipped.
+- Also fixed: a pure menu-bar-only session (the Dashboard window never opened) never started the periodic 60-second refresh that free-space and low-disk monitoring depend on — only a one-off refresh each time the menu bar icon was clicked. The menu bar popover now also starts that recurring refresh the first time it's opened, which is effectively guaranteed for anyone actually using the app.
+
+---
+
 ## [2.9.0] — 2026-08-14
 
 ### Added

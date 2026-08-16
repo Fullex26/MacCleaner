@@ -242,8 +242,10 @@ categories schedule disk-check storage-insights install-deps --help --version" -
         projects) COMPREPLY=( $(compgen -W "--roots --min-age-days --clean --yes --targets \
 --trash --dry-run --json --help" -- "$cur") ) ;;
         report) COMPREPLY=( $(compgen -W "-n --limit --json --help" -- "$cur") ) ;;
-        doctor|categories|disk-check|storage-insights)
+        doctor|categories|storage-insights)
                 COMPREPLY=( $(compgen -W "--json --help" -- "$cur") ) ;;
+        disk-check)
+                COMPREPLY=( $(compgen -W "--json --no-post --help" -- "$cur") ) ;;
         schedule)
                 # positional action, plus --json
                 local seen="" j=0
