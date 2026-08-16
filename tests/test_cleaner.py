@@ -2060,9 +2060,46 @@ class TestDiskCheck(unittest.TestCase):
         self.assertEqual(r.returncode, 0, "disk-check is a monitor: always exit 0")
         data = json.loads(r.stdout)
         for key in ["free_bytes", "free_human", "threshold_bytes",
-                    "below_threshold", "notified"]:
+                    "below_threshold", "notified", "should_notify"]:
             self.assertIn(key, data)
         self.assertIsInstance(data["below_threshold"], bool)
+
+    def test_no_post_skips_notification_but_shares_the_throttle(self):
+        """--no-post is how the app claims delivery itself (real icon via
+        NotificationManager) instead of the generic-icon osascript path --
+        but it must still consume the 24h throttle, so the standalone
+        launchd disk-check agent doesn't also fire for the same dip."""
+        r = self.run_cli("disk-check", "--no-post", "--json",
+                         low_disk_threshold_gb=10_000_000)
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["below_threshold"])
+        self.assertTrue(data["should_notify"], "the app must be told to post its own alert")
+        self.assertFalse(data["notified"], "--no-post must never post one itself")
+        self.assertEqual(self.notified(), "", "no osascript call must happen under --no-post")
+        self.assertTrue(self.alerts.exists(), "the throttle must still be stamped")
+
+        # A follow-up normal run must now stay quiet -- same 24h window.
+        r2 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        data2 = json.loads(r2.stdout)
+        self.assertFalse(data2["notified"], "must be throttled by the --no-post run above")
+        self.assertFalse(data2["should_notify"])
+
+    def test_should_notify_false_when_alerts_disabled(self):
+        r = self.run_cli("disk-check", "--no-post", "--json",
+                         low_disk_threshold_gb=10_000_000, low_disk_alerts=False)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["below_threshold"], "numbers still reported")
+        self.assertFalse(data["should_notify"], "low_disk_alerts=false must still gate --no-post")
+        self.assertFalse(data["notified"])
+        self.assertFalse(self.alerts.exists())
+
+    def test_should_notify_false_when_above_threshold(self):
+        r = self.run_cli("disk-check", "--no-post", "--json", low_disk_threshold_gb=0)
+        data = json.loads(r.stdout)
+        self.assertFalse(data["below_threshold"])
+        self.assertFalse(data["should_notify"])
+        self.assertFalse(data["notified"])
 
     def test_huge_threshold_triggers_notification(self):
         r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)

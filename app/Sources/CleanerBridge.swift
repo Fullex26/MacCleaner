@@ -162,6 +162,15 @@ struct StorageInsightsReport: Codable {
     let entries: [StorageInsightEntry]
 }
 
+struct DiskCheckReport: Codable {
+    let free_bytes: Int
+    let free_human: String
+    let threshold_bytes: Int
+    let below_threshold: Bool
+    let notified: Bool
+    let should_notify: Bool
+}
+
 struct AgentStatus: Codable, Identifiable {
     let label: String
     let plist_present: Bool
@@ -464,6 +473,31 @@ final class CleanerBridge: ObservableObject {
         freeBytes = report.disk_history?.current.free_bytes
         lastCleanedAt = report.runs.last.flatMap { Self.parseTimestamp($0.timestamp) }
         diskSnapshots = report.disk_history?.snapshots ?? []
+        await checkLowDiskIfNeeded()
+    }
+
+    /// Delivers the low-disk alert itself, in-process, so it carries the real
+    /// app icon — the standalone launchd `diskwatch` agent's own alert (same
+    /// condition, but via `osascript`) always shows a generic one, since
+    /// `display notification` has no attribution option. Gated locally on the
+    /// `freeBytes` this tick already fetched for free, so a comfortably-above
+    /// -threshold Mac never pays the extra `disk-check` subprocess call every
+    /// 60s. `--no-post` shares `alerts.json`'s 24h throttle with the launchd
+    /// agent (see AGENTS.md's `disk-check --json` section), so whichever one
+    /// runs first for a given dip is the only one that fires.
+    private func checkLowDiskIfNeeded() async {
+        await ensureSettingsLoaded().value
+        guard lowDiskAlertsEnabled, notificationsEnabled, let freeBytes,
+              Double(freeBytes) < lowDiskThresholdGB * 1024 * 1024 * 1024
+        else { return }
+        guard let check = try? await run(DiskCheckReport.self, ["disk-check", "--no-post", "--json"]),
+              check.should_notify
+        else { return }
+        let thresholdHuman = ByteCountFormatter.string(
+            fromByteCount: Int64(check.threshold_bytes), countStyle: .file)
+        NotificationManager.shared.post(
+            title: "Low disk space: \(check.free_human) free",
+            body: "Below your \(thresholdHuman) threshold — open MacCleaner to reclaim space.")
     }
 
     /// Full scan, debounced so a wake plus a menu-open doesn't launch two.

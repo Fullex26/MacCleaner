@@ -298,9 +298,15 @@ _maccleaner() {
               ;;
           esac
           ;;
-        doctor|categories|disk-check|storage-insights)
+        doctor|categories|storage-insights)
           _arguments -s -S \
             '--json[machine-readable output]' \
+            '(-h --help)'{-h,--help}'[show help]' && ret=0
+          ;;
+        disk-check)
+          _arguments -s -S \
+            '--json[machine-readable output]' \
+            '--no-post[report should_notify without posting -- the caller delivers it]' \
             '(-h --help)'{-h,--help}'[show help]' && ret=0
           ;;
         install-deps)

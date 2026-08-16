@@ -52,6 +52,15 @@ struct MenuBarPanel: View {
             // no-op on every later menu open.
             bridge.ensureSettingsLoaded()
             bridge.observeUpdater()
+            // startAutoRefresh() is otherwise only called from MainView's
+            // .task (the Dashboard window), which a pure menu-bar-only
+            // session may never open — without this, such a session would
+            // never get the recurring 60s tick that also drives the
+            // real-icon low-disk alert, only a one-shot refresh each time
+            // the popover happens to be opened. Idempotent: invalidates and
+            // recreates its own timers, so calling it again later from
+            // MainView is harmless.
+            bridge.startAutoRefresh()
             await bridge.lightRefresh()
             await bridge.fullRefreshIfStale()
         }

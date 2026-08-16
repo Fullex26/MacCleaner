@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.9.0"
+VERSION = "2.9.1"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -2795,9 +2795,15 @@ def _low_disk_decision(alerts, now, free_bytes, threshold_bytes):
     return False, {"state": "below", "last_notified": last}
 
 
-def run_disk_check(config, json_mode=False):
+def run_disk_check(config, json_mode=False, post=True):
     """Cheap enough to run hourly: one disk_usage call, no measurement, no
-    snapshot. Always exits 0 — it is a monitor, not a check that fails."""
+    snapshot. Always exits 0 — it is a monitor, not a check that fails.
+
+    `post=False` (used by the app's own periodic check, which delivers via
+    NotificationManager for a correctly-attributed icon instead of the
+    generic-icon osascript path) skips posting here but still makes and
+    persists the throttle decision, so the app and the standalone launchd
+    disk-check agent share one 24h window and never double-notify."""
     ds = disk_stats()
     raw_threshold = config.get("low_disk_threshold_gb", 10)
     try:
@@ -2822,14 +2828,19 @@ def run_disk_check(config, json_mode=False):
     # still-below-but-throttled) is accurate regardless of what happens below.
     persist_state = not should_notify
     if enabled and should_notify:
-        notified = _notify(
-            f"Low disk space: {fmt_size(free)} free",
-            f"Below your {fmt_size(threshold)} threshold — "
-            f"open MacCleaner to reclaim space.")
-        # Only stamp the throttle when the banner actually posted — otherwise
-        # a failed notification would suppress retries for the next 24h even
-        # though the user never saw anything (finding M5).
-        persist_state = notified
+        if post:
+            notified = _notify(
+                f"Low disk space: {fmt_size(free)} free",
+                f"Below your {fmt_size(threshold)} threshold — "
+                f"open MacCleaner to reclaim space.")
+            # Only stamp the throttle when the banner actually posted —
+            # otherwise a failed notification would suppress retries for the
+            # next 24h even though the user never saw anything (finding M5).
+            persist_state = notified
+        else:
+            # The caller is taking over delivery; claim the throttle slot
+            # so the launchd agent doesn't also fire for this same dip.
+            persist_state = True
     if enabled and persist_state and alerts.get("low_disk") != state:
         # Skip the write entirely when nothing changed, so an hourly agent
         # isn't rewriting alerts.json every run for no reason (finding M3).
@@ -2842,6 +2853,7 @@ def run_disk_check(config, json_mode=False):
         "threshold_bytes": threshold,
         "below_threshold": free < threshold,
         "notified": notified,
+        "should_notify": bool(enabled and should_notify),
     }
     if json_mode:
         print(json.dumps({"version": VERSION, **result}, indent=2))
@@ -3352,6 +3364,8 @@ def build_parser():
     p_disk = sub.add_parser("disk-check",
                             help="Warn when free space is below the configured threshold (cheap; for launchd)")
     p_disk.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_disk.add_argument("--no-post", action="store_true",
+                        help="Report should_notify without posting -- the caller (the app) delivers it instead")
 
     p_storage = sub.add_parser("storage-insights",
                                help="Read-only: largest files in Documents/Downloads/Desktop (never deletes)")
@@ -3413,7 +3427,7 @@ def main():
         return
 
     if args.command == "disk-check":
-        run_disk_check(config, json_mode=args.json)
+        run_disk_check(config, json_mode=args.json, post=not args.no_post)
         return
 
     if args.command == "storage-insights":
