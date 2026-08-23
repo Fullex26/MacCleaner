@@ -164,6 +164,127 @@ class TestTargets(unittest.TestCase):
             self.assertEqual(targets[tid]["category"], "ai")
 
 
+class TestV210Targets(unittest.TestCase):
+    """The ten targets added in 2.10.0. Each was verified to exist with real
+    size on a working developer Mac before being added -- these tests pin the
+    id, category, safety level, and exact path so a later refactor can't
+    silently relocate or re-classify one."""
+
+    # (id, category, safe, path-or-glob)
+    EXPECTED = [
+        ("chrome-http-cache", "caches", True, "~/Library/Caches/Google/Chrome"),
+        ("clang-module-cache", "caches", True, "~/.cache/clang"),
+        ("electron-updater-pending", "caches", True, "~/Library/Caches/*electron-updater/pending"),
+        ("typescript-cache", "node", True, "~/Library/Caches/typescript"),
+        ("rustup-downloads", "rust", True, "~/.rustup/downloads"),
+        ("ollama-updates", "ai", True, "~/Library/Caches/ollama/updates"),
+        ("codex-sparkle-updates", "ai", True,
+         "~/Library/Caches/com.openai.codex/org.sparkle-project.Sparkle"),
+        ("codex-runtimes", "ai", False, "~/.cache/codex-runtimes"),
+        ("antigravity-browser-profile", "ai", False, "~/.gemini/antigravity-browser-profile"),
+    ]
+
+    def setUp(self):
+        self.targets = {t["id"]: t
+                        for t in cleaner.get_targets(cleaner.DEFAULT_CONFIG,
+                                                     all_categories=True)}
+
+    def test_all_ten_exist_with_expected_category_and_safety(self):
+        for tid, category, safe, _ in self.EXPECTED:
+            self.assertIn(tid, self.targets, f"{tid} missing")
+            self.assertEqual(self.targets[tid]["category"], category, tid)
+            self.assertEqual(self.targets[tid]["safe"], safe, tid)
+
+    def test_paths_resolve_to_the_documented_locations(self):
+        for tid, _, _, raw in self.EXPECTED:
+            t = self.targets[tid]
+            expected = os.path.expanduser(raw)
+            actual = t["glob"] if t["glob"] else str(t["path"])
+            self.assertEqual(actual, expected, tid)
+
+    def test_every_new_target_has_a_description(self):
+        """The description is what the TUI/app shows to justify a delete."""
+        for tid, _, _, _ in self.EXPECTED + [("spotify-browser-cache", None, None, None)]:
+            self.assertTrue(self.targets[tid]["description"].strip(),
+                            f"{tid} needs a description")
+
+    def test_spotify_target_takes_only_the_two_real_cache_dirs(self):
+        """~/Library/Caches/com.spotify.client is NOT an HTTP cache dir -- it is
+        the Spotify desktop app's embedded-Chromium profile root, holding
+        Default/Login Data, Default/Cookies, Browser/Cookies, Local State and
+        the WidevineCdm DRM module alongside the actual caches. A safe target
+        pointed at the root would let an unattended `clean --yes` destroy live
+        session state, so this target names the two regenerable subdirectories
+        explicitly instead."""
+        t = self.targets["spotify-browser-cache"]
+        self.assertTrue(t["safe"])
+        self.assertEqual(t["category"], "caches")
+        root = os.path.expanduser("~/Library/Caches/com.spotify.client")
+        self.assertEqual([str(p) for p in cleaner._target_paths(t)],
+                         [f"{root}/Browser/Cache", f"{root}/Data"])
+        self.assertIsNone(t["path"], "must use the multi-path form, not a single root path")
+        self.assertNotIn("spotify-http-cache", self.targets,
+                         "the over-broad root-path target must be gone, not merely renamed")
+
+    def test_no_target_points_at_a_chromium_profile_root(self):
+        """Generalises the Spotify finding: a directory holding `Login Data`
+        or a `Cookies` DB is a live profile, never an auto-deletable cache."""
+        for t in self.targets.values():
+            if not t["safe"]:
+                continue
+            for p in cleaner._target_paths(t):
+                for marker in ("Login Data", "Cookies", "Local State"):
+                    self.assertFalse(
+                        (p / marker).exists(),
+                        f"safe target {t['id']} points at {p}, which holds {marker}")
+
+    def test_labels_are_unique(self):
+        """Two targets sharing a label render as indistinguishable rows in the
+        TUI checklist and the app's target list."""
+        seen = {}
+        for t in self.targets.values():
+            self.assertNotIn(t["label"], seen,
+                             f"{t['id']} reuses the label of {seen.get(t['label'])}")
+            seen[t["label"]] = t["id"]
+
+    def test_runtime_and_profile_targets_are_review_level(self):
+        """codex-runtimes is an executable runtime and antigravity's profile
+        holds live browser session state -- neither is a regenerable cache in
+        the way `--yes` assumes, so both must stay opt-in."""
+        self.assertFalse(self.targets["codex-runtimes"]["safe"])
+        self.assertFalse(self.targets["antigravity-browser-profile"]["safe"])
+
+    def test_no_new_target_duplicates_an_existing_path(self):
+        """Two targets pointing at one path would double-count reclaimable
+        bytes and race each other during a clean."""
+        seen = {}
+        for t in self.targets.values():
+            keys = ([t["glob"]] if t["glob"]
+                    else [str(p) for p in cleaner._target_paths(t)])
+            for key in keys:
+                self.assertNotIn(key, seen,
+                                 f"{t['id']} duplicates {seen.get(key)} at {key}")
+                seen[key] = t["id"]
+
+    def test_new_caches_targets_are_narrower_than_general_caches(self):
+        """They live under ~/Library/Caches, which `general-caches` also owns
+        as a review-level empty_only sweep. That is the point -- a user can
+        take the specific safe one without the broad review-level one -- but
+        none of them may BE the general target's own path."""
+        general = str(self.targets["general-caches"]["path"])
+        for tid in ("chrome-http-cache", "spotify-browser-cache", "typescript-cache"):
+            for path in cleaner._target_paths(self.targets[tid]):
+                self.assertTrue(str(path).startswith(general + os.sep), tid)
+                self.assertNotEqual(str(path), general, tid)
+
+    def test_static_target_count_reached_93(self):
+        """83 before 2.10.0, +10 here. `logs` is filtered because those
+        targets are generated per oversized ~/Library/Logs folder, so an
+        unfiltered count differs on every machine."""
+        static = [t for t in self.targets.values() if t["category"] != "logs"]
+        self.assertEqual(len(static), 93)
+
+
 class TestLegacyTranslation(unittest.TestCase):
     def t(self, argv):
         return cleaner.translate_legacy(argv)

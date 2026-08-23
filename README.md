@@ -9,7 +9,7 @@
 
 MacCleaner finds and removes the developer detritus that accumulates silently — Xcode DerivedData, Docker layers, package manager caches, downloaded AI models, stale `node_modules` in projects you abandoned months ago. A single command can reclaim tens of gigabytes.
 
-- **CLI** — `scan`, `clean`, `projects`, `report`, `doctor`, `config`. 83 cleanup targets across 23 categories. Interactive checklist or fully unattended.
+- **CLI** — `scan`, `clean`, `projects`, `report`, `doctor`, `config`. 93 cleanup targets across 23 categories. Interactive checklist or fully unattended.
 - **macOS app, redesigned in v2.6** — sidebar navigation, glass panels, and a rich menu bar popover (disk ring, reclaimable hero number, top categories, one-click "Clean safe items") over the same engine and config as the CLI.
 - **Agent-ready** — every command speaks `--json`, every target has a stable ID, exit codes are documented. Point your AI agent at [AGENTS.md](AGENTS.md) and it can operate the whole tool.
 - **Safe by design** — deletes only inside your home directory, never follows symlinks, and can move things to the Trash instead of deleting.
@@ -109,7 +109,7 @@ python3 ~/mac-cleaner/cleaner.py clean --targets npm-cache,pip-cache,xcode-deriv
 
 ## What It Cleans
 
-23 categories, 83 targets. Enable or disable any category via `maccleaner config enable|disable <category>`; run `maccleaner categories` to list every target and its ID.
+23 categories, 93 targets. Enable or disable any category via `maccleaner config enable|disable <category>`; run `maccleaner categories` to list every target and its ID.
 
 | Category | What's in it |
 |----------|--------------|
