@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.9.1"
+VERSION = "2.10.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -416,11 +416,26 @@ def get_targets(config, all_categories=False):
     targets = []
 
     def add(category, tid, label, path, safe=True, cmd=None,
-            estimate_cmd=None, estimate_parser=None, desc="", empty_only=False):
+            estimate_cmd=None, estimate_parser=None, desc="", empty_only=False,
+            paths=None):
+        """`paths` is the multi-path form (consumed by _target_paths), for a
+        target whose regenerable content sits in two or more sibling
+        subdirectories that must be named individually because their shared
+        parent also holds live state -- see spotify-browser-cache. It is
+        mutually exclusive with `path`/glob patterns."""
         if category not in enabled:
             return
-        p, pattern = None, None
-        if path is not None:
+        p, pattern, multi = None, None, None
+        if paths is not None:
+            multi = [Path(os.path.expanduser(str(x))) for x in paths]
+            # Same prefix rule as the single-path branch, applied per entry so
+            # a skip_paths entry can retire part of a multi-path target
+            # without silently taking the whole thing with it.
+            multi = [x for x in multi
+                     if not any(str(x).startswith(str(s)) for s in skip)]
+            if not multi:
+                return
+        elif path is not None:
             if "*" in str(path):
                 pattern = os.path.expanduser(str(path))
             else:
@@ -433,6 +448,7 @@ def get_targets(config, all_categories=False):
             "label": label,
             "description": desc,
             "path": p,
+            "paths": multi,
             "glob": pattern,
             "skip": [str(s) for s in skip] if pattern else [],
             "safe": safe,
@@ -506,6 +522,11 @@ def get_targets(config, all_categories=False):
     add("node", "npm-logs", "npm logs", "~/.npm/_logs",
         desc="npm debug log files")
 
+    # Node (v2.10 addition)
+    add("node", "typescript-cache", "TypeScript server cache", "~/Library/Caches/typescript",
+        desc="Auto-downloaded @types packages the TS language server caches for editors; "
+             "re-fetched on demand")
+
     # Python
     add("python", "pip-cache", "pip cache", "~/Library/Caches/pip",
         desc="pip download/wheel cache")
@@ -542,6 +563,25 @@ def get_targets(config, all_categories=False):
         desc="OpenAI Codex CLI conversation history — delete only if you don't need past sessions")
     add("ai", "codex-archived-sessions", "Codex archived sessions", "~/.codex/archived_sessions", safe=False,
         desc="Codex CLI sessions already archived by the tool — old conversation history")
+
+    # AI (v2.10 additions)
+    add("ai", "ollama-updates", "Ollama update downloads", "~/Library/Caches/ollama/updates",
+        desc="An Ollama app update already downloaded and waiting to install; discarding it "
+             "just means the updater fetches it again. Distinct from ollama-models, "
+             "which holds the models themselves")
+    add("ai", "codex-sparkle-updates", "Codex update downloads",
+        "~/Library/Caches/com.openai.codex/org.sparkle-project.Sparkle",
+        desc="A Codex/ChatGPT app update Sparkle has already downloaded and extracted, staged "
+             "to install on next quit. Removing it discards that pending update — no data is "
+             "lost and it re-downloads on the next check; best done while the app is closed")
+    add("ai", "codex-runtimes", "Codex downloaded runtimes", "~/.cache/codex-runtimes", safe=False,
+        desc="Executable runtimes Codex downloads and runs from — review-level because a running "
+             "Codex session may be executing out of this directory right now, so removing it can "
+             "break work in flight, not just delay the next start")
+    add("ai", "antigravity-browser-profile", "Antigravity browser profile",
+        "~/.gemini/antigravity-browser-profile", safe=False,
+        desc="Browser profile for Gemini Antigravity — holds live session state and logins, "
+             "not just cache; deleting signs you out of anything it was holding")
 
     # IDE / editors
     add("ide", "vscode-cache", "VS Code cache", "~/Library/Application Support/Code/Cache",
@@ -608,6 +648,35 @@ def get_targets(config, all_categories=False):
     add("caches", "expo-cache", "Expo cache", "~/.expo/cache",
         desc="Expo CLI download cache")
 
+    # App caches (v2.10 additions — keep above general-caches, which is the
+    # broad review-level sweep of the same directory)
+    add("caches", "chrome-http-cache", "Chrome HTTP cache", "~/Library/Caches/Google/Chrome",
+        desc="Chrome's on-disk HTTP and compiled-code cache, per profile; refills as you browse. "
+             "Holds no cookies, history, or logins — those live under Application Support")
+    # NOT ~/Library/Caches/com.spotify.client itself: that root is the desktop
+    # app's embedded-Chromium profile, holding Default/Login Data,
+    # Default/Cookies, Browser/Cookies, Local State and the WidevineCdm DRM
+    # module beside the caches. Naming the two regenerable subdirectories
+    # recovers ~83% of the space with none of that risk, which is what lets
+    # this stay safe=True (an unattended --yes would otherwise sign the user
+    # out of the in-app browser and drop the DRM module).
+    add("caches", "spotify-browser-cache", "Spotify browser cache", None,
+        paths=["~/Library/Caches/com.spotify.client/Browser/Cache",
+               "~/Library/Caches/com.spotify.client/Data"],
+        desc="Spotify desktop's embedded-browser cache and its streamed-audio cache; "
+             "both re-fetched on demand. Offline downloads are not here — they live "
+             "under Application Support and are never touched")
+    add("caches", "clang-module-cache", "Clang module cache", "~/.cache/clang",
+        desc="Precompiled C/C++/ObjC/Swift module cache used by clang and SourceKit; "
+             "rebuilt on the next compile")
+    add("caches", "electron-updater-pending", "Electron app update downloads",
+        "~/Library/Caches/*electron-updater/pending",
+        desc="Update installers Electron apps have already downloaded and staged. "
+             "Removing one discards an update that was ready to install — the app "
+             "re-downloads it on its next check, but a pending 'restart to update' "
+             "may need re-triggering. Only matches apps whose updater directory ends "
+             "in 'electron-updater' (Squirrel and ToDesktop apps are unaffected)")
+
     add("caches", "general-caches", "General app caches", "~/Library/Caches", safe=False, empty_only=True,
         desc="Everything in ~/Library/Caches — broad; review before deleting")
 
@@ -638,6 +707,12 @@ def get_targets(config, all_categories=False):
     # Rust (v2.1 addition — place with the other rust adds)
     add("rust", "sccache-cache", "sccache cache", "~/Library/Caches/Mozilla.sccache",
         desc="Shared compilation cache; rebuilt on demand")
+
+    # Rust (v2.10 addition)
+    add("rust", "rustup-downloads", "rustup download cache", "~/.rustup/downloads",
+        desc="Partial or interrupted toolchain downloads (rustup normally deletes these "
+             "after unpacking, so it's usually empty); avoid during a 'rustup update'. "
+             "The installed toolchains under ~/.rustup/toolchains are never touched")
 
     # Ruby
     add("ruby", "gem-cleanup", "Ruby gem cleanup", None,

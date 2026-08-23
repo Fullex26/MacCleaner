@@ -7,6 +7,28 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.10.0] — 2026-08-23
+
+Ten new cleanup targets, taking the static table from 83 to 93. Each was found
+by scanning a real working developer Mac and verified to exist with real size
+before being added — none were guessed from vendor documentation.
+
+### Added
+- **`caches`** — `chrome-http-cache` (Chrome's per-profile HTTP and compiled-code cache under `~/Library/Caches/Google/Chrome`; verified to hold no cookies, history, or logins), `spotify-browser-cache`, `clang-module-cache` (clang/SourceKit precompiled modules), and `electron-updater-pending` (a glob, `~/Library/Caches/*electron-updater/pending`, for update installers Electron apps have downloaded and staged).
+- **`ai`** — `ollama-updates` and `codex-sparkle-updates` (both staged app updates that simply re-download), plus two **review-only** targets: `codex-runtimes` (a running Codex session may be executing out of that directory, so removing it can break work in flight, not merely delay the next start) and `antigravity-browser-profile` (a full Chromium profile with live logins — deleting it signs you out).
+- **`node`** — `typescript-cache`, the TypeScript language server's automatic `@types` acquisition cache.
+- **`rust`** — `rustup-downloads`, partial or interrupted toolchain downloads. The installed toolchains under `~/.rustup/toolchains` are never touched.
+- **Multi-path targets.** `get_targets()`'s `add()` gained a `paths=[...]` form for a target whose regenerable content sits in several sibling directories whose shared parent must not be swept. `_target_paths()` already understood this shape; `skip_paths` is applied per entry, so excluding one path retires just that path rather than the whole target.
+
+### Fixed
+- **Caught in review before shipping:** the Spotify target was originally a single `safe=True` path at `~/Library/Caches/com.spotify.client`. That directory looks like a cache root but is actually the Spotify desktop app's embedded-Chromium profile — `Default/Login Data`, `Default/Cookies`, `Browser/Cookies`, `Local State`, and the `WidevineCdm` DRM module sit there beside the real caches, so an unattended `clean --yes` would have silently destroyed live session state with no confirmation. It now names only the two regenerable subdirectories (`Browser/Cache` and `Data`), recovering ~83% of the space with none of the risk. Offline-downloaded music was never in scope either way — it lives under Application Support and is untouched. Two new regression tests generalise the lesson beyond this one target: `test_no_target_points_at_a_chromium_profile_root` fails if **any** `safe=True` target resolves to a directory containing a `Login Data`, `Cookies`, or `Local State` file, and `test_labels_are_unique` fails on duplicate labels (the original name, "Spotify cache", collided exactly with the existing `spotify-cache`, rendering two indistinguishable rows in the TUI and app).
+
+### Notes
+- `completions/complete_data.py` — the committed snapshot of the engine's target list that the completion test harness runs against — has no generator script, so it silently drifts when targets are added. `CLAUDE.md` now documents the exact regeneration command, including why it must read `DEFAULT_CONFIG` rather than `load_config()` (the latter would bake the regenerating developer's own `skip_paths` exclusions into the committed file).
+- Six of the ten new targets nest under `~/Library/Caches`, which the review-level `general-caches` target also sweeps. `scan` does not de-duplicate overlapping targets, so "total reclaimable" now double-counts roughly 4.5 GiB more than before on a machine like the test one. This is long-standing behaviour (`electron-cache`, `pip-cache` and others already nest the same way) and is not a regression, but the magnitude is larger now and it is worth addressing separately.
+
+---
+
 ## [2.9.1] — 2026-08-16
 
 ### Fixed
