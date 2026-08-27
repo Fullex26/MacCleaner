@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.11.0"
+VERSION = "2.11.1"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -462,6 +462,17 @@ def get_targets(config, all_categories=False):
     # Xcode
     add("xcode", "xcode-derived-data", "Xcode DerivedData", "~/Library/Developer/Xcode/DerivedData",
         desc="Intermediate build products; Xcode rebuilds them on demand")
+    # Xcode's default DerivedData is the target just above; a project pointed
+    # at a custom location (Xcode > Settings > Locations, or -derivedDataPath)
+    # writes to ~/Library/Developer/<Name>DerivedData instead, which nothing
+    # here used to cover. On a real machine that meant 6.2 GB of pure build
+    # output sitting beside a "190 MB reclaimable" report. The glob matches
+    # direct children of ~/Library/Developer only, so it cannot reach the
+    # default location one level deeper inside Xcode/ -- no double-counting.
+    add("xcode", "xcode-derived-data-custom", "Xcode DerivedData (custom locations)",
+        "~/Library/Developer/*DerivedData*",
+        desc="Build output from projects using a custom DerivedData path; "
+             "rebuilt on the next build, exactly like the default location")
     add("xcode", "xcode-previews", "Xcode Previews", "~/Library/Developer/Xcode/UserData/Previews",
         desc="SwiftUI preview build products")
     add("xcode", "xcode-ios-device-support", "Xcode iOS DeviceSupport", "~/Library/Developer/Xcode/iOS DeviceSupport",

@@ -7,6 +7,16 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.11.1] — 2026-08-27
+
+### Added
+- **`xcode-derived-data-custom`** (`xcode`, safe) — `~/Library/Developer/*DerivedData*`. The existing `xcode-derived-data` target only knows Xcode's default location, so a project pointed at a custom DerivedData path (Xcode → Settings → Locations, or `-derivedDataPath`) was invisible to every scan. On the machine this was found on, MacCleaner reported **190 MB reclaimable while 6.2 GB of pure build output** sat in `~/Library/Developer/RecovrDerivedData*`. The glob matches direct children of `~/Library/Developer` only, so it cannot reach the default location one level deeper inside `Xcode/` — no double-counting, pinned by a test that checks with `glob` rather than `fnmatch` (whose `*` spans `/` and would have hidden the overlap). Static targets: 93 → 94.
+
+### Notes
+- Two storage sinks found during the same investigation are **outside MacCleaner's reach by design** and worth knowing about: `/private/var/folders/<…>/T` (macOS's per-user temp directory) had accumulated **20 GB across ~15,000 entries**, mostly orphaned `TemporaryDirectory.*`, simulator device temp dirs and Interface Builder scratch; macOS clears this on restart, which is the safe way to reclaim it. Separately, `/private/tmp` held **8.4 GB** of AI-coding-session working directories whose nested `DerivedData`/`node_modules` are pure build output — the `tmp` scanner correctly refuses these while they are under `tmp_min_age_days` (3) old, since a live session may still be using them.
+
+---
+
 ## [2.11.0] — 2026-08-27
 
 MacCleaner could tell you about 10 GB of rebuildable caches while your disk sat
