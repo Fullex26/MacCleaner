@@ -287,6 +287,163 @@ class TestV210Targets(unittest.TestCase):
         self.assertEqual(len(static), 94)
 
 
+class TestReclaimableTotalDeduplication(unittest.TestCase):
+    """"Total reclaimable" is the headline number in the CLI, the app header
+    and the menu bar. It was a plain sum over targets, but 27 targets nest
+    inside `general-caches` (the review-level sweep of all of ~/Library/Caches),
+    so every one of their bytes was counted twice -- 2.5 GB of overstatement on
+    a real machine, more on a fuller one. A user cannot free the same byte
+    twice, so the total must be a union, not a sum."""
+
+    def _t(self, tid, path, size):
+        return {"id": tid, "category": "caches", "label": tid, "description": "",
+                "path": Path(path), "paths": None, "glob": None, "skip": [],
+                "safe": True, "cmd": None, "estimate_cmd": None,
+                "estimate_parser": None, "empty_only": False, "size": size}
+
+    def test_nested_target_is_not_double_counted(self):
+        outer = self._t("outer", "/x/Caches", 1000)
+        inner = self._t("inner", "/x/Caches/Chrome", 400)
+        self.assertEqual(cleaner.reclaimable_total([outer, inner]), 1000)
+
+    def test_order_does_not_matter(self):
+        outer = self._t("outer", "/x/Caches", 1000)
+        inner = self._t("inner", "/x/Caches/Chrome", 400)
+        self.assertEqual(cleaner.reclaimable_total([inner, outer]),
+                         cleaner.reclaimable_total([outer, inner]))
+
+    def test_siblings_both_count(self):
+        a = self._t("a", "/x/Caches/A", 300)
+        b = self._t("b", "/x/Caches/B", 700)
+        self.assertEqual(cleaner.reclaimable_total([a, b]), 1000)
+
+    def test_sibling_prefix_collision_is_not_treated_as_nesting(self):
+        """"/x/Caches2" starts with the string "/x/Caches" but is not inside
+        it -- a naive startswith() would wrongly drop it."""
+        a = self._t("a", "/x/Caches", 1000)
+        b = self._t("b", "/x/Caches2", 500)
+        self.assertEqual(cleaner.reclaimable_total([a, b]), 1500)
+
+    def test_cmd_targets_still_count(self):
+        cmd = {"id": "brew", "category": "homebrew", "label": "brew", "description": "",
+               "path": None, "paths": None, "glob": None, "skip": [], "safe": True,
+               "cmd": "brew cleanup", "estimate_cmd": None, "estimate_parser": None,
+               "empty_only": False, "size": 2000}
+        self.assertEqual(cleaner.reclaimable_total([cmd]), 2000)
+
+    def test_missing_size_is_treated_as_zero(self):
+        t = self._t("a", "/x/A", None)
+        self.assertEqual(cleaner.reclaimable_total([t]), 0)
+
+    def test_scan_json_uses_the_deduplicated_total(self):
+        outer = self._t("outer", "/x/Caches", 1000)
+        inner = self._t("inner", "/x/Caches/Chrome", 400)
+        with mock.patch.object(cleaner, "measure_targets", side_effect=lambda t: t):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cleaner.scan_json([outer, inner])
+            d = json.loads(buf.getvalue())
+        self.assertEqual(d["total_reclaimable_bytes"], 1000,
+                         "JSON total must be the union, not the sum")
+
+
+class TestSystemTempAdvisory(unittest.TestCase):
+    """macOS's per-user temp directory (`$TMPDIR`,
+    /private/var/folders/<..>/<..>/T) accumulated 20 GB across ~15,000
+    orphaned entries on a real machine -- more than every cleanable target
+    combined -- and nothing surfaced it. It sits outside $HOME so the engine
+    will never delete from it, and it should not: macOS clears it on restart.
+    So it is advisory-only, exactly like Swap: report it, name the remedy,
+    never touch it, never fail the aggregate `ok`."""
+
+    def test_reports_size_and_entry_count_above_the_floor(self):
+        with mock.patch.object(cleaner, "_system_temp_usage",
+                               return_value={"path": "/var/folders/x/y/T",
+                                             "bytes": 20 * 1024 ** 3,
+                                             "entries": 14999}):
+            r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
+        c = next(c for c in r["checks"] if c["name"] == "System temp")
+        self.assertTrue(c["advisory"], "must never gate the aggregate ok")
+        self.assertFalse(c["ok"], "20 GB is over the floor, so it is flagged")
+        self.assertIn("20.0 GB", c["status"])
+        self.assertIn("14,999", c["status"])
+        self.assertIn("restart", c["status"].lower(),
+                      "the remedy is a restart, not a delete")
+
+    def test_quiet_below_both_floors(self):
+        with mock.patch.object(cleaner, "_system_temp_usage",
+                               return_value={"path": "/var/folders/x/y/T",
+                                             "bytes": 100 * 1024 ** 2, "entries": 12}):
+            r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
+        names = [c["name"] for c in r["checks"]]
+        self.assertNotIn("System temp", names,
+                         "a normal-sized temp dir is not worth a row")
+
+    def test_entry_count_alone_is_enough_to_flag(self):
+        """Size alone under-reports this. A real machine showed 16,289 entries
+        holding only 3 GB -- but that same directory had been 20 GB hours
+        earlier. The entry count is the signal that tools are leaking scratch;
+        the size just depends on when you happen to look."""
+        with mock.patch.object(cleaner, "_system_temp_usage",
+                               return_value={"path": "/var/folders/x/y/T",
+                                             "bytes": 3 * 1024 ** 3, "entries": 16289}):
+            r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
+        c = next(c for c in r["checks"] if c["name"] == "System temp")
+        self.assertFalse(c["ok"])
+        self.assertTrue(c["advisory"])
+        self.assertIn("16,289", c["status"])
+
+    def test_advisory_never_flips_top_level_ok(self):
+        with mock.patch.object(cleaner, "_system_temp_usage",
+                               return_value={"path": "/var/folders/x/y/T",
+                                             "bytes": 50 * 1024 ** 3, "entries": 99999}):
+            r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
+        non_advisory = [c for c in r["checks"] if not c.get("advisory")]
+        self.assertEqual(r["ok"], all(c["ok"] for c in non_advisory))
+
+    def test_degrades_quietly_when_it_cannot_measure(self):
+        with mock.patch.object(cleaner, "_system_temp_usage", return_value=None):
+            r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
+        self.assertNotIn("System temp", [c["name"] for c in r["checks"]])
+
+    def test_never_becomes_a_target(self):
+        """It must stay report-only -- no id, nothing cleanable points at it."""
+        targets = cleaner.get_targets(cleaner.DEFAULT_CONFIG, all_categories=True)
+        for t in targets:
+            for p in cleaner._target_paths(t):
+                self.assertNotIn("/var/folders/", str(p),
+                                 f"{t['id']} must not target the system temp dir")
+
+
+class TestGetSizeDoesNotCrossMounts(unittest.TestCase):
+    """get_size() measures every target. Without -x it walks into mounted disk
+    images and counts their contents on top of the image file -- the same flaw
+    that made a directory measure 106 GB against a real 11 GB. Currently
+    harmless only because no target path happens to contain a mount point,
+    which is not a property anyone checks when adding a target."""
+
+    def test_du_is_invoked_with_x(self):
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout="8\t/x\n", stderr="")
+        with mock.patch.object(cleaner.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(Path, "exists", return_value=True):
+                cleaner.get_size(Path("/x"))
+        self.assertEqual(seen["argv"][0], "du")
+        flags = "".join(a for a in seen["argv"] if a.startswith("-"))
+        self.assertIn("x", flags, "get_size must not descend into mounted volumes")
+        self.assertIn("k", flags, "still reports KB")
+
+    def test_still_returns_bytes(self):
+        def fake_run(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, stdout="8\t/x\n", stderr="")
+        with mock.patch.object(cleaner.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(Path, "exists", return_value=True):
+                self.assertEqual(cleaner.get_size(Path("/x")), 8 * 1024)
+
+
 class TestCustomDerivedData(unittest.TestCase):
     """`xcode-derived-data` only knows Xcode's default location. A project
     configured with a custom DerivedData path (Xcode > Settings > Locations,
@@ -5114,10 +5271,15 @@ class TestHeldOpenDeletedParsing(unittest.TestCase):
 
 
 class TestDoctorPressureChecks(unittest.TestCase):
-    def _doctor(self, swap=None, held=None):
+    def _doctor(self, swap=None, held=None, stmp=None):
+        # All three pressure collectors are mocked, `stmp` included. Leaving
+        # the system-temp one live made every assertion in this class depend
+        # on the size of the running machine's $TMPDIR -- they passed only
+        # because that directory happened to be small when the check landed.
         buf = io.StringIO()
         with mock.patch.object(cleaner, "_swap_usage", return_value=swap), \
              mock.patch.object(cleaner, "_held_open_deleted", return_value=held), \
+             mock.patch.object(cleaner, "_system_temp_usage", return_value=stmp), \
              contextlib.redirect_stdout(buf):
             cleaner.run_doctor(json.loads(json.dumps(cleaner.DEFAULT_CONFIG)),
                                json_mode=True)
@@ -5336,7 +5498,8 @@ class TestDoctorPressureChecks(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_doctor_still_exits_zero_with_a_failing_check(self):
-        # run_doctor returns all_ok but main() deliberately discards it, so
+        # run_doctor returns {"ok", "checks"} but main() deliberately discards
+        # it, so
         # `doctor` always exits 0. CI's smoke test runs bare
         # `python3 cleaner.py doctor` -- wiring ok=False to an exit code would
         # break the build. Deterministically MAKE a check fail (invalid config

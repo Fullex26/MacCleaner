@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.11.1"
+VERSION = "2.12.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -260,7 +260,13 @@ def get_size(path: Path) -> int:
         return 0
     try:
         result = subprocess.run(
-            ["du", "-sk", str(path)],
+            # -x: never descend into a mounted volume beneath `path`. Without
+            # it du counts a mounted disk image's CONTENTS on top of the image
+            # file itself -- the same bytes twice. That flaw made one directory
+            # measure 106 GB against a real 11 GB when checked by hand. No
+            # current target path contains a mount point, but nothing checks
+            # that when a target is added, so measure correctly by default.
+            ["du", "-skx", str(path)],
             capture_output=True, text=True, timeout=120
         )
         if result.returncode == 0:
@@ -1142,7 +1148,7 @@ def show_welcome():
 
 def print_scan(targets, show_all=False):
     targets = measure_targets(targets)
-    total = sum(t["size"] for t in targets)
+    total = reclaimable_total(targets)
     visible = [t for t in targets
                if show_all or t["size"] > 0 or t.get("cmd")]
 
@@ -1188,9 +1194,36 @@ def print_scan(targets, show_all=False):
         print(f"{'='*72}\n")
 
 
+def reclaimable_total(targets):
+    """Bytes a user could actually free, counting each byte once.
+
+    A plain sum over targets double-counts: 27 targets sit inside
+    `general-caches` (the review-level sweep of all of ~/Library/Caches), so
+    their bytes appeared in both. On a real machine that overstated the
+    headline "total reclaimable" by 2.5 GB. Nobody can free the same byte
+    twice, so a target whose every path lies inside another target's path
+    contributes nothing extra and is skipped.
+
+    cmd-based targets (brew cleanup, docker prune) have no path and always
+    count -- there is nothing to nest them inside."""
+    owned = []
+    for t in targets:
+        owned.extend(str(p) for p in _target_paths(t))
+    total = 0
+    for t in targets:
+        paths = [str(p) for p in _target_paths(t)]
+        if paths and all(
+            any(p != q and p.startswith(q.rstrip(os.sep) + os.sep) for q in owned)
+            for p in paths
+        ):
+            continue  # fully contained in another target -- already counted
+        total += t.get("size") or 0
+    return total
+
+
 def scan_json(targets, extra=None):
     targets = measure_targets(targets)
-    total = sum(t["size"] for t in targets)
+    total = reclaimable_total(targets)
     output = {
         "version": VERSION,
         "timestamp": datetime.datetime.now().isoformat(),
@@ -2511,6 +2544,16 @@ def app_leftovers_to_targets(hits):
 # in the quantity that matters, and the "restart to free it" remedy it implied
 # is durable for minutes. The ratio survives only as informational text.
 SWAP_WARN_BYTES = 8 * 1024 ** 3
+# macOS's per-user temp dir ($TMPDIR). Flagged well below the swap threshold
+# because, unlike swap, this is dead weight: orphaned scratch left behind by
+# tools that exited without cleaning up. Observed at 20 GB / ~15,000 entries
+# on a working developer Mac.
+SYSTEM_TEMP_WARN_BYTES = 5 * 1024 ** 3
+# Either threshold flags. Size alone under-reports: a real machine showed
+# 16,289 entries holding only 3 GB, and that same directory had been 20 GB a
+# few hours earlier. The entry count is the durable signal that tools are
+# leaking scratch there; the byte figure just depends on when you look.
+SYSTEM_TEMP_WARN_ENTRIES = 2000
 
 _SWAP_UNITS = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
 
@@ -2619,6 +2662,34 @@ def _held_open_deleted():
     if not result.stdout:
         return None
     return _parse_held_open_deleted(result.stdout)
+
+
+def _system_temp_usage():
+    """Size and entry count of macOS's per-user temp dir ($TMPDIR).
+
+    Report-only. This lives outside $HOME, so the engine will never delete
+    from it -- and shouldn't: macOS clears it on restart, which is both safer
+    and more complete than any sweep this tool could do. Returns None on any
+    failure so the check simply disappears rather than guessing."""
+    tmpdir = os.environ.get("TMPDIR") or tempfile.gettempdir()
+    # Only the real per-user folder, never /tmp (that's the `tmp` scanner's
+    # territory and IS cleanable).
+    if "/var/folders/" not in tmpdir:
+        return None
+    root = Path(tmpdir)
+    if not root.is_dir():
+        return None
+    try:
+        r = subprocess.run(["du", "-skx", str(root)],
+                           capture_output=True, text=True, timeout=120)
+        kb = int(r.stdout.split()[0])
+    except Exception:
+        return None
+    try:
+        entries = sum(1 for _ in os.scandir(root))
+    except OSError:
+        entries = 0
+    return {"path": str(root), "bytes": kb * 1024, "entries": entries}
 
 
 def run_doctor(config, json_mode=False):
@@ -2756,6 +2827,19 @@ def run_doctor(config, json_mode=False):
         else:
             check("Swap", detail, advisory=True)
 
+    # macOS per-user temp dir. Report-only for the same reason as Swap: real
+    # disk is consumed, but the correct remedy is a restart (macOS clears
+    # $TMPDIR at boot), not this tool reaching into a system path.
+    stmp = _system_temp_usage()
+    if stmp and (stmp["bytes"] >= SYSTEM_TEMP_WARN_BYTES
+                 or stmp["entries"] >= SYSTEM_TEMP_WARN_ENTRIES):
+        check("System temp",
+              f"{fmt_size(stmp['bytes'])} across {stmp['entries']:,} entries in "
+              f"macOS's temp folder — leftover scratch from tools that exited "
+              f"without cleaning up. macOS clears this on restart; MacCleaner "
+              f"deliberately never deletes here",
+              ok=False, advisory=True)
+
     # Deleted-but-still-open files (2.8.0). Report-only: the space returns by
     # itself the moment the holding process exits, and killing someone's
     # process is not a cleanup action this tool should take.
@@ -2809,7 +2893,11 @@ def run_doctor(config, json_mode=False):
             print(f"  {flag} {c['name']:<16} {c['status']}")
         print(f"{'='*64}\n")
 
-    return all_ok
+    # Returns the full result, not just the bool: a function that computed
+    # fifteen checks throwing away fourteen of them made it impossible to
+    # assert on any individual check without re-parsing printed JSON.
+    # `main()` discards this either way, so `doctor` still always exits 0.
+    return {"ok": all_ok, "checks": checks}
 
 
 # ── Categories ──────────────────────────────────────────────────────────────────

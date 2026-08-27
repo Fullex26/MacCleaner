@@ -7,6 +7,28 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.12.0] — 2026-08-28
+
+An accuracy release. Every item here came from a real investigation on a
+working developer Mac where MacCleaner reported 190 MB reclaimable against a
+disk sitting at 94% full — three separate reasons, all of them the tool's
+fault rather than the machine's.
+
+### Fixed
+- **"Total reclaimable" was overstated.** It was a plain sum over targets, but 27 targets nest inside `general-caches` (the review-level sweep of all of `~/Library/Caches`), so every one of their bytes was counted twice — **2.5 GB of overstatement** on a real machine, and more on a fuller one. `reclaimable_total()` now reports the union: a target whose every path lies inside another target's path contributes nothing extra, because nobody can free the same byte twice. Per-target sizes are unchanged and still individually accurate; only the aggregate moved. Nesting uses a trailing-separator check, so `/x/Caches2` is correctly *not* treated as a child of `/x/Caches`.
+- **`get_size()` now passes `du -x`.** Without it, `du` descends into any mounted volume beneath the path and counts that disk image's contents *on top of* the image file — the same bytes twice. Measured that way by hand, one directory read **106 GB against an actual 11 GB**, a threefold error that misdirected an entire storage investigation. No current target path contains a mount point, but nothing checks that when a target is added, so it now measures correctly by default.
+
+### Added
+- **`System temp` — a third advisory `doctor` check.** macOS's per-user temp directory (`$TMPDIR`) had accumulated **20 GB across ~15,000 orphaned entries** — more than every cleanable target combined — and nothing surfaced it. Flags at 5 GiB **or** 2000 entries, because size alone badly under-reports the problem: the same directory later measured 16,289 entries holding 3 GB, having been 20 GB hours earlier. The entry count is the durable signal that tools are leaking scratch; the byte figure just depends on when you look. Report-only, exactly like `Swap`: it names the remedy (restart — macOS clears `$TMPDIR` at boot), never becomes a target, never deletes, and never affects top-level `ok`. `/tmp` is deliberately excluded, since that is the cleanable `tmp` scanner's territory.
+
+### Changed
+- `run_doctor()` returns `{"ok", "checks"}` instead of a bare bool. A function that computed fifteen checks and discarded fourteen of them made individual checks impossible to assert on without re-parsing printed JSON. `main()` still discards the value, so **`doctor` still always exits 0** — the CI smoke test's contract is unchanged.
+
+### Notes
+- The `doctor` pressure-check tests mocked two of the three collectors and left the third live, so every assertion in that class silently depended on the size of the running machine's `$TMPDIR`. They passed only because that directory happened to be small. All three are now mocked.
+
+---
+
 ## [2.11.1] — 2026-08-27
 
 ### Added
