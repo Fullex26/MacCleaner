@@ -231,7 +231,7 @@ _maccleaner() {
 
     if [ -z "$sub" ]; then
         COMPREPLY=( $(compgen -W "scan clean projects report doctor config \
-categories schedule disk-check storage-insights install-deps --help --version" -- "$cur") )
+categories schedule disk-check storage-insights storage-map install-deps --help --version" -- "$cur") )
         _maccleaner_finish; return 0
     fi
 
@@ -246,6 +246,8 @@ categories schedule disk-check storage-insights install-deps --help --version" -
                 COMPREPLY=( $(compgen -W "--json --help" -- "$cur") ) ;;
         disk-check)
                 COMPREPLY=( $(compgen -W "--json --no-post --help" -- "$cur") ) ;;
+        storage-map)
+                COMPREPLY=( $(compgen -W "--min-size --json --help" -- "$cur") ) ;;
         schedule)
                 # positional action, plus --json
                 local seen="" j=0

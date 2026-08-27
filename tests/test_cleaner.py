@@ -285,6 +285,99 @@ class TestV210Targets(unittest.TestCase):
         self.assertEqual(len(static), 93)
 
 
+class TestStorageMap(unittest.TestCase):
+    """`storage-map` is the whole-disk browser: one level of children with
+    real on-disk sizes, categorised, read-only. It exists because a cache
+    cleaner scoped to $HOME cannot answer "where did my disk go"."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "big").mkdir()
+        (self.tmp / "big" / "blob").write_bytes(b"x" * (3 * 1024 * 1024))
+        (self.tmp / "small").mkdir()
+        (self.tmp / "small" / "blob").write_bytes(b"x" * 4096)
+        (self.tmp / "loose.bin").write_bytes(b"x" * (1024 * 1024))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_lists_children_largest_first_with_sizes(self):
+        r = cleaner.scan_storage_map(str(self.tmp))
+        names = [c["name"] for c in r["children"]]
+        self.assertEqual(names[0], "big", "largest child must sort first")
+        self.assertIn("loose.bin", names)
+        self.assertIn("small", names)
+        by = {c["name"]: c for c in r["children"]}
+        self.assertGreaterEqual(by["big"]["size_bytes"], 3 * 1024 * 1024)
+        self.assertGreater(by["big"]["size_bytes"], by["small"]["size_bytes"])
+        self.assertEqual(by["big"]["kind"], "dir")
+        self.assertEqual(by["loose.bin"]["kind"], "file")
+
+    def test_reports_root_and_total(self):
+        r = cleaner.scan_storage_map(str(self.tmp))
+        self.assertEqual(r["root"], str(self.tmp))
+        self.assertGreaterEqual(r["total_bytes"], 4 * 1024 * 1024)
+        self.assertTrue(r["total_human"])
+
+    def test_min_bytes_filters(self):
+        r = cleaner.scan_storage_map(str(self.tmp), min_bytes=2 * 1024 * 1024)
+        self.assertEqual([c["name"] for c in r["children"]], ["big"])
+
+    def test_does_not_cross_mount_points(self):
+        """The whole reason this exists. `du` without -x walks INTO a mounted
+        disk image and counts its contents on top of the image file, reporting
+        the same bytes twice -- measured by hand that way, one directory on a
+        real machine read 106 GB when it actually held 11 GB. The command must
+        carry -x."""
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout="4\t%s\n" % self.tmp, stderr="")
+        with mock.patch.object(cleaner.subprocess, "run", side_effect=fake_run):
+            cleaner.scan_storage_map(str(self.tmp))
+        self.assertEqual(seen["argv"][0], "du")
+        # -x may be bundled with other short flags (`-xkd`), so check the
+        # option characters rather than looking for a standalone "-x".
+        flags = "".join(a for a in seen["argv"] if a.startswith("-"))
+        self.assertIn("x", flags, "du must not descend into mounted volumes")
+
+    def test_missing_root_is_an_empty_result_not_a_crash(self):
+        r = cleaner.scan_storage_map(str(self.tmp / "nope"))
+        self.assertEqual(r["children"], [])
+        self.assertEqual(r["total_bytes"], 0)
+
+    def test_categories_are_assigned_for_known_locations(self):
+        self.assertEqual(cleaner._storage_category(Path("/Applications/Foo.app")), "applications")
+        self.assertEqual(cleaner._storage_category(Path.home() / "Documents"), "documents")
+        self.assertEqual(cleaner._storage_category(Path.home() / "Library" / "Caches"), "caches")
+        self.assertEqual(cleaner._storage_category(Path("/System/Library")), "system")
+        self.assertEqual(cleaner._storage_category(Path.home() / "Library" / "Developer"), "developer")
+        self.assertEqual(cleaner._storage_category(Path("/wherever/else")), "other")
+
+    def test_read_only_never_deletes(self):
+        before = sorted(p.name for p in self.tmp.iterdir())
+        cleaner.scan_storage_map(str(self.tmp))
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), before)
+
+    def test_cli_json_end_to_end(self):
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "storage-map", str(self.tmp), "--json"],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = json.loads(r.stdout)
+        self.assertEqual(d["root"], str(self.tmp))
+        self.assertIn("version", d)
+        self.assertEqual(d["children"][0]["name"], "big")
+
+    def test_cli_defaults_to_home_when_no_path_given(self):
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "storage-map", "--json"],
+                           capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["root"], str(Path.home()))
+
+
 class TestLegacyTranslation(unittest.TestCase):
     def t(self, argv):
         return cleaner.translate_legacy(argv)
@@ -3631,6 +3724,79 @@ SIMCTL_RUNTIMES = {"runtimes": [
      "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
      "state": "Ready", "sizeBytes": 6000000000},
 ]}
+
+
+# Real `simctl runtime list -j` output from Xcode 26 (verified on a live
+# machine): a bare dict keyed by image UUID, where "identifier" is that UUID
+# and the com.apple.CoreSimulator.SimRuntime.* string lives in a SEPARATE
+# "runtimeIdentifier" field. SIMCTL_RUNTIMES above still models the older
+# shape where both fields carried the reverse-DNS string; keeping both
+# fixtures is the point -- the scanner has to handle either.
+SIMCTL_RUNTIMES_UUID_SHAPE = {
+    "8F2D0371-60AE-4D92-B93E-D5EA487B3BA2": {
+        "identifier": "8F2D0371-60AE-4D92-B93E-D5EA487B3BA2",
+        "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+        "state": "Ready", "sizeBytes": 5000000000, "deletable": True},
+    "7EC20E6E-F277-4A98-A693-EFAD7A8BA74F": {
+        "identifier": "7EC20E6E-F277-4A98-A693-EFAD7A8BA74F",
+        "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-1",
+        "state": "Ready", "sizeBytes": 8000000000, "deletable": True},
+}
+
+
+class TestSimulatorRuntimeIdentifierShapes(unittest.TestCase):
+    """Regression for a real miss: on Xcode 26 the unused-runtime target
+    never appeared, because the scanner validated `identifier` against a
+    pattern that only matches the reverse-DNS form while that field actually
+    carries a UUID. Every runtime failed the check and was silently dropped,
+    so 8 GB of genuinely unused runtime stayed invisible to scan and clean
+    alike -- with no warning, since a dropped candidate looks identical to
+    'nothing to clean'."""
+
+    def _scan(self, runtimes):
+        devices = {"devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+                {"udid": "AAAAAAAA-0000-0000-0000-000000000001",
+                 "name": "iPhone 17", "state": "Shutdown",
+                 "lastBootedAt": "2026-08-20T00:00:00Z"}]}}
+
+        def fake(args):
+            return devices if args[:2] == ["list", "devices"] else runtimes
+        with mock.patch.object(cleaner, "_simctl_json", side_effect=fake):
+            with mock.patch.object(cleaner, "get_size", return_value=0):
+                return cleaner.scan_simulator_targets({"simulator_stale_days": 30})
+
+    def test_uuid_identifier_shape_still_yields_the_unused_runtime(self):
+        targets = self._scan(SIMCTL_RUNTIMES_UUID_SHAPE)
+        unused = [t for t in targets if t["id"] == "simulator-unused-runtimes"]
+        self.assertEqual(len(unused), 1,
+                         "iOS 18.1 has no devices and must be offered")
+        t = unused[0]
+        self.assertIn("7EC20E6E-F277-4A98-A693-EFAD7A8BA74F", t["cmd"])
+        self.assertNotIn("8F2D0371", t["cmd"], "the in-use runtime must be left alone")
+        self.assertEqual(t["precomputed_bytes"], 8000000000)
+        self.assertFalse(t["safe"])
+
+    def test_reverse_dns_identifier_shape_still_works(self):
+        """The older shape must keep working -- this fix widens what is
+        accepted, it does not swap one shape for another."""
+        targets = self._scan(SIMCTL_RUNTIMES)
+        unused = [t for t in targets if t["id"] == "simulator-unused-runtimes"]
+        self.assertEqual(len(unused), 1)
+        self.assertIn("com.apple.CoreSimulator.SimRuntime.iOS-18-6", unused[0]["cmd"])
+
+    def test_junk_identifiers_are_still_rejected(self):
+        """The validation exists because these strings are interpolated into a
+        shell command. Widening it must not let a shell metacharacter through."""
+        evil = {"x": {"identifier": "abc; rm -rf ~", "runtimeIdentifier": "x",
+                      "state": "Ready", "sizeBytes": 1, "deletable": True},
+                "y": {"identifier": "$(whoami)", "runtimeIdentifier": "y",
+                      "state": "Ready", "sizeBytes": 1, "deletable": True},
+                "z": {"identifier": "../../etc/passwd", "runtimeIdentifier": "z",
+                      "state": "Ready", "sizeBytes": 1, "deletable": True}}
+        targets = self._scan(evil)
+        self.assertEqual([t for t in targets if t["id"] == "simulator-unused-runtimes"], [],
+                         "no target at all rather than one built from junk")
 
 
 class TestSimulatorTargets(unittest.TestCase):

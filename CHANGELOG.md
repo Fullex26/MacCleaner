@@ -7,6 +7,27 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.11.0] — 2026-08-27
+
+MacCleaner could tell you about 10 GB of rebuildable caches while your disk sat
+at 92% full, and had no way to show you the other 390 GB. This release adds the
+missing half: a read-only browser over the whole disk, including everywhere the
+cleanup engine is deliberately forbidden to go.
+
+### Added
+- **`storage-map` — a read-only whole-disk browser.** `maccleaner storage-map [PATH]` lists one level of children beneath a path (default `$HOME`), largest first, with sizes and a display category (`applications`, `documents`, `media`, `developer`, `caches`, `appdata`, `system`, `other`). Unlike every other command in the engine it **reads outside `$HOME`** — `/Applications`, `/Library`, `/` all work — because a cache cleaner scoped to your home folder structurally cannot answer "where did my disk go". `--min-size MB` hides small entries; `--json` for the machine contract.
+- **Storage tab in the app** (`⌘2`). Drill into any folder, jump straight to `/`, `/Applications`, `/Library`, `~/Library` or `~/Documents`, see a proportional bar per row, Reveal in Finder, and **Move to Trash**.
+- **"Show in Dock" setting.** MacCleaner has always been an `LSUIElement` app — menu bar only, no Dock icon, not addable to the Dock. That is now a preference (Settings → Appearance, config key `show_in_dock`, default off so nothing changes for existing users). The bundle still *launches* as an accessory so there's no Dock flash while settings load; `CleanerBridge` promotes it to a regular app at runtime when the setting is on, which is why settings now load from the bridge's initialiser rather than a view's `.task` — a menu-bar-only session may never open a window at all.
+
+### Fixed
+- **The unused-simulator-runtime target could never fire on current Xcode.** The scanner validated a runtime's `identifier` against a pattern matching only the `com.apple.CoreSimulator.SimRuntime.*` form. Xcode 26's `simctl runtime list -j` puts an image **UUID** in that field and moves the reverse-DNS string to `runtimeIdentifier`, so every runtime failed validation and was silently discarded — indistinguishable from "nothing to clean", while 8 GB of genuinely unused runtime sat there. The check now accepts both shapes, and both remain strictly shell-safe (the validation exists because these strings are interpolated into a `simctl` command). The test fixture only modelled the old shape, which is why this was never caught; a fixture matching real Xcode 26 output has been added alongside it.
+
+### Notes
+- **Measurement must not cross mount points.** `storage-map` runs `du -xkd 1`. Without `-x`, `du` descends into mounted disk images and counts their contents *on top of* the image files themselves — the same bytes twice. Measured that way by hand, `/Library/Developer/CoreSimulator` on a real machine reported **106 GB** against an actual **11 GB**, a threefold overstatement that sent an entire storage investigation down the wrong path before it was caught. `TestStorageMap.test_does_not_cross_mount_points` pins the flag. The older `get_size()` helper (`du -sk`, no `-x`) has the same latent flaw and is currently harmless only because every target path it measures is inside `$HOME` and free of mount points — worth fixing before that stops being true.
+- **Deletion from the storage browser is Trash-only, and deliberately not the cleanup engine's delete path.** That path is built for rebuildable caches and hard-deletes; anything reachable from the browser may be irreplaceable personal work. `FileManager.trashItem` is recoverable and lets macOS's own permission rules decide what is off limits — a system file simply fails, which is the correct answer.
+
+---
+
 ## [2.10.0] — 2026-08-23
 
 Ten new cleanup targets, taking the static table from 83 to 93. Each was found

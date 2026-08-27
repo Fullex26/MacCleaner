@@ -8,6 +8,7 @@ struct SettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 generalSection
+                appearanceSection
                 scheduleSection
                 alertsSection
                 updatesSection
@@ -98,6 +99,22 @@ struct SettingsView: View {
     }
 
     // MARK: - Alerts (notifications + low-disk warning)
+
+    private var appearanceSection: some View {
+        SettingsSection(title: "Appearance") {
+            Toggle(isOn: Binding(
+                get: { bridge.showInDock },
+                set: { on in Task { await bridge.setShowInDock(on) } }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Show in Dock")
+                    Text("MacCleaner stays in the menu bar either way")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
 
     private var alertsSection: some View {
         SettingsSection(title: "Alerts") {

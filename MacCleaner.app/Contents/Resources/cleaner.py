@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.10.0"
+VERSION = "2.11.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -204,6 +204,7 @@ DEFAULT_CONFIG = {
     "low_disk_alerts": True,         # warn when free space drops below the threshold
     "low_disk_threshold_gb": 10,     # the low-disk warning threshold
     "full_refresh_hours": 6,         # how often the app runs a full scan (app-side)
+    "show_in_dock": False,           # app-side: show a Dock icon as well as the menu bar
 }
 
 
@@ -1425,6 +1426,148 @@ def _storage_insights_roots():
     return [Path(p) for p in raw.split(":") if p]
 
 
+# ── Storage map (whole-disk browser) ───────────────────────────────────────────
+# Deliberately separate from the get_targets()/collect_targets()/delete_target()
+# family: entries here have no `id` and no `safe` flag, are never passed to
+# delete_target(), and may sit anywhere on the disk including outside $HOME.
+# This is a READ-ONLY view. It exists because MacCleaner's cleanup engine is
+# scoped to rebuildable caches inside $HOME, which makes it structurally unable
+# to answer "where did my 400 GB go" -- most of a real disk is applications,
+# personal files and system data that a cache cleaner should never touch but a
+# user still needs to see.
+
+# Longest prefix wins, so more specific paths must come first.
+def _storage_category(path):
+    """Bucket a path for display. Presentation only -- nothing downstream
+    changes behaviour based on this, so an unrecognised path is just 'other'."""
+    p = str(Path(path))
+    home = str(Path.home())
+    rules = [
+        (home + "/Library/Developer", "developer"),
+        (home + "/Library/Caches", "caches"),
+        (home + "/Library/Containers", "appdata"),
+        (home + "/Library/Application Support", "appdata"),
+        (home + "/Library", "appdata"),
+        (home + "/Documents", "documents"),
+        (home + "/Desktop", "documents"),
+        (home + "/Downloads", "documents"),
+        (home + "/Movies", "media"),
+        (home + "/Music", "media"),
+        (home + "/Pictures", "media"),
+        ("/Applications", "applications"),
+        (home + "/Applications", "applications"),
+        ("/Library/Developer", "developer"),
+        ("/Library/Caches", "caches"),
+        ("/System", "system"),
+        ("/Library", "system"),
+        ("/private", "system"),
+        ("/usr", "system"),
+    ]
+    best = ("other", -1)
+    for prefix, cat in rules:
+        if (p == prefix or p.startswith(prefix + os.sep)) and len(prefix) > best[1]:
+            best = (cat, len(prefix))
+    return best[0]
+
+
+def _du_children(root):
+    """`du -xkd 1` -- immediate children plus the root's own total, in bytes.
+
+    The `-x` is the whole point and must never be dropped: without it du
+    descends into any mounted disk image beneath `root` and counts that
+    image's *contents* on top of the image file itself, reporting the same
+    bytes twice. Measured by hand without -x, /Library/Developer/CoreSimulator
+    on a real machine read 106 GB when it actually held 11 GB -- a threefold
+    overstatement that sent a whole storage investigation down the wrong path.
+    """
+    try:
+        r = subprocess.run(["du", "-xkd", "1", str(root)],
+                           capture_output=True, text=True, timeout=600)
+    except Exception as e:
+        print("Warning: could not measure %s: %s" % (root, e), file=sys.stderr)
+        return {}, 0
+    # du reports partial results plus stderr noise for unreadable subtrees;
+    # a non-zero exit is normal there and the readable numbers are still good.
+    sizes, total = {}, 0
+    root_s = str(root)
+    for line in r.stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            kb = int(parts[0])
+        except ValueError:
+            continue
+        path = parts[1]
+        if path == root_s:
+            total = kb * 1024
+        else:
+            sizes[path] = kb * 1024
+    return sizes, total
+
+
+def scan_storage_map(root=None, min_bytes=0):
+    """One level of children beneath `root`, largest first, with real sizes.
+
+    Read-only: it stats and measures, and never deletes, moves or opens file
+    contents. Unreadable subtrees are reported at whatever size du managed
+    rather than failing the whole scan."""
+    root = Path(os.path.expanduser(str(root))) if root else Path.home()
+    empty = {"root": str(root), "total_bytes": 0, "total_human": fmt_size(0),
+             "category": _storage_category(root), "children": []}
+    if not root.exists() or not root.is_dir():
+        return empty
+
+    sizes, total = _du_children(root)
+    children = []
+    for path, size in sizes.items():
+        if size < min_bytes:
+            continue
+        p = Path(path)
+        # Only direct children -- du -d 1 shouldn't return anything deeper,
+        # but a path with an embedded newline would confuse the parse above.
+        if p.parent != root:
+            continue
+        children.append({
+            "path": path,
+            "name": p.name,
+            "size_bytes": size,
+            "size_human": fmt_size(size),
+            "kind": "dir" if p.is_dir() and not p.is_symlink() else
+                    ("link" if p.is_symlink() else "file"),
+            "category": _storage_category(p),
+        })
+
+    # du -d 1 lists directories only; loose files in the root are measured here.
+    listed = {c["path"] for c in children}
+    try:
+        for entry in os.scandir(root):
+            if entry.path in listed:
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    continue
+                size = entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+            if size < min_bytes:
+                continue
+            children.append({
+                "path": entry.path,
+                "name": entry.name,
+                "size_bytes": size,
+                "size_human": fmt_size(size),
+                "kind": "link" if entry.is_symlink() else "file",
+                "category": _storage_category(Path(entry.path)),
+            })
+    except OSError:
+        pass
+
+    children.sort(key=lambda c: -c["size_bytes"])
+    return {"root": str(root), "total_bytes": total, "total_human": fmt_size(total),
+            "category": _storage_category(root), "children": children}
+
+
 def scan_storage_insights(config):
     """Read-only scan of the configured roots (default ~/Documents,
     ~/Downloads, ~/Desktop) for files >= STORAGE_INSIGHTS_MIN_BYTES.
@@ -1500,6 +1643,35 @@ def _relative_days(mtime):
     return f"{int(days)} days ago"
 
 
+def show_storage_map(root=None, min_bytes=0, json_mode=False):
+    r = scan_storage_map(root, min_bytes=min_bytes)
+    if json_mode:
+        print(json.dumps({"version": VERSION, **r}, indent=2))
+        return r
+    if not r["children"]:
+        print(f"Nothing to show in {r['root']}.")
+        return r
+    if RICH:
+        table = Table(title=f"{r['root']}  —  {r['total_human']}", show_lines=False)
+        table.add_column("Size", style="green", justify="right")
+        table.add_column("Name", style="cyan")
+        table.add_column("Kind", style="magenta")
+        table.add_column("Category", style="yellow")
+        for c in r["children"]:
+            table.add_row(c["size_human"], c["name"], c["kind"], c["category"])
+        console.print(table)
+    else:
+        print(f"\n{'='*66}")
+        print(f"{r['root']}  —  {r['total_human']}")
+        print(f"{'='*66}")
+        for c in r["children"]:
+            marker = "/" if c["kind"] == "dir" else ("@" if c["kind"] == "link" else " ")
+            name = c["name"] if len(c["name"]) <= 40 else c["name"][:37] + "..."
+            print(f"{c['size_human']:>10}  {name}{marker:<2} [{c['category']}]")
+        print()
+    return r
+
+
 def show_storage_insights(config, json_mode=False):
     hits = scan_storage_insights(config)
     if json_mode:
@@ -1544,11 +1716,21 @@ def show_storage_insights(config, json_mode=False):
 # shell=True) — anything that fails these shapes is dropped rather than ever
 # reaching a shell, so a malformed/hostile simctl response can't inject.
 _SIMCTL_UDID_RE = re.compile(r"[0-9A-Fa-f-]{8,}\Z")
-# Anchored to the real shape genuine identifiers always carry -- a bare
+# Anchored to the real shapes genuine identifiers carry -- a bare
 # character-class check let "all", "--outdated", "--unusable" (all real
 # `xcrun simctl runtime delete` arguments, "all" deletes every runtime image
 # on the machine) through as if they were valid runtime identifiers (F3).
-_SIMCTL_RUNTIME_ID_RE = re.compile(r"com\.apple\.CoreSimulator\.SimRuntime\.[A-Za-z0-9.-]+\Z")
+#
+# TWO shapes, because simctl's `runtime list -j` moved the goalposts: older
+# Xcode put the reverse-DNS string in "identifier", while Xcode 26 puts an
+# image UUID there and moves the reverse-DNS string to "runtimeIdentifier".
+# Accepting only the first form meant every runtime failed validation and was
+# silently dropped on current Xcode, so simulator-unused-runtimes could never
+# fire at all -- indistinguishable, from the outside, from "nothing to clean".
+# Both alternatives are still strictly shell-safe character sets.
+_SIMCTL_RUNTIME_ID_RE = re.compile(
+    r"(?:com\.apple\.CoreSimulator\.SimRuntime\.[A-Za-z0-9.-]+"
+    r"|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\Z")
 
 
 def _git_info(project_dir):
@@ -3446,6 +3628,14 @@ def build_parser():
                                help="Read-only: largest files in Documents/Downloads/Desktop (never deletes)")
     p_storage.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    p_map = sub.add_parser("storage-map",
+                           help="Read-only: browse where disk space is going, anywhere on the disk")
+    p_map.add_argument("path", nargs="?", default=None,
+                       help="Directory to inspect (default: your home folder)")
+    p_map.add_argument("--min-size", type=float, default=0,
+                       metavar="MB", help="Hide entries smaller than this")
+    p_map.add_argument("--json", action="store_true", help="Machine-readable output")
+
     p_sched = sub.add_parser("schedule",
                              help="Manage the launchd cleanup schedule (weekly/monthly/off/status)")
     p_sched.add_argument("action", choices=["status", "weekly", "monthly", "off"])
@@ -3503,6 +3693,12 @@ def main():
 
     if args.command == "disk-check":
         run_disk_check(config, json_mode=args.json, post=not args.no_post)
+        return
+
+    if args.command == "storage-map":
+        show_storage_map(args.path,
+                         min_bytes=int(args.min_size * 1024 * 1024),
+                         json_mode=args.json)
         return
 
     if args.command == "storage-insights":
