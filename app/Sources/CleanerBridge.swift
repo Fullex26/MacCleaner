@@ -162,6 +162,25 @@ struct StorageInsightsReport: Codable {
     let entries: [StorageInsightEntry]
 }
 
+struct StorageMapEntry: Codable, Identifiable {
+    let path: String
+    let name: String
+    let size_bytes: Int
+    let size_human: String
+    let kind: String      // "dir" | "file" | "link"
+    let category: String
+    var id: String { path }
+    var isDirectory: Bool { kind == "dir" }
+}
+
+struct StorageMapReport: Codable {
+    let root: String
+    let total_bytes: Int
+    let total_human: String
+    let category: String
+    let children: [StorageMapEntry]
+}
+
 struct DiskCheckReport: Codable {
     let free_bytes: Int
     let free_human: String
@@ -190,6 +209,7 @@ struct EngineConfig: Codable {
     var low_disk_alerts: Bool?
     var low_disk_threshold_gb: Double?
     var full_refresh_hours: Double?
+    var show_in_dock: Bool?
 }
 
 enum BridgeError: LocalizedError {
@@ -231,6 +251,12 @@ final class CleanerBridge: ObservableObject {
     @Published var notificationsEnabled = true
     @Published var lowDiskAlertsEnabled = true
     @Published var lowDiskThresholdGB: Double = 10
+    /// Whether the app also shows a Dock icon. The bundle is `LSUIElement`, so
+    /// it always *launches* as a menu-bar-only accessory — no Dock flash while
+    /// settings load. When this is on, `applyDockVisibility()` promotes it to a
+    /// regular app at runtime. Kept in config.json (not UserDefaults) so it
+    /// lives alongside every other MacCleaner setting.
+    @Published var showInDock = false
     @Published var scheduleStatus: ScheduleStatus?
     @Published var scheduleSupported = true
     /// Set for the whole `setSchedule` round trip (bootout + bootstrap +
@@ -256,9 +282,24 @@ final class CleanerBridge: ObservableObject {
     /// calls, so a Projects re-scan must not make the Dashboard's own Scan
     /// button/spinner claim to be busy, and vice versa. `fullRefreshIfStale()`
     /// still watches both — see its guard below.
+    /// Loads settings as soon as the bridge exists, which is at app launch.
+    /// This is what applies "Show in Dock" for a menu-bar-only session — the
+    /// `Window` scene's `.task` can't be relied on, since an `LSUIElement` app
+    /// may never open a window at all. Memoized inside `ensureSettingsLoaded`,
+    /// so the views' own calls are no-ops afterwards.
+    init() {
+        ensureSettingsLoaded()
+    }
+
     @Published var isScanning = false
     @Published var isScanningProjects = false
     @Published var isScanningStorageInsights = false
+    /// The storage browser's current level. Unlike every other view here it can
+    /// point anywhere on the disk, including outside $HOME — it is read-only,
+    /// and deletion goes through the Trash rather than the cleanup engine.
+    @Published var storageMap: StorageMapReport?
+    @Published var isScanningStorageMap = false
+    @Published var storageMapError: String?
     @Published var isCleaning = false
     @Published var statusMessage: String?
     @Published var lastClean: CleanResult?
@@ -640,6 +681,42 @@ final class CleanerBridge: ObservableObject {
         }
     }
 
+    /// Loads one level of the storage browser. `path` nil means the home folder.
+    /// Never touches `statusMessage`: this runs concurrently with the Dashboard's
+    /// own scan, and a shared banner can't represent two failures at once.
+    func scanStorageMap(_ path: String? = nil) async {
+        isScanningStorageMap = true
+        defer { isScanningStorageMap = false }
+        var args = ["storage-map"]
+        if let path { args.append(path) }
+        args.append("--json")
+        do {
+            storageMap = try await run(StorageMapReport.self, args)
+            storageMapError = nil
+        } catch {
+            // Leave any previously loaded level on screen rather than blanking
+            // the browser out from under the user.
+            storageMapError = error.localizedDescription
+        }
+    }
+
+    /// Moves one item to the Trash. Deliberately NOT the cleanup engine's
+    /// delete path: that one is built for rebuildable caches and hard-deletes.
+    /// Anything reachable from the storage browser may be irreplaceable
+    /// personal work, so the only removal offered is the recoverable one, and
+    /// macOS's own permission rules decide what is off limits (a system file
+    /// simply fails here, which is the correct answer).
+    func moveToTrash(_ path: String) async -> Bool {
+        let url = URL(fileURLWithPath: path)
+        do {
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            return true
+        } catch {
+            storageMapError = "Couldn't move \(url.lastPathComponent) to the Trash: \(error.localizedDescription)"
+            return false
+        }
+    }
+
     func scanStorageInsights() async {
         isScanningStorageInsights = true
         defer { isScanningStorageInsights = false }
@@ -710,6 +787,8 @@ final class CleanerBridge: ObservableObject {
             notificationsEnabled = cfg.notifications ?? true
             lowDiskAlertsEnabled = cfg.low_disk_alerts ?? true
             lowDiskThresholdGB = cfg.low_disk_threshold_gb ?? 10
+            showInDock = cfg.show_in_dock ?? false
+            applyDockVisibility()
             fullRefreshHours = cfg.full_refresh_hours ?? 6
         } catch {
             statusMessage = "Could not load settings: \(error.localizedDescription)"
@@ -750,6 +829,28 @@ final class CleanerBridge: ObservableObject {
         } catch {
             statusMessage = "Config change failed: \(error.localizedDescription)"
         }
+    }
+
+    func setShowInDock(_ on: Bool) async {
+        do {
+            try await runPlain(["config", "set", "show_in_dock", on ? "true" : "false"])
+            showInDock = on
+            applyDockVisibility()
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// `.regular` puts the app in the Dock and the ⌘-Tab switcher; `.accessory`
+    /// is the menu-bar-only mode the bundle launches in. Switching back to
+    /// `.accessory` while a window is open would leave that window unreachable
+    /// from the Dock, so the main window is re-activated on the way up and the
+    /// user keeps the menu bar either way.
+    func applyDockVisibility() {
+        let policy: NSApplication.ActivationPolicy = showInDock ? .regular : .accessory
+        guard NSApp.activationPolicy() != policy else { return }
+        NSApp.setActivationPolicy(policy)
+        if showInDock { NSApp.activate(ignoringOtherApps: true) }
     }
 
     func setLowDiskThreshold(_ gb: Double) async {

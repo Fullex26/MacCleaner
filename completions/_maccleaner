@@ -203,6 +203,7 @@ _maccleaner() {
     'categories:List categories and their targets'
     'schedule:Manage the launchd cleanup schedule'
     'disk-check:Low-disk warning check (for launchd)'
+    'storage-map:Browse where disk space is going (read-only)'
     'storage-insights:Largest files in Documents/Downloads/Desktop (read-only)'
     'install-deps:Install rich for prettier output'
   )
@@ -308,6 +309,13 @@ _maccleaner() {
             '--json[machine-readable output]' \
             '--no-post[report should_notify without posting -- the caller delivers it]' \
             '(-h --help)'{-h,--help}'[show help]' && ret=0
+          ;;
+        storage-map)
+          _arguments -s -S \
+            '--min-size[hide entries smaller than this (MB)]:MB:' \
+            '--json[machine-readable output]' \
+            '(-h --help)'{-h,--help}'[show help]' \
+            '1:directory:_files -/' && ret=0
           ;;
         install-deps)
           _arguments '(-h --help)'{-h,--help}'[show help]' && ret=0
