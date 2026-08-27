@@ -277,12 +277,67 @@ class TestV210Targets(unittest.TestCase):
                 self.assertTrue(str(path).startswith(general + os.sep), tid)
                 self.assertNotEqual(str(path), general, tid)
 
-    def test_static_target_count_reached_93(self):
-        """83 before 2.10.0, +10 here. `logs` is filtered because those
-        targets are generated per oversized ~/Library/Logs folder, so an
-        unfiltered count differs on every machine."""
+    def test_static_target_count(self):
+        """83 before 2.10.0, +10 in 2.10.0, +1 in 2.11.0
+        (xcode-derived-data-custom) = 94. Bump deliberately when adding a
+        target; a DROP here means one was lost by accident. `logs` is
+        filtered because those targets are generated per oversized
+        ~/Library/Logs folder, so an unfiltered count differs per machine."""
         static = [t for t in self.targets.values() if t["category"] != "logs"]
-        self.assertEqual(len(static), 93)
+        self.assertEqual(len(static), 94)
+
+
+class TestCustomDerivedData(unittest.TestCase):
+    """`xcode-derived-data` only knows Xcode's default location. A project
+    configured with a custom DerivedData path (Xcode > Settings > Locations,
+    or an -derivedDataPath build flag) puts gigabytes of pure build output in
+    ~/Library/Developer/<Name>DerivedData, which MacCleaner walked straight
+    past -- on one real machine it reported 190 MB reclaimable while 6.2 GB
+    of build output sat there untouched."""
+
+    def setUp(self):
+        self.targets = {t["id"]: t
+                        for t in cleaner.get_targets(cleaner.DEFAULT_CONFIG,
+                                                     all_categories=True)}
+
+    def test_target_exists_and_is_safe(self):
+        t = self.targets["xcode-derived-data-custom"]
+        self.assertEqual(t["category"], "xcode")
+        self.assertTrue(t["safe"], "build output is rebuildable by definition")
+        self.assertTrue(t["description"].strip())
+
+    def test_glob_targets_sibling_derived_data_dirs(self):
+        t = self.targets["xcode-derived-data-custom"]
+        self.assertEqual(t["glob"],
+                         os.path.expanduser("~/Library/Developer/*DerivedData*"))
+
+    def test_does_not_overlap_the_default_location(self):
+        """~/Library/Developer/Xcode/DerivedData is a level deeper, so the
+        glob cannot match it -- the two targets must never double-count."""
+        default = str(self.targets["xcode-derived-data"]["path"])
+        self.assertEqual(default,
+                         os.path.expanduser("~/Library/Developer/Xcode/DerivedData"))
+        # Must be checked with glob, not fnmatch: fnmatch's "*" happily spans
+        # "/" while glob's does not, and glob is what _target_paths() actually
+        # uses to expand this pattern.
+        import glob as globmod
+        self.assertNotIn(default,
+                         globmod.glob(self.targets["xcode-derived-data-custom"]["glob"]))
+
+    def test_matches_a_real_custom_layout(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            dev = tmp / "Library" / "Developer"
+            (dev / "RecovrDerivedData" / "Build").mkdir(parents=True)
+            (dev / "RecovrDerivedData-clone" / "Build").mkdir(parents=True)
+            (dev / "Xcode" / "DerivedData").mkdir(parents=True)
+            pattern = str(dev / "*DerivedData*")
+            import glob as globmod
+            hits = sorted(Path(p).name for p in globmod.glob(pattern))
+            self.assertEqual(hits, ["RecovrDerivedData", "RecovrDerivedData-clone"])
+            self.assertNotIn("Xcode", hits, "must not swallow the Xcode dir itself")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestStorageMap(unittest.TestCase):
