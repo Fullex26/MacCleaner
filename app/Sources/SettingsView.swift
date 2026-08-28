@@ -199,10 +199,16 @@ struct SettingsView: View {
             return "A legacy cron schedule exists — choosing an option migrates it to launchd."
         }
         if status.schedule != nil {
-            let allLoaded = status.agents.allSatisfy(\.loaded)
-            return allLoaded
-                ? "Active — cleans run in the background and notify when done. Low-disk check: hourly."
-                : "Installed but not loaded — pick the schedule again to reload it."
+            if status.agents.allSatisfy(\.loaded) {
+                return "Active — cleans run in the background and notify when done. Low-disk check: hourly."
+            }
+            // An agent whose load state could not be verified is not a
+            // broken schedule — telling the user to reload one that is
+            // running fine is the exact false alarm engine 2.14.1 fixed.
+            if status.agents.contains(where: { !$0.loaded && !$0.isUnverified }) {
+                return "Installed but not loaded — pick the schedule again to reload it."
+            }
+            return "Installed. Its running state could not be confirmed just now."
         }
         return "No automatic cleanup. Scans and cleans only run when you start them."
     }

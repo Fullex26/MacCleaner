@@ -371,8 +371,8 @@ New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`month
   "version": "2.14.0",
   "schedule": "weekly",
   "agents": [
-    { "label": "com.fullex.maccleaner.clean",     "plist_present": true, "loaded": true },
-    { "label": "com.fullex.maccleaner.diskwatch", "plist_present": true, "loaded": true }
+    { "label": "com.fullex.maccleaner.clean",     "plist_present": true, "loaded": true, "load_state": "loaded" },
+    { "label": "com.fullex.maccleaner.diskwatch", "plist_present": true, "loaded": true, "load_state": "loaded" }
   ],
   "legacy_cron": false
 }
@@ -380,6 +380,7 @@ New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`month
 
 - `"schedule"` is `"weekly"`, `"monthly"`, or `null` (nothing installed, or the clean agent's plist couldn't be parsed) — derived from the clean agent's `StartCalendarInterval` (`Day` key ⇒ monthly, `Weekday` key ⇒ weekly).
 - `"agents"` lists only agents whose plist is actually on disk (0, 1, or 2 entries) — `plist_present` is therefore always `true` for any entry present in the array; `loaded` reflects a live `launchctl list <label>` check, so a plist that's present but not bootstrapped shows `loaded: false`.
+- **New in 2.14.1** — `"load_state"`: `"loaded"`, `"not_loaded"`, or `"unknown"`. `launchctl` can fail for reasons that say nothing about the agent (no `launchctl` on `PATH`, no Aqua/GUI session — the usual case over ssh, inside a sandbox, or under another launchd job — or a timeout). Only `launchctl list`'s documented no-such-service answer (exit `113`, or a `Could not find service` message) counts as `"not_loaded"`; every other failure is `"unknown"`, meaning *the question could not be asked*, not that the schedule is broken. `"loaded"` stays a plain bool for backward compatibility (`loaded == (load_state == "loaded")`), so `"unknown"` reports `loaded: false` — **agents must read `load_state`, not `loaded`, before concluding a schedule is broken**. `doctor`'s `Schedule` check is `ok: true` for `"unknown"` and says so in its status text; only a definitive `"not_loaded"` is `ok: false`.
 - `"legacy_cron"` is `true` when a crontab line referencing `mac-cleaner/cleaner.py` is still present.
 - `schedule weekly --json` / `schedule monthly --json` add `"migrated_cron": bool` — `true` if a legacy cron line was found and removed as part of this install (regardless of whether the new agents loaded cleanly).
 - `schedule off --json` adds `"removed": bool` — `true` if at least one agent's plist actually existed and was unloaded/deleted; `false` when nothing was scheduled.
@@ -501,7 +502,7 @@ Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 5
 
 ## 6. Safety guarantees (blast radius)
 
-- **Home-only, with one narrow carve-out**: the deleter refuses any path not strictly inside `$HOME`, and refuses `$HOME` itself and `/`. Out-of-home paths surface as per-item errors, never deletions. **New in 2.5.0**: the sole exception is `tmp-*` targets (the `tmp_scan`-marked dynamic IDs from `scan_tmp_artifacts()`/`tmp_to_targets()` only — no static or command-based target qualifies), and even then only for a path that resolves to a *direct child* of the tmp scan root (default `/private/tmp`, `/tmp` included via symlink resolution; overridable for tests via `MACCLEANER_TMP_ROOT`) — never the root itself, never anything nested deeper. There is deliberately no config key that widens this carve-out.
+- **Home-only, with one narrow carve-out**: the deleter refuses any path not strictly inside `$HOME`, and refuses `$HOME` itself and `/`. Out-of-home paths surface as per-item errors, never deletions. **New in 2.5.0**: the sole exception is `tmp-*` targets (the `tmp_scan`-marked dynamic IDs from `scan_tmp_artifacts()`/`tmp_to_targets()` only — no static or command-based target qualifies), and even then only for a path that resolves to a *direct child* of the tmp scan root (default `/private/tmp`, `/tmp` included via symlink resolution; overridable for tests via `MACCLEANER_TMP_ROOT`), **or one level below that** — never the root itself, never anything nested deeper than two levels. **Widened from one level to two in 2.14.1**: 2.14.0's nested scan offers the build tree *inside* a workspace (`/private/tmp/<repo>-<task-id>/derived`) so the sibling run logs and `.xcresult` bundles survive, but under a direct-children-only rule every such target was surfaced with a size and then refused at delete time as `refused (outside home)` — reporting reclaimable space it could not reclaim. The `tmp_scan` marker requirement is unchanged. There is deliberately no config key that widens this carve-out.
 - **Symlinks are never followed**: a symlink is unlinked (the link itself), never traversed into its destination. The projects scanner also never follows symlinks while walking.
 - **Empty-only targets**: `general-caches` (`~/Library/Caches`) and `trash` (`~/.Trash`) delete *contents* only — the directory itself is preserved.
 - **Trash mode**: `--trash` (or `delete_mode: "trash"`) moves paths to `~/.Trash` instead of deleting — fully recoverable until the Trash is emptied. Exception: the `trash` target always hard-deletes (moving Trash into Trash would be a no-op).
