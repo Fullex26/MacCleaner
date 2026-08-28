@@ -7,6 +7,25 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.14.0] — 2026-08-28
+
+Closing the gap between what MacCleaner can *see* and what it can *act on*.
+Both items came from hand-hunting ~15 GB on a real machine that the tool
+watched and could not touch.
+
+### Fixed
+- **The `/tmp` scanner could not see build output nested inside a working directory — at any age.** It classified only the top level, so an AI-coding session's folder (logs + `.xcresult` bundles + a 4.1 GB Xcode build tree) was rejected wholesale: the folder itself isn't build junk, and nothing looked inside it. `_nested_build_dirs()` now checks exactly one level down and offers **just the build tree**, never the parent — the logs and test results beside it are often exactly what the session was for. Bounded to one level deliberately: an unbounded walk of every tmp tree would be slow and far likelier to surface something live.
+- **The DerivedData signature required an `info.plist` Xcode doesn't always write.** A real 4.1 GB tree with `Build/`, `Index.noindex/`, `ModuleCache.noindex/`, `Logs/` and `SDKStatCaches.noindex/` was rejected for lacking that one file, because it was produced under a custom `-derivedDataPath`. The rule is now `Build/` + `Index.noindex/` plus one corroborating Xcode-only marker. Still strictly **content**-based: the folder that motivated this was named `derived`, and a folder merely *named* `DerivedData` with no build shape still does not qualify.
+- The `tmp_min_age_days` gate applies unchanged to nested output, and that matters: the real 4.1 GB case was **zero days old** — an active build — and the age gate is exactly what protects it. On the test machine the scanner correctly reports nothing today, but would now find 4.6 GB once those trees age out, where before it would have found none of it ever.
+
+### Added
+- **`Docker disk image` — a fourth advisory `doctor` check.** Docker Desktop's VM image is routinely the largest single item MacCleaner can see and cannot reclaim (10 GB on the test machine). Sized by allocated blocks, because the file is sparse: 1.0 TB apparent against ~10 GB real. Report-only for a different reason than the other advisories — the space genuinely *is* reclaimable, just not from outside. `docker system prune` frees space inside the VM, but the host-side image only shrinks when Docker's own TRIM runs, which needs Docker running; the status says so when it isn't. **MacCleaner never touches the image**: deleting or truncating it would destroy every container, image and volume in it.
+
+### Notes
+- The `doctor` pressure-check tests broke for the second release running, both times because a newly added advisory collector wasn't mocked and leaked the developer's real machine state into the assertions. The helper now mocks a declared `COLLECTORS` list, and a new tripwire test reads `run_doctor`'s source and fails if a collector it calls is missing from that list — so the third occurrence fails loudly instead of silently making tests machine-dependent.
+
+---
+
 ## [2.13.0] — 2026-08-28
 
 The "largest items" view could only see a small slice of a real disk, and one
