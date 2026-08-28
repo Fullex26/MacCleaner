@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.12.0"
+VERSION = "2.13.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -1460,9 +1460,74 @@ TMP_CLONE_ARTIFACTS = {
 
 # ── Storage Insights (read-only, never wired into the delete pipeline) ────────
 STORAGE_INSIGHTS_MIN_BYTES = 100 * 1024 * 1024
-STORAGE_INSIGHTS_MAX_RESULTS = 50
-STORAGE_INSIGHTS_ROOTS_DEFAULT = f"{HOME}/Documents:{HOME}/Downloads:{HOME}/Desktop"
+STORAGE_INSIGHTS_MAX_RESULTS = 100
+# Widened in 2.13.0 from the original three. ~/Library is the single largest
+# thing on a typical developer Mac (85 GB on the machine this was built
+# against, against ~35 GB of Documents), and /Applications is where the
+# biggest individual items live -- neither was reachable before, so the
+# "largest items" view could not see most of the disk.
+STORAGE_INSIGHTS_ROOTS_DEFAULT = ":".join([
+    f"{HOME}/Documents", f"{HOME}/Downloads", f"{HOME}/Desktop",
+    f"{HOME}/Library", f"{HOME}/Applications", "/Applications",
+])
 _STORAGE_INSIGHTS_SKIP_DIRS = set(ARTIFACT_MANIFESTS) | TMP_CLONE_ARTIFACTS
+# Directory suffixes macOS treats as a single opaque document/app, not a
+# folder. Reported whole and never descended into: /Applications holds ZERO
+# loose files over the size floor but a dozen multi-GB .app bundles, so a
+# file-only scan sees nothing there at all. Listing the binaries inside an
+# app would also invite deleting one, which breaks the app.
+STORAGE_INSIGHTS_BUNDLE_SUFFIXES = (
+    ".app", ".framework", ".xcarchive", ".photoslibrary", ".imovielibrary",
+    ".fcpbundle", ".tvlibrary", ".theater", ".logicx", ".band", ".sparsebundle",
+    ".pkg", ".bundle", ".plugin", ".kext", ".qlgenerator", ".mdimporter",
+)
+
+
+def _disk_bytes(st):
+    """Bytes a file actually occupies on disk.
+
+    `st_size` is the APPARENT size and lies for sparse files: Docker's
+    Docker.raw reports 1.0 TB apparent against 9.97 GB allocated, which would
+    put a phantom terabyte at the top of a "largest items" list on a 460 GB
+    disk. `st_blocks` is always 512-byte units regardless of filesystem block
+    size, and is what `du` and Finder report. It is also correct (smaller)
+    for APFS-compressed files, where apparent size overstates too."""
+    return st.st_blocks * 512
+
+
+def _is_bundle_dir(name):
+    return name.endswith(STORAGE_INSIGHTS_BUNDLE_SUFFIXES)
+
+
+def _bundle_size(root):
+    """Total bytes of a bundle, stat-only.
+
+    Deliberately NOT `du`/get_size(): this keeps the whole scan inside the
+    same os.scandir/os.stat contract the rest of scan_storage_insights uses,
+    which is what makes the "never opens file contents" guarantee (and so the
+    "never triggers an iCloud download of an evicted file" guarantee)
+    provable by mocking builtins.open. Symlinks are never followed and never
+    counted -- a symlink inside a bundle usually points back into the same
+    bundle (Frameworks/Versions/Current), so following them would both
+    double-count and risk a cycle. Unreadable subtrees contribute 0 rather
+    than aborting: a partial size for one app beats losing the whole scan."""
+    total, stack = 0, [root]
+    while stack:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink():
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(e.path)
+                else:
+                    total += _disk_bytes(e.stat(follow_symlinks=False))
+            except OSError:
+                continue
+    return total
 
 
 def _storage_insights_roots():
@@ -1660,14 +1725,23 @@ def scan_storage_insights(config):
                 if e.is_symlink():
                     continue
                 if e.is_dir(follow_symlinks=False):
-                    if e.name in _STORAGE_INSIGHTS_SKIP_DIRS or e.name.endswith(".app"):
+                    if e.name in _STORAGE_INSIGHTS_SKIP_DIRS:
+                        continue
+                    if _is_bundle_dir(e.name):
+                        # One row for the whole bundle; never descend.
+                        size = _bundle_size(e.path)
+                        if size >= STORAGE_INSIGHTS_MIN_BYTES:
+                            st = e.stat(follow_symlinks=False)
+                            hits.append({"path": Path(e.path), "size_bytes": size,
+                                         "mtime": st.st_mtime, "is_bundle": True})
                         continue
                     stack.append(Path(e.path))
                 elif e.is_file(follow_symlinks=False):
                     st = e.stat(follow_symlinks=False)
-                    if st.st_size >= STORAGE_INSIGHTS_MIN_BYTES:
-                        hits.append({"path": Path(e.path), "size_bytes": st.st_size,
-                                     "mtime": st.st_mtime})
+                    size = _disk_bytes(st)
+                    if size >= STORAGE_INSIGHTS_MIN_BYTES:
+                        hits.append({"path": Path(e.path), "size_bytes": size,
+                                     "mtime": st.st_mtime, "is_bundle": False})
             except OSError:
                 continue
     hits.sort(key=lambda h: h["size_bytes"], reverse=True)
@@ -1721,30 +1795,34 @@ def show_storage_insights(config, json_mode=False):
     if json_mode:
         print(json.dumps({
             "version": VERSION,
+            "roots": [str(r) for r in _storage_insights_roots()],
+            "min_bytes": STORAGE_INSIGHTS_MIN_BYTES,
             "entries": [
                 {"path": str(h["path"]), "size_bytes": h["size_bytes"],
-                 "size_human": fmt_size(h["size_bytes"]), "mtime": h["mtime"]}
+                 "size_human": fmt_size(h["size_bytes"]), "mtime": h["mtime"],
+                 "is_bundle": bool(h.get("is_bundle"))}
                 for h in hits
             ],
         }, indent=2))
         return
     floor_human = fmt_size(STORAGE_INSIGHTS_MIN_BYTES)
-    roots_overridden = "MACCLEANER_STORAGE_INSIGHTS_ROOTS" in os.environ
-    roots_text = (
-        ", ".join(str(r) for r in _storage_insights_roots())
-        if roots_overridden
-        else "~/Documents, ~/Downloads, or ~/Desktop"
-    )
+    home = str(HOME)
+    roots_text = ", ".join(
+        str(r).replace(home, "~") for r in _storage_insights_roots())
     if not hits:
         print(f"No files found at or above {floor_human} in {roots_text}.")
         return
     if RICH:
-        table = Table(title="Large Files", show_lines=False)
+        table = Table(title=f"Largest Items (>={floor_human})", show_lines=False)
         table.add_column("Size", style="green", justify="right")
+        table.add_column("Kind", style="magenta")
         table.add_column("Path", style="cyan")
         table.add_column("Modified", style="yellow")
         for h in hits:
-            table.add_row(fmt_size(h["size_bytes"]), str(h["path"]), _relative_days(h["mtime"]))
+            table.add_row(fmt_size(h["size_bytes"]),
+                          "app/bundle" if h.get("is_bundle") else "file",
+                          str(h["path"]).replace(home, "~"),
+                          _relative_days(h["mtime"]))
         console.print(table)
     else:
         print(f"\n{'='*60}")

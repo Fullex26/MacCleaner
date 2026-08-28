@@ -7,6 +7,24 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.13.0] — 2026-08-28
+
+The "largest items" view could only see a small slice of a real disk, and one
+of the numbers it did show was off by a factor of a hundred.
+
+### Added
+- **Applications and the whole home Library are now covered.** Default roots go from three to six: `~/Documents`, `~/Downloads`, `~/Desktop`, **`~/Library`**, **`~/Applications`**, **`/Applications`**. On the machine this was built against, `~/Library` alone is 85 GB against ~35 GB of Documents — the old three roots simply could not see where the disk had gone. `storage-insights --json` now also echoes `roots` and `min_bytes`, so "nothing large in Documents" is distinguishable from "Documents was never scanned". Result cap raised 50 → 100 to fit the wider scope.
+- **Bundle-aware scanning.** A `.app`, `.framework`, `.photoslibrary`, `.xcarchive` (and similar — see `STORAGE_INSIGHTS_BUNDLE_SUFFIXES`) is reported as **one entry carrying its whole size**, flagged `is_bundle: true`, and never descended into. This is what makes `/Applications` work at all: it holds **zero** loose files over the 100 MB floor and a dozen multi-GB app bundles, so a file-only scan showed nothing there. Listing an app's internal binaries would also be actively misleading, since deleting one breaks the app. The app's list shows a distinct icon for a bundle so an 11 GB row reads as "this is a whole application".
+
+### Fixed
+- **Sparse files reported ~100× too large.** Sizes came from `st_size` (apparent size). Docker's `Docker.raw` reports **1.0 TB apparent against 9.97 GB actually allocated**, so a phantom terabyte sat at the top of a largest-items list on a 460 GB disk — obvious nonsense that discredits every other number on the page. Sizes now use `st_blocks * 512`, matching `du` and Finder, and are also correct (smaller) for APFS-compressed files: Xcode drops from a claimed 8.8 GB to a true 4.0 GB.
+- **Storage tab layout was broken.** Each row's proportional bar used a `GeometryReader`, which is greedy in both axes — it claimed the entire row width, shoving the category, size and action buttons hard against the window edge and stretching the view past its pane, which pushed the header and breadcrumb off the top of the window entirely. The bar now draws on a fixed-width track needing no measurement, and the view's bounds are pinned explicitly. The bar fraction is also clamped, so a level reporting 0 bytes can no longer produce a `NaN` width.
+
+### Notes
+- Two pre-existing tests were assertion-shaped rather than intent-shaped and broke on purely additive changes: one pinned the exact key set of a scan result (so adding `is_bundle` failed a test about the *delete pipeline*), and one pinned the exact default-root list. Both now assert the invariant they actually care about. A third scanned the developer's **real home directory** in-process — it passed at 33 s and later blew a 300 s timeout on unchanged code, purely because the machine had filled up; it now redirects `HOME` to a temp dir and runs in 0.2 s.
+
+---
+
 ## [2.12.0] — 2026-08-28
 
 An accuracy release. Every item here came from a real investigation on a

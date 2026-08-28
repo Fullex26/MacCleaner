@@ -68,7 +68,7 @@ struct DashboardView: View {
             // title (`Font.sectionLabel`) — the app's one named "section
             // heading" token; there is no separate `DesignSystem.Typography`
             // namespace.
-            Text("Large Files".uppercased())
+            Text("Largest Items".uppercased())
                 .font(.sectionLabel)
                 .tracking(0.5)
                 .foregroundStyle(.secondary)
@@ -111,7 +111,11 @@ struct DashboardView: View {
                 // returned zero qualifying entries — gated on
                 // `storageInsights != nil` so this is literally true; see
                 // the trailing `else` below for the pre-scan case.
-                Text("No files ≥100 MB found in Documents, Downloads, or Desktop.")
+                Text(bridge.storageInsights?.roots.map { roots in
+                    "Nothing ≥100 MB in " + roots
+                        .map { ($0 as NSString).abbreviatingWithTildeInPath }
+                        .joined(separator: ", ") + "."
+                } ?? "No items ≥100 MB found.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -408,7 +412,7 @@ struct TargetRow: View {
     }
 }
 
-/// One row in the "Large Files" section — read-only, no selection/checkbox
+/// One row in the "Largest Items" section — read-only, no selection/checkbox
 /// (unlike `TargetRow`/`ArtifactRow`, this list isn't part of any clean
 /// workflow). Styling otherwise mirrors those rows: `.rowLabel` primary
 /// text, a `.caption`/`.secondary` meta line, and a trailing
@@ -426,6 +430,12 @@ struct LargeFileRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
+            // An 11 GB .app must not read as a stray file: the engine reports
+            // a bundle as one item carrying its whole size, and the icon is
+            // what tells the user that deleting it removes the whole app.
+            Image(systemName: entry.isBundle ? "app.badge" : "doc")
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
             VStack(alignment: .leading, spacing: 2) {
                 Text((entry.path as NSString).lastPathComponent)
                     .font(.rowLabel)

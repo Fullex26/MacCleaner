@@ -583,11 +583,19 @@ class TestStorageMap(unittest.TestCase):
         self.assertEqual(d["children"][0]["name"], "big")
 
     def test_cli_defaults_to_home_when_no_path_given(self):
+        # HOME is redirected at a temp dir on purpose. This used to measure
+        # the developer's real home directory, which made a unit test's
+        # runtime a function of how full the machine was -- it passed at 33s
+        # and later blew a 300s timeout on the same code.
+        fake_home = self.tmp / "fakehome"
+        (fake_home / "stuff").mkdir(parents=True)
+        (fake_home / "stuff" / "f").write_bytes(b"x" * 2048)
+        env = {**os.environ, "HOME": str(fake_home)}
         r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
                             "storage-map", "--json"],
-                           capture_output=True, text=True, timeout=300)
+                           capture_output=True, text=True, timeout=120, env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(json.loads(r.stdout)["root"], str(Path.home()))
+        self.assertEqual(json.loads(r.stdout)["root"], str(fake_home))
 
 
 class TestLegacyTranslation(unittest.TestCase):
@@ -5592,11 +5600,17 @@ class TestStorageInsightsScanner(unittest.TestCase):
         self._make_file(nm, "bundle.js", 120)
         self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
 
-    def test_skips_app_bundle_contents(self):
+    def test_reports_the_bundle_itself_never_its_contents(self):
+        # Pre-2.13 this asserted []: bundles were skipped entirely, which is
+        # why /Applications (zero loose large files, a dozen multi-GB apps)
+        # showed nothing at all. The bundle is now one row carrying its whole
+        # size -- but its internals must still never be listed individually.
         app_contents = self.docs / "SomeApp.app" / "Contents" / "MacOS"
         app_contents.mkdir(parents=True)
         self._make_file(app_contents, "SomeApp", 200)
-        self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
+        hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual([h["path"].name for h in hits], ["SomeApp.app"])
+        self.assertTrue(hits[0]["is_bundle"])
 
     def test_symlinked_directory_not_followed(self):
         real = self.tmp / "real_outside"
@@ -5655,18 +5669,140 @@ class TestStorageInsightsScanner(unittest.TestCase):
         self._make_file(self.docs, "big.mov", 150)
         hits = cleaner.scan_storage_insights(self.cfg)
         self.assertEqual(len(hits), 1)
-        self.assertEqual(set(hits[0].keys()), {"path", "size_bytes", "mtime"})
+        keys = set(hits[0].keys())
+        # The invariant is the ABSENCE of target shape, not an exact key set:
+        # pinning the whole set made a purely additive field (is_bundle) fail
+        # a test that has nothing to do with the delete pipeline.
+        self.assertEqual(keys & {"id", "safe", "category", "cmd", "empty_only"}, set())
+        self.assertLessEqual({"path", "size_bytes", "mtime"}, keys)
 
     def test_default_roots_env_unset(self):
-        # Without the override, the function must fall back to the real
-        # ~/Documents:~/Downloads:~/Desktop default -- verify the default
-        # string is built correctly rather than raising or returning None.
+        # Without the override, the function must fall back to the built-in
+        # default list -- verify it is built correctly rather than raising or
+        # returning None. Widened in 2.13.0 from three roots to six.
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("MACCLEANER_STORAGE_INSIGHTS_ROOTS", None)
             roots = cleaner._storage_insights_roots()
         self.assertEqual(roots, [cleaner.HOME / "Documents",
                                   cleaner.HOME / "Downloads",
-                                  cleaner.HOME / "Desktop"])
+                                  cleaner.HOME / "Desktop",
+                                  cleaner.HOME / "Library",
+                                  cleaner.HOME / "Applications",
+                                  Path("/Applications")])
+
+
+class TestStorageInsightsBundlesAndRoots(unittest.TestCase):
+    """2.13.0 widened the large-items scan to Applications and the whole home
+    Library, and made it bundle-aware.
+
+    Bundle-awareness is what makes /Applications useful at all: on a real Mac
+    that directory contains ZERO loose files over the 100 MB floor but twelve
+    .app bundles over 1 GB. Reporting the files *inside* a bundle would be
+    both useless (dozens of rows per app) and actively misleading -- nobody
+    should delete a lone binary out of an app -- so a bundle is one row
+    carrying its whole size, and the scan never descends into it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "Applications"
+        big = self.root / "Big.app" / "Contents" / "MacOS"
+        big.mkdir(parents=True)
+        # Three chunks, none individually over the floor: only the bundle
+        # total clears it, which is exactly the case a file-only scan misses.
+        for n in ("a", "b", "c"):
+            (big / n).write_bytes(b"x" * (40 * 1024 * 1024))
+        (self.root / "Tiny.app" / "Contents").mkdir(parents=True)
+        (self.root / "Tiny.app" / "Contents" / "x").write_bytes(b"x" * 1024)
+        (self.root / "loose.bin").write_bytes(b"x" * (150 * 1024 * 1024))
+        self.env = {"MACCLEANER_STORAGE_INSIGHTS_ROOTS": str(self.root)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _scan(self):
+        with mock.patch.dict(os.environ, self.env):
+            return cleaner.scan_storage_insights(cleaner.DEFAULT_CONFIG)
+
+    def test_bundle_reported_as_one_entry_with_its_total_size(self):
+        hits = {h["path"].name: h for h in self._scan()}
+        self.assertIn("Big.app", hits, "a 120 MB bundle must be reported")
+        self.assertGreaterEqual(hits["Big.app"]["size_bytes"], 120 * 1024 * 1024)
+        self.assertTrue(hits["Big.app"].get("is_bundle"))
+
+    def test_does_not_descend_into_a_bundle(self):
+        names = [h["path"].name for h in self._scan()]
+        for inner in ("a", "b", "c"):
+            self.assertNotIn(inner, names)
+
+    def test_bundle_below_the_floor_is_not_reported(self):
+        self.assertNotIn("Tiny.app", [h["path"].name for h in self._scan()])
+
+    def test_loose_files_still_reported_alongside_bundles(self):
+        names = [h["path"].name for h in self._scan()]
+        self.assertIn("loose.bin", names)
+        self.assertIn("Big.app", names)
+
+    def test_plain_files_are_not_marked_as_bundles(self):
+        loose = next(h for h in self._scan() if h["path"].name == "loose.bin")
+        self.assertFalse(loose.get("is_bundle"))
+
+    def test_default_roots_cover_applications_desktop_documents_and_library(self):
+        os.environ.pop("MACCLEANER_STORAGE_INSIGHTS_ROOTS", None)
+        roots = {str(r) for r in cleaner._storage_insights_roots()}
+        home = str(Path.home())
+        for expected in (f"{home}/Documents", f"{home}/Downloads", f"{home}/Desktop",
+                         f"{home}/Library", f"{home}/Applications", "/Applications"):
+            self.assertIn(expected, roots, f"{expected} must be covered")
+
+    def test_sparse_file_reports_actual_disk_usage_not_apparent_size(self):
+        """Docker.raw is the motivating case: a sparse disk image whose
+        apparent st_size reads 1.0 TB while it actually occupies ~10 GB. A
+        scan ranking by apparent size puts a phantom terabyte at the top of a
+        "largest items" list on a 460 GB disk, which is obvious nonsense and
+        destroys trust in every other number on the page. Rank by allocated
+        blocks, which is what `du` and Finder report."""
+        sparse = self.root / "sparse.img"
+        with open(sparse, "wb") as f:
+            f.seek(900 * 1024 * 1024 * 1024)   # 900 GB apparent
+            f.write(b"x")
+        st = os.stat(sparse)
+        if st.st_blocks * 512 >= st.st_size:
+            self.skipTest("filesystem did not store the file sparsely")
+        hit = next((h for h in self._scan() if h["path"].name == "sparse.img"), None)
+        if hit is not None:
+            self.assertLess(hit["size_bytes"], st.st_size,
+                            "must not report the apparent 900 GB")
+            self.assertLessEqual(hit["size_bytes"], st.st_blocks * 512 + 4096)
+
+    def test_bundle_size_also_uses_allocated_blocks(self):
+        hits = {h["path"].name: h for h in self._scan()}
+        real = int(subprocess.run(["du", "-skx", str(self.root / "Big.app")],
+                                  capture_output=True, text=True).stdout.split()[0]) * 1024
+        # du and a stat-walk can differ slightly on directory overhead; a few
+        # percent is fine, an order of magnitude is the bug this guards.
+        self.assertAlmostEqual(hits["Big.app"]["size_bytes"], real,
+                               delta=max(2 * 1024 * 1024, real * 0.05))
+
+    def test_still_never_opens_file_contents(self):
+        """The iCloud-eviction guarantee must survive bundle measurement --
+        summing a bundle has to stay stat-only, or scanning a cloud-backed
+        folder could trigger downloads of evicted files."""
+        with mock.patch("builtins.open", side_effect=AssertionError("opened a file")):
+            self._scan()
+
+    def test_unreadable_subtree_does_not_kill_the_scan(self):
+        """~/Library and /Applications both contain entries a normal user
+        cannot read. One EACCES must not lose every other result."""
+        blocked = self.root / "blocked"
+        blocked.mkdir()
+        (blocked / "f").write_bytes(b"x" * (200 * 1024 * 1024))
+        os.chmod(blocked, 0o000)
+        try:
+            names = [h["path"].name for h in self._scan()]
+            self.assertIn("Big.app", names)
+            self.assertIn("loose.bin", names)
+        finally:
+            os.chmod(blocked, 0o755)
 
 
 class TestStorageInsightsCommand(unittest.TestCase):

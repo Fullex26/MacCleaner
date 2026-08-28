@@ -155,11 +155,20 @@ struct StorageInsightEntry: Codable, Identifiable {
     let size_bytes: Int
     let size_human: String
     let mtime: Double
+    /// True for a .app or other macOS bundle, which the engine reports as a
+    /// single item carrying its whole size rather than descending into.
+    /// Optional so a pre-2.13 engine still decodes.
+    let is_bundle: Bool?
     var id: String { path }
+    var isBundle: Bool { is_bundle ?? false }
 }
 
 struct StorageInsightsReport: Codable {
     let entries: [StorageInsightEntry]
+    /// Every location scanned, reported by the engine so the UI can say what
+    /// was covered instead of leaving an empty result ambiguous. Optional for
+    /// the same backward-compatibility reason as `is_bundle`.
+    let roots: [String]?
 }
 
 struct StorageMapEntry: Codable, Identifiable {

@@ -26,6 +26,12 @@ struct StorageView: View {
             Divider()
             content
         }
+        // Pin the pane's bounds explicitly. Without this the VStack takes its
+        // ideal size from the List's content, so one over-wide row used to
+        // stretch the whole view past the detail pane and push the header off
+        // the top of the window entirely.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .clipped()
         .task {
             if bridge.storageMap == nil && !bridge.isScanningStorageMap {
                 await bridge.scanStorageMap(nil)
@@ -166,6 +172,7 @@ struct StorageView: View {
                 }
             }
             .listStyle(.inset)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -214,28 +221,41 @@ private struct StorageRow: View {
 
     @State private var hovering = false
 
+    /// Fixed so the bar can never claim row width from the columns beside it.
+    private static let barWidth: CGFloat = 120
+
+    /// `fraction` comes from engine sizes that can round above the parent
+    /// total (or be NaN if a level reports 0 bytes), which would draw a bar
+    /// past its track.
+    private var clampedFraction: CGFloat {
+        let f = CGFloat(fraction)
+        return f.isFinite ? min(max(f, 0), 1) : 0
+    }
+
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: symbol)
                 .foregroundStyle(Color.forCategory(entry.category))
                 .frame(width: 18)
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(entry.name)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                // Proportional bar: how much of this level this entry accounts
-                // for. Far quicker to scan down than comparing numbers.
-                GeometryReader { geo in
-                    ZStack(alignment: .leading) {
-                        Capsule().fill(Color.secondary.opacity(0.15))
-                        Capsule()
-                            .fill(Color.forCategory(entry.category).opacity(0.85))
-                            .frame(width: max(2, geo.size.width * fraction))
-                    }
-                }
-                .frame(height: 4)
+            Text(entry.name)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            // Proportional bar on a FIXED-WIDTH track. This used to be a
+            // GeometryReader, which is greedy in both axes: it claimed the
+            // whole row, shoving the category, size and buttons hard against
+            // the window edge and blowing the layout out sideways. A fixed
+            // track needs no measurement and cannot expand.
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.15))
+                Capsule()
+                    .fill(Color.forCategory(entry.category).opacity(0.85))
+                    .frame(width: max(2, Self.barWidth * clampedFraction))
             }
+            .frame(width: Self.barWidth, height: 4)
 
             Text(entry.category)
                 .font(.caption2)
