@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.13.0"
+VERSION = "2.14.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -2023,8 +2023,19 @@ def _classify_tmp_dir(p):
                         return "derived-data"
             except OSError:
                 pass
-        if (p / "info.plist").exists() and (p / "Build").is_dir() and (p / "Index.noindex").is_dir():
-            return "derived-data"
+        # Build/ + Index.noindex/ plus one more Xcode-only marker. The old
+        # rule additionally REQUIRED info.plist, which Xcode does not always
+        # write under a custom -derivedDataPath -- a real 4.2 GB tree with
+        # Build/, Index.noindex/, ModuleCache.noindex/, Logs/ and
+        # SDKStatCaches.noindex/ was rejected for lacking that one file. The
+        # combination below is still distinctive to DerivedData; no ordinary
+        # source or document folder carries it.
+        if (p / "Build").is_dir() and (p / "Index.noindex").is_dir():
+            corroborating = ("info.plist", "ModuleCache.noindex",
+                             "SDKStatCaches.noindex", "CompilationCache.noindex",
+                             "Logs", "SourcePackages")
+            if any((p / c).exists() for c in corroborating):
+                return "derived-data"
         if (p / ".git").exists():
             try:
                 names = {e.name for e in os.scandir(p)}
@@ -2037,6 +2048,33 @@ def _classify_tmp_dir(p):
     except OSError:
         return None
     return None
+
+
+def _nested_build_dirs(parent, cutoff):
+    """Build trees sitting one level inside `parent`, content-classified.
+
+    Never name-matched: the tree that motivated this was called `derived`,
+    and a folder merely NAMED DerivedData with no build shape must not
+    qualify. The same min-age cutoff as the top level applies -- a build may
+    be writing into it right now, and the real case was zero days old."""
+    found = []
+    try:
+        entries = list(os.scandir(parent))
+    except OSError:
+        return found
+    uid = os.getuid()
+    for e in entries:
+        try:
+            if not e.is_dir(follow_symlinks=False):
+                continue
+            st = e.stat(follow_symlinks=False)
+            if st.st_uid != uid or st.st_mtime > cutoff:
+                continue
+            if _classify_tmp_dir(Path(e.path)) == "derived-data":
+                found.append(Path(e.path))
+        except OSError:
+            continue
+    return found
 
 
 def scan_tmp_artifacts(config):
@@ -2073,6 +2111,15 @@ def scan_tmp_artifacts(config):
             kind = _classify_tmp_dir(Path(e.path))
             if kind:
                 hits.append({"path": Path(e.path), "kind": kind, "mtime": st.st_mtime})
+                continue
+            # The directory itself isn't build junk -- but AI-coding sessions
+            # produce a working directory that CONTAINS a build tree beside
+            # logs and test results worth keeping. Offer just the build tree.
+            # Exactly one level: an unbounded walk of every tmp tree would be
+            # slow and far likelier to surface something live.
+            for child in _nested_build_dirs(Path(e.path), cutoff):
+                hits.append({"path": child, "kind": "derived-data",
+                             "mtime": child.stat().st_mtime})
         except OSError:
             continue
     hits.sort(key=lambda h: str(h["path"]))
@@ -2632,6 +2679,13 @@ SYSTEM_TEMP_WARN_BYTES = 5 * 1024 ** 3
 # few hours earlier. The entry count is the durable signal that tools are
 # leaking scratch there; the byte figure just depends on when you look.
 SYSTEM_TEMP_WARN_ENTRIES = 2000
+# Docker Desktop's VM disk image. Flagged from 5 GiB: it is routinely the
+# largest single item MacCleaner can see and cannot reclaim.
+DOCKER_IMAGE_WARN_BYTES = 5 * 1024 ** 3
+DOCKER_RAW_PATHS = [
+    HOME / "Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw",
+    HOME / "Library/Containers/com.docker.docker/Data/vms/0/Docker.raw",
+]
 
 _SWAP_UNITS = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
 
@@ -2740,6 +2794,32 @@ def _held_open_deleted():
     if not result.stdout:
         return None
     return _parse_held_open_deleted(result.stdout)
+
+
+def _docker_disk_image():
+    """Docker Desktop's disk image, sized by ALLOCATED blocks.
+
+    The file is sparse -- 1.0 TB apparent against ~10 GB allocated on a real
+    machine -- so apparent size would claim a terabyte on a 460 GB disk.
+
+    Report-only. `docker system prune` frees space inside the VM, but the
+    host-side image only shrinks when Docker's own TRIM runs, which requires
+    Docker to be running. MacCleaner cannot reclaim it from outside, and
+    truncating or deleting the image would destroy every container, image and
+    volume in it. Returns None when Docker isn't installed."""
+    for raw in DOCKER_RAW_PATHS:
+        try:
+            st = os.stat(raw)
+        except OSError:
+            continue
+        running = False
+        try:
+            running = subprocess.run(["pgrep", "-f", "com.docker.backend"],
+                                     capture_output=True, timeout=5).returncode == 0
+        except Exception:
+            pass
+        return {"path": str(raw), "bytes": _disk_bytes(st), "running": running}
+    return None
 
 
 def _system_temp_usage():
@@ -2916,6 +2996,24 @@ def run_doctor(config, json_mode=False):
               f"macOS's temp folder — leftover scratch from tools that exited "
               f"without cleaning up. macOS clears this on restart; MacCleaner "
               f"deliberately never deletes here",
+              ok=False, advisory=True)
+
+    # Docker's disk image. Report-only for a different reason than the others:
+    # the space IS reclaimable, just not by this tool -- only Docker's own
+    # TRIM can shrink the host-side image, and only while Docker is running.
+    dk = _docker_disk_image()
+    if dk and dk["bytes"] >= DOCKER_IMAGE_WARN_BYTES:
+        how = ("start Docker Desktop, then run `docker system prune`"
+               if not dk["running"]
+               else "run `docker system prune`")
+        state = "Docker is not running, so nothing can shrink it right now; "
+        if dk["running"]:
+            state = ""
+        check("Docker disk image",
+              f"Docker's VM image holds {fmt_size(dk['bytes'])}. {state}"
+              f"to reclaim it, {how} — Docker returns the freed space to the "
+              f"disk itself. MacCleaner never touches this image: deleting or "
+              f"truncating it would destroy every container, image and volume",
               ok=False, advisory=True)
 
     # Deleted-but-still-open files (2.8.0). Report-only: the space returns by

@@ -5279,19 +5279,39 @@ class TestHeldOpenDeletedParsing(unittest.TestCase):
 
 
 class TestDoctorPressureChecks(unittest.TestCase):
-    def _doctor(self, swap=None, held=None, stmp=None):
-        # All three pressure collectors are mocked, `stmp` included. Leaving
-        # the system-temp one live made every assertion in this class depend
-        # on the size of the running machine's $TMPDIR -- they passed only
-        # because that directory happened to be small when the check landed.
+    # Every advisory collector run_doctor() calls. Mocking these is what keeps
+    # this class deterministic: each time a new one was added (system temp in
+    # 2.12.0, Docker in 2.13.0) it leaked the real machine's state in and broke
+    # these tests. A collector missing here silently makes assertions depend on
+    # the developer's own machine -- test_every_advisory_collector_is_mocked
+    # below fails if this list falls behind.
+    COLLECTORS = ("_swap_usage", "_held_open_deleted", "_system_temp_usage",
+                  "_docker_disk_image")
+
+    def _doctor(self, swap=None, held=None, stmp=None, docker=None):
+        values = {"_swap_usage": swap, "_held_open_deleted": held,
+                  "_system_temp_usage": stmp, "_docker_disk_image": docker}
         buf = io.StringIO()
-        with mock.patch.object(cleaner, "_swap_usage", return_value=swap), \
-             mock.patch.object(cleaner, "_held_open_deleted", return_value=held), \
-             mock.patch.object(cleaner, "_system_temp_usage", return_value=stmp), \
-             contextlib.redirect_stdout(buf):
+        with contextlib.ExitStack() as stack:
+            for name in self.COLLECTORS:
+                stack.enter_context(
+                    mock.patch.object(cleaner, name, return_value=values[name]))
+            stack.enter_context(contextlib.redirect_stdout(buf))
             cleaner.run_doctor(json.loads(json.dumps(cleaner.DEFAULT_CONFIG)),
                                json_mode=True)
         return json.loads(buf.getvalue())
+
+    def test_every_advisory_collector_is_mocked(self):
+        """Tripwire for the mistake made twice already: adding an advisory
+        collector to run_doctor() without adding it to COLLECTORS makes every
+        test in this class depend on the running machine."""
+        import inspect
+        src = inspect.getsource(cleaner.run_doctor)
+        called = {n for n in dir(cleaner)
+                  if n.startswith("_") and n.endswith(("_usage", "_deleted", "_image"))
+                  and callable(getattr(cleaner, n)) and (n + "()") in src}
+        self.assertEqual(called - set(self.COLLECTORS), set(),
+                         "new advisory collector must be added to COLLECTORS")
 
     def _checks(self, **kw):
         return {c["name"]: c for c in self._doctor(**kw)["checks"]}
@@ -5689,6 +5709,173 @@ class TestStorageInsightsScanner(unittest.TestCase):
                                   cleaner.HOME / "Library",
                                   cleaner.HOME / "Applications",
                                   Path("/Applications")])
+
+
+class TestDockerImageAdvisory(unittest.TestCase):
+    """Docker Desktop's disk image is the largest single item MacCleaner can
+    see and cannot reclaim. `docker system prune` frees space INSIDE the VM,
+    but the host-side .raw only shrinks when Docker's own TRIM runs, which
+    needs Docker running. So this is advisory, like Swap and System temp:
+    report the space, name the remedy, never touch it."""
+
+    def _doctor(self, docker=None):
+        buf = io.StringIO()
+        with mock.patch.object(cleaner, "_swap_usage", return_value=None), \
+             mock.patch.object(cleaner, "_held_open_deleted", return_value=None), \
+             mock.patch.object(cleaner, "_system_temp_usage", return_value=None), \
+             mock.patch.object(cleaner, "_docker_disk_image", return_value=docker), \
+             contextlib.redirect_stdout(buf):
+            cleaner.run_doctor(json.loads(json.dumps(cleaner.DEFAULT_CONFIG)),
+                               json_mode=True)
+        return json.loads(buf.getvalue())
+
+    def test_reports_allocated_size_and_names_the_remedy(self):
+        d = self._doctor({"path": "/x/Docker.raw", "bytes": 10 * 1024 ** 3,
+                          "running": False})
+        c = next(c for c in d["checks"] if c["name"] == "Docker disk image")
+        self.assertTrue(c["advisory"])
+        self.assertFalse(c["ok"])
+        self.assertIn("10.0 GB", c["status"])
+        self.assertIn("Docker", c["status"])
+
+    def test_says_docker_must_be_running_to_reclaim(self):
+        d = self._doctor({"path": "/x/Docker.raw", "bytes": 20 * 1024 ** 3,
+                          "running": False})
+        c = next(c for c in d["checks"] if c["name"] == "Docker disk image")
+        self.assertIn("not running", c["status"].lower())
+
+    def test_quiet_below_the_floor(self):
+        d = self._doctor({"path": "/x/Docker.raw", "bytes": 100 * 1024 ** 2,
+                          "running": True})
+        self.assertNotIn("Docker disk image", [c["name"] for c in d["checks"]])
+
+    def test_absent_when_docker_is_not_installed(self):
+        d = self._doctor(None)
+        self.assertNotIn("Docker disk image", [c["name"] for c in d["checks"]])
+
+    def test_never_flips_top_level_ok(self):
+        d = self._doctor({"path": "/x/Docker.raw", "bytes": 99 * 1024 ** 3,
+                          "running": False})
+        non_advisory = [c for c in d["checks"] if not c.get("advisory")]
+        self.assertEqual(d["ok"], all(c["ok"] for c in non_advisory))
+
+    def test_measures_allocated_not_apparent_size(self):
+        """Docker.raw is sparse: 1.0 TB apparent against ~10 GB allocated.
+        Reporting apparent size would claim a terabyte on a 460 GB disk."""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            raw = tmp / "Docker.raw"
+            with open(raw, "wb") as f:
+                f.seek(500 * 1024 * 1024 * 1024)
+                f.write(b"x")
+            st = os.stat(raw)
+            if st.st_blocks * 512 >= st.st_size:
+                self.skipTest("filesystem did not store the file sparsely")
+            with mock.patch.object(cleaner, "DOCKER_RAW_PATHS", [raw]):
+                info = cleaner._docker_disk_image()
+            self.assertIsNotNone(info)
+            self.assertLess(info["bytes"], st.st_size)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestTmpNestedBuildOutput(unittest.TestCase):
+    """The tmp scanner classified only the top level, and required an
+    `info.plist` to recognise DerivedData. Both assumptions failed on real
+    output: a 4.2 GB Xcode DerivedData tree sat one level down inside a tmp
+    working directory, in a folder named `derived` with no `info.plist`, and
+    the scanner could not see it AT ANY AGE. Detection stays content-based --
+    never name-based -- so a custom `-derivedDataPath` name is irrelevant."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "tmproot"
+        self.root.mkdir()
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        self.cfg["tmp_min_age_days"] = 0
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _derived(self, at, info_plist=True):
+        """A realistic DerivedData tree. `info_plist=False` reproduces the
+        real-world case that defeated the old signature."""
+        at.mkdir(parents=True, exist_ok=True)
+        (at / "Build").mkdir()
+        (at / "Index.noindex").mkdir()
+        (at / "ModuleCache.noindex").mkdir()
+        (at / "Logs").mkdir()
+        (at / "Build" / "blob").write_bytes(b"x" * 4096)
+        if info_plist:
+            (at / "info.plist").write_text("<plist/>")
+
+    def _scan(self):
+        with mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root):
+            return cleaner.scan_tmp_artifacts(self.cfg)
+
+    def test_derived_data_without_info_plist_is_recognised(self):
+        """The real folder had Build/, Index.noindex/ and ModuleCache.noindex/
+        but no info.plist, so the old three-part signature rejected it."""
+        self._derived(self.root / "job", info_plist=False)
+        kinds = {h["kind"] for h in self._scan()}
+        self.assertIn("derived-data", kinds)
+
+    def test_nested_build_output_is_found_one_level_down(self):
+        """The tmp dir itself is not build output -- it CONTAINS it. This is
+        the shape every AI-coding-session working directory had."""
+        job = self.root / "session"
+        job.mkdir()
+        (job / "notes.log").write_bytes(b"x" * 128)
+        self._derived(job / "derived", info_plist=False)
+        hits = self._scan()
+        paths = {str(h["path"]) for h in hits}
+        self.assertIn(str(job / "derived"), paths,
+                      "the nested build tree must be offered")
+        self.assertNotIn(str(job), paths,
+                         "the parent holds logs the user may still want; "
+                         "only the build tree is offered")
+
+    def test_nested_hits_are_review_level(self):
+        job = self.root / "session"
+        job.mkdir()
+        self._derived(job / "derived", info_plist=False)
+        for t in cleaner.tmp_to_targets(self._scan()):
+            self.assertFalse(t["safe"], "never auto-cleaned by --yes")
+
+    def test_detection_is_by_content_not_name(self):
+        """A folder named `derived`, `dd`, or anything else must be found;
+        a folder merely NAMED DerivedData with no build shape must not."""
+        for name in ("derived", "dd", "out"):
+            job = self.root / f"job-{name}"
+            job.mkdir()
+            self._derived(job / name, info_plist=False)
+        decoy = self.root / "job-decoy"
+        (decoy / "DerivedData").mkdir(parents=True)
+        (decoy / "DerivedData" / "readme.txt").write_text("not build output")
+        paths = {str(h["path"]) for h in self._scan()}
+        for name in ("derived", "dd", "out"):
+            self.assertIn(str(self.root / f"job-{name}" / name), paths, name)
+        self.assertNotIn(str(decoy / "DerivedData"), paths,
+                         "name alone must never qualify a directory")
+
+    def test_age_gate_still_applies_to_nested_output(self):
+        """A build may be writing into it right now. The real 4.2 GB case was
+        0.0 days old, and the age gate is what protects a live build."""
+        job = self.root / "fresh"
+        job.mkdir()
+        self._derived(job / "derived", info_plist=False)
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg["tmp_min_age_days"] = 3
+        with mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root):
+            self.assertEqual(cleaner.scan_tmp_artifacts(cfg), [])
+
+    def test_does_not_descend_more_than_one_level(self):
+        """Bounded on purpose: an unbounded walk of every tmp tree would be
+        both slow and far more likely to surface something live."""
+        job = self.root / "job"
+        self._derived(job / "a" / "b" / "deep", info_plist=False)
+        paths = {str(h["path"]) for h in self._scan()}
+        self.assertNotIn(str(job / "a" / "b" / "deep"), paths)
 
 
 class TestStorageInsightsBundlesAndRoots(unittest.TestCase):
