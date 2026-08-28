@@ -1212,7 +1212,11 @@ class TestDoctorSchedule(unittest.TestCase):
 
     def test_plist_present_but_not_loaded_is_not_ok(self):
         (self.agents / "com.fullex.maccleaner.clean.plist").write_text("<plist/>")
-        self.write_launchctl('#!/bin/sh\nexit 1\n')  # `launchctl list <label>` always fails
+        # Real `launchctl list <unknown-label>` prints this and exits 113 --
+        # the stub used to `exit 1`, which conflated "launchd says no such
+        # service" with "launchctl could not be asked at all" (2.14.1).
+        self.write_launchctl(
+            '#!/bin/sh\necho \'Could not find service "x" in domain for port\' >&2\nexit 113\n')
         r = self.run_doctor()
         self.assertEqual(r.returncode, 0)
         data = json.loads(r.stdout)
@@ -1228,6 +1232,21 @@ class TestDoctorSchedule(unittest.TestCase):
         sched = next(c for c in data["checks"] if c["name"] == "Schedule")
         self.assertTrue(sched["ok"])
         self.assertIn("launchd:", sched["status"])
+
+    def test_unreachable_launchctl_is_not_reported_as_broken(self):
+        """2.14.1: a launchctl failure that is NOT "no such service" (missing
+        binary, no GUI session, timeout) means we could not ask -- not that
+        the agent is unloaded. Reporting it as a MacCleaner-owned fault sent
+        users to reinstall a schedule that was running fine."""
+        (self.agents / "com.fullex.maccleaner.clean.plist").write_text("<plist/>")
+        self.write_launchctl('#!/bin/sh\necho "Could not find domain" >&2\nexit 112\n')
+        r = self.run_doctor()
+        data = json.loads(r.stdout)
+        sched = next(c for c in data["checks"] if c["name"] == "Schedule")
+        self.assertTrue(sched["ok"], "could-not-verify must not read as a broken schedule")
+        self.assertIn("could not", sched["status"].lower())
+        self.assertNotIn("not loaded", sched["status"].lower())
+        self.assertTrue(data["ok"], "an unverifiable schedule must not fail doctor overall")
 
     def test_no_plist_at_all_reports_not_scheduled(self):
         r = self.run_doctor()
@@ -2964,7 +2983,10 @@ class TestScheduler(unittest.TestCase):
         not_loaded.write_text(
             '#!/bin/sh\n'
             f'printf "launchctl %s\\n" "$*" >> "$CALLS_FILE"\n'
-            'if [ "$1" = "list" ]; then exit 1; fi\n'
+            # 113 + "Could not find service" is what real launchctl says
+            # for a label it does not have; a bare `exit 1` would now mean
+            # "could not ask" instead of "not loaded" (2.14.1).
+            'if [ "$1" = "list" ]; then echo \'Could not find service\' >&2; exit 113; fi\n'
             'exit 0\n')
         not_loaded.chmod(0o755)
 
@@ -3777,6 +3799,140 @@ class TestTmpScanner(unittest.TestCase):
         self.assertEqual(len({t["id"] for t in targets}), 2)
 
 
+class TestNestedTmpTargetsAreActuallyDeletable(unittest.TestCase):
+    """2.14.0 started offering a build tree nested one level inside a /tmp
+    workspace, but left `_tmp_scan_path_allowed` requiring a DIRECT child of
+    the scan root -- so every nested target it surfaced was discovered, sized,
+    shown to the user, and then refused at delete time with "outside home".
+    The feature reported reclaimable space it could never reclaim.
+
+    Whatever the scanner offers must be deletable; these two must not drift
+    apart again."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.root = Path(self.td.name)
+        self._p = mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self.td.cleanup()
+
+    def _nested_workspace(self, name="myrepo-task-abc"):
+        ws = self.root / name
+        (ws / "derived" / "Build").mkdir(parents=True)
+        (ws / "derived" / "Index.noindex").mkdir()
+        (ws / "derived" / "ModuleCache.noindex").mkdir()
+        (ws / "run.log").write_text("evidence worth keeping")
+        old = time.time() - 5 * 86400
+        for p in (ws, ws / "derived"):
+            os.utime(p, (old, old))
+        return ws
+
+    def test_every_offered_tmp_target_passes_the_carve_out(self):
+        self._nested_workspace()
+        targets = cleaner.tmp_to_targets(cleaner.scan_tmp_artifacts({"tmp_min_age_days": 3}))
+        self.assertTrue(targets, "the nested build tree must still be found")
+        for t in targets:
+            self.assertTrue(
+                cleaner._tmp_scan_path_allowed(t["path"]),
+                f"{t['id']} is offered to the user but would be refused at delete time")
+
+    def test_nested_build_tree_actually_deletes_and_siblings_survive(self):
+        ws = self._nested_workspace()
+        t = cleaner.tmp_to_targets(cleaner.scan_tmp_artifacts({"tmp_min_age_days": 3}))[0]
+        cleaner.delete_target(t, "rm")
+        self.assertFalse((ws / "derived").exists(), "the build tree should be gone")
+        self.assertTrue((ws / "run.log").exists(),
+                        "sibling logs are exactly what nesting the target was meant to preserve")
+
+    def test_three_levels_deep_is_still_refused(self):
+        """The carve-out widens by exactly one level, not to 'anywhere under
+        /tmp'. Nothing generates such a path today; this pins the boundary."""
+        deep = self.root / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+        self.assertFalse(cleaner._tmp_scan_path_allowed(deep))
+
+    def test_marker_is_still_required_for_a_nested_path(self):
+        """Widening the path rule must not weaken the second gate: a target
+        without the tmp_scan marker is still refused outside $HOME."""
+        ws = self._nested_workspace()
+        t = dict(cleaner.tmp_to_targets(cleaner.scan_tmp_artifacts({"tmp_min_age_days": 3}))[0])
+        t["tmp_scan"] = False
+        freed, status = cleaner.delete_target(t, "rm")
+        self.assertIn("refused", status)
+        self.assertTrue((ws / "derived").exists())
+
+
+class TestLaunchdLoadState(unittest.TestCase):
+    """`_launchd_is_loaded` returned a plain bool, so ANY launchctl failure
+    -- binary missing, no Aqua session, timeout -- became "not loaded". The
+    schedule then read as broken while both agents were running fine, and
+    the JSON told the app the same thing (2.14.1)."""
+
+    def _run(self, **kw):
+        with mock.patch.object(cleaner.subprocess, "run", **kw) as m:
+            return cleaner._launchd_is_loaded("com.fullex.maccleaner.clean"), m
+
+    def test_zero_exit_is_loaded(self):
+        state, _ = self._run(return_value=mock.Mock(returncode=0, stderr=""))
+        self.assertIs(state, True)
+
+    def test_service_not_found_is_definitively_not_loaded(self):
+        state, _ = self._run(return_value=mock.Mock(
+            returncode=113, stderr='Could not find service "x" in domain for port'))
+        self.assertIs(state, False)
+
+    def test_other_nonzero_is_unknown(self):
+        state, _ = self._run(return_value=mock.Mock(
+            returncode=112, stderr="Could not find domain for port"))
+        self.assertIsNone(state, "an unexplained launchctl failure is not proof of anything")
+
+    def test_missing_launchctl_is_unknown(self):
+        state, _ = self._run(side_effect=FileNotFoundError("launchctl"))
+        self.assertIsNone(state)
+
+    def test_timeout_is_unknown(self):
+        state, _ = self._run(side_effect=subprocess.TimeoutExpired("launchctl", 5))
+        self.assertIsNone(state)
+
+
+class TestScheduleStateLoadState(unittest.TestCase):
+    """JSON contract: `loaded` must stay a plain bool (the Swift app decodes
+    it as non-optional `Bool` in CleanerBridge.ScheduleAgent), so the
+    tri-state is exposed additively as `load_state`."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        d = Path(self.td.name)
+        for label in (cleaner.CLEAN_LABEL, cleaner.WATCH_LABEL):
+            (d / f"{label}.plist").write_bytes(b"<plist/>")
+        self._p = mock.patch.object(cleaner, "LAUNCH_AGENTS_DIR", d)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self.td.cleanup()
+
+    def _state(self, value):
+        with mock.patch.object(cleaner, "_launchd_is_loaded", return_value=value), \
+             mock.patch.object(cleaner, "_read_crontab", return_value=""):
+            return cleaner._schedule_state()
+
+    def test_unknown_keeps_loaded_false_but_flags_load_state(self):
+        agents = self._state(None)["agents"]
+        self.assertTrue(all(a["loaded"] is False for a in agents))
+        self.assertTrue(all(a["load_state"] == "unknown" for a in agents))
+
+    def test_loaded_and_not_loaded_map_to_load_state(self):
+        self.assertTrue(all(a["load_state"] == "loaded"
+                            for a in self._state(True)["agents"]))
+        self.assertTrue(all(a["load_state"] == "not_loaded"
+                            for a in self._state(False)["agents"]))
+        self.assertTrue(all(a["loaded"] is True for a in self._state(True)["agents"]))
+
+
 class TestTmpDeletionCarveOut(unittest.TestCase):
     """The single, narrow exception to the home-only delete guarantee:
     marker (tmp_scan=True, set only by tmp_to_targets) AND a path that is a
@@ -3819,10 +3975,25 @@ class TestTmpDeletionCarveOut(unittest.TestCase):
             self.assertIn("refused", err or "")
             self.assertTrue(d.exists())
 
-    def test_marker_with_nested_path_refused(self):
+    def test_marker_with_one_level_nested_path_allowed(self):
+        """DELIBERATELY REVERSED in 2.14.1. This previously asserted that a
+        nested path was refused. 2.14.0 began offering the build tree INSIDE
+        a workspace (/tmp/<repo>-<task-id>/derived) so the sibling logs
+        survive, but left this rule at direct-children-only -- so every
+        nested target it surfaced was refused at delete time and the feature
+        could not reclaim a byte. The carve-out now spans exactly two levels;
+        the marker requirement below is unchanged, and three levels is still
+        refused (test_three_levels_deep_is_still_refused)."""
         d = self.root / "top" / "nested"; d.mkdir(parents=True)
         freed, err = cleaner.delete_target(self._tmp_target(d))
+        self.assertIsNone(err)
+        self.assertFalse(d.exists())
+
+    def test_marker_with_two_levels_nested_path_refused(self):
+        d = self.root / "top" / "mid" / "nested"; d.mkdir(parents=True)
+        freed, err = cleaner.delete_target(self._tmp_target(d))
         self.assertIn("refused", err or "")
+        self.assertTrue(d.exists())
 
     def test_root_itself_refused(self):
         # Pins the `rp != root` clause: a tmp_scan target whose path IS

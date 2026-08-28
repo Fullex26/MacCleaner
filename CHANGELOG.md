@@ -7,6 +7,47 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.14.1] — 2026-08-28
+
+### Fixed
+- **v2.14.0's nested `/tmp` targets could never actually be deleted.** The
+  nested scan offers the build tree *inside* a workspace
+  (`/private/tmp/<repo>-<task-id>/derived`) rather than the workspace itself,
+  deliberately, so the run logs and `.xcresult` bundles beside it survive —
+  but `_tmp_scan_path_allowed` still only permitted a *direct* child of the
+  scan root. Every nested target was therefore discovered, sized, shown to the
+  user, and then refused at delete time as `refused (outside home)`: the
+  feature reported reclaimable space it could not reclaim. The carve-out to
+  the home-only delete rule now spans exactly two levels below the tmp scan
+  root instead of one. Both other gates are unchanged — the `tmp_scan` marker
+  only `tmp_to_targets()` sets is still required, three levels deep is still
+  refused, and there is still no config key that widens any of it. A test that
+  previously asserted a nested path was refused is deliberately reversed, and
+  says so.
+
+- **`doctor` and `schedule status` called a healthy schedule broken.**
+  `_launchd_is_loaded()` treated *any* `launchctl` failure as proof the agent
+  was not loaded — including the cases that prove nothing at all: no
+  `launchctl` on `PATH`, no Aqua/GUI session (ssh, a sandbox, another launchd
+  job), or a timeout. On the machine this was found on, both agents were
+  loaded with `LastExitStatus = 0` and the weekly clean was running on
+  schedule, yet the same command reported `loaded: false` for both and
+  `doctor` declared the install unhealthy and told the user to reinstall it.
+  Only `launchctl list`'s documented no-such-service answer (exit `113`, or a
+  `Could not find service` message) now counts as not-loaded; anything else is
+  reported as *could not verify*, which never fails the check. The Settings
+  pane no longer tells users to reload a schedule that is running.
+
+### Added
+- `schedule --json`'s `agents[]` entries gain **`load_state`**
+  (`"loaded"` | `"not_loaded"` | `"unknown"`). Additive: `loaded` keeps its
+  existing bool meaning, because `CleanerBridge.AgentStatus` decodes it as a
+  non-optional `Bool` and making it nullable would break every
+  already-installed app. Agents must read `load_state`, not `loaded`, before
+  concluding a schedule is broken.
+
+---
+
 ## [2.14.0] — 2026-08-28
 
 Closing the gap between what MacCleaner can *see* and what it can *act on*.

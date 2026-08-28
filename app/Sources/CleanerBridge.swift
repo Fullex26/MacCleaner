@@ -203,7 +203,15 @@ struct AgentStatus: Codable, Identifiable {
     let label: String
     let plist_present: Bool
     let loaded: Bool
+    /// "loaded" | "not_loaded" | "unknown" — added in engine 2.14.1.
+    /// Optional so an older installed engine (which omits the key) still
+    /// decodes; `loaded` stays the non-optional bool it has always been.
+    /// "unknown" means launchctl could not be asked (no GUI session, no
+    /// binary on PATH, timeout) — NOT that the agent is missing, so the UI
+    /// must not tell the user to reinstall a schedule that may be running.
+    let load_state: String?
     var id: String { label }
+    var isUnverified: Bool { load_state == "unknown" }
 }
 
 struct ScheduleStatus: Codable {
