@@ -1,6 +1,6 @@
 # AGENTS.md — MacCleaner machine interface
 
-MacCleaner is a macOS developer storage cleanup tool: it scans 94 known cache/artifact locations across 23 categories (Xcode, Docker, npm, pip, Homebrew, AI model caches, Flutter, PHP, VMs, ...) plus stale per-project build artifacts, stale build litter left under `/private/tmp`, unused iOS simulator devices/runtimes, and orphaned per-app leftovers under `~/Library` from apps you've already uninstalled, reports sizes, and deletes what you select. The engine is a single stdlib-only Python 3 script. Entry point: `python3 cleaner.py` from a repo checkout, or `maccleaner` (shell alias) / `python3 ~/mac-cleaner/cleaner.py` after `install.sh`. Every data command takes `--json`; that JSON interface is the contract this document specifies (the bundled macOS app is just another client of it). Current version: 2.12.0. As of 2.4.0, `install.sh` also wires up zsh/bash shell completions (`completions/_maccleaner`, `completions/maccleaner.bash`) and the CLI tarball ships them too — a human-facing convenience only, it doesn't change any of the JSON below.
+MacCleaner is a macOS developer storage cleanup tool: it scans 94 known cache/artifact locations across 23 categories (Xcode, Docker, npm, pip, Homebrew, AI model caches, Flutter, PHP, VMs, ...) plus stale per-project build artifacts, stale build litter left under `/private/tmp`, unused iOS simulator devices/runtimes, and orphaned per-app leftovers under `~/Library` from apps you've already uninstalled, reports sizes, and deletes what you select. The engine is a single stdlib-only Python 3 script. Entry point: `python3 cleaner.py` from a repo checkout, or `maccleaner` (shell alias) / `python3 ~/mac-cleaner/cleaner.py` after `install.sh`. Every data command takes `--json`; that JSON interface is the contract this document specifies (the bundled macOS app is just another client of it). Current version: 2.13.0. As of 2.4.0, `install.sh` also wires up zsh/bash shell completions (`completions/_maccleaner`, `completions/maccleaner.bash`) and the CLI tarball ships them too — a human-facing convenience only, it doesn't change any of the JSON below.
 
 ## 1. Quick recipes
 
@@ -59,7 +59,7 @@ maccleaner doctor    [--json]
 maccleaner config    show | path | enable CAT | disable CAT | set KEY VALUE
 maccleaner categories [--json]
 maccleaner disk-check [--json]    # cheap; for launchd's hourly diskwatch agent
-maccleaner storage-insights [--json]   # read-only: largest files in Documents/Downloads/Desktop (never deletes)
+maccleaner storage-insights [--json]   # read-only: largest items in Documents, Downloads, Desktop, ~/Library and Applications (never deletes)
 maccleaner storage-map [PATH] [--min-size MB] [--json]   # read-only: browse where disk space goes, anywhere on the disk
 maccleaner schedule  status | weekly | monthly | off [--json]   # manage the launchd schedule
 maccleaner install-deps          # pip-installs 'rich' (optional, cosmetic only)
@@ -90,7 +90,7 @@ Abbreviated but field-accurate examples. All JSON is pretty-printed to stdout.
 
 ```json
 {
-  "version": "2.11.0",
+  "version": "2.13.0",
   "timestamp": "2026-07-14T09:12:03.481920",
   "disk": "Used: 380Gi / 460Gi (85%)",
   "disk_stats": {
@@ -132,7 +132,7 @@ Targets are sorted by `size_bytes` descending. Command-based targets (docker/bre
 
 ```json
 {
-  "version": "2.11.0",
+  "version": "2.13.0",
   "timestamp": "2026-07-14T09:14:55.102331",
   "delete_mode": "rm",
   "freed_bytes": 14495514624,
@@ -152,7 +152,7 @@ Targets are sorted by `size_bytes` descending. Command-based targets (docker/bre
 
 ```json
 {
-  "version": "2.11.0",
+  "version": "2.13.0",
   "timestamp": "2026-07-14T09:14:55.102331",
   "dry_run": true,
   "delete_mode": "rm",
@@ -187,7 +187,7 @@ Same envelope shape as `clean --json` (`delete_mode`, `freed_bytes`, `disk_after
 
 ```json
 {
-  "version": "2.11.0",
+  "version": "2.13.0",
   "timestamp": "2026-07-14T09:16:12.000000",
   "roots": ["/Users/you/Documents", "/Users/you/Code"],
   "min_age_days": 30,
@@ -212,7 +212,7 @@ Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets`
 
 ```json
 {
-  "version": "2.11.0",
+  "version": "2.13.0",
   "ok": true,
   "checks": [
     { "name": "Python",       "status": "3.12.4", "ok": true },
@@ -280,7 +280,7 @@ Both 2.8.0 checks use hardcoded thresholds (8 GiB of swapfiles on disk; 500 MB h
 
 ```json
 {
-  "version": "2.11.0",
+  "version": "2.13.0",
   "free_bytes": 8321499136,
   "free_human": "7.8 GB",
   "threshold_bytes": 10737418240,
@@ -300,7 +300,7 @@ New in 2.2.0. Deliberately cheap: one `shutil.disk_usage` call — no `du` measu
 
 ```json
 {
-  "version": "2.11.0",
+  "version": "2.13.0",
   "root": "/Users/you",
   "total_bytes": 170728030208,
   "total_human": "159.0 GB",
@@ -326,14 +326,31 @@ Differences from every other command here, all deliberate:
 
 ```json
 {
-  "version": "2.11.0",
+  "version": "2.13.0",
+  "roots": [
+    "/Users/you/Documents", "/Users/you/Downloads", "/Users/you/Desktop",
+    "/Users/you/Library", "/Users/you/Applications", "/Applications"
+  ],
+  "min_bytes": 104857600,
   "entries": [
-    { "path": "/Users/you/Downloads/large-export.dmg", "size_bytes": 2147483648, "size_human": "2.0 GB", "mtime": 1752393600.0 }
+    {"path": "/Applications/Civ6.app", "size_bytes": 12348030976,
+     "size_human": "11.5 GB", "mtime": 1756300000.0, "is_bundle": true},
+    {"path": "/Users/you/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw",
+     "size_bytes": 10708401152, "size_human": "10.0 GB",
+     "mtime": 1756300000.0, "is_bundle": false}
   ]
 }
 ```
 
-New in 2.9.0. Read-only, iterative (non-recursive-call) scan of three default roots — `~/Documents`, `~/Downloads`, `~/Desktop` — for files at or above a **100 MB floor** (`STORAGE_INSIGHTS_MIN_BYTES = 100 * 1024 * 1024`), returning up to a **50-entry cap** (`STORAGE_INSIGHTS_MAX_RESULTS = 50`), largest first. Both numbers are hardcoded constants in `cleaner.py` — there is no `config.json` key for either, and no flag overrides them. The roots list itself can be overridden with `MACCLEANER_STORAGE_INSIGHTS_ROOTS` (colon-separated absolute paths, same convention as `MACCLEANER_TMP_ROOT`); unset, it defaults to the three paths above.
+New in 2.9.0; roots widened and bundle-awareness added in 2.13.0. Read-only, iterative (non-recursive-call) scan for items at or above a **100 MB floor** (`STORAGE_INSIGHTS_MIN_BYTES`), returning up to **100** entries (`STORAGE_INSIGHTS_MAX_RESULTS`, raised from 50 in 2.13.0), largest first.
+
+**Default roots (2.13.0):** `~/Documents`, `~/Downloads`, `~/Desktop`, `~/Library`, `~/Applications`, `/Applications`. The original three covered a small slice of a real disk — `~/Library` alone was 85 GB against ~35 GB of Documents on the machine this was built against. Override with `MACCLEANER_STORAGE_INSIGHTS_ROOTS` (colon-separated absolute paths). The response now echoes `"roots"` and `"min_bytes"`, so a caller can tell "nothing large in Documents" apart from "Documents was never scanned".
+
+**Bundles are one entry (2.13.0).** A directory whose name ends in `.app`, `.framework`, `.xcarchive`, `.photoslibrary`, `.pkg`, `.bundle`, `.kext` (see `STORAGE_INSIGHTS_BUNDLE_SUFFIXES`) is reported as a single entry carrying its whole size, with `"is_bundle": true`, and is never descended into. Without this, `/Applications` returns nothing at all: on a real Mac it holds **zero** loose files over the floor and a dozen multi-GB `.app` bundles. Listing an app's internal binaries would also be actively misleading, since deleting one breaks the app.
+
+**Sizes are allocated blocks, not apparent size (2.13.0).** Entries report `st_blocks * 512`, which is what `du` and Finder show. `st_size` lies for sparse files: Docker's `Docker.raw` reports **1.0 TB apparent against 9.97 GB allocated**, which put a phantom terabyte at the top of a "largest items" list on a 460 GB disk. It is also correct (smaller) for APFS-compressed files. Bundle totals are summed the same way.
+
+Still stat-only end to end — it never opens file contents, so it cannot trigger an iCloud download of an evicted file, and bundle measurement preserves that guarantee. Unreadable subtrees are skipped rather than aborting the scan.
 
 Each entry is `{"path": str, "size_bytes": int, "size_human": str, "mtime": float}` — `mtime` is the raw `os.stat` modification time (seconds since epoch, as a float), left for the caller to format. Known-noise directories (`_STORAGE_INSIGHTS_SKIP_DIRS` — dev artifact dir names such as `node_modules`, `.venv`, `Pods`, `target`, `DerivedData`, `.next`, drawn from the same name sets `scan_projects`/`scan_tmp_artifacts` use to recognize artifact noise) and anything ending in `.app` are never descended into. The set also includes some generic directory names (`build`, `dist`, `venv`, `.build`, among others) alongside the framework-specific ones, so a personal folder literally named e.g. `~/Documents/build` is skipped too even if it isn't a real build artifact — the classification is name-only here, unlike `scan_tmp_artifacts`'s content-based check. Symlinks encountered *during* the walk (both directories and files) are always skipped; the configured roots themselves are followed if they are symlinks, since macOS's "Desktop & Documents Folders" iCloud sync replaces `~/Documents`/`~/Desktop` with symlinks into `~/Library/Mobile Documents/com~apple~CloudDocs/...`, and refusing to follow the root would silently return nothing for the most common real-world setup.
 
@@ -349,7 +366,7 @@ New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`month
 
 ```json
 {
-  "version": "2.11.0",
+  "version": "2.13.0",
   "schedule": "weekly",
   "agents": [
     { "label": "com.fullex.maccleaner.clean",     "plist_present": true, "loaded": true },
@@ -367,7 +384,7 @@ New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`month
 
 **Exit codes**: `status` and `off` always exit `0`, even when nothing is scheduled. `weekly`/`monthly` exit `1` if either agent failed to load with `launchctl` (the plist is still written to disk either way, and the stderr output includes the manual `launchctl bootstrap` command to load it); they exit `0` when both agents loaded. An unrecognized `action` is an argparse usage error, exit `2`, before any of this runs.
 
-`weekly`/`monthly --json` have one more exit path that does **not** follow the common envelope above: if no usable, non-virtualenv `python3` interpreter can be resolved for `ProgramArguments[0]` (see `_agent_python()`), nothing is written — no plist, no `launchctl` call — and the command exits `1` printing only `{"version": "2.11.0", "error": "<message>"}`. This response has no `schedule`, `agents`, or `legacy_cron` keys at all; a strict external decoder expecting the common shape on every `weekly`/`monthly` call should check for `"error"` first.
+`weekly`/`monthly --json` have one more exit path that does **not** follow the common envelope above: if no usable, non-virtualenv `python3` interpreter can be resolved for `ProgramArguments[0]` (see `_agent_python()`), nothing is written — no plist, no `launchctl` call — and the command exits `1` printing only `{"version": "2.13.0", "error": "<message>"}`. This response has no `schedule`, `agents`, or `legacy_cron` keys at all; a strict external decoder expecting the common shape on every `weekly`/`monthly` call should check for `"error"` first.
 
 Honors `MACCLEANER_LAUNCH_AGENTS_DIR` (default `~/Library/LaunchAgents`) for both reading and writing agent plists — see §5.
 
@@ -375,7 +392,7 @@ Honors `MACCLEANER_LAUNCH_AGENTS_DIR` (default `~/Library/LaunchAgents`) for bot
 
 ```json
 {
-  "version": "2.11.0",
+  "version": "2.13.0",
   "categories": [
     {
       "name": "xcode",
@@ -396,7 +413,7 @@ Lists **all** categories and targets regardless of the enabled_categories config
 
 ```json
 {
-  "version": "2.11.0",
+  "version": "2.13.0",
   "runs": [
     {
       "timestamp": "2026-07-13T09:00:04.120394",
@@ -428,7 +445,7 @@ Lists **all** categories and targets regardless of the enabled_categories config
 }
 ```
 
-Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 50 runs. With no history: `{"version": "2.11.0", "runs": [], "disk_history": {...}}` (`disk_history` is present either way).
+Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 50 runs. With no history: `{"version": "2.13.0", "runs": [], "disk_history": {...}}` (`disk_history` is present either way).
 
 `disk_history` is **additive** (new in 2.1.0) and always present, even with no cleanup history. `current` is today's `disk_stats()` snapshot. `snapshots` is the full contents of `snapshots.log` (append-only, capped at the most recent 365 entries; a snapshot recorded on the same calendar day as the previous one replaces it instead of adding a new entry — so a machine scanned any number of times a day, including every few minutes by the menu bar app's auto-refresh, accumulates at most one entry per day, giving 365 entries roughly a year of history). Every `scan` and every real `clean`/`projects --clean` run (not `--dry-run`) records one snapshot. `reclaimable_bytes` and `categories` (a map of category → bytes) are `null` unless the run covers the **full, unscoped target list** — a plain `scan`, or a plain `clean` with no `--category`/`--min-size`/`--targets` (this doesn't depend on `--yes`: an unscoped interactive `clean` counts too). The sums span every measured target regardless of `safe` — review targets (e.g. all of `ai`, and `system`'s `trash`/`ios-backups`) are folded into `categories` too, not excluded; for `clean` the sum is taken after the run, over whatever remains uncleaned (targets not deleted/trashed this pass, including any review target skipped or declined). They're `null` for `scan --category …`, `scan --min-size …`, any `clean` scoped by `--targets`/`--category`/`--min-size`, and *every* `projects --clean` run (project artifacts aren't part of the regular category sweep, and it never records full scope) — in all of those cases only `disk_total_bytes`/`disk_free_bytes` are trustworthy. Use `MACCLEANER_SNAPSHOTS` to point the engine at a different snapshots file (see §5).
 
