@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.14.0"
+VERSION = "2.14.1"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -900,17 +900,29 @@ def _safe_to_delete(path: Path) -> bool:
 
 def _tmp_scan_path_allowed(path):
     """The single, narrow carve-out to the home-only rule: a path is
-    deletable outside $HOME only when it is a DIRECT child of the tmp scan
-    root (resolved, so /tmp symlinking to /private/tmp is handled) — and
-    delete_target additionally requires the target to carry the tmp_scan
-    marker that only scan_tmp_artifacts()/tmp_to_targets() set. There is
-    deliberately no config key that widens this."""
+    deletable outside $HOME only when it is a direct child of the tmp scan
+    root, OR one level below that (resolved, so /tmp symlinking to
+    /private/tmp is handled) — and delete_target additionally requires the
+    target to carry the tmp_scan marker that only
+    scan_tmp_artifacts()/tmp_to_targets() set. There is deliberately no
+    config key that widens this.
+
+    The grandchild level exists because 2.14.0's nested scan offers the
+    build tree INSIDE a workspace (/private/tmp/<repo>-<task-id>/derived)
+    rather than the workspace itself, deliberately, so the run logs and
+    .xcresults beside it survive. Without this it offered those targets and
+    then refused every one of them at delete time as "outside home" —
+    reporting reclaimable space it could never reclaim. Exactly two levels:
+    depth is what bounds the blast radius here, and nothing generates a
+    deeper path."""
     try:
         rp = Path(path).resolve()
         root = TMP_SCAN_ROOT.resolve()
     except OSError:
         return False
-    return rp.parent == root and rp != root
+    if rp == root:
+        return False
+    return rp.parent == root or rp.parent.parent == root
 
 
 def _remove(path: Path):
@@ -2320,16 +2332,32 @@ def print_projects(hits, roots, min_age):
 
 
 # ── Doctor ──────────────────────────────────────────────────────────────────────
-def _launchd_is_loaded(label: str) -> bool:
-    """True only if launchd currently has `label` loaded — a plist file on
-    disk merely means it was written, not that bootstrap/load succeeded or
-    that it's still loaded (finding I1)."""
+def _launchd_is_loaded(label: str):
+    """Tri-state: True (loaded), False (launchd says no such service), or
+    None (could not ask).
+
+    A plist file on disk merely means it was written, not that bootstrap/load
+    succeeded or that it's still loaded (finding I1) — so this asks launchd.
+    But launchctl can fail for reasons that say nothing about the agent:
+    no binary on PATH, no Aqua/GUI session (the common case for anything
+    running over ssh, from a sandbox, or under another launchd job), or a
+    timeout. Returning False for those made `doctor` report a perfectly
+    healthy weekly schedule as broken and send the user to reinstall it.
+
+    Only `launchctl list <label>`'s documented "no such service" answer —
+    exit 113, or the "Could not find service" message on older releases
+    that exit 1 — is proof of not-loaded. Everything else is None.
+    """
     try:
         r = subprocess.run(["launchctl", "list", label],
                            capture_output=True, text=True, timeout=5)
-        return r.returncode == 0
     except Exception:
+        return None
+    if r.returncode == 0:
+        return True
+    if r.returncode == 113 or "could not find service" in (r.stderr or "").lower():
         return False
+    return None
 
 
 def _app_bundle_version(app_path: Path):
@@ -2886,22 +2914,31 @@ def run_doctor(config, json_mode=False):
 
     try:
         st = _schedule_state()
-        loaded = [a["label"] for a in st["agents"] if a["loaded"]]
-        not_loaded = [a["label"] for a in st["agents"] if not a["loaded"]]
-        if loaded:
-            note = f"launchd: {', '.join(loaded)}"
-            if not_loaded:
-                note += (f" (plist present but not loaded: {', '.join(not_loaded)}"
-                         " — run scheduler.sh weekly to reload)")
+        def _by(state):
+            return [a["label"] for a in st["agents"] if a["load_state"] == state]
+        loaded, not_loaded, unknown = _by("loaded"), _by("not_loaded"), _by("unknown")
+        # "launchctl could not be asked" is NOT "the agent isn't loaded"
+        # (2.14.1). Only a definitive not-loaded is a MacCleaner-owned,
+        # fixable fault; an unverifiable answer is reported as exactly that
+        # and never fails the check, or doctor sends users to reinstall a
+        # schedule that is running perfectly well.
+        unverified = (f" (could not verify with launchctl: {', '.join(unknown)}"
+                      " — it may well be running; re-check from a normal"
+                      " login shell)" if unknown else "")
+        if not_loaded:
+            check("Schedule",
+                  f"plist present but not loaded: {', '.join(not_loaded)}"
+                  " — run scheduler.sh weekly to reload" + unverified, ok=False)
+        elif loaded:
+            note = f"launchd: {', '.join(loaded)}" + unverified
             if st["legacy_cron"]:
                 note += " (plus a legacy cron entry — run scheduler.sh weekly to clean up)"
             check("Schedule", note)
-        elif not_loaded:
-            # The plist exists but launchd doesn't have it loaded — distinct
-            # from "never installed at all" (finding I1).
+        elif unknown:
             check("Schedule",
-                  f"plist present but not loaded: {', '.join(not_loaded)}"
-                  " — run scheduler.sh weekly to reload", ok=False)
+                  f"could not verify with launchctl: {', '.join(unknown)}"
+                  " — the plists are installed and may well be running;"
+                  " re-check from a normal login shell")
         elif st["legacy_cron"]:
             check("Schedule", "legacy cron entry (run scheduler.sh weekly to migrate to launchd)")
         else:
@@ -3628,9 +3665,16 @@ def _schedule_state():
     for label in (CLEAN_LABEL, WATCH_LABEL):
         plist_path = LAUNCH_AGENTS_DIR / f"{label}.plist"
         present = plist_path.exists()
+        state = _launchd_is_loaded(label) if present else False
         agents.append({"label": label,
                        "plist_present": present,
-                       "loaded": _launchd_is_loaded(label) if present else False})
+                       # `loaded` stays a plain bool: the Swift app decodes
+                       # it as non-optional Bool. The tri-state is exposed
+                       # additively as `load_state` (2.14.1).
+                       "loaded": state is True,
+                       "load_state": {True: "loaded", False: "not_loaded"}.get(
+                           state, "unknown")})
+
         if label == CLEAN_LABEL and present:
             try:
                 with open(plist_path, "rb") as f:
@@ -3648,8 +3692,11 @@ def _print_schedule_status(state):
     if not state["agents"]:
         print("❌ Not scheduled (run ./scheduler.sh weekly)")
     for a in state["agents"]:
-        if a["loaded"]:
+        if a["load_state"] == "loaded":
             print(f"✅ {a['label']} (launchd)")
+        elif a["load_state"] == "unknown":
+            print(f"❔ {a['label']} — installed, but launchctl could not be "
+                  f"asked here (re-check from a normal login shell)")
         else:
             print(f"⚠️  {a['label']} — plist present but not loaded "
                   f"(run ./scheduler.sh weekly or monthly to reload)")
