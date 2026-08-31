@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.17.0"
+VERSION = "2.17.1"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -373,6 +373,14 @@ def get_size(path: Path) -> int:
         parts = result.stdout.split()
         if parts and parts[0].isdigit():
             return int(parts[0]) * 1024
+    except subprocess.TimeoutExpired:
+        # A hanging path (observed live: dataless cloud-backed entries under
+        # ~/Library/Caches blocking stat indefinitely) must not hang the
+        # scan — but a silent 0 hides real gigabytes. Say so, once per call.
+        print(f"Warning: sizing {path} exceeded 120s (a file inside may be "
+              f"stuck materializing from iCloud); reporting 0 for it",
+              file=sys.stderr)
+        return 0
     except Exception:
         pass
     return 0

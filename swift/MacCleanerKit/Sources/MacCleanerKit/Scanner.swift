@@ -44,7 +44,14 @@ public enum Scanner {
 
     /// `du -skx`, same binary the Python engine uses — Stage 2 verifies
     /// resolution and contract shape; measurement itself is shared plumbing.
-    public static func duBytes(_ path: String) -> Int64 {
+    public static func duBytes(_ path: String, timeout: TimeInterval = 120) -> Int64 {
+        // The timeout is not theoretical: dataless cloud-backed entries under
+        // ~/Library/Caches (com.apple.Music, com.apple.TV) block ANY stat of
+        // them indefinitely while macOS re-materializes. The Python engine's
+        // 120s cap survived that; this function had none, and the first live
+        // soak run left an mck process wedged for five minutes until killed
+        // by hand. A measurement that can hang forever is worse than a wrong
+        // number.
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         p.arguments = ["du", "-skx", path]
@@ -52,8 +59,13 @@ public enum Scanner {
         p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
         guard (try? p.run()) != nil else { return 0 }
+        let killer = DispatchWorkItem {
+            if p.isRunning { p.terminate(); kill(p.processIdentifier, SIGKILL) }
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: killer)
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
+        killer.cancel()
         guard let line = String(data: data, encoding: .utf8),
               let kb = Int64(line.split(separator: "\t").first ?? "") else { return 0 }
         return kb * 1024
