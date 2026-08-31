@@ -7,6 +7,14 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.14.2] — 2026-08-29
+
+### Fixed
+- **The `tmp` scanner no longer trusts age alone — it now checks whether anything is actually running against a candidate before offering it.** A nested write does not update the parent directory's mtime, so a workspace can read as weeks-stale at its top level while a build writes inside it. This was observed live: a DerivedData root's timestamp receded (68s → 76s → 84s ago across three samples) while `xcodebuild` held seven open handles beneath it and was writing a new `.xcresult` — and a peer agent, reading the same stale surface, proposed deleting exactly that tree mid-run. The scanner now reads the process list once per scan and skips any candidate whose path appears on a live command line. Matching is boundary-aware (`/tmp/ws` cannot shield `/tmp/ws2`), MacCleaner's own process tree is excluded (the first implementation reported a tree busy because *asking about the path put the path into the asking shell's own command line* — a check must not see its own reflection), and if the process list is unreadable the guard degrades open, because these targets are review-only and the age gate remains.
+- **Storage tab rendered with its header missing and the list bleeding under the titlebar.** The earlier fix (pinned frames + `clipped`) did not cure it. The view is now structurally identical to the Projects tab — plain `VStack`, no manual frames, Spacer-based empty states — which renders correctly on real machines; Storage was the only view carrying extra layout modifiers, and it was the only view misrendering.
+
+---
+
 ## [2.14.1] — 2026-08-28
 
 ### Fixed

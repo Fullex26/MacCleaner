@@ -5950,6 +5950,118 @@ class TestDockerImageAdvisory(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestTmpLivenessGuard(unittest.TestCase):
+    """Age alone is not proof a tmp workspace is idle.
+
+    A nested write does not update the parent's mtime, so a directory can
+    read as weeks-stale at its top level while a build writes inside it. This
+    was observed live: /private/tmp/<ws>/DerivedData reported "last written
+    68s / 76s / 84s ago" across three samples -- its mtime going further into
+    the past -- while an xcodebuild process held 7 open handles beneath it and
+    was writing a new .xcresult. A peer session read the same lock state as
+    "idle" and proposed deleting it. Nothing may be offered for deletion while
+    a live process names it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "tmproot"
+        self.root.mkdir()
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        self.cfg["tmp_min_age_days"] = 0
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _derived(self, at):
+        at.mkdir(parents=True, exist_ok=True)
+        for d in ("Build", "Index.noindex", "Logs"):
+            (at / d).mkdir()
+        (at / "Build" / "blob").write_bytes(b"x" * 2048)
+
+    def _scan(self, running=()):
+        with mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root), \
+             mock.patch.object(cleaner, "_running_command_lines",
+                               return_value=list(running)):
+            return cleaner.scan_tmp_artifacts(self.cfg)
+
+    def test_workspace_named_by_a_live_process_is_not_offered(self):
+        ws = self.root / "ws"
+        self._derived(ws)
+        cmd = f"xcodebuild -derivedDataPath {ws} -resultBundlePath {ws}/r.xcresult"
+        self.assertEqual(self._scan(running=[cmd]), [],
+                         "a live build's own output must never be offered")
+
+    def test_nested_tree_named_by_a_live_process_is_not_offered(self):
+        ws = self.root / "session"
+        ws.mkdir()
+        self._derived(ws / "derived")
+        cmd = f"xcodebuild -derivedDataPath {ws}/derived"
+        self.assertEqual(self._scan(running=[cmd]), [])
+
+    def test_still_offered_when_nothing_references_it(self):
+        ws = self.root / "ws"
+        self._derived(ws)
+        self.assertTrue(self._scan(running=["/usr/sbin/cupsd", "loginwindow"]),
+                        "an idle workspace must still be reclaimable")
+
+    def test_unrelated_process_does_not_suppress(self):
+        ws = self.root / "ws"
+        self._derived(ws)
+        other = self.root / "other-ws"
+        self._derived(other)
+        cmd = f"xcodebuild -derivedDataPath {other}"
+        names = {str(h["path"]) for h in self._scan(running=[cmd])}
+        self.assertIn(str(ws), names, "only the referenced path is protected")
+        self.assertNotIn(str(other), names)
+
+    def test_substring_collision_does_not_over_suppress(self):
+        """A path that merely shares a prefix with a busy one must still be
+        offered -- `/tmp/ws` appearing in a command must not shield `/tmp/ws2`."""
+        ws = self.root / "ws"
+        ws2 = self.root / "ws2"
+        self._derived(ws)
+        self._derived(ws2)
+        names = {str(h["path"]) for h in self._scan(running=[f"xcodebuild -x {ws}"])}
+        self.assertIn(str(ws2), names)
+        self.assertNotIn(str(ws), names)
+
+    def test_degrades_open_when_process_list_is_unavailable(self):
+        """If ps can't be read we cannot prove a path is busy. These targets
+        are review-only and never auto-cleaned, so failing closed here would
+        silently hide everything; the age gate remains the guard."""
+        with mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root), \
+             mock.patch.object(cleaner, "_running_command_lines", return_value=None):
+            ws = self.root / "ws"
+            self._derived(ws)
+            self.assertTrue(cleaner.scan_tmp_artifacts(self.cfg))
+
+    def test_own_process_tree_is_excluded(self):
+        """The scan must not see ITSELF as a holder. Observed for real: asking
+        `_path_is_in_use` about a path put that path into the asking shell's
+        own command line, so the answer came back True with nothing actually
+        using it -- the check reporting on its own reflection."""
+        ws = self.root / "ws"
+        self._derived(ws)
+        # A command line containing the path, attributed to this very process.
+        with mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root), \
+             mock.patch.object(cleaner, "_running_command_lines",
+                               return_value=[f"python3 -c print('{ws}')"]), \
+             mock.patch.object(cleaner, "_own_process_tree",
+                               return_value={f"python3 -c print('{ws}')"}):
+            self.assertTrue(cleaner.scan_tmp_artifacts(self.cfg),
+                            "our own command line must not suppress a candidate")
+
+    def test_process_list_is_read_once_per_scan(self):
+        """One ps call for the whole scan, not one per candidate."""
+        for n in range(4):
+            self._derived(self.root / f"ws{n}")
+        with mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root), \
+             mock.patch.object(cleaner, "_running_command_lines",
+                               return_value=[]) as rc:
+            cleaner.scan_tmp_artifacts(self.cfg)
+        self.assertEqual(rc.call_count, 1)
+
+
 class TestTmpNestedBuildOutput(unittest.TestCase):
     """The tmp scanner classified only the top level, and required an
     `info.plist` to recognise DerivedData. Both assumptions failed on real

@@ -21,17 +21,17 @@ struct StorageView: View {
     @State private var pendingTrash: StorageMapEntry?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        // Structure mirrors ProjectsView exactly — plain VStack, no manual
+        // frames, no clipped. That view renders correctly inside the split
+        // view on real machines; this one was the only view carrying extra
+        // layout modifiers, and it was also the one that rendered with its
+        // header missing and the list bleeding under the titlebar. Match the
+        // known-good shape instead of theorising.
+        VStack(spacing: 0) {
             header
             Divider()
             content
         }
-        // Pin the pane's bounds explicitly. Without this the VStack takes its
-        // ideal size from the List's content, so one over-wide row used to
-        // stretch the whole view past the detail pane and push the header off
-        // the top of the window entirely.
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .clipped()
         .task {
             if bridge.storageMap == nil && !bridge.isScanningStorageMap {
                 await bridge.scanStorageMap(nil)
@@ -144,15 +144,25 @@ struct StorageView: View {
     @ViewBuilder
     private var content: some View {
         if let error = bridge.storageMapError, bridge.storageMap == nil {
-            message("Couldn't read that location.", detail: error, symbol: "exclamationmark.triangle")
+            Spacer()
+            Label(error, systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.secondary)
+            Spacer()
         } else if bridge.storageMap == nil {
-            message("Measuring…",
-                    detail: "First scan of a large folder can take a moment.",
-                    symbol: "clock")
+            Spacer()
+            if bridge.isScanningStorageMap {
+                ProgressView("Measuring… first scan of a large folder can take a moment.")
+            } else {
+                Text("Choose a location to see where disk space is going.")
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
         } else if let map = bridge.storageMap, map.children.isEmpty {
-            message("Nothing in here.",
-                    detail: bridge.storageMapError ?? "This folder is empty, or its contents aren't readable without administrator access.",
-                    symbol: "tray")
+            Spacer()
+            Label(bridge.storageMapError ?? "This folder is empty, or its contents aren't readable without administrator access.",
+                  systemImage: "tray")
+                .foregroundStyle(.secondary)
+            Spacer()
         } else if let map = bridge.storageMap {
             List {
                 if let error = bridge.storageMapError {
@@ -172,24 +182,9 @@ struct StorageView: View {
                 }
             }
             .listStyle(.inset)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
-    private func message(_ title: String, detail: String, symbol: String) -> some View {
-        VStack(spacing: 6) {
-            Image(systemName: symbol).font(.title2).foregroundStyle(.secondary)
-            Text(title).font(.callout.weight(.medium))
-            Text(detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: 420)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
-    }
 
     // MARK: - Navigation
 
