@@ -50,7 +50,7 @@ eq "zsh schedule action"  "monthly off run status weekly" "$(Z 'maccleaner sched
 eq "zsh targets 1st"      "94" "$(Z 'maccleaner clean --targets ' | wc -l | tr -d ' ')"
 eq "zsh targets 2nd"      "93" "$(Z 'maccleaner clean --targets npm-cache,' | wc -l | tr -d ' ')"
 eq "zsh targets 3rd"      "92" "$(Z 'maccleaner clean --targets npm-cache,pip-cache,' | wc -l | tr -d ' ')"
-eq "zsh config set keys"  "15" "$(Z 'maccleaner config set ' | wc -l | tr -d ' ')"
+eq "zsh config set keys"  "17" "$(Z 'maccleaner config set ' | wc -l | tr -d ' ')"
 eq "zsh engine down"      "23" "$(env MACCLEANER_ENGINE=/nope HOME=/tmp/nohome "$HERE/capture.zsh" "$HERE" 'maccleaner config enable ' | wc -l | tr -d ' ')"
 
 echo "Tier 3b: mclean/mpreview/mreport alias completion (zsh)"

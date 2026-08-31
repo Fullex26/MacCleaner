@@ -11,6 +11,7 @@ struct SettingsView: View {
                 appearanceSection
                 scheduleSection
                 alertsSection
+                v3Section
                 updatesSection
             }
             .padding()
@@ -150,6 +151,38 @@ struct SettingsView: View {
                     Text("MacCleaner stays in the menu bar either way")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private var v3Section: some View {
+        SettingsSection(title: "V3 Engine (soak)") {
+            Toggle(isOn: Binding(
+                get: { bridge.v3SoakEnabled },
+                set: { on in Task { await bridge.setV3Soak(on) } }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Verify the new Swift engine in the background")
+                    Text("Runs read-only beside each full scan and records any disagreement. Never deletes anything.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let n = bridge.soakDivergences {
+                HStack(spacing: 8) {
+                    Image(systemName: n == 0 ? "checkmark.seal" : "exclamationmark.triangle")
+                        .foregroundStyle(n == 0 ? Color.green : .orange)
+                    Text(n == 0 ? "Last comparison: engines agree"
+                                : "Last comparison: \(n) divergence\(n == 1 ? "" : "s")")
+                        .font(.callout)
+                    if n > 0 {
+                        Button("Show Log") {
+                            NSWorkspace.shared.selectFile(CleanerBridge.soakLogPath(),
+                                                          inFileViewerRootedAtPath: "")
+                        }
+                        .buttonStyle(.link)
+                    }
                 }
             }
         }

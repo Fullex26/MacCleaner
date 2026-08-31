@@ -230,6 +230,7 @@ struct EngineConfig: Codable {
     var low_disk_threshold_gb: Double?
     var full_refresh_hours: Double?
     var show_in_dock: Bool?
+    var v3_soak: Bool?
 }
 
 enum BridgeError: LocalizedError {
@@ -277,6 +278,11 @@ final class CleanerBridge: ObservableObject {
     /// regular app at runtime. Kept in config.json (not UserDefaults) so it
     /// lives alongside every other MacCleaner setting.
     @Published var showInDock = false
+    /// V3 dual-engine soak (Stage 3): run the read-only Swift engine beside
+    /// each full Python scan and log divergence. Python stays the engine of
+    /// record; the soak never deletes and never changes behaviour.
+    @Published var v3SoakEnabled = true
+    @Published var soakDivergences: Int?
     @Published var scheduleStatus: ScheduleStatus?
     @Published var scheduleSupported = true
     /// Set for the whole `setSchedule` round trip (bootout + bootstrap +
@@ -464,6 +470,7 @@ final class CleanerBridge: ObservableObject {
             report = try await run(ScanReport.self, ["scan", "--json"])
             statusMessage = nil
             lastFullScan = Date()
+            runSoakIfEnabled(against: report)
             // A fresh, successful scan is the signal that any prior clean's
             // progress is now stale — the target list it was tracking has
             // just been replaced. Left untouched on failure: a failed scan
@@ -808,6 +815,7 @@ final class CleanerBridge: ObservableObject {
             lowDiskAlertsEnabled = cfg.low_disk_alerts ?? true
             lowDiskThresholdGB = cfg.low_disk_threshold_gb ?? 10
             showInDock = cfg.show_in_dock ?? false
+            v3SoakEnabled = cfg.v3_soak ?? true
             applyDockVisibility()
             fullRefreshHours = cfg.full_refresh_hours ?? 6
         } catch {
@@ -871,6 +879,117 @@ final class CleanerBridge: ObservableObject {
         guard NSApp.activationPolicy() != policy else { return }
         NSApp.setActivationPolicy(policy)
         if showInDock { NSApp.activate(ignoringOtherApps: true) }
+    }
+
+    func setV3Soak(_ on: Bool) async {
+        do {
+            try await runPlain(["config", "set", "v3_soak", on ? "true" : "false"])
+            v3SoakEnabled = on
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// V3 Stage 3: run the read-only Swift engine (mck) against the same
+    /// config, compare its scan table with the Python report we just got,
+    /// and append any divergence to soak.log. Fire-and-forget: the soak can
+    /// never delay, fail, or alter the real scan — Python remains the engine
+    /// of record throughout the soak period.
+    func runSoakIfEnabled(against report: ScanReport?) {
+        guard v3SoakEnabled, let report else { return }
+        let mck = ProcessInfo.processInfo.environment["MACCLEANER_MCK"]
+            ?? Bundle.main.path(forResource: "mck", ofType: nil)
+        guard let mck, FileManager.default.isExecutableFile(atPath: mck) else { return }
+        // Only soak against the standard installed config: mck must see the
+        // exact same enabled categories / skip paths or every comparison is
+        // noise. A non-standard layout just skips the soak silently.
+        let configPath = NSHomeDirectory() + "/mac-cleaner/config.json"
+        guard FileManager.default.fileExists(atPath: configPath) else { return }
+        let pyTargets = report.targets
+        Task.detached(priority: .utility) { [weak self] in
+            let divergences = Self.soakCompare(mck: mck, configPath: configPath,
+                                               pyTargets: pyTargets)
+            await MainActor.run { [weak self] in
+                self?.soakDivergences = divergences
+            }
+        }
+    }
+
+    nonisolated static func soakLogPath() -> String {
+        let dir = NSHomeDirectory() + "/Library/Application Support/MacCleaner"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        return dir + "/soak.log"
+    }
+
+    /// Runs mck, compares, logs, returns the divergence count (nil = soak
+    /// could not run at all, which is not the same as zero divergences).
+    nonisolated static func soakCompare(mck: String, configPath: String,
+                                        pyTargets: [ScanTarget]) -> Int? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: mck)
+        p.arguments = ["scan", "--json", "--all"]
+        var env = ProcessInfo.processInfo.environment
+        env["MACCLEANER_CONFIG"] = configPath
+        p.environment = env
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = obj["targets"] as? [[String: Any]] else { return nil }
+
+        struct SwiftRow { let safe: Bool; let exists: Bool; let size: Int64; let cmd: Bool }
+        var swiftById: [String: SwiftRow] = [:]
+        for r in rows {
+            guard let id = r["id"] as? String else { continue }
+            swiftById[id] = SwiftRow(safe: r["safe"] as? Bool ?? false,
+                                     exists: r["exists"] as? Bool ?? false,
+                                     size: (r["size_bytes"] as? NSNumber)?.int64Value ?? 0,
+                                     cmd: r["cmd"] as? Bool ?? false)
+        }
+        var lines: [String] = []
+        func log(_ kind: String, _ id: String, _ detail: String) {
+            lines.append("{\"ts\": \"\(ISO8601DateFormatter().string(from: Date()))\", " +
+                         "\"kind\": \"\(kind)\", \"id\": \"\(id)\", \"detail\": \"\(detail)\"}")
+        }
+        var pyIds = Set<String>()
+        for t in pyTargets {
+            pyIds.insert(t.id)
+            guard let sw = swiftById[t.id] else {
+                log("missing_in_swift", t.id, "python has it, mck does not")
+                continue
+            }
+            if sw.safe != t.safe {
+                log("safe_mismatch", t.id, "python=\(t.safe) swift=\(sw.safe)")
+            }
+            if !sw.cmd {
+                if let ex = t.exists, ex != sw.exists {
+                    log("exists_mismatch", t.id, "python=\(ex) swift=\(sw.exists)")
+                }
+                // du timing between the two runs makes small drift normal;
+                // only a >10% AND >1 MiB gap counts as divergence.
+                let delta = abs(Int64(t.size_bytes) - sw.size)
+                let floor = max(Int64(Double(max(t.size_bytes, 1)) * 0.10), 1 << 20)
+                if delta > floor {
+                    log("size_divergence", t.id, "python=\(t.size_bytes) swift=\(sw.size)")
+                }
+            }
+        }
+        for id in swiftById.keys where !pyIds.contains(id) {
+            log("missing_in_python", id, "mck has it, python does not")
+        }
+        if !lines.isEmpty {
+            let blob = lines.joined(separator: "\n") + "\n"
+            if let h = FileHandle(forWritingAtPath: soakLogPath()) {
+                h.seekToEndOfFile(); h.write(blob.data(using: .utf8)!); try? h.close()
+            } else {
+                try? blob.write(toFile: soakLogPath(), atomically: true, encoding: .utf8)
+            }
+        }
+        return lines.count
     }
 
     func setLowDiskThreshold(_ gb: Double) async {

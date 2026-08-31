@@ -135,6 +135,30 @@ rm -f "$BUILD_DIR/MacCleaner-$NATIVE_ARCH" "$BUILD_DIR/MacCleaner-$OTHER_ARCH"
 cp "$APP_DIR/Info.plist" "$BUNDLE/Contents/"
 cp "$REPO_DIR/cleaner.py" "$BUNDLE/Contents/Resources/"
 
+# V3 Stage 3: embed the read-only Swift engine (mck) for the dual-engine
+# soak. Best-effort — a machine without the Swift toolchain still gets a
+# fully working app, just with the soak silently unavailable (the bridge
+# checks for the binary before running it). Universal when possible, to
+# match the app binary itself.
+if command -v swift >/dev/null 2>&1; then
+    echo "→ Building mck (V3 soak engine)…"
+    if swift build -c release --package-path "$REPO_DIR/swift/MacCleanerKit" \
+        --arch arm64 --arch x86_64 >/dev/null 2>&1; then
+        MCK_BIN="$REPO_DIR/swift/MacCleanerKit/.build/apple/Products/Release/mck"
+    else
+        swift build -c release --package-path "$REPO_DIR/swift/MacCleanerKit" >/dev/null 2>&1 || true
+        MCK_BIN="$REPO_DIR/swift/MacCleanerKit/.build/release/mck"
+    fi
+    if [ -x "$MCK_BIN" ]; then
+        cp "$MCK_BIN" "$BUNDLE/Contents/Resources/mck"
+        echo "→ mck embedded"
+    else
+        echo "⚠️  mck build failed — app ships without the V3 soak engine" >&2
+    fi
+else
+    echo "⚠️  swift toolchain not found — app ships without the V3 soak engine" >&2
+fi
+
 # App icon (regenerate via app/icon/generate_icon.py)
 if [ -f "$APP_DIR/MacCleaner.icns" ]; then
     echo "→ Copying app icon…"
