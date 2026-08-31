@@ -617,7 +617,7 @@
     },
     {
       "description": "Stale iOS simulator devices and unused runtime images (via simctl) \u2014 review carefully",
-      "enabled": false,
+      "enabled": true,
       "name": "simulators",
       "targets": []
     },

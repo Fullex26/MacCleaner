@@ -50,6 +50,34 @@ case "scan":
             ])
         }
     }
+    // Simulators: cmd targets assembled from simctl's own identifiers,
+    // emitted with the same shape static cmd targets use (presence-only in
+    // the parity gate; nothing here ever executes them).
+    if config.enabledCategories.contains("simulators") {
+        for t in SimulatorScanner.scan(staleDays: config.simulatorStaleDays) {
+            targets.append([
+                "id": t.id, "category": t.category, "label": t.label,
+                "description": t.desc, "safe": false,
+                "exists": false, "size_bytes": 0,
+                "cmd": true,
+            ])
+        }
+    }
+    // Leftovers: multi-path review-only targets, sized like the Python
+    // engine sizes them (du per path, summed).
+    if config.enabledCategories.contains("leftovers") {
+        let hits = LeftoversScanner.scan(minAgeDays: config.appLeftoverMinAgeDays,
+                                         skipPaths: config.skipPaths)
+        for t in LeftoversScanner.targets(from: hits) {
+            let size = t.paths.reduce(Int64(0)) { $0 + Scanner.duBytes($1) }
+            targets.append([
+                "id": t.id, "category": t.category, "label": t.label,
+                "description": t.desc, "safe": false,
+                "exists": true, "size_bytes": size,
+                "cmd": false,
+            ])
+        }
+    }
     jsonOut(["version": version, "targets": targets])
 case "categories":
     guard args.contains("--json") else { exit(2) }
