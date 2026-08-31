@@ -42,6 +42,62 @@ SEED_FILES = {
     "Library/Caches/app.electron-updater/pending/Setup.dmg": 7,
 }
 
+# tmp-scanner scenarios, seeded under the sandboxed MACCLEANER_TMP_ROOT.
+# Directory name -> (shape builder marker, aged?, expected?) — documented in
+# each builder below. Ages use utime(now - 5 days); the config's
+# tmp_min_age_days default (1) then admits aged dirs and refuses fresh ones.
+TMP_AGE = 5 * 86400
+
+def _seed_tmp_root(tmp: Path):
+    import time as _t
+    old = _t.time() - TMP_AGE
+
+    def aged(*paths):
+        for p in paths:
+            os.utime(p, (old, old))
+
+    def derived_shape(d: Path):
+        (d / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        (d / "Build" / "Intermediates.noindex" / "o.o").write_bytes(b"x" * (2 * BLOCK))
+
+    # offered: top-level DerivedData shape
+    d = tmp / "ws-derived-top"; derived_shape(d); aged(d)
+    # offered: repo clone with manifest + build artifacts
+    c = tmp / "ws-clone"
+    (c / ".git").mkdir(parents=True)
+    (c / "package.json").write_bytes(b"{}")
+    (c / "node_modules").mkdir()
+    (c / "node_modules" / "m.js").write_bytes(b"x" * (3 * BLOCK))
+    aged(c)
+    # offered: the NESTED case — workspace itself is not junk, its child is
+    # (Build/ + Index.noindex/ + one corroborating marker, no info.plist)
+    w = tmp / "ws-nested"
+    (w / "derived" / "Build").mkdir(parents=True)
+    (w / "derived" / "Index.noindex").mkdir()
+    (w / "derived" / "ModuleCache.noindex").mkdir()
+    (w / "derived" / "Build" / "big.o").write_bytes(b"x" * (4 * BLOCK))
+    (w / "run.log").write_bytes(b"keep me")
+    aged(w, w / "derived")
+    # offered: the .xcactivitylog signature
+    x = tmp / "xcactivity-ws"
+    (x / "Logs" / "Build").mkdir(parents=True)
+    (x / "Logs" / "Build" / "1.xcactivitylog").write_bytes(b"x" * BLOCK)
+    aged(x)
+    # refused: too young (mtime = now)
+    y = tmp / "ws-young"; derived_shape(y)
+    # refused: active-session prefix, however old
+    cl = tmp / "claude-session"; derived_shape(cl); aged(cl)
+    # refused: symlink, never followed
+    os.symlink(str(d), str(tmp / "link-trap"))
+    # refused: plain file
+    (tmp / "plainfile").write_bytes(b"x")
+    # refused: .git clone with manifest but NO build artifacts
+    g = tmp / "clean-checkout"
+    (g / ".git").mkdir(parents=True)
+    (g / "package.json").write_bytes(b"{}")
+    aged(g)
+
+
 def build_sandbox(root: Path):
     home = root / "home"
     for rel, blocks in SEED_FILES.items():
@@ -50,6 +106,7 @@ def build_sandbox(root: Path):
         p.write_bytes(b"x" * (blocks * BLOCK))
     for extra in ["tmp-root", "leftover-lib", "apps", "agents", "state"]:
         (root / extra).mkdir(parents=True, exist_ok=True)
+    _seed_tmp_root(root / "tmp-root")
     cfg = {
         "enabled_categories": CATEGORIES,
         "skip_paths": [],

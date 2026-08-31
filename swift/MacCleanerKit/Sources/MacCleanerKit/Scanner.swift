@@ -44,7 +44,7 @@ public enum Scanner {
 
     /// `du -skx`, same binary the Python engine uses — Stage 2 verifies
     /// resolution and contract shape; measurement itself is shared plumbing.
-    static func duBytes(_ path: String) -> Int64 {
+    public static func duBytes(_ path: String) -> Int64 {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         p.arguments = ["du", "-skx", path]

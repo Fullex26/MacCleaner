@@ -63,6 +63,26 @@
       "size_human": "16.0 KB"
     },
     {
+      "category": "tmp",
+      "description": "Stale repo clone containing build artifacts; left in /private/tmp by a tool or AI session",
+      "exists": true,
+      "id": "tmp-ws-clone",
+      "label": "/tmp: ws-clone",
+      "safe": false,
+      "size_bytes": 16384,
+      "size_human": "16.0 KB"
+    },
+    {
+      "category": "tmp",
+      "description": "Xcode-style derived build products; left in /private/tmp by a tool or AI session",
+      "exists": true,
+      "id": "tmp-derived",
+      "label": "/tmp: derived",
+      "safe": false,
+      "size_bytes": 16384,
+      "size_human": "16.0 KB"
+    },
+    {
       "category": "python",
       "description": "pip download/wheel cache",
       "exists": true,
@@ -71,6 +91,26 @@
       "safe": true,
       "size_bytes": 12288,
       "size_human": "12.0 KB"
+    },
+    {
+      "category": "tmp",
+      "description": "Xcode-style derived build products; left in /private/tmp by a tool or AI session",
+      "exists": true,
+      "id": "tmp-ws-derived-top",
+      "label": "/tmp: ws-derived-top",
+      "safe": false,
+      "size_bytes": 8192,
+      "size_human": "8.0 KB"
+    },
+    {
+      "category": "tmp",
+      "description": "Xcode-style derived build products; left in /private/tmp by a tool or AI session",
+      "exists": true,
+      "id": "tmp-xcactivity-ws",
+      "label": "/tmp: xcactivity-ws",
+      "safe": false,
+      "size_bytes": 4096,
+      "size_human": "4.0 KB"
     },
     {
       "category": "xcode",
@@ -554,7 +594,7 @@
     }
   ],
   "timestamp": "<TS>",
-  "total_reclaimable_bytes": 159744,
-  "total_reclaimable_human": "156.0 KB",
+  "total_reclaimable_bytes": 204800,
+  "total_reclaimable_human": "200.0 KB",
   "version": "2.16.0"
 }
