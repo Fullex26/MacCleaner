@@ -11,5 +11,6 @@ let package = Package(
     targets: [
         .target(name: "MacCleanerKit"),
         .executableTarget(name: "mck", dependencies: ["MacCleanerKit"]),
+        .testTarget(name: "MacCleanerKitTests", dependencies: ["MacCleanerKit"]),
     ]
 )

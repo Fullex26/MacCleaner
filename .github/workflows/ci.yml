@@ -40,6 +40,12 @@ jobs:
       - name: Build MacCleanerKit (V3 Stage 2, read-only Swift kit)
         run: swift build -c release --package-path swift/MacCleanerKit
 
+      - name: MacCleanerKit unit tests
+        # --enable-xctest is load-bearing: this toolchain's bare `swift test`
+        # runs only the swift-testing runner, discovers zero XCTest cases,
+        # and reports a green "0 tests" — a suite that silently runs nothing.
+        run: swift test --package-path swift/MacCleanerKit --enable-xctest
+
       - name: Swift/Python engine parity (tools/check_swift_parity.py)
         run: python3 tools/check_swift_parity.py
 

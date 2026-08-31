@@ -26,6 +26,7 @@ public struct Target {
 public struct Config {
     public var enabledCategories: [String]
     public var skipPaths: [String]
+    public var tmpMinAgeDays: Double = 1
 
     /// Mirrors load_config()'s merge-with-defaults posture for the two keys
     /// Stage 2 needs: a missing/unreadable config means "everything enabled,
@@ -37,6 +38,10 @@ public struct Config {
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             if let cats = obj["enabled_categories"] as? [String] { enabled = Set(cats) }
             if let s = obj["skip_paths"] as? [String] { skip = s }
+            var cfg = Config(enabledCategories: Array(enabled), skipPaths: skip)
+            if let d = obj["tmp_min_age_days"] as? Double { cfg.tmpMinAgeDays = d }
+            else if let i = obj["tmp_min_age_days"] as? Int { cfg.tmpMinAgeDays = Double(i) }
+            return cfg
         }
         return Config(enabledCategories: Array(enabled), skipPaths: skip)
     }

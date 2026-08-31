@@ -37,8 +37,16 @@ an unverified deletion engine is the one artifact this project must never ship.
    push) rather than byte-for-byte, since JSON key order proves nothing.
    The sabotage test was run before trusting the gate: one wrong path in
    the generated table fails parity naming the exact target and field.
-   Still open within this stage: the dynamic scanners (tmp / simulators /
-   leftovers) and cmd-target estimates are presence-only in `mck`.
+   The **tmp scanner is ported** (`TmpScanner.swift`): content
+   classification, the 2.14.2 liveness guard (own-process-tree exclusion
+   included), nested build-tree detection, slugify/id parity — covered by
+   XCTest unit tests (CI runs `swift test --enable-xctest`; the bare
+   `swift test` silently discovers zero XCTest cases on current toolchains)
+   plus fixture-sandbox parity: 4 offered and 5 refused tmp scenarios are
+   seeded by `tools/gen_contract_fixtures.py` and pinned in the committed
+   fixtures. Still open within this stage: simulators and leftovers ports,
+   and cmd-target estimates (presence-only in `mck`) — owned by a parallel
+   session along with Stage 3's dual-engine soak.
 3. **Dual-engine app.** The app gains an engine toggle (default: Python).
    Swift scan results are compared against the Python engine's in the
    background; divergences are logged, never acted on. This is the
