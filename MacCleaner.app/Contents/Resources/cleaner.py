@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.15.0"
+VERSION = "2.16.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -1466,6 +1466,60 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
     return total_freed, results
 
 
+def run_clean_min_free(targets, min_free_gb, mode="rm", json_mode=False, notify=False):
+    """Clean SAFE targets, largest first, only until `min_free_gb` is free.
+
+    Built for agents working under a fail-closed disk floor: free just enough
+    to clear the floor, then stop, instead of blowing away every cache on the
+    machine. Review-level targets are never touched — an until-threshold clean
+    is unattended by nature, so it gets exactly the --yes safety contract.
+    `target_met` is reported honestly: exhausting every safe target without
+    reaching the floor is `false`, never a quiet success."""
+    threshold = int(min_free_gb * 1024 ** 3)
+    say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
+    targets = measure_targets(targets)
+    safe = sorted([t for t in targets if t["safe"] and (t.get("exists") or t.get("cmd"))],
+                  key=lambda x: x["size"] or 0, reverse=True)
+    total_freed, results = 0, []
+    say(f"\n🧹 MacCleaner — {disk_free()} · target: {fmt_size(threshold)} free\n")
+    for t in safe:
+        if disk_stats()["free_bytes"] >= threshold:
+            break
+        freed, err = delete_target(t, mode=mode)
+        total_freed += freed
+        status = "error" if err else ("trashed" if mode == "trash" and not t.get("cmd") else "deleted")
+        results.append({"id": t["id"], "label": t["label"], "freed": freed,
+                        "status": status, **({"error": err} if err else {})})
+        say(f"  ✅ Cleaned: {t['label']} ({fmt_size(freed)})" if not err
+            else f"  ⚠️  {t['label']}: {err}")
+    free_now = disk_stats()["free_bytes"]
+    target_met = free_now >= threshold
+    if results:
+        write_log(total_freed, results)
+        record_snapshot()
+    if notify and load_config().get("notifications", True):
+        _notify(f"MacCleaner freed {fmt_size(total_freed)}",
+                f"{fmt_size(free_now)} free" +
+                ("" if target_met else f" — couldn't reach {fmt_size(threshold)}"))
+    if json_mode:
+        print(json.dumps({
+            "version": VERSION,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "delete_mode": mode,
+            "min_free_gb": min_free_gb,
+            "target_met": target_met,
+            "free_bytes": free_now,
+            "freed_bytes": total_freed,
+            "freed_human": fmt_size(total_freed),
+            "disk_after": disk_free(),
+            "items": results,
+        }, indent=2))
+    else:
+        say(f"\n  {'Target met' if target_met else 'Target NOT met — every safe target already cleaned'}"
+            f" · freed {fmt_size(total_freed)} · {fmt_size(free_now)} free\n")
+    return total_freed, results
+
+
 def run_dry_run(targets, mode="rm", json_mode=False):
     """Resolve exactly what a real clean of `targets` would delete. Deletes
     nothing, writes no report.log entry, records no snapshot."""
@@ -1718,7 +1772,7 @@ def _du_children(root):
     return sizes, total
 
 
-def scan_storage_map(root=None, min_bytes=0):
+def scan_storage_map(root=None, min_bytes=0, depth=1):
     """One level of children beneath `root`, largest first, with real sizes.
 
     Read-only: it stats and measures, and never deletes, moves or opens file
@@ -1776,6 +1830,14 @@ def scan_storage_map(root=None, min_bytes=0):
         pass
 
     children.sort(key=lambda c: -c["size_bytes"])
+    if depth > 1:
+        # One JSON tree instead of N drill-down calls -- for agents auditing
+        # a whole subtree. The key is attached only when depth > 1 so depth-1
+        # output stays byte-identical to the pre-2.15 contract.
+        for c in children:
+            if c["kind"] == "dir":
+                sub = scan_storage_map(c["path"], min_bytes=min_bytes, depth=depth - 1)
+                c["children"] = sub["children"]
     return {"root": str(root), "total_bytes": total, "total_human": fmt_size(total),
             "category": _storage_category(root), "children": children}
 
@@ -1864,8 +1926,8 @@ def _relative_days(mtime):
     return f"{int(days)} days ago"
 
 
-def show_storage_map(root=None, min_bytes=0, json_mode=False):
-    r = scan_storage_map(root, min_bytes=min_bytes)
+def show_storage_map(root=None, min_bytes=0, json_mode=False, depth=1):
+    r = scan_storage_map(root, min_bytes=min_bytes, depth=depth)
     if json_mode:
         print(json.dumps({"version": VERSION, **r}, indent=2))
         return r
@@ -4013,13 +4075,73 @@ def _print_schedule_status(state):
         print("⚠️  A legacy cron entry is still present — run ./scheduler.sh weekly to migrate.")
 
 
+def _next_scheduled_run(schedule, now):
+    """When the installed schedule will next fire, or None when off.
+
+    Mirrors the plists run_schedule_install writes: weekly = Monday 09:00
+    (launchd Weekday 1), monthly = the 1st at 09:00. Kept as a pure function
+    of `now` so it is testable to the minute; the 9 o'clock constant lives in
+    the plists and here, and changing one means changing both."""
+    if schedule not in ("weekly", "monthly"):
+        return None
+    at = datetime.time(9, 0)
+    if schedule == "weekly":
+        days_ahead = (0 - now.weekday()) % 7   # Monday is weekday() == 0
+        candidate = datetime.datetime.combine(
+            now.date() + datetime.timedelta(days=days_ahead), at)
+        if candidate <= now:
+            candidate += datetime.timedelta(days=7)
+        return candidate
+    candidate = datetime.datetime.combine(now.date().replace(day=1), at)
+    if candidate <= now:
+        year = now.year + (1 if now.month == 12 else 0)
+        month = 1 if now.month == 12 else now.month + 1
+        candidate = datetime.datetime.combine(
+            datetime.date(year, month, 1), at)
+    return candidate
+
+
 def run_schedule_status(json_mode=False):
     state = _schedule_state()
+    nxt = _next_scheduled_run(state.get("schedule"), datetime.datetime.now())
+    state["next_run"] = nxt.isoformat() if nxt else None
     if json_mode:
         print(json.dumps({"version": VERSION, **state}, indent=2))
     else:
         _print_schedule_status(state)
+        if nxt:
+            print(f"  Next scheduled clean: {nxt.strftime('%A %d %b, %-I:%M %p')}")
     return state
+
+
+def run_schedule_run(json_mode=False):
+    """Fire the scheduled clean agent right now, via launchctl.
+
+    Exists so "is the schedule alive?" is answerable with one click/command
+    instead of waiting for Monday 9am: the schedule feature was reported
+    broken while working perfectly, because nothing about it was observable.
+    Kickstarting the REAL agent (not just running `clean --yes` inline) is
+    the point -- it exercises the same launchd plumbing the Monday run uses,
+    so success here is evidence the scheduled run will work too."""
+    target = f"gui/{os.getuid()}/{CLEAN_LABEL}"
+    err = None
+    try:
+        r = subprocess.run(["launchctl", "kickstart", "-k", target],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            err = (r.stderr.strip() or f"launchctl exited {r.returncode}") +                   " — is a schedule installed? (maccleaner schedule weekly)"
+    except Exception as e:
+        err = str(e)
+    started = err is None
+    if json_mode:
+        print(json.dumps({"version": VERSION, "started": started,
+                          **({"error": err} if err else {})}, indent=2))
+    elif started:
+        print("✅ Scheduled clean started — watch for its notification, "
+              "or check `maccleaner report` in a minute.")
+    else:
+        print(f"Could not start the scheduled clean: {err}", file=sys.stderr)
+    return started
 
 
 def run_schedule_install(kind, json_mode=False):
@@ -4213,6 +4335,8 @@ def build_parser():
     p_clean.add_argument("--json", action="store_true", help="Machine-readable results")
     p_clean.add_argument("--dry-run", action="store_true",
                          help="Show exactly what would be deleted, delete nothing")
+    p_clean.add_argument("--min-free", type=float, metavar="GB",
+                         help="Clean safe targets, largest first, only until this much space is free")
     p_clean.add_argument("--notify", action="store_true",
                          help="Post a macOS notification when the clean finishes")
 
@@ -4272,11 +4396,13 @@ def build_parser():
                        help="Directory to inspect (default: your home folder)")
     p_map.add_argument("--min-size", type=float, default=0,
                        metavar="MB", help="Hide entries smaller than this")
+    p_map.add_argument("--depth", type=int, choices=[1, 2, 3], default=1,
+                       help="Levels to include (JSON nests 'children'; bounded on purpose)")
     p_map.add_argument("--json", action="store_true", help="Machine-readable output")
 
     p_sched = sub.add_parser("schedule",
                              help="Manage the launchd cleanup schedule (weekly/monthly/off/status)")
-    p_sched.add_argument("action", choices=["status", "weekly", "monthly", "off"])
+    p_sched.add_argument("action", choices=["status", "weekly", "monthly", "off", "run"])
     p_sched.add_argument("--json", action="store_true", help="Machine-readable output")
 
     sub.add_parser("install-deps", help="Install 'rich' for pretty terminal output")
@@ -4301,6 +4427,9 @@ def main():
     if args.command == "schedule":
         if args.action == "status":
             run_schedule_status(json_mode=args.json)
+        elif args.action == "run":
+            if not run_schedule_run(json_mode=args.json):
+                sys.exit(1)
         elif args.action in ("weekly", "monthly"):
             if not run_schedule_install(args.action, json_mode=args.json):
                 sys.exit(1)
@@ -4338,7 +4467,7 @@ def main():
     if args.command == "storage-map":
         show_storage_map(args.path,
                          min_bytes=int(args.min_size * 1024 * 1024),
-                         json_mode=args.json)
+                         json_mode=args.json, depth=args.depth)
         return
 
     if args.command == "storage-insights":
@@ -4469,6 +4598,14 @@ def main():
         if args.dry_run:
             selected = [t for t in targets if t["safe"] or explicit]
             run_dry_run(selected, mode=mode, json_mode=args.json)
+            return
+        if args.min_free is not None:
+            if not auto:
+                print("--min-free is unattended by nature: pass --yes to confirm "
+                      "cleaning safe targets without prompts.", file=sys.stderr)
+                sys.exit(1)
+            run_clean_min_free(targets, args.min_free, mode=mode,
+                               json_mode=args.json, notify=args.notify)
             return
         full = not explicit and not categories and args.min_size is None
         run_clean(targets, auto_approve=auto, mode=mode, json_mode=args.json,

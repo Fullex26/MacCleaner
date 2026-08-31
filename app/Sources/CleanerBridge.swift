@@ -218,6 +218,9 @@ struct ScheduleStatus: Codable {
     let schedule: String?
     let agents: [AgentStatus]
     let legacy_cron: Bool
+    /// ISO timestamp of the next scheduled clean, engine 2.15+. Optional so
+    /// an older installed engine still decodes.
+    let next_run: String?
 }
 
 struct EngineConfig: Codable {
@@ -889,6 +892,27 @@ final class CleanerBridge: ObservableObject {
             // failure here as "can't manage scheduling", not an error banner.
             scheduleStatus = nil
             scheduleSupported = false
+        }
+    }
+
+    /// Feedback line for the Run Now button — transient, replaced on the
+    /// next press and cleared when the schedule itself changes.
+    @Published var scheduleRunFeedback: String?
+    @Published var isRunningScheduleNow = false
+
+    /// Fires the scheduled clean agent immediately via `schedule run`. The
+    /// point is observability: the schedule was reported broken while working
+    /// perfectly, because nothing about it could be poked. Kickstarting the
+    /// real launchd agent (not an inline clean) exercises the same plumbing
+    /// Monday's run uses, so success here is evidence for the scheduled one.
+    func runScheduleNow() async {
+        isRunningScheduleNow = true
+        defer { isRunningScheduleNow = false }
+        do {
+            try await runPlain(["schedule", "run", "--json"])
+            scheduleRunFeedback = "Started — it runs in the background; History will show it in a minute."
+        } catch {
+            scheduleRunFeedback = "Couldn't start it: \(error.localizedDescription)"
         }
     }
 
