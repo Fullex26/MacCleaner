@@ -935,8 +935,14 @@ final class CleanerBridge: ObservableObject {
         p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
         guard (try? p.run()) != nil else { return nil }
+        // mck bounds its own du calls now, but a wedged child must never pin
+        // an app thread forever regardless: hard-kill the whole soak run
+        // after 10 minutes. The first live soak hung exactly this way.
+        let killer = DispatchWorkItem { if p.isRunning { p.terminate(); kill(p.processIdentifier, SIGKILL) } }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 600, execute: killer)
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
+        killer.cancel()
         guard p.terminationStatus == 0,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rows = obj["targets"] as? [[String: Any]] else { return nil }
