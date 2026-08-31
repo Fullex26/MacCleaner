@@ -4,7 +4,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ---
 
-## Current State — v2.10.0 ✅
+## Current State — v2.15.0 ✅
 
 - Subcommand CLI — `scan`, `clean`, `projects`, `report`, `doctor`, `config`, `categories` — with every v1 spelling (`--preview`, `--clean --yes`, `--report`, `--json`, `--config-*`) still working, so existing cron jobs, aliases, and the old menu bar app don't break
 - Agent-ready interface — `--json` on every data command, stable kebab-case target IDs (`clean --targets npm-cache,pip-cache`), JSON on stdout / messages on stderr, documented exit codes, `AGENTS.md` contract
@@ -28,6 +28,8 @@ This document tracks planned features and long-term direction. Community input w
 - **v2.10 additions** — ten new cleanup targets (83 → 93), each found by scanning a real working developer Mac rather than guessed from vendor docs: `chrome-http-cache`, `spotify-browser-cache`, `clang-module-cache`, `electron-updater-pending` (`caches`); `typescript-cache` (`node`); `rustup-downloads` (`rust`); `ollama-updates`, `codex-sparkle-updates` (`ai`); plus review-only `codex-runtimes` and `antigravity-browser-profile`. `add()` gained a `paths=[...]` multi-path form, introduced because the Spotify target had to name two specific subdirectories: its apparent cache root turned out to be the app's embedded-Chromium profile holding logins, cookies and the DRM module, which a `--yes` sweep would have destroyed. Two new tests generalise that catch to every target — no `safe` target may resolve to a directory containing `Login Data`/`Cookies`/`Local State`, and no two targets may share a label. 406 tests total
 - **v2.9 additions** — a new `storage-insights` subcommand: a read-only scan of `~/Documents`, `~/Downloads`, and `~/Desktop` (overridable via `MACCLEANER_STORAGE_INSIGHTS_ROOTS`) for individually large files, 100 MB floor, top 50 by size, stat-only so it never opens file contents and never triggers an iCloud-eviction download/hang. Deliberately separate from the delete pipeline — no target, no category, untouched by `clean`/`--yes`/`--dry-run` — because "large" personal file isn't the same judgment as "safe, rebuildable cache." The app's Dashboard gained a matching "Large Files" panel with per-item Reveal in Finder, degrading gracefully on an engine that predates the subcommand. 395 tests total
 
+- **v2.11–v2.14 additions** — the Storage sidebar section (a read-only whole-disk drill-down over `storage-map --json`, with Move to Trash via `FileManager.trashItem` rather than the engine's delete path); accurate sizing everywhere (`du -x` so mounted disk images are never double-counted; allocated-blocks sizing so sparse files like `Docker.raw` report ~10 GB, not their 1 TB apparent size); `reclaimable_total()` de-duplicating nested targets out of the headline; three advisory `doctor` checks (Swap, Held-open files, System temp, Docker disk image); `storage-insights` widened to six roots with bundle-aware sizing; nested `/tmp` build-tree detection inside task workspaces with the delete carve-out widened to exactly two levels so those targets are actually deletable; and a tri-state `launchctl` check (`load_state`) so an unreachable `launchctl` is reported as "could not verify" instead of a broken schedule
+- **v2.15 additions** — the last three Phase 6 items land: `report --stats` (local-first usage analytics over `report.log` — nothing leaves the machine), `config sync on|off|status` (config in iCloud Drive behind a symlink, with `save_config` writing through it), and the weekly cleanup digest (the scheduled clean's notification now carries a trailing-7-day total, so the weekly run's notification is the weekly report); `tmp_min_age_days` default lowered 3 → 1 now that every tmp target is review-only; staged designs committed for the two remaining structural items (`docs/V3-SWIFT-ENGINE.md`, `docs/APP-STORE-FEASIBILITY.md`)
 ---
 
 ## Next — v2.x Ideas
@@ -103,9 +105,9 @@ This document tracks planned features and long-term direction. Community input w
 
 > Eliminates the Python dependency, making the tool accessible to all Mac users.
 
-- [ ] **Full Swift rewrite of cleaner engine** — replace `cleaner.py` with Swift, removing Python 3 requirement. Deliberately not done in v2.0: the Python engine is the tested core and the agent interface; Swift stays a thin client
+- [ ] **Full Swift rewrite of cleaner engine** — staged migration design accepted in `docs/V3-SWIFT-ENGINE.md` (contract fixtures → read-only `MacCleanerKit` → dual-engine soak → guard-first deletion port → cutover). Deliberately not attempted as one rewrite: the Python engine is the tested core, and parity for a deletion tool must be proved, not assumed
 - [x] **SwiftUI preferences window** — Settings tab in the v2.0 app, persisted through the same `config.json` as the CLI
-- [ ] **Sandboxed App Store build** — adapt for Mac App Store sandbox requirements
+- [ ] **Sandboxed App Store build** — assessed in `docs/APP-STORE-FEASIBILITY.md`: the sandbox denies exactly what MacCleaner does, so a MAS variant would be the read-only storage X-ray (`storage-map`/`storage-insights`), not the cleaner. Blocked on the V3 Swift core plus a product decision, not on engineering effort
 - [x] **Sparkle auto-updater** — shipped in v2.6.0, see Phase 4
 - [x] **Universal binary** — `app/build.sh` compiles arm64 + x86_64 and lipos them together
 
@@ -115,10 +117,10 @@ This document tracks planned features and long-term direction. Community input w
 
 > Long-term, if the project gains traction.
 
-- [ ] **Mac App Store release** — requires full native rewrite + sandboxing + Apple Developer account
-- [ ] **iCloud sync for config** — sync preferences across multiple Macs
-- [ ] **Usage analytics (opt-in)** — understand which cleanup categories are most valuable
-- [ ] **Scheduled scan reports** — weekly email/notification summarizing what was cleaned
+- [ ] **Mac App Store release** — see `docs/APP-STORE-FEASIBILITY.md`; revisit after V3 stage 3, when a Swift read-only core exists and the MAS variant becomes a packaging exercise. Requires owner-level App Store Connect actions
+- [x] **iCloud sync for config** — `config sync on|off|status` (v2.15.0): config.json lives in iCloud Drive behind a symlink, shared by the CLI, the app, and the launchd agents; `off` is local-only and leaves the iCloud copy for other Macs
+- [x] **Usage analytics (opt-in)** — `report --stats` (v2.15.0), implemented local-first: aggregates this machine's own `report.log` by target and category to answer "which categories are most valuable" with nothing ever leaving the machine. A networked telemetry backend was deliberately not built
+- [x] **Scheduled scan reports** — the weekly scheduled clean's completion notification now carries a trailing-7-day digest (v2.15.0) — the weekly run's notification is the weekly report, with no second agent and no plist change. Email was deliberately not built (no send infrastructure; notifications are the native channel)
 
 ---
 

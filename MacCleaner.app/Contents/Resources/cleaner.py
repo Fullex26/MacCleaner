@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.14.2"
+VERSION = "2.15.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -197,7 +197,7 @@ DEFAULT_CONFIG = {
     "project_roots": ["~/Documents", "~/Developer", "~/Projects", "~/Code", "~/dev"],
     "project_min_age_days": 30,
     "project_git_check": True,
-    "tmp_min_age_days": 3,           # /tmp dirs younger than this are never offered
+    "tmp_min_age_days": 1,           # /tmp dirs younger than this are never offered
     "simulator_stale_days": 30,      # simulators not booted for this long count as stale
     "app_leftover_min_age_days": 7,  # orphaned app data younger than this is never offered
     "notifications": True,           # notify when a scheduled clean finishes
@@ -249,8 +249,99 @@ def load_config():
 def save_config(cfg):
     """Atomic write (temp file + os.replace) so a torn write (two Settings
     clicks racing, or a crash mid-save) can never leave invalid JSON on disk
-    for load_config to trip over."""
-    _atomic_write_json(CONFIG_PATH, cfg)
+    for load_config to trip over.
+
+    When `config sync` is on, CONFIG_PATH is a symlink into iCloud Drive —
+    resolve it first, because os.replace() onto the symlink itself would
+    silently swap it for a plain local file and end syncing on the first
+    settings change."""
+    target = CONFIG_PATH
+    try:
+        if target.is_symlink():
+            target = Path(os.path.realpath(target))
+    except OSError:
+        pass
+    _atomic_write_json(target, cfg)
+
+
+def _icloud_config_dir():
+    """Where the synced config lives. iCloud Drive needs no entitlements, so
+    this works for a plain CLI + non-sandboxed app. MACCLEANER_ICLOUD_DIR
+    overrides for tests."""
+    override = os.environ.get("MACCLEANER_ICLOUD_DIR")
+    if override:
+        return Path(override)
+    return HOME / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "MacCleaner"
+
+
+def run_config_sync(action, json_mode=False):
+    """`config sync on|off|status` — keep config.json in iCloud Drive with a
+    symlink at CONFIG_PATH, so the CLI, the app, and the launchd agents all
+    read and write the shared copy unchanged.
+
+    Rules: `on` adopts an existing iCloud copy as the shared truth (that is
+    the point — a second Mac joining sync wants the first Mac's settings),
+    backing the local file up beside itself first. `off` is local-only: the
+    symlink becomes a real file with the current content, and the iCloud
+    copy stays for other Macs. The config file is ~1 KB, small enough that
+    iCloud's "optimize storage" eviction effectively never takes it."""
+    icloud_cfg = _icloud_config_dir() / "config.json"
+
+    def is_enabled():
+        try:
+            return (CONFIG_PATH.is_symlink()
+                    and os.path.realpath(CONFIG_PATH) == os.path.realpath(icloud_cfg))
+        except OSError:
+            return False
+
+    def state():
+        return {"enabled": is_enabled(),
+                "config_path": str(CONFIG_PATH),
+                "icloud_path": str(icloud_cfg)}
+
+    if action == "status":
+        st = state()
+        if json_mode:
+            print(json.dumps({"version": VERSION, "sync": st}, indent=2))
+        else:
+            print(f"Config sync: {'on' if st['enabled'] else 'off'}")
+            print(f"  config:  {st['config_path']}")
+            print(f"  iCloud:  {st['icloud_path']}")
+        return st
+
+    if action == "on":
+        if is_enabled():
+            print("Config sync is already on.")
+            return state()
+        icloud_cfg.parent.mkdir(parents=True, exist_ok=True)
+        local_is_file = CONFIG_PATH.exists() and not CONFIG_PATH.is_symlink()
+        if icloud_cfg.exists():
+            # iCloud copy wins; keep the local settings recoverable beside it.
+            if local_is_file:
+                shutil.copy2(CONFIG_PATH, CONFIG_PATH.parent / (CONFIG_PATH.name + ".pre-sync.bak"))
+                CONFIG_PATH.unlink()
+        elif local_is_file:
+            shutil.move(str(CONFIG_PATH), str(icloud_cfg))
+        else:
+            _atomic_write_json(icloud_cfg, load_config())
+        if CONFIG_PATH.is_symlink():
+            CONFIG_PATH.unlink()
+        os.symlink(str(icloud_cfg), str(CONFIG_PATH))
+        print(f"Config sync on — settings now live in iCloud Drive:\n  {icloud_cfg}")
+        return state()
+
+    if action == "off":
+        if not is_enabled():
+            print("Config sync is not on — nothing to do.")
+            return state()
+        current = load_config()
+        CONFIG_PATH.unlink()
+        _atomic_write_json(CONFIG_PATH, current)
+        print("Config sync off — settings are local again "
+              "(the iCloud copy remains for other Macs).")
+        return state()
+
+    raise ValueError(f"unknown sync action: {action}")
 
 
 # ── Size helpers ───────────────────────────────────────────────────────────────
@@ -1352,9 +1443,9 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
 
     if notify and load_config().get("notifications", True):
         cleaned = sum(1 for r in results if r["status"] in ("deleted", "trashed"))
-        _notify(f"MacCleaner freed {fmt_size(total_freed)}",
-                f"{cleaned} item{'s' if cleaned != 1 else ''} cleaned · "
-                f"{fmt_size(disk_stats()['free_bytes'])} free")
+        # write_log already ran, so the 7-day digest includes this run — the
+        # weekly scheduled clean's notification doubles as the weekly report.
+        _notify(*_clean_notification(total_freed, cleaned))
 
     if json_mode:
         print(json.dumps({
@@ -2179,7 +2270,7 @@ def scan_tmp_artifacts(config):
     skip_paths honored (AGENTS.md documents it as "never touch" -- the
     static get_targets()/add() path already drops any target under a
     skip prefix, and this scanner must match that, finding F1)."""
-    min_age = config.get("tmp_min_age_days", 3)
+    min_age = config.get("tmp_min_age_days", 1)
     cutoff = time.time() - min_age * 86400
     skip = [Path(os.path.expanduser(p)) for p in config.get("skip_paths", [])]
     hits = []
@@ -3287,6 +3378,138 @@ def write_log(total_freed: int, results: list):
         print(f"Warning: could not write log: {e}", file=sys.stderr)
 
 
+def _read_report_log():
+    """report.log as a list, or [] on any problem — never raises. Shared by
+    the weekly digest and the stats aggregation."""
+    try:
+        with open(LOG_PATH) as f:
+            logs = json.load(f)
+        return logs if isinstance(logs, list) else []
+    except Exception:
+        return []
+
+
+def _weekly_digest_totals(now=None):
+    """(bytes_freed, run_count) over the trailing 7 days of report.log.
+
+    Feeds the scheduled clean's notification (Phase 6 "scheduled scan
+    reports"): the scheduled clean is itself weekly, so its completion
+    notification doubles as the weekly summary — no second agent, no plist
+    change, existing installs pick it up with the engine update."""
+    now = now or datetime.datetime.now()
+    cutoff = now - datetime.timedelta(days=7)
+    freed = runs = 0
+    for entry in _read_report_log():
+        try:
+            ts = datetime.datetime.fromisoformat(entry["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ts >= cutoff:
+            freed += int(entry.get("total_freed_bytes", 0) or 0)
+            runs += 1
+    return freed, runs
+
+
+def _clean_notification(total_freed, cleaned):
+    """(title, message) for the post-clean notification. Called after
+    write_log, so the run being announced is already in the 7-day window."""
+    week_bytes, week_runs = _weekly_digest_totals()
+    title = f"MacCleaner freed {fmt_size(total_freed)}"
+    message = (f"{cleaned} item{'s' if cleaned != 1 else ''} cleaned · "
+               f"{fmt_size(week_bytes)} freed this week "
+               f"({week_runs} run{'s' if week_runs != 1 else ''}) · "
+               f"{fmt_size(disk_stats()['free_bytes'])} free")
+    return title, message
+
+
+_DYNAMIC_ID_CATEGORIES = (("tmp-", "tmp"), ("project-", "projects"),
+                          ("leftover-", "leftovers"), ("simulator-", "simulators"))
+
+
+def _aggregate_stats():
+    """Local-first usage stats over report.log (Phase 6 "usage analytics").
+
+    Everything is computed from this machine's own cleanup history and
+    nothing ever leaves the machine — "opt-in" is running the command. An
+    item counts as usage only when it actually freed bytes; skips and
+    errors are not usage. Categories come from the current target table,
+    with dynamic-family IDs (tmp-*/project-*/leftover-*/simulator-*)
+    mapped by their stable prefix since those IDs are per-machine."""
+    logs = _read_report_log()
+    try:
+        id_to_cat = {t["id"]: t["category"]
+                     for t in get_targets(load_config(), all_categories=True)}
+    except Exception:
+        id_to_cat = {}
+
+    def category_of(tid):
+        if tid in id_to_cat:
+            return id_to_cat[tid]
+        for prefix, cat in _DYNAMIC_ID_CATEGORIES:
+            if tid.startswith(prefix):
+                return cat
+        return "other"
+
+    per_target = {}
+    total = 0
+    first_run = last_run = None
+    for run in logs:
+        ts = run.get("timestamp")
+        if ts:
+            first_run = first_run or ts
+            last_run = ts
+        total += int(run.get("total_freed_bytes", 0) or 0)
+        for item in run.get("items", []):
+            freed = int(item.get("freed", 0) or 0)
+            if freed <= 0:
+                continue
+            tid = item.get("id", "?")
+            d = per_target.setdefault(tid, {
+                "id": tid, "label": item.get("label", tid),
+                "category": category_of(tid),
+                "freed_bytes": 0, "times_cleaned": 0})
+            d["freed_bytes"] += freed
+            d["times_cleaned"] += 1
+
+    targets = sorted(per_target.values(),
+                     key=lambda d: (-d["freed_bytes"], d["id"]))
+    per_cat = {}
+    for d in targets:
+        pc = per_cat.setdefault(d["category"],
+                                {"category": d["category"],
+                                 "freed_bytes": 0, "times_cleaned": 0})
+        pc["freed_bytes"] += d["freed_bytes"]
+        pc["times_cleaned"] += d["times_cleaned"]
+    categories = sorted(per_cat.values(),
+                        key=lambda d: (-d["freed_bytes"], d["category"]))
+    return {"runs": len(logs), "total_freed_bytes": total,
+            "total_freed_human": fmt_size(total),
+            "first_run": first_run, "last_run": last_run,
+            "targets": targets, "categories": categories}
+
+
+def show_stats(json_mode=False):
+    stats = _aggregate_stats()
+    if json_mode:
+        print(json.dumps({"version": VERSION, "stats": stats}, indent=2))
+        return
+    if not stats["runs"]:
+        print("No cleanup history yet — run 'maccleaner clean' first.")
+        return
+    print(f"── MacCleaner Usage Stats ── {stats['runs']} runs · "
+          f"{stats['total_freed_human']} freed all-time")
+    print()
+    print("By category:")
+    for c in stats["categories"]:
+        print(f"  {c['category']:<14} {fmt_size(c['freed_bytes']):>10}  "
+              f"({c['times_cleaned']}×)")
+    print()
+    print("Top targets:")
+    for t in stats["targets"][:15]:
+        print(f"  {t['label'][:40]:<40} {fmt_size(t['freed_bytes']):>10}  "
+              f"({t['times_cleaned']}×)")
+
+
 # ── Disk snapshots ──────────────────────────────────────────────────────────────
 def load_snapshots():
     if not SNAPSHOTS_PATH.exists():
@@ -4006,6 +4229,8 @@ def build_parser():
 
     p_report = sub.add_parser("report", help="Show cleanup history")
     p_report.add_argument("-n", "--limit", type=int, default=10, help="Number of runs to show")
+    p_report.add_argument("--stats", action="store_true",
+                          help="Aggregate usage stats (local-only) instead of the run list")
     p_report.add_argument("--json", action="store_true", help="Machine-readable output")
 
     p_doctor = sub.add_parser("doctor", help="Check environment / install health")
@@ -4020,6 +4245,11 @@ def build_parser():
     c_dis = csub.add_parser("disable", help="Disable a category")
     c_dis.add_argument("category")
     c_set = csub.add_parser("set", help="Set a config key (value parsed as JSON when possible)")
+    c_sync = csub.add_parser("sync", help="Sync config across Macs via iCloud Drive")
+    c_sync.add_argument("sync_action", choices=["on", "off", "status"],
+                        help="on: move config to iCloud Drive and symlink it; "
+                             "off: make it local again; status: show state")
+    c_sync.add_argument("--json", action="store_true", help="Machine-readable output (status)")
     c_set.add_argument("key")
     c_set.add_argument("value")
 
@@ -4089,6 +4319,8 @@ def main():
             cmd_config_set_category(config, args.config_cmd, args.category.lower())
         elif args.config_cmd == "set":
             cmd_config_set_key(config, args.key, args.value)
+        elif args.config_cmd == "sync":
+            run_config_sync(args.sync_action, json_mode=getattr(args, "json", False))
         return
 
     if args.command == "categories":
@@ -4114,7 +4346,10 @@ def main():
         return
 
     if args.command == "report":
-        show_report(limit=args.limit, json_mode=args.json)
+        if args.stats:
+            show_stats(json_mode=args.json)
+        else:
+            show_report(limit=args.limit, json_mode=args.json)
         return
 
     if args.command == "projects":

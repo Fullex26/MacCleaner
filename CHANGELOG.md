@@ -7,6 +7,42 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [2.15.0] — 2026-08-31
+
+The release that closes out the roadmap's Phase 6. All three remaining
+tractable items land, implemented local-first; the two structural items
+(Swift engine, App Store) get committed staged designs instead of unverified
+code — see `docs/V3-SWIFT-ENGINE.md` and `docs/APP-STORE-FEASIBILITY.md`.
+
+### Added
+- **`report --stats [--json]`** — local usage analytics aggregated from this
+  machine's own `report.log`: totals, per-target and per-category freed bytes
+  and clean counts, sorted by value. Nothing ever leaves the machine —
+  "opt-in" is running the command; a telemetry backend was deliberately not
+  built. Dynamic-family IDs (`tmp-*`, `project-*`, `leftover-*`,
+  `simulator-*`) are attributed to their category by stable prefix.
+- **`config sync on|off|status [--json]`** — optional config sync via iCloud
+  Drive: `config.json` relocates to
+  `~/Library/Mobile Documents/com~apple~CloudDocs/MacCleaner/` with a symlink
+  at the config path, so the CLI, the app, and the launchd agents all keep
+  reading and writing it unchanged. A second Mac turning sync on adopts the
+  iCloud copy as the shared truth (its local file is backed up beside itself
+  as `config.json.pre-sync.bak`); `off` is local-only and leaves the iCloud
+  copy for other Macs. `save_config` now resolves the symlink before its
+  atomic write — without that, the first settings change would have silently
+  replaced the symlink with a plain local file and ended syncing.
+- **Weekly cleanup digest** — `clean --notify`'s notification now appends a
+  trailing-7-day total ("2.3 GB freed this week (3 runs)"). The scheduled
+  clean is itself weekly, so its completion notification doubles as the
+  weekly cleanup report: no second agent, no plist change, existing installed
+  schedules pick it up with the engine update.
+
+### Changed
+- **`tmp_min_age_days` default lowered 3 → 1.** Every tmp target is
+  review-only (`--yes` never takes one), so the age gate's only job is
+  keeping an *active* task's workspace out of the list — and at 3 days,
+  multi-GB finished workspaces sat invisible on a 90%-full disk for most of a
+  week. An explicit `config set tmp_min_age_days N` is unaffected.
 ## [2.14.2] — 2026-08-29
 
 ### Fixed
