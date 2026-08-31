@@ -216,6 +216,16 @@ jobs:
           # code; inside-out signing is the recommended pattern — see step 1.5
           # above, which now does exactly that for Sparkle.framework. --deep
           # is correct and kept on --verify below, which is a read-only check.)
+          # mck (V3 soak engine, 2.17.0): a standalone Mach-O in Resources.
+          # The notary rejects ANY unsigned nested executable — v2.17.0's
+          # first release attempt failed with six "binary is not signed"
+          # errors, all pointing at Resources/mck. Signed before the outer
+          # app, like Sparkle's binaries; conditional because local/dev
+          # builds without a Swift toolchain legitimately omit it.
+          if [ -f "$APP/Contents/Resources/mck" ]; then
+            codesign --force --options runtime --timestamp \
+              --sign "$IDENTITY" --keychain "$KEYCHAIN" "$APP/Contents/Resources/mck"
+          fi
           codesign --force --options runtime --timestamp \
             --sign "$IDENTITY" --keychain "$KEYCHAIN" "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
