@@ -164,6 +164,8 @@ _maccleaner_config_keys() {
     'low_disk_alerts:warn when free space is low'
     'low_disk_threshold_gb:low-disk threshold'
     'full_refresh_hours:app full-scan cadence'
+    'show_in_dock:show a Dock icon as well as the menu bar'
+    'v3_soak:run the V3 engine read-only beside scans'
     'tmp_min_age_days:minimum /tmp artifact age'
     'simulator_stale_days:minimum unused simulator age'
     'app_leftover_min_age_days:minimum orphaned app-data age'

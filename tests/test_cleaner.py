@@ -415,6 +415,39 @@ class TestSystemTempAdvisory(unittest.TestCase):
                                  f"{t['id']} must not target the system temp dir")
 
 
+class TestGetSizePartialOutput(unittest.TestCase):
+    """du exits NON-ZERO when any subdirectory is unreadable — while still
+    printing a correct total for everything it could read. get_size() treated
+    that exit code as failure and discarded the number, so ~/Library/Caches
+    (one unreadable com.apple.* subdir inside) measured 0 bytes against a
+    real 6.7 GB, deterministically — found by the V3 dual-engine soak on its
+    first real run, because the Swift engine parsed the partial total and the
+    Python engine didn't. A partial total is the honest answer; 0 is not."""
+
+    def _run(self, rc, stdout):
+        def fake(argv, **kw):
+            return subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr="du: x: Permission denied")
+        return fake
+
+    def test_partial_total_survives_nonzero_exit(self):
+        with mock.patch.object(cleaner.subprocess, "run",
+                               side_effect=self._run(1, "6697524\t/x\n")):
+            with mock.patch.object(Path, "exists", return_value=True):
+                self.assertEqual(cleaner.get_size(Path("/x")), 6697524 * 1024)
+
+    def test_zero_only_when_stdout_unusable(self):
+        with mock.patch.object(cleaner.subprocess, "run",
+                               side_effect=self._run(1, "")):
+            with mock.patch.object(Path, "exists", return_value=True):
+                self.assertEqual(cleaner.get_size(Path("/x")), 0)
+
+    def test_clean_exit_still_works(self):
+        with mock.patch.object(cleaner.subprocess, "run",
+                               side_effect=self._run(0, "8\t/x\n")):
+            with mock.patch.object(Path, "exists", return_value=True):
+                self.assertEqual(cleaner.get_size(Path("/x")), 8 * 1024)
+
+
 class TestGetSizeDoesNotCrossMounts(unittest.TestCase):
     """get_size() measures every target. Without -x it walks into mounted disk
     images and counts their contents on top of the image file -- the same flaw

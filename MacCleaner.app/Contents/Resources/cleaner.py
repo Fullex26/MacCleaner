@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.16.0"
+VERSION = "2.17.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -205,6 +205,7 @@ DEFAULT_CONFIG = {
     "low_disk_threshold_gb": 10,     # the low-disk warning threshold
     "full_refresh_hours": 6,         # how often the app runs a full scan (app-side)
     "show_in_dock": False,           # app-side: show a Dock icon as well as the menu bar
+    "v3_soak": True,                 # app-side: run the V3 engine read-only beside scans and log divergence
 }
 
 
@@ -360,8 +361,18 @@ def get_size(path: Path) -> int:
             ["du", "-skx", str(path)],
             capture_output=True, text=True, timeout=120
         )
-        if result.returncode == 0:
-            return int(result.stdout.split()[0]) * 1024
+        # du exits non-zero when ANY subdirectory is unreadable -- while
+        # still printing a correct total for everything it could read.
+        # Gating on returncode == 0 threw that number away: ~/Library/Caches
+        # (one unreadable com.apple.* subdir inside) measured 0 bytes against
+        # a real 6.7 GB, deterministically. Found by the V3 dual-engine soak
+        # on its first live run -- the Swift engine parsed the partial total,
+        # the Python engine didn't, and the disagreement was the bug. A
+        # partial total is the honest answer; parse stdout whenever it's
+        # usable and let 0 mean only "du said nothing".
+        parts = result.stdout.split()
+        if parts and parts[0].isdigit():
+            return int(parts[0]) * 1024
     except Exception:
         pass
     return 0
