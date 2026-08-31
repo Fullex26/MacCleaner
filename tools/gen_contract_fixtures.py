@@ -26,7 +26,7 @@ REPO = Path(__file__).resolve().parent.parent
 ENGINE = REPO / "cleaner.py"
 BLOCK = 4096
 
-CATEGORIES = ["xcode", "node", "python", "caches", "tmp", "leftovers"]
+CATEGORIES = ["xcode", "node", "python", "caches", "tmp", "leftovers", "simulators"]
 
 # path (relative to fake HOME) -> size in 4KiB blocks
 SEED_FILES = {
@@ -98,15 +98,135 @@ def _seed_tmp_root(tmp: Path):
     aged(g)
 
 
+LEFTOVER_AGE = 10 * 86400   # > app_leftover_min_age_days (7) by margin
+
+
+def _seed_leftover_lib(lib: Path, apps: Path):
+    """Leftovers sandbox: one orphan spanning several roots, one candidate
+    owned by an installed app (case-insensitive), one owned via wrapper
+    nesting, Apple/self exclusions, wrong shapes, and a symlink trap.
+    mdfind is absent from the stub PATH, so the Spotlight pass degrades to a
+    no-op in BOTH engines. All sizes 4 KiB multiples."""
+    import time as _t
+    old = _t.time() - LEFTOVER_AGE
+
+    def aged(*paths):
+        for p in paths:
+            os.utime(p, (old, old))
+
+    # roots
+    for r in ("Caches", "Preferences", "Saved Application State",
+              "HTTPStorages", "WebKit"):
+        (lib / r).mkdir(parents=True, exist_ok=True)
+    # the orphan, present in four roots with per-root shapes
+    d = lib / "Caches" / "com.gone.app"; d.mkdir()
+    (d / "blob").write_bytes(b"x" * (2 * BLOCK)); aged(d)
+    w = lib / "WebKit" / "com.gone.app"; w.mkdir()
+    (w / "blob").write_bytes(b"x" * BLOCK); aged(w)
+    pl = lib / "Preferences" / "com.gone.app.plist"
+    pl.write_bytes(b"x" * BLOCK); aged(pl)
+    sv = lib / "Saved Application State" / "com.gone.app.savedState"; sv.mkdir()
+    (sv / "data.data").write_bytes(b"x" * BLOCK); aged(sv)
+    # a second orphan: binarycookies FILE shape
+    ck = lib / "HTTPStorages" / "com.cookie.only.binarycookies"
+    ck.write_bytes(b"x" * BLOCK); aged(ck)
+    # excluded: Apple domain, however orphaned
+    ap = lib / "Caches" / "com.apple.something"; ap.mkdir(); aged(ap)
+    # owned: installed app (opposite case in its Info.plist)
+    owned = lib / "Caches" / "com.installed.tool"; owned.mkdir(); aged(owned)
+    sub = lib / "Caches" / "com.installed.tool.helper"; sub.mkdir(); aged(sub)
+    # owned via wrapper-nested .app
+    wr = lib / "Caches" / "com.wrapped.app"; wr.mkdir(); aged(wr)
+    # wrong shapes: file where dir expected; dir where file expected
+    (lib / "Caches" / "com.file.shaped").write_bytes(b"x"); aged(lib / "Caches" / "com.file.shaped")
+    bad = lib / "Preferences" / "com.dir.shaped.plist"; bad.mkdir(); aged(bad)
+    # symlink: never a candidate
+    os.symlink(str(d), str(lib / "Caches" / "com.linked.app"))
+    # too young: refused by the age gate
+    yg = lib / "Caches" / "com.too.young"; yg.mkdir()
+    # installed apps
+    plist = ('<?xml version="1.0" encoding="UTF-8"?>'
+             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+             '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+             '<plist version="1.0"><dict><key>CFBundleIdentifier</key>'
+             '<string>%s</string></dict></plist>')
+    t = apps / "Tool.app" / "Contents"; t.mkdir(parents=True)
+    (t / "Info.plist").write_text(plist % "com.installed.TOOL")
+    v = apps / "Vendor Wrapper" / "Wrapped.app" / "Contents"; v.mkdir(parents=True)
+    (v / "Info.plist").write_text(plist % "com.wrapped.app")
+
+
+def _write_xcrun_stub(stub: Path, root: Path):
+    """Canned `xcrun simctl` for the sandbox: fixed ancient timestamps (so
+    staleness never depends on when fixtures are generated), a booted device
+    that must be skipped, an injection-shaped udid that must be dropped, a
+    device with no timestamps whose aged dataPath exercises the mtime
+    fallback, and the Xcode-26 UUID-keyed runtime shape with one unused
+    runtime. dataPaths point into the sandbox at 4 KiB seeds."""
+    dp1 = root / "simdata" / "dev1"
+    dp2 = root / "simdata" / "dev2"
+    for d in (dp1, dp2):
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "disk.img").write_bytes(b"x" * (2 * BLOCK))
+    import time as _t
+    old = _t.time() - TMP_AGE * 20
+    for d in (dp1, dp2):
+        os.utime(d, (old, old))
+    devices = {
+        "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+                {"udid": "AAAAAAAA-0000-0000-0000-000000000001", "name": "Stale One",
+                 "state": "Shutdown", "lastBootedAt": "2019-01-01T00:00:00Z",
+                 "dataPath": str(dp1)},
+                {"udid": "AAAAAAAA-0000-0000-0000-000000000002", "name": "Booted",
+                 "state": "Booted", "lastBootedAt": "2019-01-01T00:00:00Z"},
+                {"udid": "AAAAAAAA-0000-0000-0000-000000000003", "name": "Mtime Fallback",
+                 "state": "Shutdown", "dataPath": str(dp2)},
+                {"udid": "evil;rm -rf /", "name": "Injection",
+                 "state": "Shutdown", "lastBootedAt": "2019-01-01T00:00:00Z"},
+            ],
+        }
+    }
+    runtimes = {
+        "11111111-2222-3333-4444-555555555555": {
+            "identifier": "11111111-2222-3333-4444-555555555555",
+            "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-1",
+            "state": "Ready", "sizeBytes": 8000000000, "deletable": True},
+        "66666666-7777-8888-9999-000000000000": {
+            "identifier": "66666666-7777-8888-9999-000000000000",
+            "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+            "state": "Ready", "sizeBytes": 5000000000, "deletable": True},
+    }
+    devices_json = json.dumps(devices).replace("'", "'\\''")
+    runtimes_json = json.dumps(runtimes).replace("'", "'\\''")
+    lines = [
+        "#!/bin/bash",
+        "# Uses ONLY bash builtins: the sandbox PATH holds just du/xcrun, so",
+        "# forking cat/sed/etc. here fails silently with output nobody sees.",
+        'case "$*" in',
+        '  *"list devices"*) printf \'%s\\n\' \'' + "'PLACEHOLDER_D'" + '\' ;;',
+        '  *"runtime list"*) printf \'%s\\n\' \'' + "'PLACEHOLDER_R'" + '\' ;;',
+        "  *) exit 1 ;;",
+        "esac",
+    ]
+    script = "\n".join(lines) + "\n"
+    script = script.replace("'PLACEHOLDER_D'", devices_json)
+    script = script.replace("'PLACEHOLDER_R'", runtimes_json)
+    (stub / "xcrun").write_text(script)
+    os.chmod(stub / "xcrun", 0o755)
+
+
 def build_sandbox(root: Path):
     home = root / "home"
     for rel, blocks in SEED_FILES.items():
         p = home / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"x" * (blocks * BLOCK))
-    for extra in ["tmp-root", "leftover-lib", "apps", "agents", "state"]:
+    for extra in ["tmp-root", "leftover-lib", "apps", "agents", "state", "bin"]:
         (root / extra).mkdir(parents=True, exist_ok=True)
     _seed_tmp_root(root / "tmp-root")
+    _seed_leftover_lib(root / "leftover-lib", root / "apps")
+    _write_xcrun_stub(root / "bin", root)
     cfg = {
         "enabled_categories": CATEGORIES,
         "skip_paths": [],
@@ -124,8 +244,8 @@ def build_sandbox(root: Path):
 
 def base_env(root: Path):
     stub = root / "bin"
-    if not stub.exists():
-        stub.mkdir()
+    stub.mkdir(exist_ok=True)
+    if not (stub / "du").exists():
         os.symlink("/usr/bin/du", stub / "du")
     return {
         "HOME": str(root / "home"),

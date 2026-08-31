@@ -27,6 +27,8 @@ public struct Config {
     public var enabledCategories: [String]
     public var skipPaths: [String]
     public var tmpMinAgeDays: Double = 1
+    public var simulatorStaleDays: Double = 30
+    public var appLeftoverMinAgeDays: Double = 7
 
     /// Mirrors load_config()'s merge-with-defaults posture for the two keys
     /// Stage 2 needs: a missing/unreadable config means "everything enabled,
@@ -41,6 +43,10 @@ public struct Config {
             var cfg = Config(enabledCategories: Array(enabled), skipPaths: skip)
             if let d = obj["tmp_min_age_days"] as? Double { cfg.tmpMinAgeDays = d }
             else if let i = obj["tmp_min_age_days"] as? Int { cfg.tmpMinAgeDays = Double(i) }
+            if let d = obj["simulator_stale_days"] as? Double { cfg.simulatorStaleDays = d }
+            else if let i = obj["simulator_stale_days"] as? Int { cfg.simulatorStaleDays = Double(i) }
+            if let d = obj["app_leftover_min_age_days"] as? Double { cfg.appLeftoverMinAgeDays = d }
+            else if let i = obj["app_leftover_min_age_days"] as? Int { cfg.appLeftoverMinAgeDays = Double(i) }
             return cfg
         }
         return Config(enabledCategories: Array(enabled), skipPaths: skip)

@@ -3,6 +3,16 @@
   "disk_stats": "<DISK>",
   "targets": [
     {
+      "category": "simulators",
+      "description": "Runtime images with no simulator devices \u2014 re-downloadable in Xcode",
+      "exists": true,
+      "id": "simulator-unused-runtimes",
+      "label": "Unused simulator runtimes (1)",
+      "safe": false,
+      "size_bytes": 8000000000,
+      "size_human": "7.5 GB"
+    },
+    {
       "category": "caches",
       "description": "Everything in ~/Library/Caches \u2014 broad; review before deleting",
       "exists": true,
@@ -53,6 +63,16 @@
       "size_human": "24.0 KB"
     },
     {
+      "category": "leftovers",
+      "description": "Found in: Caches, Preferences, Saved Application State, WebKit \u2014 no installed app matches this bundle ID; review before deleting",
+      "exists": true,
+      "id": "leftover-com-gone-app",
+      "label": "App leftovers: com.gone.app",
+      "safe": false,
+      "size_bytes": 20480,
+      "size_human": "20.0 KB"
+    },
+    {
       "category": "xcode",
       "description": "Build output from projects using a custom DerivedData path; rebuilt on the next build, exactly like the default location",
       "exists": true,
@@ -83,6 +103,16 @@
       "size_human": "16.0 KB"
     },
     {
+      "category": "simulators",
+      "description": "Not booted in 30d: Stale One, Mtime Fallback \u2014 deleted via simctl",
+      "exists": true,
+      "id": "simulator-stale-devices",
+      "label": "Stale simulator devices (2)",
+      "safe": false,
+      "size_bytes": 16384,
+      "size_human": "16.0 KB"
+    },
+    {
       "category": "python",
       "description": "pip download/wheel cache",
       "exists": true,
@@ -108,6 +138,16 @@
       "exists": true,
       "id": "tmp-xcactivity-ws",
       "label": "/tmp: xcactivity-ws",
+      "safe": false,
+      "size_bytes": 4096,
+      "size_human": "4.0 KB"
+    },
+    {
+      "category": "leftovers",
+      "description": "Found in: HTTPStorages \u2014 no installed app matches this bundle ID; review before deleting",
+      "exists": true,
+      "id": "leftover-com-cookie-only",
+      "label": "App leftovers: com.cookie.only",
       "safe": false,
       "size_bytes": 4096,
       "size_human": "4.0 KB"
@@ -594,7 +634,7 @@
     }
   ],
   "timestamp": "<TS>",
-  "total_reclaimable_bytes": 204800,
-  "total_reclaimable_human": "200.0 KB",
+  "total_reclaimable_bytes": 8000245760,
+  "total_reclaimable_human": "7.5 GB",
   "version": "2.16.0"
 }
