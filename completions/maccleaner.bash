@@ -241,7 +241,7 @@ categories schedule disk-check storage-insights storage-map install-deps --help 
 --dry-run --notify --json --help" -- "$cur") ) ;;
         projects) COMPREPLY=( $(compgen -W "--roots --min-age-days --clean --yes --targets \
 --trash --dry-run --json --help" -- "$cur") ) ;;
-        report) COMPREPLY=( $(compgen -W "-n --limit --json --help" -- "$cur") ) ;;
+        report) COMPREPLY=( $(compgen -W "-n --limit --stats --json --help" -- "$cur") ) ;;
         doctor|categories|storage-insights)
                 COMPREPLY=( $(compgen -W "--json --help" -- "$cur") ) ;;
         disk-check)
@@ -277,7 +277,9 @@ app_leftover_min_age_days" -- "$cur") )
                         else
                             COMPREPLY=()
                         fi ;;
-                    *)  COMPREPLY=( $(compgen -W "show path enable disable set --help" -- "$cur") ) ;;
+                    sync)
+                        COMPREPLY=( $(compgen -W "on off status --json" -- "$cur") ) ;;
+                    *)  COMPREPLY=( $(compgen -W "show path enable disable set sync --help" -- "$cur") ) ;;
                 esac ;;
         install-deps) COMPREPLY=( $(compgen -W "--help" -- "$cur") ) ;;
         *)      COMPREPLY=() ;;

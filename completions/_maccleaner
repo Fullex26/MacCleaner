@@ -256,6 +256,7 @@ _maccleaner() {
         report)
           _arguments -s -S \
             '(-n --limit)'{-n+,--limit=}'[number of runs to show]:count:' \
+            '--stats[aggregate usage stats (local-only) instead of the run list]' \
             '--json[machine-readable output]' \
             '(-h --help)'{-h,--help}'[show help]' && ret=0
           ;;
@@ -283,12 +284,22 @@ _maccleaner() {
                 'enable:enable a category'
                 'disable:disable a category'
                 'set:set a config key'
+                'sync:sync config across Macs via iCloud Drive'
               )
               _describe -t config-actions 'config action' actions && ret=0
               ;;
             config-arg)
               case $words[1] in
                 enable|disable) _maccleaner_categories && ret=0 ;;
+                sync)
+                  _arguments -s -S \
+                    '1:action:((
+                        on\:"move config to iCloud Drive and symlink it"
+                        off\:"make config local again"
+                        status\:"show sync state"
+                     ))' \
+                    '--json[machine-readable output (status)]' && ret=0
+                  ;;
                 set)
                   _arguments \
                     '1:config key:_maccleaner_config_keys' \

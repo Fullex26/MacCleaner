@@ -29,7 +29,7 @@ eq "equals form"          "npm-cache,pip-cache" "$(B 'maccleaner clean --targets
 eq "no dupes offered"     "0"  "$(B 'maccleaner clean --targets npm-cache,' | grep -cx 'npm-cache')"
 eq "projects --targets is freeform, not cleanup ids" "0" "$(B 'maccleaner projects --targets ' | grep -cx 'npm-cache')"
 eq "projects --targets freeform w/ prefix"           "0" "$(B 'maccleaner projects --targets npm' | grep -cx 'npm-cache')"
-eq "config actions"       "show path enable disable set" "$(B 'maccleaner config ' | grep -v '^--' | tr '\n' ' ' | sed 's/ $//')"
+eq "config actions"       "show path enable disable set sync" "$(B 'maccleaner config ' | grep -v '^--' | tr '\n' ' ' | sed 's/ $//')"
 eq "config enable cats"   "23" "$(B 'maccleaner config enable ' | wc -l | tr -d ' ')"
 eq "engine down -> static" "23" "$(env MACCLEANER_ENGINE=/nope HOME=/tmp/nohome bash "$HERE/bashtest.sh" "$HERE/maccleaner.bash" 'maccleaner config enable ' | wc -l | tr -d ' ')"
 
@@ -38,7 +38,7 @@ eq "alias mclean flags"    "--yes --targets --category --min-size --trash --dry-
 eq "alias mclean --y"      "--yes " "$(B 'mclean --y')"
 eq "alias mpreview flags"  "--category --min-size --all --json --help" "$(B 'mpreview ' | tr '\n' ' ' | sed 's/ $//')"
 eq "alias mpreview --a"    "--all " "$(B 'mpreview --a')"
-eq "alias mreport flags"   "-n --limit --json --help" "$(B 'mreport ' | tr '\n' ' ' | sed 's/ $//')"
+eq "alias mreport flags"   "-n --limit --stats --json --help" "$(B 'mreport ' | tr '\n' ' ' | sed 's/ $//')"
 eq "alias mreport --l"     "--limit " "$(B 'mreport --l')"
 eq "alias mclean --targets" "94" "$(B 'mclean --targets ' | wc -l | tr -d ' ')"
 

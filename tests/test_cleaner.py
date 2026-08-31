@@ -3538,7 +3538,9 @@ class TestCategoryMigration(unittest.TestCase):
 
     def test_new_config_keys_default(self):
         cfg = self._load_with({"enabled_categories": []})
-        self.assertEqual(cfg["tmp_min_age_days"], 3)
+        # 1 since 2.15.0 (was 3): tmp targets are review-only, so the age
+        # gate only needs to shield an ACTIVE task's workspace.
+        self.assertEqual(cfg["tmp_min_age_days"], 1)
         self.assertEqual(cfg["simulator_stale_days"], 30)
 
     def test_fresh_install_disable_survives_reload(self):
@@ -6345,3 +6347,253 @@ class TestStorageInsightsCommand(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTmpMinAgeDefault(unittest.TestCase):
+    """2.15.0 lowers tmp_min_age_days from 3 to 1. Rationale: every tmp
+    target is review-only, so the age gate's only job is keeping an ACTIVE
+    task's workspace out of the list -- and a workspace idle for a full day
+    is not active. At 3 days, multi-GB finished workspaces sat invisible on
+    a 90%-full disk for most of a week."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self._p = mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self.td.cleanup()
+
+    def test_default_config_value_is_one_day(self):
+        self.assertEqual(cleaner.DEFAULT_CONFIG["tmp_min_age_days"], 1)
+
+    def test_two_day_old_workspace_offered_when_config_omits_the_key(self):
+        """Pins the .get() fallback literal inside scan_tmp_artifacts, not
+        just DEFAULT_CONFIG -- an old config.json without the key must get
+        the same default."""
+        d = self.root / "old-workspace"
+        (d / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        old = time.time() - 2 * 86400
+        os.utime(d, (old, old))
+        hits = cleaner.scan_tmp_artifacts({})
+        self.assertEqual([h["path"].name for h in hits], ["old-workspace"])
+
+    def test_twelve_hour_old_workspace_still_protected(self):
+        d = self.root / "active-workspace"
+        (d / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        recent = time.time() - 12 * 3600
+        os.utime(d, (recent, recent))
+        self.assertEqual(cleaner.scan_tmp_artifacts({}), [])
+
+
+class TestWeeklyDigest(unittest.TestCase):
+    """Phase 6 'scheduled scan reports': the scheduled clean is weekly, so
+    its completion notification IS the weekly report -- it now carries a
+    trailing-7-day total alongside the current run. No plist change, so
+    existing installed schedules pick it up on the next engine update."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.log = Path(self.td.name) / "report.log"
+        self._p = mock.patch.object(cleaner, "LOG_PATH", self.log)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self.td.cleanup()
+
+    def _seed(self, entries):
+        now = datetime.datetime.now()
+        data = [{"timestamp": (now - datetime.timedelta(days=age)).isoformat(),
+                 "total_freed_bytes": freed, "items": []}
+                for age, freed in entries]
+        self.log.write_text(json.dumps(data))
+
+    def test_window_is_trailing_seven_days(self):
+        self._seed([(0.1, 100), (3, 200), (10, 400)])
+        freed, runs = cleaner._weekly_digest_totals()
+        self.assertEqual((freed, runs), (300, 2))
+
+    def test_missing_log_is_zero(self):
+        freed, runs = cleaner._weekly_digest_totals()
+        self.assertEqual((freed, runs), (0, 0))
+
+    def test_corrupt_log_is_zero_not_a_crash(self):
+        self.log.write_text("not json{")
+        self.assertEqual(cleaner._weekly_digest_totals(), (0, 0))
+
+    def test_notification_message_carries_week_total(self):
+        """The message builder is what run_clean hands to _notify. The run
+        being notified is already in report.log at that point, so the week
+        clause is always present and always includes this run."""
+        self._seed([(0.01, 512 * 1024 * 1024), (2, 512 * 1024 * 1024)])
+        title, message = cleaner._clean_notification(512 * 1024 * 1024, 3)
+        self.assertIn("freed", title.lower())
+        self.assertIn("this week", message)
+        self.assertIn("2 runs", message)
+        self.assertIn("1.0 GB", message)  # the 7-day total, not just this run
+
+
+class TestReportStats(unittest.TestCase):
+    """Phase 6 'usage analytics (opt-in)', implemented local-first: the
+    aggregation runs over the machine's own report.log and nothing ever
+    leaves the machine -- 'opt-in' is running the command. Answers the
+    question the roadmap item actually asked ('which categories are most
+    valuable') without a telemetry backend."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.log = Path(self.td.name) / "report.log"
+        self._p = mock.patch.object(cleaner, "LOG_PATH", self.log)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self.td.cleanup()
+
+    def _seed_two_runs(self):
+        now = datetime.datetime.now()
+        self.log.write_text(json.dumps([
+            {"timestamp": (now - datetime.timedelta(days=2)).isoformat(),
+             "total_freed_bytes": 300,
+             "items": [
+                 {"id": "npm-cache", "label": "npm cache", "freed": 100, "status": "deleted"},
+                 {"id": "pip-cache", "label": "pip cache", "freed": 200, "status": "deleted"},
+                 {"id": "brew-cleanup", "label": "Homebrew", "freed": 0, "status": "skipped"},
+             ]},
+            {"timestamp": now.isoformat(),
+             "total_freed_bytes": 50,
+             "items": [
+                 {"id": "npm-cache", "label": "npm cache", "freed": 50, "status": "deleted"},
+             ]},
+        ]))
+
+    def test_aggregates_per_target_across_runs(self):
+        self._seed_two_runs()
+        stats = cleaner._aggregate_stats()
+        by_id = {t["id"]: t for t in stats["targets"]}
+        self.assertEqual(by_id["npm-cache"]["freed_bytes"], 150)
+        self.assertEqual(by_id["npm-cache"]["times_cleaned"], 2)
+        self.assertEqual(by_id["pip-cache"]["times_cleaned"], 1)
+        self.assertNotIn("brew-cleanup", by_id,
+                         "a skipped item that freed nothing is not usage")
+
+    def test_targets_ordered_by_freed_desc_and_totals_correct(self):
+        self._seed_two_runs()
+        stats = cleaner._aggregate_stats()
+        freed = [t["freed_bytes"] for t in stats["targets"]]
+        self.assertEqual(freed, sorted(freed, reverse=True))
+        self.assertEqual(stats["total_freed_bytes"], 350)
+        self.assertEqual(stats["runs"], 2)
+
+    def test_targets_carry_category_from_current_table(self):
+        self._seed_two_runs()
+        stats = cleaner._aggregate_stats()
+        by_id = {t["id"]: t for t in stats["targets"]}
+        self.assertEqual(by_id["npm-cache"]["category"], "node")
+        cats = {c["category"]: c for c in stats["categories"]}
+        self.assertEqual(cats["node"]["freed_bytes"], 150)
+
+    def test_empty_log_yields_zeroed_stats(self):
+        stats = cleaner._aggregate_stats()
+        self.assertEqual(stats["runs"], 0)
+        self.assertEqual(stats["total_freed_bytes"], 0)
+        self.assertEqual(stats["targets"], [])
+
+    def test_report_stats_flag_end_to_end(self):
+        """Parser + dispatch + JSON shape via a real subprocess."""
+        self._seed_two_runs()
+        env = {**os.environ, "MACCLEANER_LOG": str(self.log),
+               "MACCLEANER_CONFIG": str(Path(self.td.name) / "config.json"),
+               "MACCLEANER_SNAPSHOTS": str(Path(self.td.name) / "snap.log")}
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "report", "--stats", "--json"],
+                           capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["stats"]["total_freed_bytes"], 350)
+        self.assertIn("version", data)
+
+
+class TestConfigSync(unittest.TestCase):
+    """Phase 6 'iCloud sync for config': config.json optionally lives in
+    iCloud Drive (no entitlements needed) with a symlink at CONFIG_PATH, so
+    the CLI, the app, and launchd agents all read/write it unchanged. The
+    dangerous part is save_config's os.replace(), which would silently
+    replace the symlink with a local file on the first settings change --
+    pinned here."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        base = Path(self.td.name)
+        self.cfg = base / "local" / "config.json"
+        self.cfg.parent.mkdir()
+        self.icloud = base / "icloud"
+        self._p1 = mock.patch.object(cleaner, "CONFIG_PATH", self.cfg)
+        self._p2 = mock.patch.dict(os.environ, {"MACCLEANER_ICLOUD_DIR": str(self.icloud)})
+        self._p1.start(); self._p2.start()
+
+    def tearDown(self):
+        self._p1.stop(); self._p2.stop()
+        self.td.cleanup()
+
+    def test_sync_on_relocates_config_and_leaves_symlink(self):
+        self.cfg.write_text(json.dumps({"log_threshold_mb": 123}))
+        state = cleaner.run_config_sync("on")
+        self.assertTrue(state["enabled"])
+        self.assertTrue(self.cfg.is_symlink())
+        # macOS: /var/folders symlinks to /private/var/folders — compare resolved.
+        self.assertEqual(Path(os.path.realpath(self.cfg)).parent,
+                         Path(os.path.realpath(self.icloud)))
+        self.assertEqual(cleaner.load_config()["log_threshold_mb"], 123)
+
+    def test_sync_on_adopts_existing_icloud_config_and_backs_up_local(self):
+        """Second Mac joining sync: the iCloud copy is the shared truth."""
+        self.icloud.mkdir(parents=True)
+        (self.icloud / "config.json").write_text(json.dumps({"log_threshold_mb": 777}))
+        self.cfg.write_text(json.dumps({"log_threshold_mb": 1}))
+        cleaner.run_config_sync("on")
+        self.assertEqual(cleaner.load_config()["log_threshold_mb"], 777)
+        bak = self.cfg.parent / "config.json.pre-sync.bak"
+        self.assertTrue(bak.exists())
+        self.assertEqual(json.loads(bak.read_text())["log_threshold_mb"], 1)
+
+    def test_sync_on_is_idempotent(self):
+        self.cfg.write_text("{}")
+        cleaner.run_config_sync("on")
+        state = cleaner.run_config_sync("on")
+        self.assertTrue(state["enabled"])
+        self.assertTrue(self.cfg.is_symlink())
+
+    def test_sync_off_restores_regular_file_with_current_content(self):
+        self.cfg.write_text(json.dumps({"log_threshold_mb": 55}))
+        cleaner.run_config_sync("on")
+        state = cleaner.run_config_sync("off")
+        self.assertFalse(state["enabled"])
+        self.assertFalse(self.cfg.is_symlink())
+        self.assertEqual(json.loads(self.cfg.read_text())["log_threshold_mb"], 55)
+        self.assertTrue((self.icloud / "config.json").exists(),
+                        "other Macs may still sync from it; off is local-only")
+
+    def test_save_config_writes_through_the_symlink(self):
+        """THE regression this feature lives or dies on: an atomic save must
+        follow the symlink and update the iCloud copy, never replace the
+        symlink with a plain local file."""
+        self.cfg.write_text("{}")
+        cleaner.run_config_sync("on")
+        cfg = cleaner.load_config()
+        cfg["log_threshold_mb"] = 999
+        cleaner.save_config(cfg)
+        self.assertTrue(self.cfg.is_symlink(), "save_config clobbered the symlink")
+        icloud_copy = json.loads((self.icloud / "config.json").read_text())
+        self.assertEqual(icloud_copy["log_threshold_mb"], 999)
+
+    def test_status_reports_both_states(self):
+        self.cfg.write_text("{}")
+        self.assertFalse(cleaner.run_config_sync("status")["enabled"])
+        cleaner.run_config_sync("on")
+        st = cleaner.run_config_sync("status")
+        self.assertTrue(st["enabled"])
+        self.assertIn("icloud_path", st)
