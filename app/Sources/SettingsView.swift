@@ -91,11 +91,50 @@ struct SettingsView: View {
                 Text(scheduleCaption)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                // The schedule was once reported broken while running
+                // perfectly — because it was invisible. Next-run time, the
+                // last clean on record, and a way to fire one now make it
+                // observable instead of an act of faith.
+                if bridge.scheduleStatus?.schedule != nil {
+                    if let next = nextRunText {
+                        LabeledContent("Next clean") { Text(next) }
+                            .font(.callout)
+                    }
+                    if let last = bridge.lastCleanedAt {
+                        LabeledContent("Last clean") {
+                            Text(last, format: .relative(presentation: .named))
+                        }
+                        .font(.callout)
+                    }
+                    HStack(spacing: 8) {
+                        Button {
+                            Task { await bridge.runScheduleNow() }
+                        } label: {
+                            Label(bridge.isRunningScheduleNow ? "Starting…" : "Run Now",
+                                  systemImage: "play.circle")
+                        }
+                        .disabled(bridge.isRunningScheduleNow || bridge.isSchedulingBusy)
+                        if let feedback = bridge.scheduleRunFeedback {
+                            Text(feedback)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
             } else {
                 Text("Update the MacCleaner CLI to manage scheduling here.")
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    /// "Monday 7 Sep, 9:00 am" from the engine's ISO next_run — nil when the
+    /// engine predates 2.15 or nothing is scheduled.
+    private var nextRunText: String? {
+        guard let iso = bridge.scheduleStatus?.next_run,
+              let date = CleanerBridge.parseTimestamp(iso) else { return nil }
+        return date.formatted(date: .abbreviated, time: .shortened)
     }
 
     // MARK: - Alerts (notifications + low-disk warning)

@@ -237,6 +237,7 @@ _maccleaner() {
             '--min-size=[skip targets smaller than this]:megabytes:' \
             '--trash[move to Trash instead of deleting]' \
             '--dry-run[resolve what would be deleted, delete nothing]' \
+            '--min-free[clean safe targets until this much space is free (GB)]:GB:' \
             '--notify[post a notification summarising the run]' \
             '--json[machine-readable output]' \
             '(-h --help)'{-h,--help}'[show help]' && ret=0
@@ -268,6 +269,7 @@ _maccleaner() {
                 weekly\:"run a safe clean every week"
                 monthly\:"run a safe clean every month"
                 off\:"remove the scheduled agents"
+                run\:"fire the scheduled clean right now"
              ))' \
             '--json[machine-readable output]' \
             '(-h --help)'{-h,--help}'[show help]' && ret=0
@@ -324,6 +326,7 @@ _maccleaner() {
         storage-map)
           _arguments -s -S \
             '--min-size[hide entries smaller than this (MB)]:MB:' \
+            '--depth[levels to include, 1-3]:depth:(1 2 3)' \
             '--json[machine-readable output]' \
             '(-h --help)'{-h,--help}'[show help]' \
             '1:directory:_files -/' && ret=0

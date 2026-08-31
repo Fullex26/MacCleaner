@@ -9,6 +9,19 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [2.15.0] — 2026-08-31
 
+The schedule-transparency and agents release. Theme: nothing about this tool
+should require faith — every automatic behaviour is now observable, pokeable,
+and scriptable.
+
+### Added
+- **`clean --min-free GB`** — clean safe targets, largest first, and **stop the moment free space reaches the threshold**. Built for agents under a fail-closed disk floor (a real peer agent spent an evening blocked on exactly this): free just enough to clear the floor instead of sweeping every cache on the machine. Requires `--yes`; review targets are never touched; `target_met` is reported honestly — exhausting every safe target without reaching the floor is `false`, never a quiet success.
+- **`schedule run`** — fire the scheduled clean *right now*, through the real launchd agent (`launchctl kickstart`), so success is evidence the Monday run will work too. Exists because the schedule was reported broken while working perfectly: a weekly toggle with no next-run time, no last-run record and no way to poke it is indistinguishable from a dead feature.
+- **`schedule status --json` gains `next_run`** — ISO timestamp of the next scheduled clean (`null` when off), computed from the same calendar rules the plists encode.
+- **`storage-map --depth N`** (1–3) — nested `children` arrays for one-call subtree audits by agents, instead of N drill-down round-trips. Depth-1 output stays byte-identical to the existing contract.
+- **Settings → Schedule now shows "Next clean", "Last clean", and a Run Now button** with inline feedback. The app half of the observability fix.
+
+---
+
 The release that closes out the roadmap's Phase 6. All three remaining
 tractable items land, implemented local-first; the two structural items
 (Swift engine, App Store) get committed staged designs instead of unverified

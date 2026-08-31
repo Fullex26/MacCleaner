@@ -237,7 +237,7 @@ categories schedule disk-check storage-insights storage-map install-deps --help 
 
     case $sub in
         scan)   COMPREPLY=( $(compgen -W "--category --min-size --all --json --help" -- "$cur") ) ;;
-        clean)  COMPREPLY=( $(compgen -W "--yes --targets --category --min-size --trash \
+        clean)  COMPREPLY=( $(compgen -W "--yes --targets --category --min-size --min-free --trash \
 --dry-run --notify --json --help" -- "$cur") ) ;;
         projects) COMPREPLY=( $(compgen -W "--roots --min-age-days --clean --yes --targets \
 --trash --dry-run --json --help" -- "$cur") ) ;;
@@ -247,19 +247,19 @@ categories schedule disk-check storage-insights storage-map install-deps --help 
         disk-check)
                 COMPREPLY=( $(compgen -W "--json --no-post --help" -- "$cur") ) ;;
         storage-map)
-                COMPREPLY=( $(compgen -W "--min-size --json --help" -- "$cur") ) ;;
+                COMPREPLY=( $(compgen -W "--min-size --depth --json --help" -- "$cur") ) ;;
         schedule)
                 # positional action, plus --json
                 local seen="" j=0
                 for (( j=1; j<COMP_CWORD; j++ )); do
                     case ${COMP_WORDS[j]} in
-                        status|weekly|monthly|off) seen=1 ;;
+                        status|weekly|monthly|off|run) seen=1 ;;
                     esac
                 done
                 if [ -n "$seen" ]; then
                     COMPREPLY=( $(compgen -W "--json --help" -- "$cur") )
                 else
-                    COMPREPLY=( $(compgen -W "status weekly monthly off --json --help" -- "$cur") )
+                    COMPREPLY=( $(compgen -W "status weekly monthly off run --json --help" -- "$cur") )
                 fi ;;
         config)
                 local action=${COMP_WORDS[$((i+1))]}

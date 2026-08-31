@@ -5952,6 +5952,219 @@ class TestDockerImageAdvisory(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestScheduleTransparency(unittest.TestCase):
+    """2.15.0: the schedule looked dead because it was invisible. A weekly
+    toggle with no next-run time, no last-run record and no way to fire a run
+    is indistinguishable from a broken feature -- the user reported exactly
+    that against a schedule that was working. `schedule status --json` now
+    says WHEN the next clean fires, and `schedule run` fires one on demand."""
+
+    def test_next_run_weekly_before_monday_9am(self):
+        # Friday 2026-08-28 10:00 -> Monday 2026-08-31 09:00
+        now = datetime.datetime(2026, 8, 28, 10, 0)
+        self.assertEqual(cleaner._next_scheduled_run("weekly", now),
+                         datetime.datetime(2026, 8, 31, 9, 0))
+
+    def test_next_run_weekly_on_monday_before_9(self):
+        now = datetime.datetime(2026, 8, 31, 8, 59)  # a Monday
+        self.assertEqual(cleaner._next_scheduled_run("weekly", now),
+                         datetime.datetime(2026, 8, 31, 9, 0))
+
+    def test_next_run_weekly_on_monday_after_9(self):
+        now = datetime.datetime(2026, 8, 31, 9, 0, 1)
+        self.assertEqual(cleaner._next_scheduled_run("weekly", now),
+                         datetime.datetime(2026, 9, 7, 9, 0))
+
+    def test_next_run_monthly(self):
+        now = datetime.datetime(2026, 8, 28, 10, 0)
+        self.assertEqual(cleaner._next_scheduled_run("monthly", now),
+                         datetime.datetime(2026, 9, 1, 9, 0))
+        # on the 1st before 9am -> today
+        now = datetime.datetime(2026, 9, 1, 8, 0)
+        self.assertEqual(cleaner._next_scheduled_run("monthly", now),
+                         datetime.datetime(2026, 9, 1, 9, 0))
+        # December wraps the year
+        now = datetime.datetime(2026, 12, 15, 12, 0)
+        self.assertEqual(cleaner._next_scheduled_run("monthly", now),
+                         datetime.datetime(2027, 1, 1, 9, 0))
+
+    def test_next_run_none_when_off(self):
+        self.assertIsNone(cleaner._next_scheduled_run(None,
+                                                      datetime.datetime(2026, 8, 28)))
+
+    def test_status_json_carries_next_run(self):
+        fake = {"schedule": "weekly", "agents": [], "legacy_cron": False}
+        buf = io.StringIO()
+        with mock.patch.object(cleaner, "_schedule_state", return_value=dict(fake)), \
+             contextlib.redirect_stdout(buf):
+            cleaner.run_schedule_status(json_mode=True)
+        d = json.loads(buf.getvalue())
+        self.assertIn("next_run", d, "additive key so the app can display it")
+        # parseable ISO timestamp, in the future
+        self.assertGreater(datetime.datetime.fromisoformat(d["next_run"]),
+                           datetime.datetime.now())
+
+    def test_status_json_next_run_null_when_off(self):
+        fake = {"schedule": None, "agents": [], "legacy_cron": False}
+        buf = io.StringIO()
+        with mock.patch.object(cleaner, "_schedule_state", return_value=dict(fake)), \
+             contextlib.redirect_stdout(buf):
+            cleaner.run_schedule_status(json_mode=True)
+        self.assertIsNone(json.loads(buf.getvalue())["next_run"])
+
+    def test_schedule_run_kickstarts_the_clean_agent(self):
+        calls = {}
+
+        def fake_run(argv, **kw):
+            calls["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        buf = io.StringIO()
+        with mock.patch.object(cleaner.subprocess, "run", side_effect=fake_run), \
+             contextlib.redirect_stdout(buf):
+            ok = cleaner.run_schedule_run(json_mode=True)
+        self.assertTrue(ok)
+        self.assertEqual(calls["argv"][0], "launchctl")
+        self.assertIn("kickstart", calls["argv"])
+        self.assertTrue(any(cleaner.CLEAN_LABEL in a for a in calls["argv"]))
+        self.assertTrue(json.loads(buf.getvalue())["started"])
+
+    def test_schedule_run_reports_failure_honestly(self):
+        def fake_run(argv, **kw):
+            return subprocess.CompletedProcess(argv, 113, stdout="",
+                                               stderr="Could not find service")
+        buf = io.StringIO()
+        with mock.patch.object(cleaner.subprocess, "run", side_effect=fake_run), \
+             contextlib.redirect_stdout(buf):
+            ok = cleaner.run_schedule_run(json_mode=True)
+        self.assertFalse(ok)
+        d = json.loads(buf.getvalue())
+        self.assertFalse(d["started"])
+        self.assertIn("error", d)
+
+
+class TestCleanMinFree(unittest.TestCase):
+    """`clean --min-free N`: clean safe targets, largest first, ONLY until N GB
+    are free -- then stop. Built for agents under a fail-closed disk floor
+    (the exact situation a peer session hit): free just enough to clear the
+    floor instead of blowing away every cache on the machine."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        (self.home / ".npm" / "_cacache").mkdir(parents=True)
+        (self.home / ".npm" / "_cacache" / "blob").write_bytes(b"x" * 8192)
+        (self.home / ".npm" / "_npx").mkdir(parents=True)
+        (self.home / ".npm" / "_npx" / "blob").write_bytes(b"x" * 4096)
+        self.cfg_path = self.tmp / "config.json"
+        cfg = {"enabled_categories": ["node"],
+               "known_categories": list(cleaner.ALL_CATEGORIES)}
+        self.cfg_path.write_text(json.dumps(cfg))
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_ALERTS": str(self.tmp / "alerts.json"),
+                    "MACCLEANER_TMP_ROOT": str(self.tmp / "tmproot")}
+        (self.tmp / "tmproot").mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _clean(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                               "clean", *args, "--json"],
+                              capture_output=True, text=True, env=self.env,
+                              timeout=120)
+
+    def test_already_above_target_cleans_nothing(self):
+        r = self._clean("--min-free", "0.000001", "--yes")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = json.loads(r.stdout)
+        self.assertTrue(d["target_met"])
+        self.assertEqual(d["items"], [], "no deletion when the floor is already met")
+        self.assertTrue((self.home / ".npm" / "_cacache").exists())
+
+    def test_unreachable_target_cleans_everything_and_says_not_met(self):
+        r = self._clean("--min-free", "99999999", "--yes")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = json.loads(r.stdout)
+        self.assertFalse(d["target_met"],
+                         "must not claim success it did not achieve")
+        self.assertGreater(len(d["items"]), 0, "still cleans what it can")
+        self.assertEqual(d["min_free_gb"], 99999999)
+
+    def test_min_free_requires_yes(self):
+        r = self._clean("--min-free", "1")
+        self.assertNotEqual(r.returncode, 0,
+                            "an until-threshold clean is unattended by nature")
+
+    def test_min_free_never_touches_review_targets(self):
+        r = self._clean("--min-free", "99999999", "--yes")
+        d = json.loads(r.stdout)
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        safe_ids = {t["id"] for t in cleaner.get_targets(cfg, all_categories=True)
+                    if t["safe"]}
+        for item in d["items"]:
+            self.assertIn(item["id"], safe_ids,
+                          f"{item['id']} is review-level and must never be swept")
+
+
+class TestStorageMapDepth(unittest.TestCase):
+    """`storage-map --depth N` (1-3): one call giving agents a nested tree
+    instead of N round-trips of drill-down."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "a" / "inner").mkdir(parents=True)
+        (self.tmp / "a" / "inner" / "f").write_bytes(b"x" * (2 * 1024 * 1024))
+        (self.tmp / "b").mkdir()
+        (self.tmp / "b" / "g").write_bytes(b"x" * 1024)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _map(self, *args):
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "storage-map", str(self.tmp), *args, "--json"],
+                           capture_output=True, text=True, timeout=120)
+        return r, (json.loads(r.stdout) if r.returncode == 0 else None)
+
+    def test_default_depth_has_no_nested_children(self):
+        r, d = self._map()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        a = next(c for c in d["children"] if c["name"] == "a")
+        self.assertNotIn("children", a, "depth 1 output must stay byte-compatible")
+
+    def test_depth_2_nests_one_level(self):
+        r, d = self._map("--depth", "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        a = next(c for c in d["children"] if c["name"] == "a")
+        self.assertIn("children", a)
+        self.assertEqual([c["name"] for c in a["children"]], ["inner"])
+        inner = a["children"][0]
+        self.assertNotIn("children", inner, "depth 2 stops at two levels")
+
+    def test_depth_3_nests_two_levels(self):
+        r, d = self._map("--depth", "3")
+        a = next(c for c in d["children"] if c["name"] == "a")
+        inner = a["children"][0]
+        self.assertIn("children", inner)
+        self.assertEqual([c["name"] for c in inner["children"]], ["f"])
+
+    def test_depth_out_of_range_is_a_usage_error(self):
+        r, _ = self._map("--depth", "4")
+        self.assertEqual(r.returncode, 2, "bounded on purpose; 4 is refused")
+        r, _ = self._map("--depth", "0")
+        self.assertEqual(r.returncode, 2)
+
+    def test_files_never_carry_children(self):
+        r, d = self._map("--depth", "3")
+        b = next(c for c in d["children"] if c["name"] == "b")
+        g = b["children"][0]
+        self.assertEqual(g["kind"], "file")
+        self.assertNotIn("children", g)
+
+
 class TestTmpLivenessGuard(unittest.TestCase):
     """Age alone is not proof a tmp workspace is idle.
 

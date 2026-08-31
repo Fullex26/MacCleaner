@@ -20,6 +20,7 @@ python3 cleaner.py clean --targets npm-cache,pip-cache --yes --json   # Agent mo
 python3 cleaner.py clean --trash      # Move to ~/.Trash instead of deleting
 python3 cleaner.py clean --dry-run --json   # Preview exact paths/sizes a clean would touch, zero side effects
 python3 cleaner.py clean --yes --notify     # Post a macOS notification summarizing what was freed (used by the launchd agent)
+python3 cleaner.py clean --min-free 45 --yes --json  # Clean safe targets, largest first, ONLY until 45 GiB free (agent fail-closed floors)
 python3 cleaner.py projects           # Stale build artifacts (--roots, --min-age-days, --clean, --yes, --targets, --trash, --dry-run, --json)
 python3 cleaner.py report -n 10       # Cleanup history from report.log (--json)
 python3 cleaner.py report --stats     # Local-only usage stats aggregated from report.log (--json)
@@ -28,8 +29,8 @@ python3 cleaner.py categories         # List categories + targets (--json)
 python3 cleaner.py config show|path|enable C|disable C|set KEY VALUE|sync on|off|status
 python3 cleaner.py disk-check         # Cheap low-disk warning check, for launchd (--json); always exits 0
 python3 cleaner.py storage-insights   # Read-only: largest items in Documents/Downloads/Desktop/~Library/Applications (--json)
-python3 cleaner.py storage-map [PATH] # Read-only whole-disk browser, works outside $HOME (--min-size MB, --json)
-python3 cleaner.py schedule status|weekly|monthly|off  # Manage the launchd schedule (--json); status/off always exit 0
+python3 cleaner.py storage-map [PATH] # Read-only whole-disk browser, works outside $HOME (--min-size MB, --depth 1-3, --json)
+python3 cleaner.py schedule status|weekly|monthly|off|run  # Manage/kickstart the launchd schedule (--json); status/off always exit 0
 python3 cleaner.py install-deps       # Install 'rich' for pretty output
 ```
 
