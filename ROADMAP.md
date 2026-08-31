@@ -105,7 +105,7 @@ This document tracks planned features and long-term direction. Community input w
 
 > Eliminates the Python dependency, making the tool accessible to all Mac users.
 
-- [ ] **Full Swift rewrite of cleaner engine** — staged migration design accepted in `docs/V3-SWIFT-ENGINE.md` (contract fixtures → read-only `MacCleanerKit` → dual-engine soak → guard-first deletion port → cutover). Deliberately not attempted as one rewrite: the Python engine is the tested core, and parity for a deletion tool must be proved, not assumed
+- [ ] **Full Swift rewrite of cleaner engine** — **stages 1–2 landed**: contract fixtures (`tests/fixtures/`, regenerated-and-diffed by the suite) and the read-only `MacCleanerKit` (`swift/`, generated target table, CI-enforced Swift/Python parity via `tools/check_swift_parity.py`). Stages 3–5 (dual-engine soak in the app, guard-first deletion port, cutover) per `docs/V3-SWIFT-ENGINE.md` (contract fixtures → read-only `MacCleanerKit` → dual-engine soak → guard-first deletion port → cutover). Deliberately not attempted as one rewrite: the Python engine is the tested core, and parity for a deletion tool must be proved, not assumed
 - [x] **SwiftUI preferences window** — Settings tab in the v2.0 app, persisted through the same `config.json` as the CLI
 - [ ] **Sandboxed App Store build** — assessed in `docs/APP-STORE-FEASIBILITY.md`: the sandbox denies exactly what MacCleaner does, so a MAS variant would be the read-only storage X-ray (`storage-map`/`storage-insights`), not the cleaner. Blocked on the V3 Swift core plus a product decision, not on engineering effort
 - [x] **Sparkle auto-updater** — shipped in v2.6.0, see Phase 4

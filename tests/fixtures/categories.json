@@ -1,0 +1,632 @@
+{
+  "categories": [
+    {
+      "description": "Xcode build products, device support, simulators, SwiftPM/Carthage",
+      "enabled": true,
+      "name": "xcode",
+      "targets": [
+        {
+          "id": "xcode-derived-data",
+          "label": "Xcode DerivedData",
+          "safe": true
+        },
+        {
+          "id": "xcode-derived-data-custom",
+          "label": "Xcode DerivedData (custom locations)",
+          "safe": true
+        },
+        {
+          "id": "xcode-previews",
+          "label": "Xcode Previews",
+          "safe": true
+        },
+        {
+          "id": "xcode-ios-device-support",
+          "label": "Xcode iOS DeviceSupport",
+          "safe": true
+        },
+        {
+          "id": "xcode-watchos-device-support",
+          "label": "Xcode watchOS DeviceSupport",
+          "safe": true
+        },
+        {
+          "id": "xcode-archives",
+          "label": "Xcode Archives",
+          "safe": false
+        },
+        {
+          "id": "xcode-simulator-unavailable",
+          "label": "Simulator unavailable devices",
+          "safe": true
+        },
+        {
+          "id": "xcode-simulator-runtimes",
+          "label": "Simulator runtimes",
+          "safe": false
+        },
+        {
+          "id": "xcode-cache",
+          "label": "Xcode cache",
+          "safe": true
+        },
+        {
+          "id": "xcode-coresimulator-caches",
+          "label": "CoreSimulator caches",
+          "safe": true
+        },
+        {
+          "id": "swiftpm-cache",
+          "label": "SwiftPM cache",
+          "safe": true
+        },
+        {
+          "id": "carthage-cache",
+          "label": "Carthage cache",
+          "safe": true
+        },
+        {
+          "id": "xcode-doc-cache",
+          "label": "Xcode documentation cache",
+          "safe": true
+        },
+        {
+          "id": "xcodebuildmcp-workspaces",
+          "label": "XcodeBuildMCP workspaces",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "Docker unused images, containers, and build cache",
+      "enabled": false,
+      "name": "docker",
+      "targets": [
+        {
+          "id": "docker-prune",
+          "label": "Docker unused data",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "npm/pnpm/yarn/bun/deno package caches",
+      "enabled": true,
+      "name": "node",
+      "targets": [
+        {
+          "id": "npm-cache",
+          "label": "npm cache",
+          "safe": true
+        },
+        {
+          "id": "npx-cache",
+          "label": "npx cache",
+          "safe": true
+        },
+        {
+          "id": "pnpm-store",
+          "label": "pnpm store",
+          "safe": true
+        },
+        {
+          "id": "yarn-cache",
+          "label": "yarn cache",
+          "safe": true
+        },
+        {
+          "id": "bun-cache",
+          "label": "bun cache",
+          "safe": true
+        },
+        {
+          "id": "deno-cache",
+          "label": "deno cache",
+          "safe": true
+        },
+        {
+          "id": "node-gyp-cache",
+          "label": "node-gyp cache",
+          "safe": true
+        },
+        {
+          "id": "yarn-global-cache",
+          "label": "Yarn classic global cache",
+          "safe": true
+        },
+        {
+          "id": "npm-logs",
+          "label": "npm logs",
+          "safe": true
+        },
+        {
+          "id": "typescript-cache",
+          "label": "TypeScript server cache",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "pip/uv/poetry/ruff caches, pyenv shims",
+      "enabled": true,
+      "name": "python",
+      "targets": [
+        {
+          "id": "pip-cache",
+          "label": "pip cache",
+          "safe": true
+        },
+        {
+          "id": "uv-cache",
+          "label": "uv cache",
+          "safe": true
+        },
+        {
+          "id": "poetry-cache",
+          "label": "poetry cache",
+          "safe": true
+        },
+        {
+          "id": "ruff-cache",
+          "label": "ruff cache",
+          "safe": true
+        },
+        {
+          "id": "pyenv-shims",
+          "label": "pyenv shims cache",
+          "safe": false
+        },
+        {
+          "id": "conda-clean",
+          "label": "Conda caches",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "App caches (Claude, Cursor, Chrome, Slack, Discord, Spotify, ...)",
+      "enabled": true,
+      "name": "caches",
+      "targets": [
+        {
+          "id": "claude-cache",
+          "label": "Claude app cache",
+          "safe": true
+        },
+        {
+          "id": "claude-vm-bundles",
+          "label": "Claude VM bundles",
+          "safe": true
+        },
+        {
+          "id": "claude-code-cache",
+          "label": "Claude Code Cache",
+          "safe": true
+        },
+        {
+          "id": "claude-gpu-cache",
+          "label": "Claude GPU Cache",
+          "safe": true
+        },
+        {
+          "id": "cursor-cache",
+          "label": "Cursor cache",
+          "safe": true
+        },
+        {
+          "id": "chrome-cache",
+          "label": "Chrome cache",
+          "safe": true
+        },
+        {
+          "id": "chrome-optimization-model-store",
+          "label": "Chrome on-device models",
+          "safe": false
+        },
+        {
+          "id": "chrome-optimization-hint-cache",
+          "label": "Chrome optimization hints",
+          "safe": true
+        },
+        {
+          "id": "spotify-cache",
+          "label": "Spotify cache",
+          "safe": true
+        },
+        {
+          "id": "slack-cache",
+          "label": "Slack cache",
+          "safe": true
+        },
+        {
+          "id": "slack-service-worker",
+          "label": "Slack service worker cache",
+          "safe": true
+        },
+        {
+          "id": "discord-cache",
+          "label": "Discord cache",
+          "safe": true
+        },
+        {
+          "id": "electron-cache",
+          "label": "Electron cache",
+          "safe": true
+        },
+        {
+          "id": "playwright-browsers",
+          "label": "Playwright browsers",
+          "safe": false
+        },
+        {
+          "id": "puppeteer-cache",
+          "label": "Puppeteer cache",
+          "safe": false
+        },
+        {
+          "id": "cypress-cache",
+          "label": "Cypress binary cache",
+          "safe": false
+        },
+        {
+          "id": "teams-cache",
+          "label": "Microsoft Teams cache",
+          "safe": true
+        },
+        {
+          "id": "zoom-updater",
+          "label": "Zoom installer cache",
+          "safe": true
+        },
+        {
+          "id": "terraform-plugin-cache",
+          "label": "Terraform plugin cache",
+          "safe": true
+        },
+        {
+          "id": "expo-cache",
+          "label": "Expo cache",
+          "safe": true
+        },
+        {
+          "id": "chrome-http-cache",
+          "label": "Chrome HTTP cache",
+          "safe": true
+        },
+        {
+          "id": "spotify-browser-cache",
+          "label": "Spotify browser cache",
+          "safe": true
+        },
+        {
+          "id": "clang-module-cache",
+          "label": "Clang module cache",
+          "safe": true
+        },
+        {
+          "id": "electron-updater-pending",
+          "label": "Electron app update downloads",
+          "safe": true
+        },
+        {
+          "id": "general-caches",
+          "label": "General app caches",
+          "safe": false
+        }
+      ]
+    },
+    {
+      "description": "Oversized log folders in ~/Library/Logs",
+      "enabled": false,
+      "name": "logs",
+      "targets": []
+    },
+    {
+      "description": "Homebrew download cache and unused dependencies",
+      "enabled": false,
+      "name": "homebrew",
+      "targets": [
+        {
+          "id": "brew-cleanup",
+          "label": "Homebrew cache",
+          "safe": true
+        },
+        {
+          "id": "brew-autoremove",
+          "label": "Homebrew unused deps",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "Go module and build caches",
+      "enabled": false,
+      "name": "go",
+      "targets": [
+        {
+          "id": "go-module-cache",
+          "label": "Go module cache",
+          "safe": true
+        },
+        {
+          "id": "go-pkg-cache",
+          "label": "Go pkg cache",
+          "safe": true
+        },
+        {
+          "id": "go-build-cache",
+          "label": "Go build cache",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "Cargo registry and git caches",
+      "enabled": false,
+      "name": "rust",
+      "targets": [
+        {
+          "id": "cargo-registry",
+          "label": "Cargo registry",
+          "safe": true
+        },
+        {
+          "id": "cargo-git",
+          "label": "Cargo git cache",
+          "safe": true
+        },
+        {
+          "id": "sccache-cache",
+          "label": "sccache cache",
+          "safe": true
+        },
+        {
+          "id": "rustup-downloads",
+          "label": "rustup download cache",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "Stale gem versions",
+      "enabled": false,
+      "name": "ruby",
+      "targets": [
+        {
+          "id": "gem-cleanup",
+          "label": "Ruby gem cleanup",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "CocoaPods cache",
+      "enabled": false,
+      "name": "cocoapods",
+      "targets": [
+        {
+          "id": "cocoapods-cache",
+          "label": "CocoaPods cache",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "Gradle build caches",
+      "enabled": false,
+      "name": "gradle",
+      "targets": [
+        {
+          "id": "gradle-caches",
+          "label": "Gradle caches",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "Maven local repository",
+      "enabled": false,
+      "name": "maven",
+      "targets": [
+        {
+          "id": "maven-repo",
+          "label": "Maven local repo",
+          "safe": false
+        }
+      ]
+    },
+    {
+      "description": "Downloaded AI models (Hugging Face, PyTorch, Ollama \u2014 re-downloadable) and Codex session transcripts (not re-downloadable) \u2014 review carefully",
+      "enabled": false,
+      "name": "ai",
+      "targets": [
+        {
+          "id": "huggingface-hub",
+          "label": "Hugging Face hub cache",
+          "safe": false
+        },
+        {
+          "id": "torch-hub",
+          "label": "PyTorch hub cache",
+          "safe": false
+        },
+        {
+          "id": "ollama-models",
+          "label": "Ollama models",
+          "safe": false
+        },
+        {
+          "id": "lm-studio-models",
+          "label": "LM Studio models",
+          "safe": false
+        },
+        {
+          "id": "whisper-models",
+          "label": "Whisper models",
+          "safe": false
+        },
+        {
+          "id": "codex-sessions",
+          "label": "Codex session transcripts",
+          "safe": false
+        },
+        {
+          "id": "codex-archived-sessions",
+          "label": "Codex archived sessions",
+          "safe": false
+        },
+        {
+          "id": "ollama-updates",
+          "label": "Ollama update downloads",
+          "safe": true
+        },
+        {
+          "id": "codex-sparkle-updates",
+          "label": "Codex update downloads",
+          "safe": true
+        },
+        {
+          "id": "codex-runtimes",
+          "label": "Codex downloaded runtimes",
+          "safe": false
+        },
+        {
+          "id": "antigravity-browser-profile",
+          "label": "Antigravity browser profile",
+          "safe": false
+        }
+      ]
+    },
+    {
+      "description": "Editor caches (VS Code, JetBrains)",
+      "enabled": false,
+      "name": "ide",
+      "targets": [
+        {
+          "id": "vscode-cache",
+          "label": "VS Code cache",
+          "safe": true
+        },
+        {
+          "id": "vscode-cached-data",
+          "label": "VS Code cached data",
+          "safe": true
+        },
+        {
+          "id": "jetbrains-caches",
+          "label": "JetBrains caches",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "Browser caches (Arc, Brave, Edge, Firefox)",
+      "enabled": false,
+      "name": "browsers",
+      "targets": [
+        {
+          "id": "arc-cache",
+          "label": "Arc cache",
+          "safe": true
+        },
+        {
+          "id": "brave-cache",
+          "label": "Brave cache",
+          "safe": true
+        },
+        {
+          "id": "edge-cache",
+          "label": "Edge cache",
+          "safe": true
+        },
+        {
+          "id": "firefox-cache",
+          "label": "Firefox cache",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "Trash and iOS device backups \u2014 review carefully",
+      "enabled": false,
+      "name": "system",
+      "targets": [
+        {
+          "id": "trash",
+          "label": "Empty Trash",
+          "safe": false
+        },
+        {
+          "id": "ios-backups",
+          "label": "iOS device backups",
+          "safe": false
+        }
+      ]
+    },
+    {
+      "description": "Dart & Flutter pub package cache",
+      "enabled": false,
+      "name": "flutter",
+      "targets": [
+        {
+          "id": "dart-pub-cache",
+          "label": "Dart pub cache",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "Composer package cache",
+      "enabled": false,
+      "name": "php",
+      "targets": [
+        {
+          "id": "composer-cache",
+          "label": "Composer cache",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "VM disks and container runtimes (Colima, Vagrant, minikube) \u2014 review carefully",
+      "enabled": false,
+      "name": "vms",
+      "targets": [
+        {
+          "id": "colima-vm",
+          "label": "Colima VM",
+          "safe": false
+        },
+        {
+          "id": "vagrant-boxes",
+          "label": "Vagrant boxes",
+          "safe": false
+        },
+        {
+          "id": "minikube-cache",
+          "label": "minikube cache",
+          "safe": true
+        }
+      ]
+    },
+    {
+      "description": "Stale build artifacts in /private/tmp left by tools and AI coding sessions \u2014 review carefully",
+      "enabled": true,
+      "name": "tmp",
+      "targets": []
+    },
+    {
+      "description": "Stale iOS simulator devices and unused runtime images (via simctl) \u2014 review carefully",
+      "enabled": false,
+      "name": "simulators",
+      "targets": []
+    },
+    {
+      "description": "Cache, preference, and saved-state files left behind by apps you've already deleted \u2014 review carefully",
+      "enabled": true,
+      "name": "leftovers",
+      "targets": []
+    }
+  ],
+  "version": "2.15.0"
+}

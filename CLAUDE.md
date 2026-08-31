@@ -125,6 +125,13 @@ Each target has a `safe` bool. `--yes` / `auto_approve` only cleans `safe=True` 
 - `MACCLEANER_ICLOUD_DIR` — new in 2.15.0; overrides the iCloud Drive directory `config sync` uses (default `~/Library/Mobile Documents/com~apple~CloudDocs/MacCleaner`), used by tests
 - `MACCLEANER_ENGINE` — app-side override of the engine path (app development)
 
+## V3 Swift kit (read-only, stages 1–2)
+
+`swift/MacCleanerKit/` is the beginning of the V3 native engine (`docs/V3-SWIFT-ENGINE.md`), deliberately **read-only** — it has no deletion API and must not grow one before Stage 4's guard-first port. Three moving parts, each with its own tripwire:
+- `tools/gen_contract_fixtures.py` → `tests/fixtures/*.json` — golden JSON contract fixtures generated from the real engine against a deterministic sandbox (stub `PATH` holding only `du`; 4 KiB-aligned seed files so APFS block rounding is identity; sandboxed scanner roots; `doctor` excluded as inherently machine-dependent). `TestContractFixtures` regenerates and diffs every run — an engine change that moves the contract fails the suite until fixtures are consciously regenerated.
+- `tools/gen_swift_target_table.py` → `swift/.../TargetTable.generated.swift` — the Swift target table is **generated from `get_targets()`**, never hand-edited (same reasoning as `completions/complete_data.py`). `TestSwiftTableGenerated` pins freshness. Adding a target now means: regenerate completions data AND this file.
+- `tools/check_swift_parity.py` — CI builds the kit (`swift build -c release --package-path swift/MacCleanerKit`) and runs this on every push: full 94-entry table equality plus per-target `(category, label, safe, exists, size_bytes)` scan parity in the fixture sandbox; cmd targets are presence-only (Stage 2 never executes estimate commands). Parity is semantic, not byte-for-byte. `swift/MacCleanerKit/.build/` is gitignored.
+
 ## Install Path vs. Source
 Source lives in this repo; installed copy lives at `~/mac-cleaner/`, app at `~/Applications/MacCleaner.app`. When testing changes, either re-run `install.sh` or call `cleaner.py` directly from the repo path (for the app, set `MACCLEANER_ENGINE` to the repo's `cleaner.py`).
 
