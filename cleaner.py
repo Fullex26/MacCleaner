@@ -137,7 +137,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.14.1"
+VERSION = "2.14.2"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -2062,7 +2062,85 @@ def _classify_tmp_dir(p):
     return None
 
 
-def _nested_build_dirs(parent, cutoff):
+def _running_command_lines():
+    """Command lines of every running process, or None if they can't be read.
+
+    None means "could not ask", which callers must NOT treat as "nothing is
+    running" -- see _path_is_in_use."""
+    try:
+        r = subprocess.run(["ps", "-axo", "command="],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.splitlines()
+
+
+def _own_process_tree():
+    """Command lines of this process and its ancestors.
+
+    Excluded from the in-use check because asking about a path tends to put
+    that path into our own command line -- observed for real, where checking
+    `/private/tmp/<ws>/DerivedData` matched the very shell doing the asking
+    and reported the tree busy with nothing using it. A check must not see
+    its own reflection."""
+    own, pid = set(), os.getpid()
+    for _ in range(12):
+        try:
+            r = subprocess.run(["ps", "-o", "ppid=,command=", "-p", str(pid)],
+                               capture_output=True, text=True, timeout=5)
+            line = r.stdout.strip()
+            if not line:
+                break
+            ppid, _, cmd = line.partition(" ")
+            own.add(cmd.strip())
+            pid = int(ppid)
+        except Exception:
+            break
+        if pid <= 1:
+            break
+    return own
+
+
+def _path_is_in_use(path, commands, own=None):
+    """True when a running process names `path` on its command line.
+
+    Age is not proof of idleness: a nested write does not update the parent
+    directory's mtime, so a workspace can read as weeks-stale at its top
+    level while a build writes inside it. Observed live -- a DerivedData root
+    whose mtime receded (68s, 76s, 84s ago across three samples) while
+    xcodebuild held seven open handles beneath it and was writing a new
+    .xcresult. A peer session read the lock state as idle and proposed
+    deleting exactly that tree.
+
+    Matching is on the path followed by a boundary character (or end), so
+    /tmp/ws in a command line does not shield /tmp/ws2.
+
+    `commands is None` means the process list was unreadable. That is not
+    evidence of idleness, but failing closed there would hide every candidate
+    on any machine where `ps` is restricted. These targets are review-only
+    and never auto-cleaned, so the age gate stays the guard and this returns
+    False -- the same posture the leftovers scanner takes when mdfind is
+    unavailable."""
+    if not commands:
+        return False
+    if own is None:
+        own = _own_process_tree()
+    p = str(path)
+    for line in commands:
+        if line.strip() in own:
+            continue
+        idx = line.find(p)
+        while idx != -1:
+            end = idx + len(p)
+            if end == len(line) or not (line[end].isalnum() or line[end] in "-_."):
+                return True
+            idx = line.find(p, idx + 1)
+    return False
+
+
+def _nested_build_dirs(parent, cutoff, commands=None, own=None):
     """Build trees sitting one level inside `parent`, content-classified.
 
     Never name-matched: the tree that motivated this was called `derived`,
@@ -2082,8 +2160,11 @@ def _nested_build_dirs(parent, cutoff):
             st = e.stat(follow_symlinks=False)
             if st.st_uid != uid or st.st_mtime > cutoff:
                 continue
-            if _classify_tmp_dir(Path(e.path)) == "derived-data":
-                found.append(Path(e.path))
+            if _classify_tmp_dir(Path(e.path)) != "derived-data":
+                continue
+            if _path_is_in_use(Path(e.path), commands, own):
+                continue
+            found.append(Path(e.path))
         except OSError:
             continue
     return found
@@ -2107,6 +2188,9 @@ def scan_tmp_artifacts(config):
     except OSError:
         return hits
     uid = os.getuid()
+    # Read once for the whole scan, not per candidate.
+    commands = _running_command_lines()
+    own_cmds = _own_process_tree()
     for e in entries:
         try:
             if not e.is_dir(follow_symlinks=False):
@@ -2120,6 +2204,8 @@ def scan_tmp_artifacts(config):
             if any(resolved == s.resolve() or str(resolved).startswith(str(s.resolve()) + os.sep)
                    for s in skip):
                 continue
+            if _path_is_in_use(Path(e.path), commands, own_cmds):
+                continue
             kind = _classify_tmp_dir(Path(e.path))
             if kind:
                 hits.append({"path": Path(e.path), "kind": kind, "mtime": st.st_mtime})
@@ -2129,7 +2215,7 @@ def scan_tmp_artifacts(config):
             # logs and test results worth keeping. Offer just the build tree.
             # Exactly one level: an unbounded walk of every tmp tree would be
             # slow and far likelier to surface something live.
-            for child in _nested_build_dirs(Path(e.path), cutoff):
+            for child in _nested_build_dirs(Path(e.path), cutoff, commands, own_cmds):
                 hits.append({"path": child, "kind": "derived-data",
                              "mtime": child.stat().st_mtime})
         except OSError:
