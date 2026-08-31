@@ -1,6 +1,6 @@
 # V3: Native Swift Engine — Migration Design
 
-**Status: design accepted, implementation not started.** This is the roadmap's
+**Status: stages 1–2 landed (read-only); stages 3–5 not started.** This is the roadmap's
 "Full Swift rewrite of cleaner engine" item, deliberately staged rather than
 attempted as one rewrite. The Python engine is ~4,500 lines with 490+ tests
 guarding deletion behaviour; a big-bang port cannot be verified to parity, and
@@ -17,13 +17,28 @@ an unverified deletion engine is the one artifact this project must never ship.
 
 ## Staged plan
 
-1. **Contract fixtures.** Generate golden JSON fixtures from the Python engine
-   (`scan`, `clean --dry-run`, `doctor`, `categories`, `schedule status`,
-   `report --stats`) against a synthetic filesystem layout checked into
-   `tests/fixtures/`. These are the parity oracle for every later stage.
-2. **`MacCleanerKit` (Swift package).** Port read-only pieces first: target
-   table, size measurement, scan. The Swift `scan --json` must byte-match the
-   fixtures (modulo the machine-dependent `logs` targets).
+1. **Contract fixtures.** ✅ Landed: `tools/gen_contract_fixtures.py` builds a
+   deterministic synthetic HOME (stub PATH holding only `du`, 4 KiB-aligned
+   file sizes so APFS block rounding is identity, sandboxed scanner roots)
+   and writes `tests/fixtures/*.json` for `scan --all`, `categories`,
+   `clean --dry-run`, `report --stats`, and `schedule status`.
+   `TestContractFixtures` regenerates and diffs on every run, so any engine
+   change that moves the JSON contract fails the suite until the fixtures
+   are consciously regenerated. (`doctor` is deliberately excluded — its
+   output is inherently machine-dependent.)
+2. **`MacCleanerKit` (Swift package).** ✅ Landed (`swift/MacCleanerKit`,
+   CLI `mck`): target table, path/glob resolution, `du -skx` measurement,
+   `scan --json --all` and `categories --json`. Two deliberate deviations
+   from the original sketch: the table is **generated** from the Python
+   source (`tools/gen_swift_target_table.py`, freshness pinned by
+   `TestSwiftTableGenerated`) rather than ported by hand, so transcription
+   drift is impossible by construction; and parity is **semantic** (per-id
+   field comparison via `tools/check_swift_parity.py`, run by CI on every
+   push) rather than byte-for-byte, since JSON key order proves nothing.
+   The sabotage test was run before trusting the gate: one wrong path in
+   the generated table fails parity naming the exact target and field.
+   Still open within this stage: the dynamic scanners (tmp / simulators /
+   leftovers) and cmd-target estimates are presence-only in `mck`.
 3. **Dual-engine app.** The app gains an engine toggle (default: Python).
    Swift scan results are compared against the Python engine's in the
    background; divergences are logged, never acted on. This is the

@@ -1,0 +1,560 @@
+{
+  "disk": "<DISK>",
+  "disk_stats": "<DISK>",
+  "targets": [
+    {
+      "category": "caches",
+      "description": "Everything in ~/Library/Caches \u2014 broad; review before deleting",
+      "exists": true,
+      "id": "general-caches",
+      "label": "General app caches",
+      "safe": false,
+      "size_bytes": 77824,
+      "size_human": "76.0 KB"
+    },
+    {
+      "category": "xcode",
+      "description": "Intermediate build products; Xcode rebuilds them on demand",
+      "exists": true,
+      "id": "xcode-derived-data",
+      "label": "Xcode DerivedData",
+      "safe": true,
+      "size_bytes": 40960,
+      "size_human": "40.0 KB"
+    },
+    {
+      "category": "caches",
+      "description": "Spotify desktop's embedded-browser cache and its streamed-audio cache; both re-fetched on demand. Offline downloads are not here \u2014 they live under Application Support and are never touched",
+      "exists": true,
+      "id": "spotify-browser-cache",
+      "label": "Spotify browser cache",
+      "safe": true,
+      "size_bytes": 28672,
+      "size_human": "28.0 KB"
+    },
+    {
+      "category": "caches",
+      "description": "Update installers Electron apps have already downloaded and staged. Removing one discards an update that was ready to install \u2014 the app re-downloads it on its next check, but a pending 'restart to update' may need re-triggering. Only matches apps whose updater directory ends in 'electron-updater' (Squirrel and ToDesktop apps are unaffected)",
+      "exists": true,
+      "id": "electron-updater-pending",
+      "label": "Electron app update downloads",
+      "safe": true,
+      "size_bytes": 28672,
+      "size_human": "28.0 KB"
+    },
+    {
+      "category": "node",
+      "description": "npm package download cache; re-fetched on demand",
+      "exists": true,
+      "id": "npm-cache",
+      "label": "npm cache",
+      "safe": true,
+      "size_bytes": 24576,
+      "size_human": "24.0 KB"
+    },
+    {
+      "category": "xcode",
+      "description": "Build output from projects using a custom DerivedData path; rebuilt on the next build, exactly like the default location",
+      "exists": true,
+      "id": "xcode-derived-data-custom",
+      "label": "Xcode DerivedData (custom locations)",
+      "safe": true,
+      "size_bytes": 16384,
+      "size_human": "16.0 KB"
+    },
+    {
+      "category": "python",
+      "description": "pip download/wheel cache",
+      "exists": true,
+      "id": "pip-cache",
+      "label": "pip cache",
+      "safe": true,
+      "size_bytes": 12288,
+      "size_human": "12.0 KB"
+    },
+    {
+      "category": "xcode",
+      "description": "SwiftUI preview build products",
+      "exists": false,
+      "id": "xcode-previews",
+      "label": "Xcode Previews",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "xcode",
+      "description": "Debug symbols for previously connected iOS devices; re-extracted on next connect",
+      "exists": false,
+      "id": "xcode-ios-device-support",
+      "label": "Xcode iOS DeviceSupport",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "xcode",
+      "description": "Debug symbols for previously connected watches",
+      "exists": false,
+      "id": "xcode-watchos-device-support",
+      "label": "Xcode watchOS DeviceSupport",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "xcode",
+      "description": "App Store submission archives \u2014 keep if you need dSYMs for released builds",
+      "exists": false,
+      "id": "xcode-archives",
+      "label": "Xcode Archives",
+      "safe": false,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "xcode",
+      "description": "Simulators whose runtime is no longer installed",
+      "exists": true,
+      "id": "xcode-simulator-unavailable",
+      "label": "Simulator unavailable devices",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "xcode",
+      "description": "Downloaded simulator OS images \u2014 re-download from Xcode if needed",
+      "exists": false,
+      "id": "xcode-simulator-runtimes",
+      "label": "Simulator runtimes",
+      "safe": false,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "xcode",
+      "description": "Xcode's general cache",
+      "exists": false,
+      "id": "xcode-cache",
+      "label": "Xcode cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "xcode",
+      "description": "Simulator dyld caches; regenerated on next simulator boot",
+      "exists": false,
+      "id": "xcode-coresimulator-caches",
+      "label": "CoreSimulator caches",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "xcode",
+      "description": "Swift Package Manager checkouts and manifests; re-fetched on next resolve",
+      "exists": false,
+      "id": "swiftpm-cache",
+      "label": "SwiftPM cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "xcode",
+      "description": "Carthage dependency builds",
+      "exists": false,
+      "id": "carthage-cache",
+      "label": "Carthage cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "xcode",
+      "description": "Downloaded documentation indexes; re-fetched on demand",
+      "exists": false,
+      "id": "xcode-doc-cache",
+      "label": "Xcode documentation cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "xcode",
+      "description": "Workspace scratch data written by the XcodeBuildMCP tool; regenerated on next build",
+      "exists": false,
+      "id": "xcodebuildmcp-workspaces",
+      "label": "XcodeBuildMCP workspaces",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "node",
+      "description": "Packages downloaded by npx one-off runs",
+      "exists": false,
+      "id": "npx-cache",
+      "label": "npx cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "node",
+      "description": "Unreferenced packages in the pnpm content-addressable store",
+      "exists": true,
+      "id": "pnpm-store",
+      "label": "pnpm store",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "node",
+      "description": "Yarn package cache",
+      "exists": false,
+      "id": "yarn-cache",
+      "label": "yarn cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "node",
+      "description": "Bun package download cache",
+      "exists": false,
+      "id": "bun-cache",
+      "label": "bun cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "node",
+      "description": "Deno remote module and npm caches",
+      "exists": false,
+      "id": "deno-cache",
+      "label": "deno cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "node",
+      "description": "Node.js headers downloaded for native module builds",
+      "exists": false,
+      "id": "node-gyp-cache",
+      "label": "node-gyp cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "node",
+      "description": "Yarn v1 global package cache (separate from ~/.yarn/cache)",
+      "exists": false,
+      "id": "yarn-global-cache",
+      "label": "Yarn classic global cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "node",
+      "description": "npm debug log files",
+      "exists": false,
+      "id": "npm-logs",
+      "label": "npm logs",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "node",
+      "description": "Auto-downloaded @types packages the TS language server caches for editors; re-fetched on demand",
+      "exists": false,
+      "id": "typescript-cache",
+      "label": "TypeScript server cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "python",
+      "description": "uv package cache; re-fetched on demand",
+      "exists": false,
+      "id": "uv-cache",
+      "label": "uv cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "python",
+      "description": "Poetry package cache",
+      "exists": false,
+      "id": "poetry-cache",
+      "label": "poetry cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "python",
+      "description": "Ruff lint cache",
+      "exists": false,
+      "id": "ruff-cache",
+      "label": "ruff cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "python",
+      "description": "pyenv shim binaries \u2014 regenerate with 'pyenv rehash' after deleting",
+      "exists": false,
+      "id": "pyenv-shims",
+      "label": "pyenv shims cache",
+      "safe": false,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "python",
+      "description": "Unused conda packages, tarballs, and index caches (conda clean --all)",
+      "exists": true,
+      "id": "conda-clean",
+      "label": "Conda caches",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Claude desktop app cache",
+      "exists": false,
+      "id": "claude-cache",
+      "label": "Claude app cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Claude desktop VM images",
+      "exists": false,
+      "id": "claude-vm-bundles",
+      "label": "Claude VM bundles",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Claude desktop code cache",
+      "exists": false,
+      "id": "claude-code-cache",
+      "label": "Claude Code Cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Claude desktop GPU shader cache",
+      "exists": false,
+      "id": "claude-gpu-cache",
+      "label": "Claude GPU Cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Cursor editor cache",
+      "exists": false,
+      "id": "cursor-cache",
+      "label": "Cursor cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Chrome default-profile web cache",
+      "exists": false,
+      "id": "chrome-cache",
+      "label": "Chrome cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Chrome's downloaded on-device ML prediction models \u2014 Chrome indexes them in 'Local State', which this tool does not touch, so recovery is unverified",
+      "exists": false,
+      "id": "chrome-optimization-model-store",
+      "label": "Chrome on-device models",
+      "safe": false,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Chrome's per-profile page-optimization hint cache; regenerated on demand",
+      "exists": false,
+      "id": "chrome-optimization-hint-cache",
+      "label": "Chrome optimization hints",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Spotify streamed-audio cache",
+      "exists": false,
+      "id": "spotify-cache",
+      "label": "Spotify cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Slack app cache",
+      "exists": false,
+      "id": "slack-cache",
+      "label": "Slack cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Slack service-worker cache storage",
+      "exists": false,
+      "id": "slack-service-worker",
+      "label": "Slack service worker cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Discord app cache",
+      "exists": false,
+      "id": "discord-cache",
+      "label": "Discord cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Electron framework download cache (used by app builds)",
+      "exists": false,
+      "id": "electron-cache",
+      "label": "Electron cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Playwright browser binaries \u2014 re-download with 'npx playwright install'",
+      "exists": false,
+      "id": "playwright-browsers",
+      "label": "Playwright browsers",
+      "safe": false,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Puppeteer downloaded Chromium builds",
+      "exists": false,
+      "id": "puppeteer-cache",
+      "label": "Puppeteer cache",
+      "safe": false,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Cypress browser/runner binaries \u2014 re-download with 'cypress install'",
+      "exists": false,
+      "id": "cypress-cache",
+      "label": "Cypress binary cache",
+      "safe": false,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Microsoft Teams (new) app cache",
+      "exists": false,
+      "id": "teams-cache",
+      "label": "Microsoft Teams cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Downloaded Zoom update installers",
+      "exists": false,
+      "id": "zoom-updater",
+      "label": "Zoom installer cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Cached provider plugins; re-downloaded on 'terraform init'",
+      "exists": false,
+      "id": "terraform-plugin-cache",
+      "label": "Terraform plugin cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Expo CLI download cache",
+      "exists": false,
+      "id": "expo-cache",
+      "label": "Expo cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Chrome's on-disk HTTP and compiled-code cache, per profile; refills as you browse. Holds no cookies, history, or logins \u2014 those live under Application Support",
+      "exists": false,
+      "id": "chrome-http-cache",
+      "label": "Chrome HTTP cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    },
+    {
+      "category": "caches",
+      "description": "Precompiled C/C++/ObjC/Swift module cache used by clang and SourceKit; rebuilt on the next compile",
+      "exists": false,
+      "id": "clang-module-cache",
+      "label": "Clang module cache",
+      "safe": true,
+      "size_bytes": 0,
+      "size_human": "0.0 B"
+    }
+  ],
+  "timestamp": "<TS>",
+  "total_reclaimable_bytes": 159744,
+  "total_reclaimable_human": "156.0 KB",
+  "version": "2.15.0"
+}

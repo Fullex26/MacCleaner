@@ -6597,3 +6597,92 @@ class TestConfigSync(unittest.TestCase):
         st = cleaner.run_config_sync("status")
         self.assertTrue(st["enabled"])
         self.assertIn("icloud_path", st)
+
+
+class TestContractFixtures(unittest.TestCase):
+    """V3 Stage 1 (docs/V3-SWIFT-ENGINE.md): golden contract fixtures.
+
+    tools/gen_contract_fixtures.py builds a deterministic synthetic HOME,
+    runs the REAL engine as a subprocess against it, normalizes the
+    machine-dependent parts (sandbox paths -> $HOME, timestamps, disk
+    lines), and writes tests/fixtures/*.json. This test regenerates them
+    fresh and diffs against the committed copies — any engine change that
+    moves the JSON contract fails here and forces a conscious fixture
+    update. These fixtures are also the parity oracle the Swift kit
+    (swift/MacCleanerKit) is verified against."""
+
+    FIXTURES = ["scan.json", "categories.json", "dry_run.json",
+                "report_stats.json", "schedule_status.json"]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.outdir = Path(tempfile.mkdtemp())
+        r = subprocess.run([sys.executable, str(REPO / "tools" / "gen_contract_fixtures.py"),
+                            "--out", str(cls.outdir)],
+                           capture_output=True, text=True, timeout=300)
+        cls.gen_rc, cls.gen_err = r.returncode, r.stderr
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.outdir, ignore_errors=True)
+
+    def test_generator_runs_clean(self):
+        self.assertEqual(self.gen_rc, 0, self.gen_err)
+
+    def test_fixtures_are_committed_and_current(self):
+        if self.gen_rc != 0:
+            self.skipTest("generator failed; covered by test_generator_runs_clean")
+        for name in self.FIXTURES:
+            committed = REPO / "tests" / "fixtures" / name
+            fresh = self.outdir / name
+            self.assertTrue(committed.exists(), f"missing committed fixture {name} "
+                            "— run tools/gen_contract_fixtures.py")
+            self.assertTrue(fresh.exists(), f"generator did not produce {name}")
+            self.assertEqual(json.loads(committed.read_text()),
+                             json.loads(fresh.read_text()),
+                             f"{name} drifted from the engine — regenerate "
+                             "tools/gen_contract_fixtures.py output and review the diff")
+
+    def test_scan_fixture_pins_real_sizes(self):
+        """The fixture must exercise measurement, not just shape — at least
+        five synthetic targets exist with nonzero du-measured sizes."""
+        committed = REPO / "tests" / "fixtures" / "scan.json"
+        if not committed.exists():
+            self.fail("scan.json fixture not committed")
+        data = json.loads(committed.read_text())
+        sized = [t for t in data["targets"] if t.get("exists") and t.get("size_bytes", 0) > 0]
+        self.assertGreaterEqual(len(sized), 5, [t["id"] for t in sized])
+
+    def test_categories_fixture_pins_full_table(self):
+        committed = REPO / "tests" / "fixtures" / "categories.json"
+        if not committed.exists():
+            self.fail("categories.json fixture not committed")
+        data = json.loads(committed.read_text())
+        ids = [t["id"] for c in data["categories"] for t in c["targets"]]
+        self.assertEqual(len(ids), 94, "static table size moved — regenerate fixtures "
+                         "AND tools/gen_swift_target_table.py output together")
+        self.assertEqual(len(ids), len(set(ids)))
+
+
+class TestSwiftTableGenerated(unittest.TestCase):
+    """The Swift kit's target table is GENERATED from get_targets()
+    (tools/gen_swift_target_table.py) — this pins that the committed
+    generated file is current, so a target change that forgets the
+    regeneration step fails the suite instead of failing parity later in
+    CI's Swift step (or worse, silently diverging on a machine without
+    swift). Regenerate, never hand-edit."""
+
+    def test_generated_swift_table_is_current(self):
+        committed = (REPO / "swift" / "MacCleanerKit" / "Sources" /
+                     "MacCleanerKit" / "TargetTable.generated.swift")
+        self.assertTrue(committed.exists(), "run tools/gen_swift_target_table.py")
+        before = committed.read_text()
+        r = subprocess.run([sys.executable, str(REPO / "tools" / "gen_swift_target_table.py")],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        after = committed.read_text()
+        if before != after:
+            committed.write_text(before)  # leave the tree as we found it
+            self.fail("TargetTable.generated.swift is stale — commit the "
+                      "regenerated file (tools/gen_swift_target_table.py) "
+                      "and re-run tools/check_swift_parity.py")

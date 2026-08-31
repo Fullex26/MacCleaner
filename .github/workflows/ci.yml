@@ -37,6 +37,12 @@ jobs:
       - name: Run shell completion behavior suite
         run: bash completions/run_tests.sh
 
+      - name: Build MacCleanerKit (V3 Stage 2, read-only Swift kit)
+        run: swift build -c release --package-path swift/MacCleanerKit
+
+      - name: Swift/Python engine parity (tools/check_swift_parity.py)
+        run: python3 tools/check_swift_parity.py
+
       - name: Smoke test — scan --json
         run: python3 cleaner.py scan --json | python3 -m json.tool > /dev/null
 

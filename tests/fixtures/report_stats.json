@@ -1,0 +1,50 @@
+{
+  "stats": {
+    "categories": [
+      {
+        "category": "xcode",
+        "freed_bytes": 32768,
+        "times_cleaned": 1
+      },
+      {
+        "category": "node",
+        "freed_bytes": 24576,
+        "times_cleaned": 1
+      },
+      {
+        "category": "python",
+        "freed_bytes": 12288,
+        "times_cleaned": 1
+      }
+    ],
+    "first_run": "<TS>",
+    "last_run": "<TS>",
+    "runs": 2,
+    "targets": [
+      {
+        "category": "xcode",
+        "freed_bytes": 32768,
+        "id": "xcode-derived-data",
+        "label": "Xcode DerivedData",
+        "times_cleaned": 1
+      },
+      {
+        "category": "node",
+        "freed_bytes": 24576,
+        "id": "npm-cache",
+        "label": "npm cache",
+        "times_cleaned": 1
+      },
+      {
+        "category": "python",
+        "freed_bytes": 12288,
+        "id": "pip-cache",
+        "label": "pip cache",
+        "times_cleaned": 1
+      }
+    ],
+    "total_freed_bytes": 69632,
+    "total_freed_human": "68.0 KB"
+  },
+  "version": "2.15.0"
+}

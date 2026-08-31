@@ -1,0 +1,39 @@
+{
+  "delete_mode": "rm",
+  "disk_after": "<DISK>",
+  "dry_run": true,
+  "freed_bytes": 53248,
+  "freed_human": "52.0 KB",
+  "items": [
+    {
+      "freed": 28672,
+      "id": "spotify-browser-cache",
+      "label": "Spotify browser cache",
+      "paths": [
+        {
+          "path": "$HOME/Library/Caches/com.spotify.client/Browser/Cache",
+          "size_bytes": 20480
+        },
+        {
+          "path": "$HOME/Library/Caches/com.spotify.client/Data",
+          "size_bytes": 8192
+        }
+      ],
+      "status": "would-delete"
+    },
+    {
+      "freed": 24576,
+      "id": "npm-cache",
+      "label": "npm cache",
+      "paths": [
+        {
+          "path": "$HOME/.npm/_cacache",
+          "size_bytes": 24576
+        }
+      ],
+      "status": "would-delete"
+    }
+  ],
+  "timestamp": "<TS>",
+  "version": "2.15.0"
+}
