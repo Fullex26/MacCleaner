@@ -15,6 +15,20 @@ an unverified deletion engine is the one artifact this project must never ship.
   (home-only deletes, symlink handling, the tmp carve-out) live in tested
   Python. Parity must be *proved*, not assumed.
 
+## Status (2026-09-01)
+
+Stages 1–3 are live: contract fixtures, the full read-only kit (static table
+plus all three dynamic scanners), and the in-app dual-engine soak (which
+caught one real bug in each engine during its first day). **Stage 4's first
+half — the guards — is now ported**: `Guards.safeToDelete` (parent-resolved,
+leaf-unresolved, 2.8.1 semantics) and `Guards.tmpScanPathAllowed` (two-level
+carve-out), with `mck guard-check` as a read-only verdict query and
+`tools/check_guard_parity.py` in CI judging a 20-scenario adversarial corpus
+against BOTH engines — divergence or a wrong agreed verdict fails the build.
+No deletion API exists yet; per the plan, a deletion caller may only be
+written once the guards have parity (done) and the soak has accumulated
+clean evidence over real use (in progress).
+
 ## Staged plan
 
 1. **Contract fixtures.** ✅ Landed: `tools/gen_contract_fixtures.py` builds a

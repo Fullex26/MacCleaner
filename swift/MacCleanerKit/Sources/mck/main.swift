@@ -79,6 +79,25 @@ case "scan":
         }
     }
     jsonOut(["version": version, "targets": targets])
+case "guard-check":
+    // Read-only verdict query for the Stage 4 guards — answers "WOULD the
+    // guard allow this path", never acts. Exists so the cross-engine parity
+    // harness (tools/check_guard_parity.py) can judge the same adversarial
+    // corpus with both engines. This is not a deletion API and must not
+    // become one: no caller in this binary deletes anything.
+    guard args.contains("--json"), let path = args.dropFirst().first(where: { !$0.hasPrefix("--") }) else {
+        FileHandle.standardError.write("usage: mck guard-check PATH --json [--tmp-root R]\n".data(using: .utf8)!)
+        exit(2)
+    }
+    let env = ProcessInfo.processInfo.environment
+    let home = env["HOME"] ?? NSHomeDirectory()
+    let tmpRoot = env["MACCLEANER_TMP_ROOT"] ?? "/private/tmp"
+    jsonOut([
+        "version": version,
+        "path": path,
+        "safe_to_delete": Guards.safeToDelete(path, home: home),
+        "tmp_scan_path_allowed": Guards.tmpScanPathAllowed(path, tmpRoot: tmpRoot),
+    ])
 case "categories":
     guard args.contains("--json") else { exit(2) }
     let byCat = Dictionary(grouping: allTargets, by: \.category)
@@ -94,6 +113,6 @@ case "categories":
         },
     ])
 default:
-    FileHandle.standardError.write("usage: mck scan --json --all | mck categories --json\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: mck scan --json --all | mck categories --json | mck guard-check PATH --json\n".data(using: .utf8)!)
     exit(2)
 }
