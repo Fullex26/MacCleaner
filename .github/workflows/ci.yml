@@ -49,6 +49,13 @@ jobs:
       - name: Swift/Python engine parity (tools/check_swift_parity.py)
         run: python3 tools/check_swift_parity.py
 
+      - name: Deletion-guard verdict parity (tools/check_guard_parity.py)
+        # Stage 4 gate: both engines judge the shared adversarial corpus
+        # (symlinked-ancestor et al.) and must agree on every verdict AND
+        # match the pinned expectations. Deletion callers may not be added
+        # to the Swift engine unless this passes.
+        run: python3 tools/check_guard_parity.py
+
       - name: Smoke test — scan --json
         run: python3 cleaner.py scan --json | python3 -m json.tool > /dev/null
 
