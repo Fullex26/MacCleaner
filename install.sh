@@ -90,8 +90,68 @@ PYEOF
     echo "→ Migrated shell aliases to functions (zsh doesn't complete aliases by default)"
 }
 
+# The shortcut block can end up in an rc file twice (one real machine had
+# mclean/mpreview/mreport defined at two different lines, from an older
+# install that wrote a three-line block and a later one that appended the
+# four-line one). Harmless to zsh, but the "already installed" guard below
+# then matches the *older* block and never adds `maccleaner()` at all.
+# Remove exact repeats of our own lines only, keeping the first occurrence;
+# nothing else in the file is touched.
+dedupe_maccleaner_shortcuts() {
+    local rc="$1"
+    [ -f "$rc" ] || return 0
+    [ -f "$SHORTCUTS_SRC" ] || return 0
+    python3 - "$rc" "$SHORTCUTS_SRC" <<'PYEOF'
+import sys
+
+rc_path, shortcuts_path = sys.argv[1], sys.argv[2]
+with open(shortcuts_path) as f:
+    ours = {line.rstrip("\n") for line in f if line.strip()}
+with open(rc_path) as f:
+    text = f.read()
+
+seen, out, changed = set(), [], False
+for line in text.split("\n"):
+    if line in ours:
+        if line in seen:
+            changed = True
+            continue
+        seen.add(line)
+    out.append(line)
+
+if changed:
+    with open(rc_path, "w") as f:
+        f.write("\n".join(out))
+PYEOF
+}
+
+# The Homebrew cask leaves `<Caskroom>/maccleaner/<version>/MacCleaner.app`
+# as a symlink to the bundle it installed (normally /Applications). Print
+# that bundle's path when the cask is installed, nothing otherwise.
+# MACCLEANER_CASKROOM_DIR overrides the Caskroom location (tests).
+maccleaner_cask_app() {
+    local dir="${MACCLEANER_CASKROOM_DIR:-}"
+    if [ -z "$dir" ]; then
+        local prefix
+        prefix="$(brew --prefix 2>/dev/null || true)"
+        dir="${prefix:-/opt/homebrew}/Caskroom/maccleaner"
+    fi
+    [ -d "$dir" ] || return 0
+    local link target
+    for link in "$dir"/*/MacCleaner.app; do
+        [ -L "$link" ] || continue
+        target="$(readlink "$link")"
+        if [ -d "$target" ]; then
+            echo "$target"
+            return 0
+        fi
+    done
+    return 0
+}
+
 SHELL_RC="$HOME/.zshrc"
 migrate_maccleaner_aliases "$SHELL_RC"
+dedupe_maccleaner_shortcuts "$SHELL_RC"
 if ! grep -q "mac-cleaner" "$SHELL_RC" 2>/dev/null; then
     {
         echo ""
@@ -169,6 +229,7 @@ fi
 # between releases would otherwise ship whatever was last committed).
 APP_BUNDLE="$SCRIPT_DIR/MacCleaner.app"
 APP_DEST="$HOME/Applications/MacCleaner.app"
+INSTALLED_DEST=""
 if command -v swiftc >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/app/build.sh" ]; then
     echo "→ Building MacCleaner.app from source..."
     if bash "$SCRIPT_DIR/app/build.sh"; then
@@ -201,7 +262,18 @@ if [ -d "$APP_BUNDLE" ] && [ ! -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.frame
     fi
 fi
 
-if [ -d "$APP_BUNDLE" ]; then
+CASK_APP="$(maccleaner_cask_app)"
+if [ -n "$CASK_APP" ]; then
+    # Homebrew owns the app. Installing a second copy to ~/Applications
+    # creates exactly the duplicate `doctor` warns about: Sparkle updates only
+    # the running copy, so the other falls behind silently. The engine and
+    # shortcuts above are still refreshed -- Sparkle never touches those.
+    echo "→ MacCleaner.app is managed by Homebrew ($CASK_APP) — not installing a second copy"
+    echo "  Update the app with: brew upgrade --cask maccleaner  (or let it auto-update)"
+    if [ -d "$APP_DEST" ]; then
+        echo "⚠️  A second copy exists at $APP_DEST from an earlier install — remove it to avoid two apps drifting apart"
+    fi
+elif [ -d "$APP_BUNDLE" ]; then
     mkdir -p "$HOME/Applications"
     rm -rf "$APP_DEST"
     INSTALLED_DEST=""
@@ -244,7 +316,7 @@ echo "  maccleaner report     — show history"
 echo ""
 echo "For AI agents: maccleaner scan --json  (full contract in AGENTS.md)"
 echo ""
-echo "Menu bar app: open ~/Applications/MacCleaner.app  (look for 🧹)"
+echo "Menu bar app: open ${CASK_APP:-${INSTALLED_DEST:-$APP_DEST}}  (look for 🧹)"
 echo ""
 echo "Restart your terminal or run: source ~/.zshrc"
 echo ""

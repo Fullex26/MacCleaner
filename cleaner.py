@@ -28,6 +28,7 @@ In --json mode: JSON goes to stdout, human messages to stderr.
 import os
 import re
 import sys
+import stat as statmod
 import json
 import math
 import glob as globmod
@@ -1657,6 +1658,26 @@ STORAGE_INSIGHTS_BUNDLE_SUFFIXES = (
     ".fcpbundle", ".tvlibrary", ".theater", ".logicx", ".band", ".sparsebundle",
     ".pkg", ".bundle", ".plugin", ".kext", ".qlgenerator", ".mdimporter",
 )
+# Wall-clock ceiling for one storage-insights walk. The dataless check below
+# removes the one hang that was actually observed, but any single readdir on
+# a cloud-backed volume can still stall in ways no stat flag describes. Past
+# the budget the walk stops between directories and reports `truncated`
+# rather than pin the app's Large Files panel indefinitely. (A readdir that
+# has already blocked cannot be interrupted from Python at all -- the app's
+# own per-call timeout on the engine process is the backstop for that.)
+STORAGE_INSIGHTS_TIME_BUDGET_S = 120
+# macOS marks an evicted iCloud file or folder "dataless": stat() answers
+# from metadata, but *enumerating* a dataless folder blocks in the kernel
+# until iCloud materialises it -- observed live as two engines wedged in
+# getdirentries64 under ~/Library/Mobile Documents for 20+ minutes. The flag
+# is in every lstat, so the scanner checks it BEFORE listing any directory.
+SF_DATALESS = getattr(statmod, "SF_DATALESS", 0x40000000)
+
+
+def _is_dataless(st):
+    """True if a stat result carries macOS's SF_DATALESS flag (an evicted
+    iCloud item). Never raises; a stat with no st_flags is just not dataless."""
+    return bool(getattr(st, "st_flags", 0) & SF_DATALESS)
 
 
 def _disk_bytes(st):
@@ -1675,7 +1696,7 @@ def _is_bundle_dir(name):
     return name.endswith(STORAGE_INSIGHTS_BUNDLE_SUFFIXES)
 
 
-def _bundle_size(root):
+def _bundle_size(root, stats=None):
     """Total bytes of a bundle, stat-only.
 
     Deliberately NOT `du`/get_size(): this keeps the whole scan inside the
@@ -1686,8 +1707,11 @@ def _bundle_size(root):
     counted -- a symlink inside a bundle usually points back into the same
     bundle (Frameworks/Versions/Current), so following them would both
     double-count and risk a cycle. Unreadable subtrees contribute 0 rather
-    than aborting: a partial size for one app beats losing the whole scan."""
+    than aborting: a partial size for one app beats losing the whole scan.
+    `stats`, if given, accumulates `dataless_dirs_skipped` (see _is_dataless)."""
     total, stack = 0, [root]
+    if stats is None:
+        stats = {}
     while stack:
         try:
             entries = list(os.scandir(stack.pop()))
@@ -1697,10 +1721,16 @@ def _bundle_size(root):
             try:
                 if e.is_symlink():
                     continue
+                st = e.stat(follow_symlinks=False)
                 if e.is_dir(follow_symlinks=False):
+                    if _is_dataless(st):
+                        # Evicted folder: occupies no local disk and listing
+                        # it would block on iCloud. Count it, never enter it.
+                        stats["dataless_dirs_skipped"] = stats.get("dataless_dirs_skipped", 0) + 1
+                        continue
                     stack.append(e.path)
                 else:
-                    total += _disk_bytes(e.stat(follow_symlinks=False))
+                    total += _disk_bytes(st)
             except OSError:
                 continue
     return total
@@ -1861,7 +1891,7 @@ def scan_storage_map(root=None, min_bytes=0, depth=1):
             "category": _storage_category(root), "children": children}
 
 
-def scan_storage_insights(config):
+def scan_storage_insights(config, stats=None, time_budget_s=None):
     """Read-only scan of the configured roots (default ~/Documents,
     ~/Downloads, ~/Desktop) for files >= STORAGE_INSIGHTS_MIN_BYTES.
 
@@ -1893,13 +1923,41 @@ def scan_storage_insights(config):
         during the walk are skipped entirely (`e.is_symlink()` checked
         first, before any other classification, for every entry).
 
+    Two hang guards (2.17.2), both driven by a live wedge -- two engines
+    blocked in getdirentries64 on an evicted iCloud folder under
+    ~/Library/Mobile Documents for 20+ minutes:
+      - A directory whose lstat carries SF_DATALESS is never listed (stat is
+        answered from metadata; readdir blocks until iCloud downloads it).
+        It occupies no local disk anyway. Counted in `stats`.
+      - `time_budget_s` (default STORAGE_INSIGHTS_TIME_BUDGET_S) bounds the
+        walk between directories; past it, the partial result is returned
+        and `stats["truncated"]` is True.
+    `stats`, if given, is filled with `dataless_dirs_skipped`, `truncated`
+    and `elapsed_s` -- a dict argument rather than a changed return type so
+    every existing caller keeps its plain list.
+
     This function is architecturally outside the delete pipeline: no
     `safe` field, no category, no target id, never passed to
     get_targets()/collect_targets()/delete_target()."""
+    if stats is None:
+        stats = {}
+    if time_budget_s is None:
+        time_budget_s = STORAGE_INSIGHTS_TIME_BUDGET_S
+    stats.setdefault("dataless_dirs_skipped", 0)
+    stats["truncated"] = False
+    started = time.monotonic()
     hits = []
     stack = [r for r in _storage_insights_roots() if r.is_dir()]
+    walked = 0
     while stack:
+        if walked and time.monotonic() - started > time_budget_s:
+            stats["truncated"] = True
+            print(f"Warning: storage-insights stopped after {time_budget_s}s with "
+                  f"{len(stack)} director{'y' if len(stack) == 1 else 'ies'} unvisited; "
+                  f"results are partial", file=sys.stderr)
+            break
         current = stack.pop()
+        walked += 1
         try:
             entries = list(os.scandir(current))
         except OSError:
@@ -1911,9 +1969,15 @@ def scan_storage_insights(config):
                 if e.is_dir(follow_symlinks=False):
                     if e.name in _STORAGE_INSIGHTS_SKIP_DIRS:
                         continue
+                    if _is_dataless(e.stat(follow_symlinks=False)):
+                        # Evicted iCloud folder: listing it blocks on a
+                        # download, and it holds no local bytes. Skip it
+                        # whether it is a bundle or a plain folder.
+                        stats["dataless_dirs_skipped"] += 1
+                        continue
                     if _is_bundle_dir(e.name):
                         # One row for the whole bundle; never descend.
-                        size = _bundle_size(e.path)
+                        size = _bundle_size(e.path, stats)
                         if size >= STORAGE_INSIGHTS_MIN_BYTES:
                             st = e.stat(follow_symlinks=False)
                             hits.append({"path": Path(e.path), "size_bytes": size,
@@ -1928,6 +1992,7 @@ def scan_storage_insights(config):
                                      "mtime": st.st_mtime, "is_bundle": False})
             except OSError:
                 continue
+    stats["elapsed_s"] = round(time.monotonic() - started, 3)
     hits.sort(key=lambda h: h["size_bytes"], reverse=True)
     return hits[:STORAGE_INSIGHTS_MAX_RESULTS]
 
@@ -1975,12 +2040,19 @@ def show_storage_map(root=None, min_bytes=0, json_mode=False, depth=1):
 
 
 def show_storage_insights(config, json_mode=False):
-    hits = scan_storage_insights(config)
+    stats = {}
+    hits = scan_storage_insights(config, stats=stats)
     if json_mode:
         print(json.dumps({
             "version": VERSION,
             "roots": [str(r) for r in _storage_insights_roots()],
             "min_bytes": STORAGE_INSIGHTS_MIN_BYTES,
+            # 2.17.2, additive: `truncated` means the walk hit its time
+            # budget and `entries` is partial; `dataless_dirs_skipped` is how
+            # many evicted iCloud folders were left unlisted (they hold no
+            # local bytes, and listing one can block for minutes).
+            "truncated": bool(stats.get("truncated")),
+            "dataless_dirs_skipped": int(stats.get("dataless_dirs_skipped", 0)),
             "entries": [
                 {"path": str(h["path"]), "size_bytes": h["size_bytes"],
                  "size_human": fmt_size(h["size_bytes"]), "mtime": h["mtime"],
@@ -2628,6 +2700,42 @@ def _app_bundle_version(app_path: Path):
         return None
 
 
+def _installed_app_bundles():
+    """Every MacCleaner.app doctor knows how to find, in the order install.sh
+    prefers them: ~/Applications (install.sh's target) then /Applications
+    (the Homebrew cask's, or install.sh's fallback). Existing paths only."""
+    system_apps_dir = Path(os.environ.get("MACCLEANER_SYSTEM_APPLICATIONS_DIR", "/Applications"))
+    candidates = [HOME / "Applications" / "MacCleaner.app", system_apps_dir / "MacCleaner.app"]
+    return [p for p in candidates if p.exists()]
+
+
+def _homebrew_cask_app():
+    """The MacCleaner.app the Homebrew cask manages, or None.
+
+    Homebrew leaves a `<Caskroom>/maccleaner/<version>/MacCleaner.app`
+    symlink pointing at the installed bundle, so ownership is read from the
+    link rather than guessed from a path. `MACCLEANER_CASKROOM_DIR` overrides
+    the Caskroom location (tests); otherwise both Homebrew prefixes are
+    tried. Never raises."""
+    try:
+        override = os.environ.get("MACCLEANER_CASKROOM_DIR")
+        roots = ([Path(override)] if override else
+                 [Path("/opt/homebrew/Caskroom/maccleaner"), Path("/usr/local/Caskroom/maccleaner")])
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for link in sorted(root.glob("*/MacCleaner.app")):
+                try:
+                    target = link.resolve(strict=True)
+                except OSError:
+                    continue
+                if target.is_dir():
+                    return target
+    except Exception:
+        pass
+    return None
+
+
 INSTALLED_APPS_DIRS_DEFAULT = "/Applications:%s:/System/Applications" % (HOME / "Applications")
 
 
@@ -3230,10 +3338,38 @@ def run_doctor(config, json_mode=False):
     except Exception:
         pass
 
-    system_apps_dir = Path(os.environ.get("MACCLEANER_SYSTEM_APPLICATIONS_DIR", "/Applications"))
-    app_paths = [HOME / "Applications/MacCleaner.app", system_apps_dir / "MacCleaner.app"]
-    installed_app = next((p for p in app_paths if p.exists()), None)
-    check("Menu bar app", f"installed at {installed_app}" if installed_app else "not installed")
+    installed_apps = _installed_app_bundles()
+    brew_app = _homebrew_cask_app()   # already resolved; compare resolved to resolved
+
+    def _brew_owned(p):
+        try:
+            return brew_app is not None and p.resolve() == brew_app
+        except OSError:
+            return False
+
+    installed_app = None
+    if not installed_apps:
+        check("Menu bar app", "not installed")
+    elif len(installed_apps) == 1:
+        installed_app = installed_apps[0]
+        owner = " (Homebrew cask)" if _brew_owned(installed_app) else ""
+        check("Menu bar app", f"installed at {installed_app}{owner}")
+    else:
+        # Two copies -- typically install.sh's ~/Applications one beside the
+        # Homebrew cask's /Applications one. Sparkle updates only the copy
+        # that is running, so the other silently falls behind, and Finder /
+        # Spotlight may open either. Keep the Homebrew-managed one when there
+        # is one (brew upgrade AND Sparkle both track it); otherwise keep the
+        # first and name the rest.
+        keep = next((p for p in installed_apps if _brew_owned(p)), installed_apps[0])
+        installed_app = keep
+        extras = [p for p in installed_apps if p != keep]
+        keep_note = " (Homebrew cask)" if _brew_owned(keep) else ""
+        check("Menu bar app",
+              f"installed {len(installed_apps)} times: {keep}{keep_note} and "
+              f"{', '.join(str(p) for p in extras)} — only one copy is auto-updated; "
+              f"remove {', '.join(str(p) for p in extras)}",
+              ok=False)
 
     # A6: Sparkle (v2.6) updates the app bundle but never touches the
     # installed engine at ~/mac-cleaner/cleaner.py -- the app delegates ALL
@@ -3763,6 +3899,7 @@ def run_disk_check(config, json_mode=False, post=True):
     generic-icon osascript path) skips posting here but still makes and
     persists the throttle decision, so the app and the standalone launchd
     disk-check agent share one 24h window and never double-notify."""
+    _trim_cron_log()   # this is the hourly writer; keep its own log bounded
     ds = disk_stats()
     raw_threshold = config.get("low_disk_threshold_gb", 10)
     try:
@@ -3848,6 +3985,36 @@ AGENT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 STABLE_PYTHON_CANDIDATES = ("/opt/homebrew/bin/python3", "/usr/local/bin/python3",
                             "/usr/bin/python3")
 CRON_LOG_PATH = LOG_PATH.parent / "cron.log"   # beside report.log wherever that lives
+# The hourly diskwatch agent appends to cron.log forever (1,100+ lines of
+# "BELOW threshold" on one real machine). Past CRON_LOG_MAX_BYTES it is cut
+# back to its last CRON_LOG_KEEP_LINES lines -- in place, see _trim_cron_log.
+CRON_LOG_MAX_BYTES = 512 * 1024
+CRON_LOG_KEEP_LINES = 400
+
+
+def _trim_cron_log(path=None, max_bytes=None, keep_lines=None):
+    """Cap the launchd agents' shared log at its tail, IN PLACE.
+
+    launchd opens StandardOut/ErrorPath with O_APPEND and keeps the
+    descriptor for the life of the job, so a rename-and-recreate rotation
+    would strand that descriptor on the old inode: every later line would
+    vanish into an unlinked file. Truncating and rewriting the same inode
+    keeps the append position valid. Never raises -- a log we cannot trim
+    is not a reason to fail a disk check."""
+    path = Path(path if path is not None else CRON_LOG_PATH)
+    max_bytes = CRON_LOG_MAX_BYTES if max_bytes is None else max_bytes
+    keep_lines = CRON_LOG_KEEP_LINES if keep_lines is None else keep_lines
+    try:
+        if not path.is_file() or path.stat().st_size <= max_bytes:
+            return False
+        with open(path, "r+", encoding="utf-8", errors="replace") as f:
+            tail = f.readlines()[-keep_lines:]
+            f.seek(0)
+            f.truncate()
+            f.writelines(tail)
+        return True
+    except OSError:
+        return False
 
 
 def _is_venv_interpreter(python_path) -> bool:
