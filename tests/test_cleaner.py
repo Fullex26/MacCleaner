@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -6932,3 +6933,345 @@ class TestSwiftTableGenerated(unittest.TestCase):
             self.fail("TargetTable.generated.swift is stale — commit the "
                       "regenerated file (tools/gen_swift_target_table.py) "
                       "and re-run tools/check_swift_parity.py")
+
+
+# ── 2.17.2: iCloud dataless folders, scan time budget, duplicate app copies,
+#           launchd log rotation, install.sh idempotency ─────────────────────
+
+SF_DATALESS = 0x40000000
+
+
+class _DatalessEntry:
+    """Proxy around a real os.DirEntry whose stat() carries macOS's
+    SF_DATALESS flag. The kernel is the only thing that can set that flag
+    (chflags can't), so a test has to fake it -- everything else is the real
+    entry, so is_dir()/is_symlink()/path behave exactly as in production."""
+
+    def __init__(self, entry):
+        self._e = entry
+
+    def __getattr__(self, name):
+        return getattr(self._e, name)
+
+    def stat(self, follow_symlinks=True):
+        st = self._e.stat(follow_symlinks=follow_symlinks)
+        return types.SimpleNamespace(
+            st_mode=st.st_mode, st_size=st.st_size, st_blocks=st.st_blocks,
+            st_mtime=st.st_mtime,
+            st_flags=getattr(st, "st_flags", 0) | SF_DATALESS)
+
+
+class TestStorageInsightsDataless(unittest.TestCase):
+    """An evicted ("dataless") iCloud folder blocks readdir until iCloud
+    materialises it. Observed live: two storage-insights engines wedged in
+    getdirentries64 under ~/Library/Mobile Documents for 20+ minutes at 0%
+    CPU. stat() on such a folder is safe; *enumerating* it is not. So a
+    directory whose stat carries SF_DATALESS must be skipped without ever
+    being listed -- in the main walk and inside a bundle alike."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.docs = self.tmp / "Documents"
+        self.docs.mkdir()
+        self._patch = mock.patch.dict(os.environ, {
+            "MACCLEANER_STORAGE_INSIGHTS_ROOTS": str(self.docs)})
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _big(self, d, name):
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_bytes(b"\0" * (150 * 1024 * 1024))
+
+    def _scan_with_dataless(self, names):
+        real = os.scandir
+        listed = []
+
+        def fake(path="."):
+            listed.append(str(path))
+            return iter([_DatalessEntry(e) if e.name in names else e
+                         for e in real(path)])
+
+        stats = {}
+        with mock.patch("os.scandir", side_effect=fake):
+            hits = cleaner.scan_storage_insights({}, stats=stats)
+        return hits, listed, stats
+
+    def test_dataless_plain_directory_is_never_listed(self):
+        self._big(self.docs / "Evicted", "inside.mov")
+        self._big(self.docs, "local.mov")
+        hits, listed, stats = self._scan_with_dataless({"Evicted"})
+        self.assertEqual([h["path"].name for h in hits], ["local.mov"])
+        self.assertNotIn(str(self.docs / "Evicted"), listed)
+        self.assertEqual(stats["dataless_dirs_skipped"], 1)
+
+    def test_dataless_bundle_is_never_sized(self):
+        self._big(self.docs / "Evicted.app" / "Contents", "big.bin")
+        hits, listed, stats = self._scan_with_dataless({"Evicted.app"})
+        self.assertEqual(hits, [])
+        self.assertFalse(any(p.startswith(str(self.docs / "Evicted.app"))
+                             for p in listed))
+        self.assertEqual(stats["dataless_dirs_skipped"], 1)
+
+    def test_dataless_folder_inside_a_bundle_is_never_listed(self):
+        self._big(self.docs / "Some.app" / "Contents" / "MacOS", "bin")
+        self._big(self.docs / "Some.app" / "Contents" / "Evicted", "more.bin")
+        hits, listed, stats = self._scan_with_dataless({"Evicted"})
+        self.assertEqual([h["path"].name for h in hits], ["Some.app"])
+        self.assertNotIn(str(self.docs / "Some.app" / "Contents" / "Evicted"), listed)
+        self.assertEqual(hits[0]["size_bytes"], 150 * 1024 * 1024,
+                         "the evicted folder occupies no local disk and must not be counted")
+
+    def test_materialised_directories_still_scanned(self):
+        # Sanity: the skip is keyed on the flag, not on the name or on being
+        # a directory at all.
+        self._big(self.docs / "Evicted", "inside.mov")
+        hits, listed, stats = self._scan_with_dataless(set())
+        self.assertEqual([h["path"].name for h in hits], ["inside.mov"])
+        self.assertEqual(stats["dataless_dirs_skipped"], 0)
+
+
+class TestStorageInsightsTimeBudget(unittest.TestCase):
+    """The dataless check removes the known hang, but any single readdir can
+    still stall on a cloud-backed volume the flag doesn't describe. A wall-
+    clock budget bounds the walk: past it, stop and say so rather than pin
+    the app's Large Files panel forever."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.a = self.tmp / "a"
+        self.b = self.tmp / "b"
+        for d in (self.a, self.b):
+            d.mkdir()
+            (d / f"{d.name}.mov").write_bytes(b"\0" * (150 * 1024 * 1024))
+        self._patch = mock.patch.dict(os.environ, {
+            "MACCLEANER_STORAGE_INSIGHTS_ROOTS": f"{self.a}:{self.b}"})
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_walk_stops_at_budget_and_reports_truncation(self):
+        stats = {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            hits = cleaner.scan_storage_insights({}, stats=stats, time_budget_s=0)
+        self.assertTrue(stats["truncated"])
+        self.assertEqual(len(hits), 1, "one root walked, then the budget stopped the second")
+
+    def test_default_budget_completes_a_small_tree(self):
+        stats = {}
+        hits = cleaner.scan_storage_insights({}, stats=stats)
+        self.assertFalse(stats["truncated"])
+        self.assertEqual(len(hits), 2)
+        self.assertGreater(cleaner.STORAGE_INSIGHTS_TIME_BUDGET_S, 0)
+
+    def test_json_carries_truncated_and_dataless_counts(self):
+        # Additive contract keys: the app decodes StorageInsightsReport with
+        # non-optional fields for the existing keys, so new keys must be added,
+        # never renamed -- and the app can now say "partial" honestly.
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "storage-insights", "--json"],
+                           capture_output=True, text=True, env=os.environ.copy(), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertIs(data["truncated"], False)
+        self.assertEqual(data["dataless_dirs_skipped"], 0)
+        self.assertEqual(len(data["entries"]), 2)
+
+
+class TestDoctorDuplicateAppCopies(TestDoctorSchedule):
+    """The app can be installed twice -- once by install.sh (~/Applications)
+    and once by the Homebrew cask (/Applications). Sparkle only ever updates
+    the running copy, so the other silently falls behind; doctor used to
+    report whichever it found first and compare the engine against THAT,
+    which after the next update is the stale one."""
+
+    def _write_bundle(self, app, version):
+        contents = app / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleShortVersionString": version}, f)
+
+    def _caskroom_pointing_at(self, app):
+        caskroom = self.tmp / "Caskroom" / "maccleaner"
+        (caskroom / "2.17.1").mkdir(parents=True)
+        (caskroom / "2.17.1" / "MacCleaner.app").symlink_to(app)
+        self.env["MACCLEANER_CASKROOM_DIR"] = str(caskroom)
+
+    def _menu_bar_check(self):
+        r = self.run_doctor()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        return data, next(x for x in data["checks"] if x["name"] == "Menu bar app")
+
+    def test_single_copy_is_ok(self):
+        home_app = self.home / "Applications" / "MacCleaner.app"
+        self._write_bundle(home_app, cleaner.VERSION)
+        data, c = self._menu_bar_check()
+        self.assertTrue(c["ok"])
+        self.assertIn(str(home_app), c["status"])
+
+    def test_two_copies_fail_the_check_and_name_both(self):
+        home_app = self.home / "Applications" / "MacCleaner.app"
+        sys_app = self.tmp / "sysapps" / "MacCleaner.app"
+        self._write_bundle(home_app, cleaner.VERSION)
+        self._write_bundle(sys_app, cleaner.VERSION)
+        data, c = self._menu_bar_check()
+        self.assertFalse(c["ok"])
+        self.assertIn(str(home_app), c["status"])
+        self.assertIn(str(sys_app), c["status"])
+        self.assertFalse(data["ok"], "a duplicate install is a MacCleaner-owned problem with a remedy")
+
+    def test_homebrew_owned_copy_is_named(self):
+        sys_app = self.tmp / "sysapps" / "MacCleaner.app"
+        self._write_bundle(sys_app, cleaner.VERSION)
+        self._caskroom_pointing_at(sys_app)
+        data, c = self._menu_bar_check()
+        self.assertTrue(c["ok"])
+        self.assertIn("Homebrew", c["status"])
+
+    def test_duplicate_remedy_keeps_the_homebrew_copy(self):
+        home_app = self.home / "Applications" / "MacCleaner.app"
+        sys_app = self.tmp / "sysapps" / "MacCleaner.app"
+        self._write_bundle(home_app, cleaner.VERSION)
+        self._write_bundle(sys_app, cleaner.VERSION)
+        self._caskroom_pointing_at(sys_app)
+        data, c = self._menu_bar_check()
+        self.assertFalse(c["ok"])
+        self.assertIn(f"remove {home_app}", c["status"])
+
+    def test_version_skew_compares_against_the_homebrew_copy(self):
+        # The stale install.sh copy is at 0.0.1; the Homebrew one matches the
+        # engine. The skew row must not fire -- the duplicate row already
+        # carries the remedy, and a false skew warning would send the user
+        # to re-run install.sh, which is what created the duplicate.
+        home_app = self.home / "Applications" / "MacCleaner.app"
+        sys_app = self.tmp / "sysapps" / "MacCleaner.app"
+        self._write_bundle(home_app, "0.0.1")
+        self._write_bundle(sys_app, cleaner.VERSION)
+        self._caskroom_pointing_at(sys_app)
+        data, c = self._menu_bar_check()
+        skew = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNone(skew)
+
+
+class TestCronLogTrim(unittest.TestCase):
+    """The hourly diskwatch agent appends to cron.log forever (1,100+ lines
+    of 'BELOW threshold' on one real machine). Trim in place, keeping the
+    tail: launchd holds the file open with O_APPEND, so a rename-based
+    rotation would strand its descriptor on the old inode and every later
+    line would vanish into an unlinked file."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.log = self.tmp / "cron.log"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_oversized_log_is_trimmed_in_place_keeping_the_tail(self):
+        lines = [f"line {i}" for i in range(5000)]
+        self.log.write_text("\n".join(lines) + "\n")
+        ino = os.stat(self.log).st_ino
+        cleaner._trim_cron_log(self.log, max_bytes=1024, keep_lines=100)
+        self.assertEqual(self.log.read_text().splitlines(), lines[-100:])
+        self.assertEqual(os.stat(self.log).st_ino, ino, "must trim in place, never rename")
+
+    def test_small_log_is_left_alone(self):
+        self.log.write_text("a\nb\nc\n")
+        cleaner._trim_cron_log(self.log, max_bytes=1024, keep_lines=100)
+        self.assertEqual(self.log.read_text(), "a\nb\nc\n")
+
+    def test_missing_log_is_not_an_error(self):
+        cleaner._trim_cron_log(self.log, max_bytes=1024, keep_lines=100)
+        self.assertFalse(self.log.exists())
+
+    def test_disk_check_trims_the_agent_log(self):
+        lines = [f"Free: 12.9 GB · BELOW threshold {i}" for i in range(3000)]
+        self.log.write_text("\n".join(lines) + "\n")
+        orig = (cleaner.CRON_LOG_PATH, cleaner.CRON_LOG_MAX_BYTES, cleaner.ALERTS_PATH)
+        cleaner.CRON_LOG_PATH, cleaner.CRON_LOG_MAX_BYTES = self.log, 1024
+        cleaner.ALERTS_PATH = self.tmp / "alerts.json"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cleaner.run_disk_check({"low_disk_alerts": False}, json_mode=True)
+        finally:
+            cleaner.CRON_LOG_PATH, cleaner.CRON_LOG_MAX_BYTES, cleaner.ALERTS_PATH = orig
+        kept = self.log.read_text().splitlines()
+        self.assertEqual(len(kept), cleaner.CRON_LOG_KEEP_LINES)
+        self.assertEqual(kept[-1], lines[-1])
+
+
+class TestInstallScriptHelpers(unittest.TestCase):
+    """install.sh's shell helpers, exercised in isolation: each function's
+    body is sliced out of the script and sourced into a throwaway bash, so
+    no real rc file, home directory, or app bundle is ever touched."""
+
+    SHORTCUT_LINES = (REPO / "completions" / "shell-shortcuts.sh").read_text().splitlines()
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run_fn(self, fn, args, env=None):
+        script = (
+            f'SCRIPT_DIR="{REPO}"\n'
+            'SHORTCUTS_SRC="$SCRIPT_DIR/completions/shell-shortcuts.sh"\n'
+            f'eval "$(sed -n \'/^{fn}()/,/^}}/p\' "$SCRIPT_DIR/install.sh")"\n'
+            f'{fn} "$@"\n')
+        return subprocess.run(["bash", "-c", script, "_", *args],
+                              capture_output=True, text=True,
+                              env={**os.environ, **(env or {})}, timeout=30)
+
+    def test_dedupe_removes_repeated_shortcut_lines_keeping_the_first(self):
+        rc = self.tmp / ".zshrc"
+        rc.write_text(
+            "export PATH=/x:$PATH\n\n# MacCleaner\n"
+            + "\n".join(self.SHORTCUT_LINES[1:]) + "\n\n"
+            "# Fullex Agents\nalias freview='cd \"$FULLEX_DIR\" && npm start review'\n\n"
+            "# MacCleaner\n" + "\n".join(self.SHORTCUT_LINES) + "\n"
+            "alias phanessastatus='ssh phanessa \"btop\"'\n")
+        r = self._run_fn("dedupe_maccleaner_shortcuts", [str(rc)])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = rc.read_text()
+        for line in self.SHORTCUT_LINES:
+            self.assertEqual(text.count(line + "\n"), 1, line)
+        self.assertIn("alias freview=", text)
+        self.assertIn("alias phanessastatus=", text)
+        self.assertIn("export PATH=/x:$PATH", text)
+        self.assertLess(text.index("mclean()"), text.index("maccleaner()"),
+                        "the first occurrence survives; later repeats go")
+
+    def test_dedupe_is_a_byte_for_byte_noop_on_a_clean_rc(self):
+        rc = self.tmp / ".zshrc"
+        original = "# MacCleaner\n" + "\n".join(self.SHORTCUT_LINES) + "\nalias x=y\n"
+        rc.write_text(original)
+        r = self._run_fn("dedupe_maccleaner_shortcuts", [str(rc)])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(rc.read_text(), original)
+
+    def test_dedupe_tolerates_a_missing_rc(self):
+        r = self._run_fn("dedupe_maccleaner_shortcuts", [str(self.tmp / "nope")])
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_cask_app_resolves_the_homebrew_symlink(self):
+        app = self.tmp / "Applications" / "MacCleaner.app"
+        app.mkdir(parents=True)
+        caskroom = self.tmp / "Caskroom" / "maccleaner"
+        (caskroom / "2.17.1").mkdir(parents=True)
+        (caskroom / "2.17.1" / "MacCleaner.app").symlink_to(app)
+        r = self._run_fn("maccleaner_cask_app", [],
+                         env={"MACCLEANER_CASKROOM_DIR": str(caskroom)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), str(app))
+
+    def test_cask_app_is_empty_without_a_cask(self):
+        r = self._run_fn("maccleaner_cask_app", [],
+                         env={"MACCLEANER_CASKROOM_DIR": str(self.tmp / "absent")})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "")
