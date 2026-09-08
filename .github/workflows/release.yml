@@ -575,7 +575,7 @@ jobs:
           echo "::warning::This release (${{ steps.version.outputs.version }}) is shipping WITHOUT appcast.xml (signing enabled=${{ steps.signing.outputs.enabled }}, SPARKLE_ED_PRIVATE_KEY present=${{ steps.signing.outputs.sparkle_key_present }}). Consequence: because this becomes the 'latest' release, its appcast.xml release asset does not exist, so <feed-url>/releases/latest/download/appcast.xml now 404s for EVERY installed app's Sparkle update check -- not just 'stale', fully broken -- until the NEXT tag is released with both the Developer ID signing secrets AND SPARKLE_ED_PRIVATE_KEY configured. If this was unintentional, add the missing secret(s) and cut a follow-up signed release promptly."
 
       - name: Create GitHub Release and upload assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: "MacCleaner ${{ steps.version.outputs.version }}"
           body_path: release_notes.md
