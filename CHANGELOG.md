@@ -7,6 +7,14 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [Unreleased]
+
+### Changed
+- **`ROADMAP.md` is current again, and now stays that way.** Its "Current State" heading still said v2.15.0 at 2.17.2 — four releases of drift, invisible because nothing pointed at it. The v2.16 and v2.17 work is written up (schedule observability and `clean --min-free`; the V3 dual-engine soak and the `get_size` partial-`du` bug it caught on its first live run; the iCloud-dataless hangs in both engines), and the Swift-rewrite and App Store entries now reflect that stages 1–3 plus Stage 4's guards have landed.
+- **New drift tripwire: `TestRoadmapCurrency`.** Pins the roadmap heading's version to `cleaner.VERSION`, in the same spirit as `TestCompletions`, `TestContractFixtures` and `TestSwiftTableGenerated`. It checks the version only, never the prose — a test that pinned wording would fail on every honest edit and get deleted.
+
+---
+
 ## [2.17.2] — 2026-09-08
 
 The hang-and-duplicates release. Everything here came from one live machine:
