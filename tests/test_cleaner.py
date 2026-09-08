@@ -10,6 +10,7 @@ import io
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -7275,3 +7276,32 @@ class TestInstallScriptHelpers(unittest.TestCase):
                          env={"MACCLEANER_CASKROOM_DIR": str(self.tmp / "absent")})
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "")
+
+
+class TestRoadmapCurrency(unittest.TestCase):
+    """ROADMAP.md's "Current State" heading names a version, and it silently
+    rotted four releases behind the engine (it still said v2.15.0 at 2.17.2).
+    Nothing pointed at it, so nothing caught it — the same failure mode the
+    completions snapshot, the contract fixtures and the generated Swift table
+    each already have a tripwire for. This is that tripwire for the roadmap.
+
+    Deliberately pins ONLY the heading's version, not the prose beneath it:
+    asserting on wording would fail on every honest edit and teach people to
+    delete the test. A release that forgets the roadmap now fails here, with
+    the fix named in the message."""
+
+    HEADING = re.compile(r"^## Current State — v(\d+\.\d+\.\d+)", re.MULTILINE)
+
+    def test_current_state_heading_matches_engine_version(self):
+        roadmap = REPO / "ROADMAP.md"
+        self.assertTrue(roadmap.exists(), "ROADMAP.md is missing")
+        found = self.HEADING.search(roadmap.read_text())
+        self.assertIsNotNone(
+            found,
+            'ROADMAP.md has no "## Current State — vX.Y.Z" heading to pin; '
+            "keep that exact shape or update TestRoadmapCurrency with it")
+        self.assertEqual(
+            found.group(1), cleaner.VERSION,
+            f"ROADMAP.md's Current State says v{found.group(1)} but the engine "
+            f"is {cleaner.VERSION} — update the heading and add a bullet for "
+            "what shipped")

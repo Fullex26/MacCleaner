@@ -42,9 +42,11 @@ Categories (23): `xcode`, `docker`, `node`, `python`, `caches`, `logs`, `homebre
 
 ### Tests
 ```bash
-python3 -m unittest discover -s tests    # 373 tests, stdlib only, no deps
+python3 -m unittest discover -s tests    # 558 tests, stdlib only, no deps
 ```
 CI runs tests + smoke tests + the app build on `macos-latest`.
+
+**Docs-drift tripwire:** `TestRoadmapCurrency` pins `ROADMAP.md`'s `## Current State — vX.Y.Z` heading to `cleaner.VERSION`. That heading had silently rotted four releases behind (still v2.15.0 at 2.17.2) because nothing pointed at it. It asserts on the heading's version only, never the prose beneath it — pinning wording would fail on every honest edit and train people to delete the test. A release that forgets the roadmap now fails here.
 
 ### Install & Schedule
 ```bash
