@@ -1,0 +1,1112 @@
+import Foundation
+import AppKit
+import Combine
+
+// ── JSON models (contract with cleaner.py --json, see AGENTS.md) ───────────────
+
+struct ScanTarget: Codable, Identifiable, Hashable {
+    let id: String
+    let category: String
+    let label: String
+    let description: String?
+    let size_bytes: Int
+    let size_human: String
+    let safe: Bool
+    let exists: Bool?
+}
+
+struct DiskStats: Codable {
+    let total_bytes: Int
+    let free_bytes: Int
+    let used_bytes: Int
+    let percent_used: Double
+}
+
+struct ScanReport: Codable {
+    let timestamp: String
+    let disk: String
+    let disk_stats: DiskStats?
+    let total_reclaimable_bytes: Int
+    let total_reclaimable_human: String
+    let targets: [ScanTarget]
+}
+
+struct CleanItem: Codable, Identifiable {
+    let id: String
+    let label: String
+    let freed: Int
+    let status: String
+    let error: String?
+}
+
+struct CleanResult: Codable {
+    let delete_mode: String?
+    let freed_bytes: Int
+    let freed_human: String
+    let disk_after: String?
+    let items: [CleanItem]
+}
+
+/// `null` when git status couldn't be determined (not a repo, `git` missing,
+/// any git failure, or `project_git_check` disabled); otherwise the two
+/// signals `projects --json` reports per AGENTS.md §"projects --json".
+struct GitInfo: Codable, Hashable {
+    let dirty: Bool
+    let unpushed: Bool
+}
+
+struct ProjectArtifact: Codable, Identifiable, Hashable {
+    let id: String
+    let path: String
+    let kind: String
+    let project: String
+    let age_days: Int
+    let size_bytes: Int
+    let git: GitInfo?
+}
+
+struct ProjectsReport: Codable {
+    let roots: [String]
+    let min_age_days: Int
+    let total_bytes: Int
+    let artifacts: [ProjectArtifact]
+}
+
+struct HistoryRun: Codable, Identifiable {
+    let timestamp: String
+    let total_freed_bytes: Int
+    let total_freed_human: String
+    let disk_after: String
+    let items: [CleanItem]
+    var id: String { timestamp }
+
+    private enum CodingKeys: String, CodingKey {
+        case timestamp, total_freed_bytes, total_freed_human, disk_after, items
+    }
+
+    // FIX7 idiom (see DiskSnapshot's comment just below): report.log is a
+    // mutable, externally-editable file — one entry missing or misshaping
+    // `items` (hand edit, partial write, a future schema change) must not
+    // fail decoding of the whole HistoryReport. That used to freeze both
+    // the History tab (this struct's own consumer) and
+    // performLightRefresh()'s 60s menu bar tick, whose `try?` swallows the
+    // decode error and whose `guard let … else { return }` then bails
+    // silently, leaving the free-space/"Last cleaned" display stuck. Every
+    // other field here was already required pre-FIX7 (and a run with a
+    // missing timestamp/freed total is arguably not recoverable as a
+    // display row anyway) — only `items` gets the tolerant treatment,
+    // matching the reviewer's ask precisely: default to `[]` rather than
+    // losing the whole run over a missing/malformed items array.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        timestamp = try container.decode(String.self, forKey: .timestamp)
+        total_freed_bytes = try container.decode(Int.self, forKey: .total_freed_bytes)
+        total_freed_human = try container.decode(String.self, forKey: .total_freed_human)
+        disk_after = try container.decode(String.self, forKey: .disk_after)
+        items = (try? container.decodeIfPresent([CleanItem].self, forKey: .items)) ?? []
+    }
+}
+
+struct DiskCurrent: Codable {
+    let free_bytes: Int
+    let total_bytes: Int
+}
+
+struct DiskSnapshot: Codable, Identifiable {
+    // Optional: the engine's `load_snapshots` only filters out non-dict
+    // entries, so one externally-corrupted entry (e.g. missing a key) must
+    // not fail decoding of the whole `HistoryReport` — that used to freeze
+    // the menu bar's free-space and "Last cleaned" display, since
+    // `performLightRefresh`'s `guard … else { return }` bails out silently
+    // on any decode failure. The chart skips entries it can't use instead.
+    let ts: String?
+    let disk_free_bytes: Int?
+    let disk_total_bytes: Int?
+    let id = UUID()
+
+    private enum CodingKeys: String, CodingKey {
+        case ts, disk_free_bytes, disk_total_bytes
+    }
+}
+
+struct DiskHistory: Codable {
+    let current: DiskCurrent
+    let snapshots: [DiskSnapshot]?
+}
+
+struct HistoryReport: Codable {
+    let runs: [HistoryRun]
+    let disk_history: DiskHistory?
+}
+
+struct CategoryInfo: Codable, Identifiable {
+    let name: String
+    let description: String
+    let enabled: Bool
+    var id: String { name }
+}
+
+struct CategoriesReport: Codable {
+    let categories: [CategoryInfo]
+}
+
+struct StorageInsightEntry: Codable, Identifiable {
+    let path: String
+    let size_bytes: Int
+    let size_human: String
+    let mtime: Double
+    /// True for a .app or other macOS bundle, which the engine reports as a
+    /// single item carrying its whole size rather than descending into.
+    /// Optional so a pre-2.13 engine still decodes.
+    let is_bundle: Bool?
+    var id: String { path }
+    var isBundle: Bool { is_bundle ?? false }
+}
+
+struct StorageInsightsReport: Codable {
+    let entries: [StorageInsightEntry]
+    /// Every location scanned, reported by the engine so the UI can say what
+    /// was covered instead of leaving an empty result ambiguous. Optional for
+    /// the same backward-compatibility reason as `is_bundle`.
+    let roots: [String]?
+    /// 2.17.2: true when the engine's walk hit its time budget and `entries`
+    /// is partial. Optional so a pre-2.17.2 engine still decodes.
+    let truncated: Bool?
+    /// 2.17.2: evicted iCloud folders the engine refused to list (listing one
+    /// blocks until iCloud downloads it; they hold no local bytes anyway).
+    let dataless_dirs_skipped: Int?
+}
+
+struct StorageMapEntry: Codable, Identifiable {
+    let path: String
+    let name: String
+    let size_bytes: Int
+    let size_human: String
+    let kind: String      // "dir" | "file" | "link"
+    let category: String
+    var id: String { path }
+    var isDirectory: Bool { kind == "dir" }
+}
+
+struct StorageMapReport: Codable {
+    let root: String
+    let total_bytes: Int
+    let total_human: String
+    let category: String
+    let children: [StorageMapEntry]
+}
+
+struct DiskCheckReport: Codable {
+    let free_bytes: Int
+    let free_human: String
+    let threshold_bytes: Int
+    let below_threshold: Bool
+    let notified: Bool
+    let should_notify: Bool
+}
+
+struct AgentStatus: Codable, Identifiable {
+    let label: String
+    let plist_present: Bool
+    let loaded: Bool
+    /// "loaded" | "not_loaded" | "unknown" — added in engine 2.14.1.
+    /// Optional so an older installed engine (which omits the key) still
+    /// decodes; `loaded` stays the non-optional bool it has always been.
+    /// "unknown" means launchctl could not be asked (no GUI session, no
+    /// binary on PATH, timeout) — NOT that the agent is missing, so the UI
+    /// must not tell the user to reinstall a schedule that may be running.
+    let load_state: String?
+    var id: String { label }
+    var isUnverified: Bool { load_state == "unknown" }
+}
+
+struct ScheduleStatus: Codable {
+    let schedule: String?
+    let agents: [AgentStatus]
+    let legacy_cron: Bool
+    /// ISO timestamp of the next scheduled clean, engine 2.15+. Optional so
+    /// an older installed engine still decodes.
+    let next_run: String?
+}
+
+struct EngineConfig: Codable {
+    var delete_mode: String?
+    var notifications: Bool?
+    var low_disk_alerts: Bool?
+    var low_disk_threshold_gb: Double?
+    var full_refresh_hours: Double?
+    var show_in_dock: Bool?
+    var v3_soak: Bool?
+}
+
+enum BridgeError: LocalizedError {
+    case engine(String)
+    var errorDescription: String? {
+        if case .engine(let msg) = self { return msg }
+        return nil
+    }
+}
+
+/// Thread-safe byte accumulator for draining a pipe from its readability handler.
+final class PipeBuffer: @unchecked Sendable {
+    private var data = Data()
+    private let lock = NSLock()
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        data.append(chunk)
+        lock.unlock()
+    }
+
+    var contents: Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
+}
+
+// ── Bridge: all cleaning logic lives in cleaner.py; this only runs it ──────────
+
+@MainActor
+final class CleanerBridge: ObservableObject {
+    @Published var report: ScanReport?
+    @Published var projects: ProjectsReport?
+    @Published var storageInsights: StorageInsightsReport?
+    @Published var history: [HistoryRun] = []
+    @Published var categories: [CategoryInfo] = []
+    @Published var deleteMode: String = "rm"
+    @Published var notificationsEnabled = true
+    @Published var lowDiskAlertsEnabled = true
+    @Published var lowDiskThresholdGB: Double = 10
+    /// Whether the app also shows a Dock icon. The bundle is `LSUIElement`, so
+    /// it always *launches* as a menu-bar-only accessory — no Dock flash while
+    /// settings load. When this is on, `applyDockVisibility()` promotes it to a
+    /// regular app at runtime. Kept in config.json (not UserDefaults) so it
+    /// lives alongside every other MacCleaner setting.
+    @Published var showInDock = false
+    /// V3 dual-engine soak (Stage 3): run the read-only Swift engine beside
+    /// each full Python scan and log divergence. Python stays the engine of
+    /// record; the soak never deletes and never changes behaviour.
+    @Published var v3SoakEnabled = true
+    @Published var soakDivergences: Int?
+    @Published var scheduleStatus: ScheduleStatus?
+    @Published var scheduleSupported = true
+    /// Set for the whole `setSchedule` round trip (bootout + bootstrap +
+    /// `launchctl list`), which is slow enough that the picker would
+    /// otherwise visibly snap back to the old value until it completes.
+    @Published var isSchedulingBusy = false
+    /// The choice the picker should display while `isSchedulingBusy` — the
+    /// real `scheduleStatus.schedule` doesn't update until `loadSchedule()`
+    /// returns at the end of the round trip.
+    @Published var pendingSchedule: String?
+    @Published var fullRefreshHours: Double = 6 {
+        didSet {
+            // Reschedule the periodic timer when the configured cadence actually
+            // changes (initial config load, or a later edit) — but only once
+            // auto-refresh has actually started (fullTimer != nil), and never on
+            // a settings reload that leaves the value unchanged.
+            guard fullRefreshHours != oldValue, fullTimer != nil else { return }
+            scheduleFullTimer()
+        }
+    }
+    /// Split from a single shared `isBusy` (finding "Also fix"): Dashboard's
+    /// `scan()` and Projects' `scanProjects()` are independent subprocess
+    /// calls, so a Projects re-scan must not make the Dashboard's own Scan
+    /// button/spinner claim to be busy, and vice versa. `fullRefreshIfStale()`
+    /// still watches both — see its guard below.
+    /// Loads settings as soon as the bridge exists, which is at app launch.
+    /// This is what applies "Show in Dock" for a menu-bar-only session — the
+    /// `Window` scene's `.task` can't be relied on, since an `LSUIElement` app
+    /// may never open a window at all. Memoized inside `ensureSettingsLoaded`,
+    /// so the views' own calls are no-ops afterwards.
+    init() {
+        ensureSettingsLoaded()
+    }
+
+    @Published var isScanning = false
+    @Published var isScanningProjects = false
+    @Published var isScanningStorageInsights = false
+    /// The storage browser's current level. Unlike every other view here it can
+    /// point anywhere on the disk, including outside $HOME — it is read-only,
+    /// and deletion goes through the Trash rather than the cleanup engine.
+    @Published var storageMap: StorageMapReport?
+    @Published var isScanningStorageMap = false
+    @Published var storageMapError: String?
+    @Published var isCleaning = false
+    @Published var statusMessage: String?
+    @Published var lastClean: CleanResult?
+    @Published var lastCleanedAt: Date?
+    /// Set in the catch block of `clean(ids:)`/`autoCleanSafe()`/
+    /// `cleanProjects(ids:)` (finding B2) alongside clearing `lastClean`, so
+    /// a failed clean can never render as if the previous run's success was
+    /// still current. `statusMessage` alone can't carry this: both
+    /// `clean(ids:)` and `autoCleanSafe()` call `scan()` right after the
+    /// catch block, and a successful `scan()` sets `statusMessage = nil`,
+    /// erasing the "Clean failed" text before the UI ever gets to show it.
+    /// Cleared at the start of every clean attempt (success or another
+    /// failure both overwrite it correctly) and rendered only while "fresh"
+    /// (via `lastCleanFailedAt`), mirroring how `lastClean`/`lastCleanedAt`
+    /// already work.
+    @Published var lastCleanFailed: String?
+    @Published var lastCleanFailedAt: Date?
+    /// Dedicated error channel for `scanStorageInsights()`, mirroring why
+    /// `lastCleanFailed` exists instead of reusing `statusMessage`: this
+    /// fetch runs concurrently with the app's own startup `scan()` (see
+    /// `MacCleanerApp.swift`), so a shared field would let either call
+    /// silently erase the other's failure banner. Cleared on success,
+    /// set on failure, and `storageInsights` itself is left untouched on
+    /// failure so a transient error never wipes out prior good data.
+    @Published var storageInsightsError: String?
+    @Published var freeBytes: Int?
+    @Published var diskSnapshots: [DiskSnapshot] = []
+    /// Live per-item clean progress, for Dashboard row spinners/checks (and
+    /// any other consumer, e.g. the menu bar popover). The engine only
+    /// returns per-item results once the whole `clean` process exits — there
+    /// is no true streaming — so `cleaningIDs` is the optimistic "about to
+    /// touch these ids" set set by `clean(ids:)` before launching, and
+    /// `cleanedIDs` is the real, reconciled-from-`CleanResult.items` set set
+    /// after it exits. An id is never added to `cleanedIDs` before the
+    /// process actually exits — no "done" state is ever guessed. Both are
+    /// cleared the next time `scan()` completes successfully, so a stale
+    /// clean's spinners/checks can't leak into a later scan's target list.
+    @Published var cleaningIDs: Set<String> = []
+    @Published var cleanedIDs: Set<String> = []
+
+    private var lightTimer: Timer?
+    private var fullTimer: Timer?
+    private var lastFullScan: Date?
+    private var wakeObserver: NSObjectProtocol?
+    /// Memoized subscription to `UpdaterManager.shared.pendingUpdateVersion`
+    /// (finding B1) — set up once (see `observeUpdater()`) regardless of
+    /// whether the main window is ever opened, matching `ensureSettingsLoaded()`'s
+    /// "menu-bar-only session still works" precedent. Harmless no-op wiring
+    /// in the `SPARKLE_DISABLED` stub build, since `pendingUpdateVersion`
+    /// there is always nil and the publisher never fires.
+    private var updaterCancellable: AnyCancellable?
+    /// Memoized so settings load exactly once per app run no matter how many
+    /// call sites race to trigger it (menu bar `.task`, main window `.task`,
+    /// a notification-gated action) — awaiting it elsewhere just joins the
+    /// in-flight (or already-finished) load instead of starting a new one.
+    private var settingsLoadTask: Task<Void, Never>?
+
+    /// Engine resolution: MACCLEANER_ENGINE env override (development) →
+    /// user-installed copy (shares config with the CLI) → bundled fallback.
+    nonisolated static func enginePath() -> String {
+        if let override = ProcessInfo.processInfo.environment["MACCLEANER_ENGINE"],
+           FileManager.default.fileExists(atPath: override) {
+            return override
+        }
+        let installed = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("mac-cleaner/cleaner.py").path
+        if FileManager.default.fileExists(atPath: installed) { return installed }
+        return Bundle.main.path(forResource: "cleaner", ofType: "py") ?? installed
+    }
+
+    /// Every engine call gets a hard ceiling. Two `storage-insights` engines
+    /// once sat wedged in a kernel directory read on an evicted iCloud folder
+    /// for 20+ minutes at 0% CPU, and with no timeout the Dashboard's Large
+    /// Files panel spun for the life of the app. The engine now guards
+    /// against that walk itself (dataless skip + 120s budget), but a child
+    /// that has already blocked in the kernel cannot be interrupted from
+    /// Python at all — killing it from here is the only backstop. 10 minutes
+    /// is generous for every other subcommand (a full `scan` measures ~90
+    /// targets with parallel `du`; `clean` can run `docker system prune`).
+    nonisolated static let defaultEngineTimeout: TimeInterval = 600
+
+    nonisolated private static func runEngine(_ args: [String],
+                                              timeout: TimeInterval = defaultEngineTimeout) throws -> Data {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = [enginePath()] + args
+        // Homebrew tools (brew, docker, ...) aren't on the default GUI PATH
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
+        process.environment = env
+
+        let out = Pipe()
+        let err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+
+        let errBuffer = PipeBuffer()
+        err.fileHandleForReading.readabilityHandler = { handle in
+            errBuffer.append(handle.availableData)
+        }
+
+        try process.run()
+        // Same shape as soakCompare's guard: terminate, then SIGKILL in case
+        // the child is blocked somewhere SIGTERM can't reach (a kernel
+        // readdir wait is exactly that). `timedOut` is set before the kill
+        // so the error below can say what happened instead of "exited -9".
+        let timedOut = TimedOutFlag()
+        let killer = DispatchWorkItem {
+            if process.isRunning {
+                timedOut.set()
+                process.terminate()
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: killer)
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        killer.cancel()
+        err.fileHandleForReading.readabilityHandler = nil
+
+        if timedOut.value {
+            throw BridgeError.engine(
+                "engine `\(args.first ?? "")` gave up after \(Int(timeout))s — killed")
+        }
+        if process.terminationStatus != 0 {
+            let msg = String(data: errBuffer.contents, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            throw BridgeError.engine(msg.isEmpty ? "engine exited \(process.terminationStatus)" : msg)
+        }
+        return data
+    }
+
+    /// Minimal thread-safe flag for the timeout path above: the killer runs
+    /// on a global queue while the caller blocks on `readDataToEndOfFile`.
+    private final class TimedOutFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var flag = false
+        func set() { lock.lock(); flag = true; lock.unlock() }
+        var value: Bool { lock.lock(); defer { lock.unlock() }; return flag }
+    }
+
+    private func run<T: Decodable>(_ type: T.Type, _ args: [String],
+                                   timeout: TimeInterval = CleanerBridge.defaultEngineTimeout) async throws -> T {
+        let data = try await Task.detached(priority: .userInitiated) {
+            try Self.runEngine(args, timeout: timeout)
+        }.value
+        return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    private func runPlain(_ args: [String]) async throws {
+        _ = try await Task.detached(priority: .userInitiated) {
+            try Self.runEngine(args)
+        }.value
+    }
+
+    // ── Actions ────────────────────────────────────────────────────────────────
+
+    /// One-time (memoized) subscription that surfaces a scheduled Sparkle
+    /// update (finding B1) as a native notification, reusing
+    /// `NotificationManager` rather than building new plumbing. Safe to call
+    /// from multiple `.task`s (MenuBarPanel, MainView) — only the first
+    /// subscribes. `UpdaterManager.shared.pendingUpdateVersion` exists in
+    /// both the Sparkle-enabled and `SPARKLE_DISABLED` builds (always nil in
+    /// the stub), so this needs no `#if` of its own.
+    func observeUpdater() {
+        guard updaterCancellable == nil else { return }
+        updaterCancellable = UpdaterManager.shared.$pendingUpdateVersion
+            .compactMap { $0 }
+            .removeDuplicates()
+            .sink { [weak self] version in
+                guard let self, self.notificationsEnabled else { return }
+                NotificationManager.shared.post(
+                    title: "MacCleaner update available",
+                    body: "Version \(version) is ready to install.")
+            }
+    }
+
+    func scan() async {
+        isScanning = true
+        defer { isScanning = false }
+        do {
+            report = try await run(ScanReport.self, ["scan", "--json"])
+            statusMessage = nil
+            lastFullScan = Date()
+            runSoakIfEnabled(against: report)
+            // A fresh, successful scan is the signal that any prior clean's
+            // progress is now stale — the target list it was tracking has
+            // just been replaced. Left untouched on failure: a failed scan
+            // shouldn't erase the last real clean result off the screen.
+            cleaningIDs.removeAll()
+            cleanedIDs.removeAll()
+        } catch {
+            statusMessage = "Scan failed: \(error.localizedDescription)"
+        }
+    }
+
+    // ── Auto-refresh ───────────────────────────────────────────────────────────
+    //
+    // Two cadences on purpose: `report --json` is a couple of file reads and one
+    // stat, so it can run every minute; a full `scan` shells out to `du` for
+    // 70+ targets and must not.
+
+    func startAutoRefresh() {
+        lightTimer?.invalidate()
+        lightTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.lightRefresh() }
+        }
+        // A tolerance-less 60s repeating timer defeats timer coalescing and
+        // App Nap, so an idle menu bar app wakes the process on the dot
+        // 1440x/day. 10% tolerance lets the system batch this with other
+        // wake-ups (finding M7).
+        lightTimer?.tolerance = 6
+        scheduleFullTimer()
+        if wakeObserver == nil {
+            wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    await self?.lightRefresh()
+                    await self?.fullRefreshIfStale()
+                }
+            }
+        }
+        Task { await lightRefresh() }
+    }
+
+    private func scheduleFullTimer() {
+        fullTimer?.invalidate()
+        let interval = max(3600, fullRefreshHours * 3600)
+        fullTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.fullRefreshIfStale() }
+        }
+        fullTimer?.tolerance = interval * 0.1
+    }
+
+    /// Cheap: free space and last-cleaned only. Never runs during a clean.
+    func lightRefresh() async {
+        guard !isCleaning else { return }
+        await performLightRefresh()
+    }
+
+    /// The unguarded body of `lightRefresh()`. `clean(ids:)`/`autoCleanSafe()`
+    /// call this directly for their post-clean refresh instead of going
+    /// through `lightRefresh()`: at that point `isCleaning` is still `true`
+    /// (it isn't cleared until the function's `defer` fires on return), so
+    /// the guarded entry point would just no-op. Calling the unguarded body
+    /// still guarantees no *concurrent* refresh — a timer-driven
+    /// `lightRefresh()` call — can interleave with a clean in flight, since
+    /// everything here runs sequentially on the main actor.
+    private func performLightRefresh() async {
+        guard let report = try? await run(HistoryReport.self, ["report", "--json", "-n", "1"])
+        else { return }
+        freeBytes = report.disk_history?.current.free_bytes
+        lastCleanedAt = report.runs.last.flatMap { Self.parseTimestamp($0.timestamp) }
+        diskSnapshots = report.disk_history?.snapshots ?? []
+        await checkLowDiskIfNeeded()
+    }
+
+    /// Delivers the low-disk alert itself, in-process, so it carries the real
+    /// app icon — the standalone launchd `diskwatch` agent's own alert (same
+    /// condition, but via `osascript`) always shows a generic one, since
+    /// `display notification` has no attribution option. Gated locally on the
+    /// `freeBytes` this tick already fetched for free, so a comfortably-above
+    /// -threshold Mac never pays the extra `disk-check` subprocess call every
+    /// 60s. `--no-post` shares `alerts.json`'s 24h throttle with the launchd
+    /// agent (see AGENTS.md's `disk-check --json` section), so whichever one
+    /// runs first for a given dip is the only one that fires.
+    private func checkLowDiskIfNeeded() async {
+        await ensureSettingsLoaded().value
+        guard lowDiskAlertsEnabled, notificationsEnabled, let freeBytes,
+              Double(freeBytes) < lowDiskThresholdGB * 1024 * 1024 * 1024
+        else { return }
+        guard let check = try? await run(DiskCheckReport.self, ["disk-check", "--no-post", "--json"]),
+              check.should_notify
+        else { return }
+        let thresholdHuman = ByteCountFormatter.string(
+            fromByteCount: Int64(check.threshold_bytes), countStyle: .file)
+        NotificationManager.shared.post(
+            title: "Low disk space: \(check.free_human) free",
+            body: "Below your \(thresholdHuman) threshold — open MacCleaner to reclaim space.")
+    }
+
+    /// Full scan, debounced so a wake plus a menu-open doesn't launch two.
+    func fullRefreshIfStale() async {
+        // Watches both scan flags (finding "Also fix" — split isBusy): a
+        // Projects re-scan in flight must still hold off the debounced
+        // Dashboard refresh, and vice versa.
+        guard !isCleaning, !isScanning, !isScanningProjects else { return }
+        let interval = max(3600, fullRefreshHours * 3600)
+        if let last = lastFullScan, Date().timeIntervalSince(last) < interval { return }
+        await scan()
+    }
+
+    nonisolated static func parseTimestamp(_ raw: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = formatter.date(from: raw) { return d }
+        formatter.formatOptions = [.withInternetDateTime]
+        if let d = formatter.date(from: raw) { return d }
+        // The engine writes datetime.isoformat(), which has no timezone suffix.
+        // Pin en_US_POSIX so this always parses the Gregorian-calendar,
+        // ASCII-digit format Python wrote, regardless of the user's region
+        // (e.g. a non-Gregorian calendar locale would otherwise misparse
+        // these and silently corrupt the chart's X axis).
+        let fallback = DateFormatter()
+        fallback.locale = Locale(identifier: "en_US_POSIX")
+        fallback.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
+        if let d = fallback.date(from: raw) { return d }
+        fallback.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return fallback.date(from: raw)
+    }
+
+    func clean(ids: [String]) async {
+        guard !ids.isEmpty else { return }
+        // Re-entrancy guard (finding B3): a popover clean and a Dashboard
+        // clean both drive the same shared `isCleaning`/`cleaningIDs` state,
+        // so letting a second one start mid-flight means whichever finishes
+        // first clears that shared state out from under the other, stranding
+        // its UI. Matches the existing `setSchedule` precedent.
+        guard !isCleaning else { return }
+        isCleaning = true
+        // Optimistic: every requested id shows a spinner immediately. Reset
+        // cleanedIDs too, in case an earlier clean's reconciled checkmarks
+        // are still showing (scan() normally clears them, but a batch that
+        // targets an id no prior scan cleared should never inherit a stale
+        // "done" from a previous run).
+        cleaningIDs = Set(ids)
+        cleanedIDs.removeAll()
+        // Optimistically cleared here so a success path never has to
+        // remember to do it (see the property's doc comment for why this
+        // can't just piggyback on `statusMessage`).
+        lastCleanFailed = nil
+        defer { isCleaning = false }
+        do {
+            var args = ["clean", "--targets", ids.joined(separator: ","), "--yes"]
+            if deleteMode == "trash" { args.append("--trash") }
+            args.append("--json")
+            lastClean = try await run(CleanResult.self, args)
+            statusMessage = nil
+            // Reconcile from the real per-item results now that the process
+            // has exited — only ids the engine actually reported on move to
+            // cleanedIDs; anything it stayed silent on (shouldn't happen,
+            // but never assume) keeps its spinner rather than being guessed
+            // as done.
+            let resultIDs = Set(lastClean?.items.map(\.id) ?? [])
+            cleaningIDs.subtract(resultIDs)
+            cleanedIDs.formUnion(resultIDs)
+            // Settings must be loaded before this check even in a menu-bar-only
+            // session (finding I4) — see ensureSettingsLoaded().
+            await ensureSettingsLoaded().value
+            if notificationsEnabled, let result = lastClean {
+                NotificationManager.shared.post(
+                    title: "MacCleaner freed \(result.freed_human)",
+                    body: "\(result.items.filter { $0.status != "skipped" }.count) items cleaned")
+            }
+        } catch {
+            statusMessage = "Clean failed: \(error.localizedDescription)"
+            // B2: a failed clean must never leave the previous run's success
+            // displayed as if it were still current.
+            lastClean = nil
+            lastCleanFailed = error.localizedDescription
+            lastCleanFailedAt = Date()
+            // The process never produced per-item results, so nothing can
+            // honestly move to cleanedIDs — just stop showing spinners for it.
+            cleaningIDs.removeAll()
+        }
+        await scan()
+        await loadHistory()
+        // One refresh covers both "Free disk" and "Last cleaned" in the menu
+        // bar, instead of leaving them up to 60s stale (finding M12). Goes
+        // through the unguarded body, not lightRefresh() — isCleaning is
+        // still true here (the `defer` above only clears it once this
+        // function returns), so lightRefresh()'s own guard would swallow it.
+        await performLightRefresh()
+    }
+
+    func autoCleanSafe() async {
+        // Re-entrancy guard (finding B3) — see clean(ids:)'s comment.
+        guard !isCleaning else { return }
+        isCleaning = true
+        lastCleanFailed = nil
+        defer { isCleaning = false }
+        do {
+            lastClean = try await run(CleanResult.self, ["clean", "--yes", "--json"])
+            statusMessage = nil
+            // Settings must be loaded before this check even in a menu-bar-only
+            // session (finding I4) — see ensureSettingsLoaded().
+            await ensureSettingsLoaded().value
+            if notificationsEnabled, let result = lastClean {
+                NotificationManager.shared.post(
+                    title: "MacCleaner freed \(result.freed_human)",
+                    body: "\(result.items.filter { $0.status != "skipped" }.count) items cleaned")
+            }
+        } catch {
+            statusMessage = "Clean failed: \(error.localizedDescription)"
+            // B2: a failed clean must never leave the previous run's success
+            // displayed as if it were still current.
+            lastClean = nil
+            lastCleanFailed = error.localizedDescription
+            lastCleanFailedAt = Date()
+        }
+        await scan()
+        await loadHistory()
+        // One refresh covers both "Free disk" and "Last cleaned" in the menu
+        // bar, instead of leaving them up to 60s stale (finding M12). Goes
+        // through the unguarded body, not lightRefresh() — isCleaning is
+        // still true here (the `defer` above only clears it once this
+        // function returns), so lightRefresh()'s own guard would swallow it.
+        await performLightRefresh()
+    }
+
+    func scanProjects() async {
+        isScanningProjects = true
+        defer { isScanningProjects = false }
+        do {
+            projects = try await run(ProjectsReport.self, ["projects", "--json"])
+            statusMessage = nil
+        } catch {
+            statusMessage = "Project scan failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Loads one level of the storage browser. `path` nil means the home folder.
+    /// Never touches `statusMessage`: this runs concurrently with the Dashboard's
+    /// own scan, and a shared banner can't represent two failures at once.
+    func scanStorageMap(_ path: String? = nil) async {
+        isScanningStorageMap = true
+        defer { isScanningStorageMap = false }
+        var args = ["storage-map"]
+        if let path { args.append(path) }
+        args.append("--json")
+        do {
+            storageMap = try await run(StorageMapReport.self, args)
+            storageMapError = nil
+        } catch {
+            // Leave any previously loaded level on screen rather than blanking
+            // the browser out from under the user.
+            storageMapError = error.localizedDescription
+        }
+    }
+
+    /// Moves one item to the Trash. Deliberately NOT the cleanup engine's
+    /// delete path: that one is built for rebuildable caches and hard-deletes.
+    /// Anything reachable from the storage browser may be irreplaceable
+    /// personal work, so the only removal offered is the recoverable one, and
+    /// macOS's own permission rules decide what is off limits (a system file
+    /// simply fails here, which is the correct answer).
+    func moveToTrash(_ path: String) async -> Bool {
+        let url = URL(fileURLWithPath: path)
+        do {
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+            return true
+        } catch {
+            storageMapError = "Couldn't move \(url.lastPathComponent) to the Trash: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func scanStorageInsights() async {
+        // Re-entrancy guard: the Dashboard's Scan button chains `scan()` then
+        // this, with no in-flight check of its own — on the wedged-engine
+        // machine that is exactly how a SECOND stuck engine appeared 10s
+        // after the first. The `.task` call site checks this flag itself;
+        // now every caller gets the same protection.
+        guard !isScanningStorageInsights else { return }
+        isScanningStorageInsights = true
+        defer { isScanningStorageInsights = false }
+        do {
+            // Engine budget is 120s (STORAGE_INSIGHTS_TIME_BUDGET_S); leave
+            // room for it to finish and print, then kill.
+            storageInsights = try await run(StorageInsightsReport.self,
+                                            ["storage-insights", "--json"], timeout: 180)
+            storageInsightsError = nil
+        } catch {
+            // Deliberately does not touch `storageInsights` (prior successful
+            // data, if any, survives a transient failure) or the shared
+            // `statusMessage` (see `storageInsightsError`'s declaration).
+            storageInsightsError = error.localizedDescription
+        }
+    }
+
+    func cleanProjects(ids: [String]) async {
+        guard !ids.isEmpty else { return }
+        // Re-entrancy guard (finding B3) — see clean(ids:)'s comment.
+        guard !isCleaning else { return }
+        isCleaning = true
+        lastCleanFailed = nil
+        defer { isCleaning = false }
+        do {
+            var args = ["projects", "--clean", "--targets", ids.joined(separator: ","), "--yes"]
+            if deleteMode == "trash" { args.append("--trash") }
+            args.append("--json")
+            lastClean = try await run(CleanResult.self, args)
+            statusMessage = nil
+        } catch {
+            statusMessage = "Clean failed: \(error.localizedDescription)"
+            // B2: a failed clean must never leave the previous run's success
+            // displayed as if it were still current.
+            lastClean = nil
+            lastCleanFailed = error.localizedDescription
+            lastCleanFailedAt = Date()
+        }
+        await scanProjects()
+        await loadHistory()
+    }
+
+    func loadHistory() async {
+        do {
+            history = try await run(HistoryReport.self, ["report", "--json", "-n", "20"]).runs.reversed()
+        } catch {
+            history = []
+        }
+    }
+
+    /// Kicks off `loadSettings()` at most once per app run and returns the
+    /// shared task, so a caller can either fire-and-forget it (the menu bar's
+    /// `.task`, which must not block on a subprocess at launch) or `await
+    /// .value` to guarantee settings are current before acting on them (the
+    /// notification checks in `clean`/`autoCleanSafe`) — without reloading
+    /// settings again just because the menu happened to open first
+    /// (finding I4).
+    @discardableResult
+    func ensureSettingsLoaded() -> Task<Void, Never> {
+        if let existing = settingsLoadTask { return existing }
+        let task = Task { await loadSettings() }
+        settingsLoadTask = task
+        return task
+    }
+
+    func loadSettings() async {
+        do {
+            categories = try await run(CategoriesReport.self, ["categories", "--json"]).categories
+            let cfg = try await run(EngineConfig.self, ["config", "show"])
+            deleteMode = cfg.delete_mode ?? "rm"
+            notificationsEnabled = cfg.notifications ?? true
+            lowDiskAlertsEnabled = cfg.low_disk_alerts ?? true
+            lowDiskThresholdGB = cfg.low_disk_threshold_gb ?? 10
+            showInDock = cfg.show_in_dock ?? false
+            v3SoakEnabled = cfg.v3_soak ?? true
+            applyDockVisibility()
+            fullRefreshHours = cfg.full_refresh_hours ?? 6
+        } catch {
+            statusMessage = "Could not load settings: \(error.localizedDescription)"
+        }
+    }
+
+    func setCategory(_ name: String, enabled: Bool) async {
+        do {
+            try await runPlain(["config", enabled ? "enable" : "disable", name])
+            categories = (try? await run(CategoriesReport.self, ["categories", "--json"]).categories) ?? categories
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    func setDeleteMode(_ mode: String) async {
+        do {
+            try await runPlain(["config", "set", "delete_mode", mode])
+            deleteMode = mode
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    func setNotifications(_ on: Bool) async {
+        do {
+            try await runPlain(["config", "set", "notifications", on ? "true" : "false"])
+            notificationsEnabled = on
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    func setLowDiskAlerts(_ on: Bool) async {
+        do {
+            try await runPlain(["config", "set", "low_disk_alerts", on ? "true" : "false"])
+            lowDiskAlertsEnabled = on
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    func setShowInDock(_ on: Bool) async {
+        do {
+            try await runPlain(["config", "set", "show_in_dock", on ? "true" : "false"])
+            showInDock = on
+            applyDockVisibility()
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// `.regular` puts the app in the Dock and the ⌘-Tab switcher; `.accessory`
+    /// is the menu-bar-only mode the bundle launches in. Switching back to
+    /// `.accessory` while a window is open would leave that window unreachable
+    /// from the Dock, so the main window is re-activated on the way up and the
+    /// user keeps the menu bar either way.
+    func applyDockVisibility() {
+        let policy: NSApplication.ActivationPolicy = showInDock ? .regular : .accessory
+        guard NSApp.activationPolicy() != policy else { return }
+        NSApp.setActivationPolicy(policy)
+        if showInDock { NSApp.activate(ignoringOtherApps: true) }
+    }
+
+    func setV3Soak(_ on: Bool) async {
+        do {
+            try await runPlain(["config", "set", "v3_soak", on ? "true" : "false"])
+            v3SoakEnabled = on
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// V3 Stage 3: run the read-only Swift engine (mck) against the same
+    /// config, compare its scan table with the Python report we just got,
+    /// and append any divergence to soak.log. Fire-and-forget: the soak can
+    /// never delay, fail, or alter the real scan — Python remains the engine
+    /// of record throughout the soak period.
+    func runSoakIfEnabled(against report: ScanReport?) {
+        guard v3SoakEnabled, let report else { return }
+        let mck = ProcessInfo.processInfo.environment["MACCLEANER_MCK"]
+            ?? Bundle.main.path(forResource: "mck", ofType: nil)
+        guard let mck, FileManager.default.isExecutableFile(atPath: mck) else { return }
+        // Only soak against the standard installed config: mck must see the
+        // exact same enabled categories / skip paths or every comparison is
+        // noise. A non-standard layout just skips the soak silently.
+        let configPath = NSHomeDirectory() + "/mac-cleaner/config.json"
+        guard FileManager.default.fileExists(atPath: configPath) else { return }
+        let pyTargets = report.targets
+        Task.detached(priority: .utility) { [weak self] in
+            let divergences = Self.soakCompare(mck: mck, configPath: configPath,
+                                               pyTargets: pyTargets)
+            await MainActor.run { [weak self] in
+                self?.soakDivergences = divergences
+            }
+        }
+    }
+
+    nonisolated static func soakLogPath() -> String {
+        let dir = NSHomeDirectory() + "/Library/Application Support/MacCleaner"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        return dir + "/soak.log"
+    }
+
+    /// Runs mck, compares, logs, returns the divergence count (nil = soak
+    /// could not run at all, which is not the same as zero divergences).
+    nonisolated static func soakCompare(mck: String, configPath: String,
+                                        pyTargets: [ScanTarget]) -> Int? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: mck)
+        p.arguments = ["scan", "--json", "--all"]
+        var env = ProcessInfo.processInfo.environment
+        env["MACCLEANER_CONFIG"] = configPath
+        p.environment = env
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        // mck bounds its own du calls now, but a wedged child must never pin
+        // an app thread forever regardless: hard-kill the whole soak run
+        // after 10 minutes. The first live soak hung exactly this way.
+        let killer = DispatchWorkItem { if p.isRunning { p.terminate(); kill(p.processIdentifier, SIGKILL) } }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 600, execute: killer)
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        killer.cancel()
+        guard p.terminationStatus == 0,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = obj["targets"] as? [[String: Any]] else { return nil }
+
+        struct SwiftRow { let safe: Bool; let exists: Bool; let size: Int64; let cmd: Bool }
+        var swiftById: [String: SwiftRow] = [:]
+        for r in rows {
+            guard let id = r["id"] as? String else { continue }
+            swiftById[id] = SwiftRow(safe: r["safe"] as? Bool ?? false,
+                                     exists: r["exists"] as? Bool ?? false,
+                                     size: (r["size_bytes"] as? NSNumber)?.int64Value ?? 0,
+                                     cmd: r["cmd"] as? Bool ?? false)
+        }
+        var lines: [String] = []
+        func log(_ kind: String, _ id: String, _ detail: String) {
+            lines.append("{\"ts\": \"\(ISO8601DateFormatter().string(from: Date()))\", " +
+                         "\"kind\": \"\(kind)\", \"id\": \"\(id)\", \"detail\": \"\(detail)\"}")
+        }
+        var pyIds = Set<String>()
+        for t in pyTargets {
+            pyIds.insert(t.id)
+            guard let sw = swiftById[t.id] else {
+                log("missing_in_swift", t.id, "python has it, mck does not")
+                continue
+            }
+            if sw.safe != t.safe {
+                log("safe_mismatch", t.id, "python=\(t.safe) swift=\(sw.safe)")
+            }
+            if !sw.cmd {
+                if let ex = t.exists, ex != sw.exists {
+                    log("exists_mismatch", t.id, "python=\(ex) swift=\(sw.exists)")
+                }
+                // du timing between the two runs makes small drift normal;
+                // only a >10% AND >1 MiB gap counts as divergence.
+                let delta = abs(Int64(t.size_bytes) - sw.size)
+                let floor = max(Int64(Double(max(t.size_bytes, 1)) * 0.10), 1 << 20)
+                if delta > floor {
+                    log("size_divergence", t.id, "python=\(t.size_bytes) swift=\(sw.size)")
+                }
+            }
+        }
+        for id in swiftById.keys where !pyIds.contains(id) {
+            log("missing_in_python", id, "mck has it, python does not")
+        }
+        if !lines.isEmpty {
+            let blob = lines.joined(separator: "\n") + "\n"
+            if let h = FileHandle(forWritingAtPath: soakLogPath()) {
+                h.seekToEndOfFile(); h.write(blob.data(using: .utf8)!); try? h.close()
+            } else {
+                try? blob.write(toFile: soakLogPath(), atomically: true, encoding: .utf8)
+            }
+        }
+        return lines.count
+    }
+
+    func setLowDiskThreshold(_ gb: Double) async {
+        do {
+            try await runPlain(["config", "set", "low_disk_threshold_gb",
+                                String(format: "%g", gb)])
+            lowDiskThresholdGB = gb
+        } catch {
+            statusMessage = "Config change failed: \(error.localizedDescription)"
+        }
+    }
+
+    func loadSchedule() async {
+        do {
+            scheduleStatus = try await run(ScheduleStatus.self, ["schedule", "status", "--json"])
+            scheduleSupported = true
+        } catch {
+            // An older engine exits 2 on the unknown subcommand; treat any
+            // failure here as "can't manage scheduling", not an error banner.
+            scheduleStatus = nil
+            scheduleSupported = false
+        }
+    }
+
+    /// Feedback line for the Run Now button — transient, replaced on the
+    /// next press and cleared when the schedule itself changes.
+    @Published var scheduleRunFeedback: String?
+    @Published var isRunningScheduleNow = false
+
+    /// Fires the scheduled clean agent immediately via `schedule run`. The
+    /// point is observability: the schedule was reported broken while working
+    /// perfectly, because nothing about it could be poked. Kickstarting the
+    /// real launchd agent (not an inline clean) exercises the same plumbing
+    /// Monday's run uses, so success here is evidence for the scheduled one.
+    func runScheduleNow() async {
+        isRunningScheduleNow = true
+        defer { isRunningScheduleNow = false }
+        do {
+            try await runPlain(["schedule", "run", "--json"])
+            scheduleRunFeedback = "Started — it runs in the background; History will show it in a minute."
+        } catch {
+            scheduleRunFeedback = "Couldn't start it: \(error.localizedDescription)"
+        }
+    }
+
+    func setSchedule(_ choice: String) async {
+        guard !isSchedulingBusy else { return }
+        isSchedulingBusy = true
+        pendingSchedule = choice
+        defer { isSchedulingBusy = false; pendingSchedule = nil }
+        do {
+            try await runPlain(["schedule", choice])
+            await loadSchedule()
+        } catch {
+            statusMessage = "Schedule change failed: \(error.localizedDescription)"
+            await loadSchedule()   // revert the picker to the real state
+        }
+    }
+}
