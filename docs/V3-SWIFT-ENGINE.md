@@ -1,6 +1,7 @@
 # V3: Native Swift Engine — Migration Design
 
-**Status: stages 1–2 landed (read-only); stages 3–5 not started.** This is the roadmap's
+**Status: stages 1–3 landed (read-only), plus Stage 4's guards. Still open: Stage 2's
+cmd-target estimates, Stage 4's deletion callers, Stage 5's cutover.** This is the roadmap's
 "Full Swift rewrite of cleaner engine" item, deliberately staged rather than
 attempted as one rewrite. The Python engine is ~4,500 lines with 490+ tests
 guarding deletion behaviour; a big-bang port cannot be verified to parity, and
@@ -58,18 +59,28 @@ clean evidence over real use (in progress).
    `swift test` silently discovers zero XCTest cases on current toolchains)
    plus fixture-sandbox parity: 4 offered and 5 refused tmp scenarios are
    seeded by `tools/gen_contract_fixtures.py` and pinned in the committed
-   fixtures. Still open within this stage: simulators and leftovers ports,
-   and cmd-target estimates (presence-only in `mck`) — owned by a parallel
-   session along with Stage 3's dual-engine soak.
-3. **Dual-engine app.** The app gains an engine toggle (default: Python).
-   Swift scan results are compared against the Python engine's in the
-   background; divergences are logged, never acted on. This is the
-   soak-test stage — run it for at least one release cycle.
-4. **Deletion port, guard-first.** Port `_safe_to_delete` / `_remove` /
-   `_tmp_scan_path_allowed` with the full adversarial suite (symlinked
-   ancestors, the 48-scenario attack suite from 2.8.1) BEFORE porting any
-   caller. Property tests: for every path the Python guard refuses, Swift
-   must refuse.
+   fixtures. The **simulators and leftovers ports landed too** (`SimulatorScanner.swift`,
+   `LeftoversScanner.swift`, #45), so the one thing still open within this
+   stage is **cmd-target estimates**: `mck` never executes an estimate command
+   and reports those targets presence-only, which is exactly why
+   `tools/check_swift_parity.py` compares cmd targets for presence alone.
+3. **Dual-engine app.** ✅ Landed (#46): the app bundles `mck` and, after each
+   full scan, runs it read-only against the same config, compares both engines'
+   target tables and logs any disagreement to `soak.log` (`v3_soak`, default
+   on). Python stays the engine of record. **It earned its keep on the first
+   live run** — 763 targets each, one divergence, `general-caches` at Python
+   0 B against Swift 6.86 GB, which turned out to be a real Python bug
+   (`du` exits non-zero on an unreadable subdirectory while still printing a
+   correct total, and `get_size()` discarded it). This is the soak stage: keep
+   it running for at least one release cycle before Stage 4's callers.
+4. **Deletion port, guard-first.** **First half landed** (#51): `Guards.safeToDelete`
+   (parent resolved, leaf deliberately unresolved — exact 2.8.1 semantics) and
+   `Guards.tmpScanPathAllowed` (the two-level carve-out), exposed read-only as
+   `mck guard-check`, with `tools/check_guard_parity.py` judging a 20-scenario
+   adversarial corpus against BOTH engines in CI. No deletion API exists yet,
+   and none may be written until the guards have parity (done) and the soak has
+   accumulated clean evidence over real use (in progress). Still to port:
+   `_remove` and the callers.
 5. **Cutover.** Swift becomes the default engine; Python ships one more
    release as `--engine python` fallback, then becomes contract documentation.
 

@@ -15,6 +15,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Changed
 - **`ROADMAP.md` is current again, and now stays that way.** Its "Current State" heading still said v2.15.0 at 2.17.2 — four releases of drift, invisible because nothing pointed at it. The v2.16 and v2.17 work is written up (schedule observability and `clean --min-free`; the V3 dual-engine soak and the `get_size` partial-`du` bug it caught on its first live run; the iCloud-dataless hangs in both engines), and the Swift-rewrite and App Store entries now reflect that stages 1–3 plus Stage 4's guards have landed.
 - **New drift tripwire: `TestRoadmapCurrency`.** Pins the roadmap heading's version to `cleaner.VERSION`, in the same spirit as `TestCompletions`, `TestContractFixtures` and `TestSwiftTableGenerated`. It checks the version only, never the prose — a test that pinned wording would fail on every honest edit and get deleted.
+- **`docs/V3-SWIFT-ENGINE.md` no longer contradicts itself.** Its header said "stages 1–2 landed; stages 3–5 not started" while its own Status section, eight lines below, correctly said stages 1–3 were live plus Stage 4's guards. Stage 2 also still listed the simulators and leftovers ports as outstanding and "owned by a parallel session", though both landed in #45 back in August. That misdirection is not hypothetical: it sent this session looking for work that was already finished. The header, the Stage 2 remainder (now correctly just cmd-target estimates), and the Stage 3 and 4 entries all now match what is actually on disk.
 
 ---
 
