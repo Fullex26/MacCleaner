@@ -7056,11 +7056,22 @@ class TestStorageInsightsTimeBudget(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_walk_stops_at_budget_and_reports_truncation(self):
+        # Behaviour change in 2.17.3, deliberate. This used to assert exactly
+        # one hit: the walk was synchronous and its `walked and ...` guard let
+        # the first directory through regardless of budget, so a zero budget
+        # still walked one root. The walk now runs in a joined daemon thread
+        # (a blocked readdir cannot be interrupted from Python, so the bound
+        # has to sit outside the walk), and a zero budget therefore grants no
+        # time at all. Returning nothing for "you have no time" is the more
+        # honest answer, and no real caller passes 0 — the default is 120s.
+        # What this test is actually for is unchanged and still asserted: the
+        # budget stops the walk, and the result says so rather than pretending
+        # to be complete.
         stats = {}
         with contextlib.redirect_stderr(io.StringIO()):
             hits = cleaner.scan_storage_insights({}, stats=stats, time_budget_s=0)
         self.assertTrue(stats["truncated"])
-        self.assertEqual(len(hits), 1, "one root walked, then the budget stopped the second")
+        self.assertLess(len(hits), 2, "a zero budget must not complete both roots")
 
     def test_default_budget_completes_a_small_tree(self):
         stats = {}
@@ -7378,3 +7389,88 @@ class TestProjectsScannerDataless(unittest.TestCase):
         self.assertEqual(
             hits, [],
             "an evicted artifact directory must not be offered for deletion")
+
+
+class TestStorageInsightsBlockingDirectory(unittest.TestCase):
+    """A directory can block `readdir` indefinitely WITHOUT carrying
+    SF_DATALESS, so the 2.17.2 dataless guard is necessary but not sufficient.
+
+    Found live, not theorised: ~/Library/Containers/com.apple.dt.ExternalViewService/Data
+    on a working developer Mac is a plain user-owned directory, mode 0700,
+    st_flags == 0 — and a bare os.listdir() on it never returns. A real
+    `storage-insights` run sat in os_scandir on it for 12 minutes at 0% CPU
+    before being killed by hand. Not iCloud; an Xcode app container.
+
+    The time budget could not save it: that check runs BETWEEN directories,
+    and a readdir already blocked in the kernel cannot be interrupted from
+    Python. So the budget has to bound the WALK, not the gaps between its
+    steps — the walk runs in a daemon thread the caller joins with a
+    deadline, and a wedged thread is abandoned rather than waited on.
+
+    Enumerating classes of blocking directory is a losing game (this one
+    would never have been guessed), so these tests deliberately assert the
+    generic property: whatever blocks and for whatever reason, the call
+    returns inside its budget with honest partial results."""
+
+    BLOCK_SECONDS = 30          # far longer than the budget under test
+    BUDGET = 2.0
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "Documents"
+        self.root.mkdir()
+        self._patch = mock.patch.dict(os.environ, {
+            "MACCLEANER_STORAGE_INSIGHTS_ROOTS": str(self.root)})
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _big(self, d, name):
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_bytes(b"\0" * (150 * 1024 * 1024))
+
+    def _scan_with_blocking_dir(self, blocking_name):
+        """os.scandir blocks forever on `blocking_name`, like the real one."""
+        real = os.scandir
+
+        def fake(path="."):
+            if os.path.basename(str(path)) == blocking_name:
+                time.sleep(self.BLOCK_SECONDS)      # uninterruptible from the caller
+            return real(path)
+
+        stats = {}
+        started = time.monotonic()
+        with mock.patch("os.scandir", side_effect=fake):
+            hits = cleaner.scan_storage_insights(
+                {}, stats=stats, time_budget_s=self.BUDGET)
+        return hits, stats, time.monotonic() - started
+
+    def test_returns_within_budget_despite_a_wedged_readdir(self):
+        self._big(self.root / "Wedged", "inside.mov")
+        hits, stats, elapsed = self._scan_with_blocking_dir("Wedged")
+        self.assertLess(
+            elapsed, self.BLOCK_SECONDS / 2,
+            f"scan_storage_insights took {elapsed:.1f}s against a {self.BUDGET}s "
+            "budget — a blocked readdir must not be waited on")
+        self.assertTrue(stats["truncated"],
+                        "a scan cut short by the budget must report truncated")
+
+    def test_results_found_before_the_block_are_still_returned(self):
+        """Partial results beat no results: whatever was measured before the
+        walk wedged must survive, so the UI shows something real."""
+        self._big(self.root, "local.mov")
+        self._big(self.root / "Wedged", "inside.mov")
+        hits, stats, elapsed = self._scan_with_blocking_dir("Wedged")
+        self.assertLess(elapsed, self.BLOCK_SECONDS / 2)
+        self.assertIn("local.mov", [h["path"].name for h in hits])
+
+    def test_clean_scan_is_not_marked_truncated(self):
+        """The bound must not fire on a healthy tree, or every scan would
+        claim to be partial."""
+        self._big(self.root, "local.mov")
+        stats = {}
+        hits = cleaner.scan_storage_insights({}, stats=stats, time_budget_s=self.BUDGET)
+        self.assertFalse(stats["truncated"])
+        self.assertEqual([h["path"].name for h in hits], ["local.mov"])

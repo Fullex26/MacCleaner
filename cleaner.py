@@ -39,6 +39,7 @@ import argparse
 import subprocess
 import datetime
 import plistlib
+import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1949,52 +1950,77 @@ def scan_storage_insights(config, stats=None, time_budget_s=None):
     hits = []
     stack = [r for r in _storage_insights_roots() if r.is_dir()]
     walked = 0
-    while stack:
-        if walked and time.monotonic() - started > time_budget_s:
-            stats["truncated"] = True
-            print(f"Warning: storage-insights stopped after {time_budget_s}s with "
-                  f"{len(stack)} director{'y' if len(stack) == 1 else 'ies'} unvisited; "
-                  f"results are partial", file=sys.stderr)
-            break
-        current = stack.pop()
-        walked += 1
-        try:
-            entries = list(os.scandir(current))
-        except OSError:
-            continue
-        for e in entries:
+
+    def _walk():
+        nonlocal walked
+        while stack:
+            if walked and time.monotonic() - started > time_budget_s:
+                stats["truncated"] = True
+                print(f"Warning: storage-insights stopped after {time_budget_s}s with "
+                      f"{len(stack)} director{'y' if len(stack) == 1 else 'ies'} unvisited; "
+                      f"results are partial", file=sys.stderr)
+                return
+            current = stack.pop()
+            walked += 1
             try:
-                if e.is_symlink():
-                    continue
-                if e.is_dir(follow_symlinks=False):
-                    if e.name in _STORAGE_INSIGHTS_SKIP_DIRS:
-                        continue
-                    if _is_dataless(e.stat(follow_symlinks=False)):
-                        # Evicted iCloud folder: listing it blocks on a
-                        # download, and it holds no local bytes. Skip it
-                        # whether it is a bundle or a plain folder.
-                        stats["dataless_dirs_skipped"] += 1
-                        continue
-                    if _is_bundle_dir(e.name):
-                        # One row for the whole bundle; never descend.
-                        size = _bundle_size(e.path, stats)
-                        if size >= STORAGE_INSIGHTS_MIN_BYTES:
-                            st = e.stat(follow_symlinks=False)
-                            hits.append({"path": Path(e.path), "size_bytes": size,
-                                         "mtime": st.st_mtime, "is_bundle": True})
-                        continue
-                    stack.append(Path(e.path))
-                elif e.is_file(follow_symlinks=False):
-                    st = e.stat(follow_symlinks=False)
-                    size = _disk_bytes(st)
-                    if size >= STORAGE_INSIGHTS_MIN_BYTES:
-                        hits.append({"path": Path(e.path), "size_bytes": size,
-                                     "mtime": st.st_mtime, "is_bundle": False})
+                entries = list(os.scandir(current))
             except OSError:
                 continue
+            for e in entries:
+                try:
+                    if e.is_symlink():
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        if e.name in _STORAGE_INSIGHTS_SKIP_DIRS:
+                            continue
+                        if _is_dataless(e.stat(follow_symlinks=False)):
+                            # Evicted iCloud folder: listing it blocks on a
+                            # download, and it holds no local bytes. Skip it
+                            # whether it is a bundle or a plain folder.
+                            stats["dataless_dirs_skipped"] += 1
+                            continue
+                        if _is_bundle_dir(e.name):
+                            # One row for the whole bundle; never descend.
+                            size = _bundle_size(e.path, stats)
+                            if size >= STORAGE_INSIGHTS_MIN_BYTES:
+                                st = e.stat(follow_symlinks=False)
+                                hits.append({"path": Path(e.path), "size_bytes": size,
+                                             "mtime": st.st_mtime, "is_bundle": True})
+                            continue
+                        stack.append(Path(e.path))
+                    elif e.is_file(follow_symlinks=False):
+                        st = e.stat(follow_symlinks=False)
+                        size = _disk_bytes(st)
+                        if size >= STORAGE_INSIGHTS_MIN_BYTES:
+                            hits.append({"path": Path(e.path), "size_bytes": size,
+                                         "mtime": st.st_mtime, "is_bundle": False})
+                except OSError:
+                    continue
+
+    # The walk runs in a DAEMON thread the caller joins with a deadline,
+    # because the budget check above can only fire BETWEEN directories and a
+    # readdir already blocked in the kernel cannot be interrupted from Python.
+    # Observed live: ~/Library/Containers/com.apple.dt.ExternalViewService/Data
+    # is a plain user-owned directory (mode 0700, st_flags == 0, NOT dataless)
+    # on which a bare os.listdir() never returns -- a real scan sat in
+    # os_scandir on it for 12 minutes at 0% CPU. The 2.17.2 dataless guard
+    # cannot catch that, and enumerating classes of blocking directory is a
+    # losing game, so bound the walk itself instead of guessing what might
+    # block. Daemon, so a wedged thread can never keep the process alive; the
+    # hits it already appended stay valid (append is atomic under the GIL) and
+    # partial results beat none.
+    worker = threading.Thread(target=_walk, name="storage-insights-walk", daemon=True)
+    worker.start()
+    worker.join(time_budget_s)
+    if worker.is_alive():
+        stats["truncated"] = True
+        print(f"Warning: storage-insights gave up after {time_budget_s}s — a "
+              f"directory is not responding to readdir; results are partial",
+              file=sys.stderr)
+
     stats["elapsed_s"] = round(time.monotonic() - started, 3)
-    hits.sort(key=lambda h: h["size_bytes"], reverse=True)
-    return hits[:STORAGE_INSIGHTS_MAX_RESULTS]
+    found = sorted(list(hits), key=lambda h: h["size_bytes"], reverse=True)
+    return found[:STORAGE_INSIGHTS_MAX_RESULTS]
 
 
 def _relative_days(mtime):
