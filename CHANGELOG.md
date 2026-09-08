@@ -7,7 +7,11 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
-## [Unreleased]
+## [2.17.2] — 2026-09-08
+
+The hang-and-duplicates release. Everything here came from one live machine:
+two engines wedged on an evicted iCloud folder, an app installed twice, and a
+launchd log that had been growing since August.
 
 ### Fixed
 - **`storage-insights` no longer hangs on evicted iCloud folders.** Two engines were found wedged for 20+ minutes at 0% CPU, blocked in a kernel directory read of a "dataless" (evicted) Pages document under `~/Library/Mobile Documents`. `stat()` on such a folder is answered from metadata, but *listing* it waits on iCloud. The walk now checks every directory's `SF_DATALESS` flag before listing it and skips evicted folders (they hold no local bytes anyway), inside bundles too. A live census of one Mac's whole iCloud tree with the check in place: 1,589 folders in 0.1 s, 72 skipped.
