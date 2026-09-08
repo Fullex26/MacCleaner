@@ -169,6 +169,12 @@ struct StorageInsightsReport: Codable {
     /// was covered instead of leaving an empty result ambiguous. Optional for
     /// the same backward-compatibility reason as `is_bundle`.
     let roots: [String]?
+    /// 2.17.2: true when the engine's walk hit its time budget and `entries`
+    /// is partial. Optional so a pre-2.17.2 engine still decodes.
+    let truncated: Bool?
+    /// 2.17.2: evicted iCloud folders the engine refused to list (listing one
+    /// blocks until iCloud downloads it; they hold no local bytes anyway).
+    let dataless_dirs_skipped: Int?
 }
 
 struct StorageMapEntry: Codable, Identifiable {
@@ -396,7 +402,19 @@ final class CleanerBridge: ObservableObject {
         return Bundle.main.path(forResource: "cleaner", ofType: "py") ?? installed
     }
 
-    nonisolated private static func runEngine(_ args: [String]) throws -> Data {
+    /// Every engine call gets a hard ceiling. Two `storage-insights` engines
+    /// once sat wedged in a kernel directory read on an evicted iCloud folder
+    /// for 20+ minutes at 0% CPU, and with no timeout the Dashboard's Large
+    /// Files panel spun for the life of the app. The engine now guards
+    /// against that walk itself (dataless skip + 120s budget), but a child
+    /// that has already blocked in the kernel cannot be interrupted from
+    /// Python at all — killing it from here is the only backstop. 10 minutes
+    /// is generous for every other subcommand (a full `scan` measures ~90
+    /// targets with parallel `du`; `clean` can run `docker system prune`).
+    nonisolated static let defaultEngineTimeout: TimeInterval = 600
+
+    nonisolated private static func runEngine(_ args: [String],
+                                              timeout: TimeInterval = defaultEngineTimeout) throws -> Data {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         process.arguments = [enginePath()] + args
@@ -416,10 +434,28 @@ final class CleanerBridge: ObservableObject {
         }
 
         try process.run()
+        // Same shape as soakCompare's guard: terminate, then SIGKILL in case
+        // the child is blocked somewhere SIGTERM can't reach (a kernel
+        // readdir wait is exactly that). `timedOut` is set before the kill
+        // so the error below can say what happened instead of "exited -9".
+        let timedOut = TimedOutFlag()
+        let killer = DispatchWorkItem {
+            if process.isRunning {
+                timedOut.set()
+                process.terminate()
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: killer)
         let data = out.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        killer.cancel()
         err.fileHandleForReading.readabilityHandler = nil
 
+        if timedOut.value {
+            throw BridgeError.engine(
+                "engine `\(args.first ?? "")` gave up after \(Int(timeout))s — killed")
+        }
         if process.terminationStatus != 0 {
             let msg = String(data: errBuffer.contents, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -428,9 +464,19 @@ final class CleanerBridge: ObservableObject {
         return data
     }
 
-    private func run<T: Decodable>(_ type: T.Type, _ args: [String]) async throws -> T {
+    /// Minimal thread-safe flag for the timeout path above: the killer runs
+    /// on a global queue while the caller blocks on `readDataToEndOfFile`.
+    private final class TimedOutFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var flag = false
+        func set() { lock.lock(); flag = true; lock.unlock() }
+        var value: Bool { lock.lock(); defer { lock.unlock() }; return flag }
+    }
+
+    private func run<T: Decodable>(_ type: T.Type, _ args: [String],
+                                   timeout: TimeInterval = CleanerBridge.defaultEngineTimeout) async throws -> T {
         let data = try await Task.detached(priority: .userInitiated) {
-            try Self.runEngine(args)
+            try Self.runEngine(args, timeout: timeout)
         }.value
         return try JSONDecoder().decode(T.self, from: data)
     }
@@ -745,10 +791,19 @@ final class CleanerBridge: ObservableObject {
     }
 
     func scanStorageInsights() async {
+        // Re-entrancy guard: the Dashboard's Scan button chains `scan()` then
+        // this, with no in-flight check of its own — on the wedged-engine
+        // machine that is exactly how a SECOND stuck engine appeared 10s
+        // after the first. The `.task` call site checks this flag itself;
+        // now every caller gets the same protection.
+        guard !isScanningStorageInsights else { return }
         isScanningStorageInsights = true
         defer { isScanningStorageInsights = false }
         do {
-            storageInsights = try await run(StorageInsightsReport.self, ["storage-insights", "--json"])
+            // Engine budget is 120s (STORAGE_INSIGHTS_TIME_BUDGET_S); leave
+            // room for it to finish and print, then kill.
+            storageInsights = try await run(StorageInsightsReport.self,
+                                            ["storage-insights", "--json"], timeout: 180)
             storageInsightsError = nil
         } catch {
             // Deliberately does not touch `storageInsights` (prior successful

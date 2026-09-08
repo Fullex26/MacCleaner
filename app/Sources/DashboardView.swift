@@ -106,6 +106,14 @@ struct DashboardView: View {
                     }
                 }
                 .frame(maxHeight: 240)
+                if bridge.storageInsights?.truncated == true {
+                    // Honest partial: the engine stopped at its time budget
+                    // (2.17.2). Never present a cut-off walk as the whole disk.
+                    Label("Partial — the scan hit its time limit; Scan again to retry.",
+                          systemImage: "clock.badge.exclamationmark")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             } else if bridge.storageInsights != nil {
                 // Only reached once a scan has actually succeeded and
                 // returned zero qualifying entries — gated on

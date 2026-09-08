@@ -7,6 +7,16 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **`storage-insights` no longer hangs on evicted iCloud folders.** Two engines were found wedged for 20+ minutes at 0% CPU, blocked in a kernel directory read of a "dataless" (evicted) Pages document under `~/Library/Mobile Documents`. `stat()` on such a folder is answered from metadata, but *listing* it waits on iCloud. The walk now checks every directory's `SF_DATALESS` flag before listing it and skips evicted folders (they hold no local bytes anyway), inside bundles too. A live census of one Mac's whole iCloud tree with the check in place: 1,589 folders in 0.1 s, 72 skipped.
+- **`storage-insights` has a wall-clock budget** (`STORAGE_INSIGHTS_TIME_BUDGET_S`, 120 s). Past it the walk stops between directories and returns what it has. JSON gains two additive keys: `truncated` (partial result) and `dataless_dirs_skipped`. The app shows a "Partial" note instead of presenting a cut-off walk as the whole disk.
+- **App: every engine call has a hard timeout** (10 min; 3 min for the large-files scan), killing the child with SIGKILL — a process already blocked in the kernel cannot be interrupted from Python. The large-files scan is also re-entrancy-guarded: the Scan button used to chain a second walk on top of a stuck one.
+- **`doctor` detects a duplicated app.** install.sh's `~/Applications` copy beside the Homebrew cask's `/Applications` copy is now a failing "Menu bar app" check naming both and which to remove. Ownership is read from the cask's Caskroom symlink, not guessed from the path. The engine/app version comparison uses the Homebrew-managed copy when one exists, so a stale second copy no longer produces a false "re-run install.sh" — which is what created the duplicate.
+- **`install.sh` skips the app when Homebrew manages it** (and warns if a second copy already exists), and de-duplicates its own shortcut lines in `~/.zshrc` — one real machine had `mclean`/`mpreview`/`mreport` defined twice from two generations of the installer.
+- **The hourly disk-watch agent's log is bounded.** `cron.log` is cut back to its last 400 lines once it passes 512 KiB, in place (launchd holds the file open with `O_APPEND`; a rename would strand its descriptor).
+
 ## [2.15.0] — 2026-08-31
 
 The schedule-transparency and agents release. Theme: nothing about this tool

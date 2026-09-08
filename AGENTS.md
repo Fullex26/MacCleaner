@@ -340,6 +340,8 @@ Differences from every other command here, all deliberate:
     "/Users/you/Library", "/Users/you/Applications", "/Applications"
   ],
   "min_bytes": 104857600,
+  "truncated": false,
+  "dataless_dirs_skipped": 72,
   "entries": [
     {"path": "/Applications/Civ6.app", "size_bytes": 12348030976,
      "size_human": "11.5 GB", "mtime": 1756300000.0, "is_bundle": true},
@@ -367,6 +369,10 @@ Each entry is `{"path": str, "size_bytes": int, "size_human": str, "mtime": floa
 **No delete/target mechanism exists for this data, at all.** Entries carry no `id` field and no `safe` field — they are not targets in the `get_targets()`/`collect_targets()` sense. No other subcommand accepts a `storage-insights` entry as input: `clean --targets` does not recognize a path or ID from this output, and there is no `storage-insights --clean` or equivalent. An agent that wants to act on a large file this command surfaces has exactly one option: operate on the reported filesystem path directly, outside MacCleaner (e.g. `rm`, moving it, or asking the user) — MacCleaner's own delete pipeline has no notion of these entries at all.
 
 **Stat-only — never opens file contents.** The scan calls `os.scandir`/`os.stat` exclusively; it never reads a file's bytes. This makes it safe to point at a directory containing iCloud-evicted ("Optimize Mac Storage") placeholder files without triggering a download of their content — a stat call reports the placeholder's size without materializing it locally.
+
+**Evicted iCloud *folders* are skipped, not listed (2.17.2).** Stat-only is enough for files, but *enumerating* a dataless (evicted) folder blocks in the kernel until iCloud materialises it — observed live as two engines stuck for 20+ minutes under `~/Library/Mobile Documents`. Every directory's `SF_DATALESS` flag is checked from its `lstat` before it is listed; flagged folders are counted in `"dataless_dirs_skipped"` and never entered, inside bundles too. They hold no local bytes, so nothing is lost from the totals.
+
+**Time budget (2.17.2).** The walk stops between directories once it has run for `STORAGE_INSIGHTS_TIME_BUDGET_S` (120 s) and returns what it has with `"truncated": true` plus a stderr warning. A caller must treat a truncated result as partial, not as "nothing else is large". Both keys are additive; a pre-2.17.2 engine simply omits them.
 
 ### `schedule status|weekly|monthly|off --json`
 
@@ -490,6 +496,7 @@ Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 5
 | `MACCLEANER_ALERTS` | Path to the low-disk alert-state file (default: `alerts.json` next to `cleaner.py`, with the same Application Support fallback as `MACCLEANER_LOG`) — new in 2.2.0 |
 | `MACCLEANER_LAUNCH_AGENTS_DIR` | Directory `schedule` reads/writes launchd agent plists in (default: `~/Library/LaunchAgents`) — new in 2.3.0, used by tests |
 | `MACCLEANER_TMP_ROOT` | Root directory the `tmp` category scans for stale build artifacts (default: `/private/tmp`) — new in 2.5.0, exists so tests (and anyone diagnosing the scanner) can point it at a throwaway directory instead of the real system tmp |
+| `MACCLEANER_CASKROOM_DIR` | Homebrew Caskroom directory for the `maccleaner` cask (default: `/opt/homebrew/Caskroom/maccleaner`, then `/usr/local/...`). `doctor` reads the cask's `<version>/MacCleaner.app` symlink to learn which bundle Homebrew manages; `install.sh` reads the same to skip installing a second copy — new in 2.17.2, exists so tests can fabricate a cask |
 | `MACCLEANER_SYSTEM_APPLICATIONS_DIR` | Directory `doctor`'s "Menu bar app" / "Engine/App version" checks treat as the system-wide Applications folder, alongside `~/Applications` (default: `/Applications`) — new in 2.6.1, exists so tests can sandbox away a real system-wide install |
 | `MACCLEANER_INSTALLED_APPS_DIRS` | Colon-separated list of directories the `leftovers` scanner treats as app roots when building its installed-bundle-ID set (default: `/Applications:~/Applications:/System/Applications`) — new in 2.7.0, exists so tests can sandbox away the real Applications folders |
 | `MACCLEANER_LEFTOVER_LIBRARY_ROOT` | Root directory the `leftovers` scanner treats as `~/Library` when looking for orphaned per-app data (default: `~/Library`) — new in 2.7.0, exists so tests (and anyone diagnosing the scanner) can point it at a throwaway directory instead of the real one |
