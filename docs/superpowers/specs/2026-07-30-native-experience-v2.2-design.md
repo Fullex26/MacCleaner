@@ -1,0 +1,163 @@
+# Native Experience v2.2 — launchd, Notifications, Live Menu Bar
+
+**Date:** 2026-07-30
+**Status:** Approved
+**Scope:** `cleaner.py`, `scheduler.sh`, `app/Sources/`, tests, docs. No distribution work (sub-project 3).
+
+Sub-project 2 of the v2.1+ program (Engine → **Native experience** → Distribution). Builds on v2.1 (`main` @ c943ebb), whose `snapshots.log` and cheap `report --json` are what this sub-project reads.
+
+---
+
+## Goals
+
+1. **launchd replaces cron** — the native macOS scheduler; runs a missed calendar job after wake instead of silently skipping it. Existing cron users are migrated automatically.
+2. **Notifications** — a scheduled clean tells you what it freed; a low-disk alert warns before you run out.
+3. **Low-disk watch** — an hourly check that works whether or not the app is running.
+4. **Live menu bar** — split-cadence auto-refresh plus "last cleaned", without hammering the disk.
+
+## Non-goals
+
+- Homebrew Cask, code signing, notarization, Sparkle, shell completions (sub-project 3).
+- Schedule management inside the app's Settings tab — writing launchd plists from a GUI that shells out to bash is indirection that breaks quietly. `scheduler.sh` stays the one place schedules are configured.
+- A Swift test target. None exists today; CI keeps building the app. Called out as a known gap.
+- Dashboard charts over `disk_history` (a natural follow-on, deliberately deferred).
+
+## Guiding constraint
+
+The engine stays the brain: every behavior here is reachable and testable from the CLI, and Swift remains a thin client. All JSON changes are additive per the superset rule.
+
+---
+
+## 1. Engine — config, `--notify`, `disk-check`
+
+### New config keys (merged into `DEFAULT_CONFIG`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `notifications` | `true` | Post a notification when a scheduled clean finishes |
+| `low_disk_alerts` | `true` | Enable the low-disk warning |
+| `low_disk_threshold_gb` | `10` | Warn when free space drops below this |
+| `full_refresh_hours` | `6` | How often the app runs a full scan (read by the app, not the CLI) |
+
+Missing keys merge from defaults on load, as they already do — so a v2.1 `config.json` picks these up untouched.
+
+The two notification switches are **independent**: `notifications` governs only the clean-finished notification, `low_disk_alerts` governs only the low-disk warning. Turning off one never silences the other, so a user can keep the warning that matters while dropping the routine one.
+
+### Notification primitive
+
+`_notify(title, message)` posts via `osascript -e 'display notification …'`. Both arguments are passed through AppleScript string escaping (`\` and `"`); target labels and byte counts are the only interpolated values, but escaping is unconditional. `osascript` missing, failing, or timing out (5 s) logs to stderr and never affects the caller's exit code — a notification failure must never turn a successful clean into a failed one.
+
+Rationale for `osascript` rather than a Swift helper: it needs no bundle, no signing, and no extra binary. Attribution is generic until the app is signed (sub-project 3); the app's own notifications are native and properly attributed.
+
+### `clean --notify`
+
+New flag on `clean`. After a run, posts: *"MacCleaner freed 3.2 GB"* / *"12 items cleaned · 84.1 GB free"*. Respects `notifications: false` (flag present but config off ⇒ no notification, no error). Nothing else about `clean` changes.
+
+Only the launchd plist passes `--notify`. That is the whole mechanism for "notify when running headless" — no process sniffing to guess whether the app is up, because the caller already knows.
+
+### `disk-check` subcommand
+
+Deliberately cheap: one `shutil.disk_usage` call. No `du`, no target measurement, no snapshot recorded — it runs hourly and must cost nothing.
+
+Behavior: compare free bytes against `low_disk_threshold_gb`; when below, notify *"Low disk space: 8.4 GB free"* / *"Below your 10 GB threshold — open MacCleaner to reclaim space."*
+
+**Throttle.** State in `alerts.json`, resolved through v2.1's existing `_resolve_state_path()` (inheriting the `MACCLEANER_ALERTS` env override and the `.app`-bundle fallback for free):
+
+```json
+{"low_disk": {"state": "below", "last_notified": "2026-07-30T09:00:00"}}
+```
+
+- `above` → `below` transition: notify, record.
+- Still `below`: re-notify only if the last notification is ≥ 24 h old.
+- `below` → `above`: clear to `above` silently, so the next dip notifies immediately.
+
+A corrupt `alerts.json` self-heals the way `snapshots.log` does (warn on stderr, restart from empty).
+
+`--json` returns `{"free_bytes", "free_human", "threshold_bytes", "below_threshold", "notified"}` and **always exits 0** — it is a monitor, not a check that fails. `low_disk_alerts: false` short-circuits to `notified: false` while still reporting the numbers.
+
+---
+
+## 2. Scheduling — `scheduler.sh` on launchd
+
+Two agents in `~/Library/LaunchAgents/`, both generated by `scheduler.sh` (so the paths and python interpreter are resolved at install time, as the cron version did):
+
+| Label | Trigger | Runs |
+|---|---|---|
+| `com.fullex.maccleaner.clean` | `StartCalendarInterval` — weekly (Mon 09:00) or monthly (1st, 09:00) | `cleaner.py clean --yes --notify` |
+| `com.fullex.maccleaner.diskwatch` | `StartInterval` 3600 | `cleaner.py disk-check` |
+
+`StandardOutPath`/`StandardErrorPath` point at the existing `cron.log` location beside `cleaner.py` (keeping one log file users already know; it is no longer cron-specific but renaming it would break existing muscle memory for no gain).
+
+The diskwatch agent installs alongside whichever schedule is chosen and is removed by `remove`. Installing a schedule when one already exists replaces it rather than stacking.
+
+### Commands (surface unchanged)
+
+`weekly` · `monthly` · `remove` · `status`, using `launchctl bootout`/`bootstrap gui/$UID` with a fallback to `unload`/`load` on older macOS, and reporting actionable messages when either fails rather than silently no-opping.
+
+### Cron auto-migration
+
+Every command first checks for a MacCleaner crontab line. If found: install the launchd equivalent (preserving weekly-vs-monthly as detected from the cron expression), remove the cron line, and print what happened. Idempotent — running twice is a no-op the second time.
+
+`status` reports launchd state from `launchctl list`, and separately flags a surviving legacy cron line if one is found.
+
+### `doctor`
+
+The Schedule check learns launchd: reports the active agent labels, reports a cron line as `legacy cron (run scheduler.sh weekly to migrate)`, and says "not scheduled" when neither exists.
+
+---
+
+## 3. App — notifications and split-cadence refresh
+
+### `NotificationManager.swift` (new)
+
+Requests `UNUserNotificationCenter` authorization once on first launch and posts alerts. Every call site tolerates denial or unavailability silently — an ad-hoc-signed app may fail to register, and that must degrade to "no notifications", never to a hang or an error dialog. Notifications the app posts are properly attributed; the CLI's `osascript` path is the headless fallback.
+
+### Refresh cadence in `CleanerBridge`
+
+Two timers, because a full scan fans out `du` across 70+ targets (measured: >1 min on a populated machine) while reading free space is instant:
+
+- **Light tick — 60 s.** Runs `report --json`, which already carries `disk_history.current.free_bytes` and the last run. Updates free disk and "last cleaned". No new engine command needed — the v2.1 contract already returns exactly this.
+- **Full scan — `full_refresh_hours` (default 6).** Runs `scan --json` for reclaimable totals. Also triggered on wake (`NSWorkspace.didWakeNotification`) and when the menu bar opens, each debounced so a wake plus a menu-open doesn't launch two scans.
+
+Timers are suspended while a clean is in flight (`isCleaning`), so a refresh never races a delete.
+
+### Menu bar and Settings
+
+The menu gains **"Last cleaned: 3 days ago"** (relative, from `report --json`'s last run; "Never" when history is empty). The bar title keeps showing reclaimable.
+
+Settings gains toggles for `notifications` and `low_disk_alerts` plus a `low_disk_threshold_gb` field, persisted via `config set` exactly like the existing settings. Schedule stays in `scheduler.sh` (non-goal above).
+
+`Info.plist` → `2.2.0`.
+
+---
+
+## 4. Error handling
+
+Every new failure path degrades rather than propagating: `osascript` absent or erroring warns on stderr and leaves exit codes alone; a corrupt `alerts.json` self-heals; `launchctl` failures print the actual stderr plus the remedy; notification authorization denial is a silent no-op in the app; `disk-check` always exits 0.
+
+---
+
+## 5. Testing
+
+Python, stdlib-only, sandboxed (tempdirs + `MACCLEANER_CONFIG` / `MACCLEANER_LOG` / `MACCLEANER_SNAPSHOTS` / new `MACCLEANER_ALERTS`), never writing into the repo or the real home. Building on v2.1's 89 tests:
+
+1. **Config** — the four new keys default correctly and merge into a config file that lacks them.
+2. **`disk-check`** — below/above threshold; `--json` shape and exit 0 in both cases; `low_disk_alerts: false` reports numbers with `notified: false`; records no snapshot and no `report.log` entry.
+3. **Throttle state machine** — first dip notifies; a second run within 24 h does not; ≥ 24 h later does; recovery to `above` then a new dip notifies immediately; corrupt `alerts.json` self-heals; `MACCLEANER_ALERTS` honored.
+4. **`_notify`** — the constructed `osascript` argv is asserted as data (never executed); quotes and backslashes in the message are escaped; a simulated missing binary leaves the caller's exit code untouched.
+5. **`clean --notify`** — notification attempted when enabled, suppressed under `notifications: false`, and in both cases the clean's own JSON and exit code are unchanged.
+6. **plist generation** — `scheduler.sh` emits valid plists (verified with `plutil -lint`) carrying the right label, interval/calendar trigger, and resolved python + cleaner paths.
+7. **Cron migration** — a fake crontab containing a MacCleaner line is migrated (launchd installed, cron line gone, weekly/monthly preserved), migration is idempotent, and an unrelated crontab line survives untouched.
+
+Shell tests run `scheduler.sh` against an overridden `LaunchAgents` directory and a stub `crontab`/`launchctl` on `PATH`, so no test touches the real user's agents or crontab.
+
+CI additionally keeps building the app; the missing Swift test target is a documented gap.
+
+## 6. Docs
+
+`AGENTS.md` — `disk-check` (flags, JSON shape, exit code), `clean --notify`, the four config keys, `MACCLEANER_ALERTS`, `alerts.json`. All additive.
+`CLAUDE.md` — new subcommand and config keys, launchd scheduling, `alerts.json` location rule, updated test count.
+`README.md` — brief user-facing blurbs for scheduled-clean notifications, low-disk alerts, and the live menu bar.
+`ROADMAP.md` — tick Notifications, low disk alerts, launchd, auto-refresh, last-cleaned timestamp.
+`CHANGELOG.md` — new `## [2.2.0]` section.
+`scheduler.sh` usage text — launchd wording, migration note.

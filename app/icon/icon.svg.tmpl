@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MacCleaner app icon — source artwork.
+
+  This is a template: {{BROOM_TRANSFORM}} is substituted by generate_icon.py
+  with the group transform (translate/rotate/scale) that positions the broom
+  glyph inside the background squircle. Regenerate app/MacCleaner.icns with:
+
+      python3 app/icon/generate_icon.py
+
+  Design: a flat, high-contrast broom glyph (warm wood handle + golden
+  bristles) on a cool blue-to-teal squircle background, following the
+  macOS "content inset within a rounded-square canvas" convention rather
+  than full-bleed artwork. Kept deliberately simple (few large shapes, no
+  fine linework) so the silhouette still reads at 16x16.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5BD8EF"/>
+      <stop offset="100%" stop-color="#075E7A"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="30%" cy="22%" r="65%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.20"/>
+      <stop offset="60%" stop-color="#FFFFFF" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Background squircle: inset from the 1024 canvas, not full-bleed -->
+  <rect x="112" y="112" width="800" height="800" rx="186" ry="186" fill="url(#bg)"/>
+  <rect x="112" y="112" width="800" height="800" rx="186" ry="186" fill="url(#sheen)"/>
+
+  <!-- Broom glyph, drawn upright then rotated/positioned as a group. Shapes
+       are kept large and chunky (thick handle, wide fan) rather than
+       true-to-life proportions, so the silhouette still holds together
+       once scaled down to 16x16 — thin linework disappears at that size. -->
+  <g transform="{{BROOM_TRANSFORM}}">
+    <!-- soft contact shadow under the fan -->
+    <ellipse cx="0" cy="336" rx="230" ry="34" fill="#02202B" opacity="0.18"/>
+
+    <!-- bristle separation lines (behind the fan mass so edges stay clean) -->
+    <g stroke="#D99A00" stroke-width="16" stroke-linecap="round" opacity="0.9">
+      <line x1="0" y1="182" x2="-110" y2="322"/>
+      <line x1="0" y1="182" x2="0" y2="332"/>
+      <line x1="0" y1="182" x2="112" y2="322"/>
+    </g>
+
+    <!-- bristle fan -->
+    <path d="M -75,176 L 75,176 L 222,326 Q 0,360 -222,326 Z" fill="#FFD23F"/>
+
+    <!-- ferrule (binding between handle and bristles) -->
+    <rect x="-76" y="128" width="152" height="62" rx="12" fill="#5B3A21"/>
+
+    <!-- handle -->
+    <rect x="-50" y="-250" width="100" height="392" rx="50" fill="#C98A4B"/>
+    <rect x="-18" y="-236" width="26" height="360" rx="13" fill="#E4B27B" opacity="0.55"/>
+
+    <!-- grip knob -->
+    <circle cx="0" cy="-250" r="58" fill="#5B3A21"/>
+
+    <!-- a couple of swept sparkle motes -->
+    <circle cx="-268" cy="292" r="20" fill="#FFFFFF" opacity="0.85"/>
+    <circle cx="-322" cy="228" r="13" fill="#FFFFFF" opacity="0.6"/>
+  </g>
+</svg>

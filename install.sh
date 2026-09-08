@@ -10,71 +10,313 @@ echo "========================"
 INSTALL_DIR="$HOME/mac-cleaner"
 mkdir -p "$INSTALL_DIR"
 
-# 2. Copy files
+# 2. Copy files (never clobber the user's existing config)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cp "$SCRIPT_DIR/cleaner.py" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/scheduler.sh" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/config.json" "$INSTALL_DIR/" 2>/dev/null || true
+if [ -d "$SCRIPT_DIR/completions" ]; then
+    mkdir -p "$INSTALL_DIR/completions"
+    for f in _maccleaner maccleaner.bash; do
+        [ -f "$SCRIPT_DIR/completions/$f" ] && cp "$SCRIPT_DIR/completions/$f" "$INSTALL_DIR/completions/" || true
+    done
+fi
+if [ ! -f "$INSTALL_DIR/config.json" ] && [ -f "$SCRIPT_DIR/config.json" ]; then
+    cp "$SCRIPT_DIR/config.json" "$INSTALL_DIR/"
+fi
 chmod +x "$INSTALL_DIR/cleaner.py"
 chmod +x "$INSTALL_DIR/scheduler.sh"
 
-# 3. Install rich for pretty output
+# 3. Install rich for pretty output (optional — plain output works without it)
 echo "→ Installing Python dependencies..."
 python3 -m pip install rich --quiet --break-system-packages 2>/dev/null || \
 python3 -m pip install rich --quiet 2>/dev/null || \
 echo "  (rich not installed — plain output mode)"
 
-# 4. Shell alias
+# 4. Shell shortcuts (functions, not aliases). zsh's `complete_aliases` option
+# is off by default, so `alias maccleaner=...` would expand to the underlying
+# `python3 ...` command *before* completion lookup ever consults _maccleaner,
+# leaving the user with plain filename completion. Functions aren't expanded
+# at parse time, so they don't have this problem.
+SHORTCUTS_SRC="$SCRIPT_DIR/completions/shell-shortcuts.sh"
+
+# Pre-v2.4 installs wrote the old alias lines below. A later `name() { ... }`
+# function definition does NOT override an earlier `alias name=...` in zsh --
+# it's a parse error ("defining function based on alias"), which aborts the
+# rest of the rc file being sourced. So existing users need those exact lines
+# converted in place, not a function block appended after them.
+migrate_maccleaner_aliases() {
+    local rc="$1"
+    [ -f "$rc" ] || return 0
+    [ -f "$SHORTCUTS_SRC" ] || return 0
+    grep -qF "alias maccleaner='python3 ~/mac-cleaner/cleaner.py'" "$rc" 2>/dev/null || return 0
+    python3 - "$rc" "$SHORTCUTS_SRC" <<'PYEOF'
+import sys
+
+rc_path, shortcuts_path = sys.argv[1], sys.argv[2]
+
+OLD = [
+    "alias maccleaner='python3 ~/mac-cleaner/cleaner.py'",
+    "alias mclean='python3 ~/mac-cleaner/cleaner.py clean'",
+    "alias mpreview='python3 ~/mac-cleaner/cleaner.py scan'",
+    "alias mreport='python3 ~/mac-cleaner/cleaner.py report'",
+]
+
+with open(shortcuts_path) as f:
+    new_lines = [line.rstrip("\n") for line in f if line.strip()]
+
+if len(new_lines) != len(OLD):
+    # shortcuts template's shape changed since this mapping was written --
+    # bail rather than guess, so a human updates both together.
+    sys.exit(0)
+
+with open(rc_path) as f:
+    text = f.read()
+
+# Exact-line replace only. Never touches anything else in the file, so
+# unrelated content survives byte-for-byte, and running this twice is a
+# no-op the second time (the old lines are gone after the first pass).
+lines = text.split("\n")
+changed = False
+for old, new in zip(OLD, new_lines):
+    for i, line in enumerate(lines):
+        if line == old:
+            lines[i] = new
+            changed = True
+
+if changed:
+    with open(rc_path, "w") as f:
+        f.write("\n".join(lines))
+PYEOF
+    echo "→ Migrated shell aliases to functions (zsh doesn't complete aliases by default)"
+}
+
+# The shortcut block can end up in an rc file twice (one real machine had
+# mclean/mpreview/mreport defined at two different lines, from an older
+# install that wrote a three-line block and a later one that appended the
+# four-line one). Harmless to zsh, but the "already installed" guard below
+# then matches the *older* block and never adds `maccleaner()` at all.
+# Remove exact repeats of our own lines only, keeping the first occurrence;
+# nothing else in the file is touched.
+dedupe_maccleaner_shortcuts() {
+    local rc="$1"
+    [ -f "$rc" ] || return 0
+    [ -f "$SHORTCUTS_SRC" ] || return 0
+    python3 - "$rc" "$SHORTCUTS_SRC" <<'PYEOF'
+import sys
+
+rc_path, shortcuts_path = sys.argv[1], sys.argv[2]
+with open(shortcuts_path) as f:
+    ours = {line.rstrip("\n") for line in f if line.strip()}
+with open(rc_path) as f:
+    text = f.read()
+
+seen, out, changed = set(), [], False
+for line in text.split("\n"):
+    if line in ours:
+        if line in seen:
+            changed = True
+            continue
+        seen.add(line)
+    out.append(line)
+
+if changed:
+    with open(rc_path, "w") as f:
+        f.write("\n".join(out))
+PYEOF
+}
+
+# The Homebrew cask leaves `<Caskroom>/maccleaner/<version>/MacCleaner.app`
+# as a symlink to the bundle it installed (normally /Applications). Print
+# that bundle's path when the cask is installed, nothing otherwise.
+# MACCLEANER_CASKROOM_DIR overrides the Caskroom location (tests).
+maccleaner_cask_app() {
+    local dir="${MACCLEANER_CASKROOM_DIR:-}"
+    if [ -z "$dir" ]; then
+        local prefix
+        prefix="$(brew --prefix 2>/dev/null || true)"
+        dir="${prefix:-/opt/homebrew}/Caskroom/maccleaner"
+    fi
+    [ -d "$dir" ] || return 0
+    local link target
+    for link in "$dir"/*/MacCleaner.app; do
+        [ -L "$link" ] || continue
+        target="$(readlink "$link")"
+        if [ -d "$target" ]; then
+            echo "$target"
+            return 0
+        fi
+    done
+    return 0
+}
+
 SHELL_RC="$HOME/.zshrc"
+migrate_maccleaner_aliases "$SHELL_RC"
+dedupe_maccleaner_shortcuts "$SHELL_RC"
 if ! grep -q "mac-cleaner" "$SHELL_RC" 2>/dev/null; then
-    echo "" >> "$SHELL_RC"
-    echo "# MacCleaner" >> "$SHELL_RC"
-    echo "alias maccleaner='python3 ~/mac-cleaner/cleaner.py'" >> "$SHELL_RC"
-    echo "alias mclean='python3 ~/mac-cleaner/cleaner.py --clean'" >> "$SHELL_RC"
-    echo "alias mpreview='python3 ~/mac-cleaner/cleaner.py --preview'" >> "$SHELL_RC"
-    echo "alias mreport='python3 ~/mac-cleaner/cleaner.py --report'" >> "$SHELL_RC"
-    echo "→ Added shell aliases: maccleaner, mclean, mpreview, mreport"
+    {
+        echo ""
+        echo "# MacCleaner"
+        [ -f "$SHORTCUTS_SRC" ] && cat "$SHORTCUTS_SRC" || true
+    } >> "$SHELL_RC"
+    echo "→ Added shell shortcuts: maccleaner, mclean, mpreview, mreport"
 fi
 
-# 5. Schedule
-echo ""
-echo "📅 Schedule cleanup?"
-echo "  1) Weekly (every Monday 9am) — recommended"
-echo "  2) Monthly (1st of month)"
-echo "  3) Skip for now"
-read -p "Choice [1/2/3]: " choice
+# 5. Shell completions (own guard — the shortcuts guard above already matches
+# for anyone who has ever run this installer, so reusing it would silently
+# skip completions for every existing user)
+COMPLETIONS_DIR="$INSTALL_DIR/completions"
+if [ -d "$COMPLETIONS_DIR" ]; then
+    ZSHRC="$HOME/.zshrc"
+    if ! grep -q "mac-cleaner/completions" "$ZSHRC" 2>/dev/null; then
+        {
+            echo ""
+            echo "# MacCleaner completions"
+            echo "fpath=(\"\$HOME/mac-cleaner/completions\" \$fpath)"
+            [ -f "$SCRIPT_DIR/completions/zsh-compdef-init.zsh" ] && cat "$SCRIPT_DIR/completions/zsh-compdef-init.zsh" || true
+        } >> "$ZSHRC"
+        echo "→ Added zsh completions (restart your shell to use them)"
+    fi
 
-case "$choice" in
-    1) bash "$INSTALL_DIR/scheduler.sh" weekly ;;
-    2) bash "$INSTALL_DIR/scheduler.sh" monthly ;;
-    *) echo "  Skipped — run '$INSTALL_DIR/scheduler.sh weekly' anytime" ;;
-esac
+    # bash: macOS ships bash 3.2, and there may be no bash-completion install,
+    # so source the file directly from whichever rc file bash actually reads.
+    # Shortcuts are defined here too (not just in ~/.zshrc) -- otherwise a
+    # bash user gets completion wired up for four commands bash never
+    # defines, and none for the shell functions that would actually work.
+    for BASHRC in "$HOME/.bash_profile" "$HOME/.bashrc"; do
+        [ -f "$BASHRC" ] || continue
+        if ! grep -q "mac-cleaner/cleaner.py" "$BASHRC" 2>/dev/null; then
+            {
+                echo ""
+                echo "# MacCleaner"
+                [ -f "$SHORTCUTS_SRC" ] && cat "$SHORTCUTS_SRC" || true
+            } >> "$BASHRC"
+            echo "→ Added shell shortcuts to $(basename "$BASHRC")"
+        fi
+        if ! grep -q "mac-cleaner/completions" "$BASHRC" 2>/dev/null; then
+            {
+                echo ""
+                echo "# MacCleaner completions"
+                echo "[ -r \"\$HOME/mac-cleaner/completions/maccleaner.bash\" ] && \\"
+                echo "    . \"\$HOME/mac-cleaner/completions/maccleaner.bash\""
+            } >> "$BASHRC"
+            echo "→ Added bash completions to $(basename "$BASHRC")"
+        fi
+    done
+fi
 
-# 6. Install menu bar app
+# 6. Schedule (skipped when not running interactively)
+if [ -t 0 ]; then
+    echo ""
+    echo "📅 Schedule cleanup?"
+    echo "  1) Weekly (every Monday 9am) — recommended"
+    echo "  2) Monthly (1st of month)"
+    echo "  3) Skip for now"
+    read -p "Choice [1/2/3]: " choice || choice=3
+
+    case "$choice" in
+        1) bash "$INSTALL_DIR/scheduler.sh" weekly ;;
+        2) bash "$INSTALL_DIR/scheduler.sh" monthly ;;
+        *) echo "  Skipped — run '$INSTALL_DIR/scheduler.sh weekly' anytime" ;;
+    esac
+else
+    echo "→ Non-interactive install — schedule later with '$INSTALL_DIR/scheduler.sh weekly'"
+fi
+
+# 7. Menu bar app: build fresh from source whenever possible, so the app
+# installed from a `git clone && bash install.sh` can never be older than the
+# checkout — falling back to the committed bundle only when swiftc isn't
+# available (the committed bundle is rebuilt each release, but a clone
+# between releases would otherwise ship whatever was last committed).
 APP_BUNDLE="$SCRIPT_DIR/MacCleaner.app"
 APP_DEST="$HOME/Applications/MacCleaner.app"
-if [ -d "$APP_BUNDLE" ]; then
+INSTALLED_DEST=""
+if command -v swiftc >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/app/build.sh" ]; then
+    echo "→ Building MacCleaner.app from source..."
+    if bash "$SCRIPT_DIR/app/build.sh"; then
+        APP_BUNDLE="$SCRIPT_DIR/build/MacCleaner.app"
+    elif [ -d "$APP_BUNDLE" ]; then
+        echo "→ Build failed — falling back to the committed app bundle"
+    fi
+elif [ -d "$APP_BUNDLE" ]; then
+    echo "→ swiftc not found — using the committed app bundle (may be older than this checkout)"
+fi
+
+# 7b. A Sparkle fetch failure outside CI is NOT fatal for app/build.sh — it
+# falls back to -DSPARKLE_DISABLED and still exits 0 (see app/build.sh's
+# fetch-or-fatal comment: only `[ -n "${CI:-}" ]` is fatal). Left unchecked,
+# the "build succeeded" branch above would happily prefer that fresh-but-
+# updater-less build over an older committed bundle that DOES have Sparkle
+# embedded, and this script would go on to print "Installation complete!"
+# with no indication the install just lost its auto-updater. Catch that here:
+# prefer the committed bundle when it has Sparkle and the chosen one doesn't;
+# otherwise remember to warn loudly in the final summary instead of silently
+# shipping a Sparkle-less app.
+SPARKLE_WARNING=""
+COMMITTED_APP_BUNDLE="$SCRIPT_DIR/MacCleaner.app"
+if [ -d "$APP_BUNDLE" ] && [ ! -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]; then
+    if [ "$APP_BUNDLE" != "$COMMITTED_APP_BUNDLE" ] && [ -d "$COMMITTED_APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]; then
+        echo "→ Freshly built app has no Sparkle.framework (fetch likely failed, e.g. offline) — preferring the committed Sparkle-bearing bundle instead"
+        APP_BUNDLE="$COMMITTED_APP_BUNDLE"
+    else
+        SPARKLE_WARNING="⚠️  This build has no auto-updater (Sparkle.framework missing) — re-run install.sh once you're back online to get auto-updates."
+    fi
+fi
+
+CASK_APP="$(maccleaner_cask_app)"
+if [ -n "$CASK_APP" ]; then
+    # Homebrew owns the app. Installing a second copy to ~/Applications
+    # creates exactly the duplicate `doctor` warns about: Sparkle updates only
+    # the running copy, so the other falls behind silently. The engine and
+    # shortcuts above are still refreshed -- Sparkle never touches those.
+    echo "→ MacCleaner.app is managed by Homebrew ($CASK_APP) — not installing a second copy"
+    echo "  Update the app with: brew upgrade --cask maccleaner  (or let it auto-update)"
+    if [ -d "$APP_DEST" ]; then
+        echo "⚠️  A second copy exists at $APP_DEST from an earlier install — remove it to avoid two apps drifting apart"
+    fi
+elif [ -d "$APP_BUNDLE" ]; then
     mkdir -p "$HOME/Applications"
     rm -rf "$APP_DEST"
-    cp -r "$APP_BUNDLE" "$APP_DEST" 2>/dev/null || \
-    cp -r "$APP_BUNDLE" "/Applications/MacCleaner.app" 2>/dev/null || true
-    echo "→ Copied MacCleaner.app to ~/Applications/"
+    INSTALLED_DEST=""
+    if cp -R "$APP_BUNDLE" "$APP_DEST" 2>/dev/null; then
+        INSTALLED_DEST="$APP_DEST"
+    elif cp -R "$APP_BUNDLE" "/Applications/MacCleaner.app" 2>/dev/null; then
+        INSTALLED_DEST="/Applications/MacCleaner.app"
+    fi
+    if [ -n "$INSTALLED_DEST" ]; then
+        echo "→ Installed MacCleaner.app to $INSTALLED_DEST"
+    else
+        echo "→ Could not install MacCleaner.app (no write access to ~/Applications or /Applications)"
+        echo "  Try 'bash app/build.sh --install' after fixing permissions"
+    fi
+    if [ -n "$INSTALLED_DEST" ] && pgrep -xq MacCleaner; then
+        killall MacCleaner 2>/dev/null || true
+        sleep 1
+        open "$INSTALLED_DEST" 2>/dev/null || true
+        echo "→ Relaunched MacCleaner.app (was running an older build)"
+    fi
+else
+    echo "→ No Swift toolchain and no committed app bundle found — skipping menu bar app install"
+    echo "  Install Xcode Command Line Tools and re-run, or run 'bash app/build.sh --install' later"
 fi
 
 echo ""
-echo "🖥️  Menu Bar App"
-echo "  To run the menu bar app:"
-echo "  1. Open: ~/Applications/MacCleaner.app"
-echo "     (or: open ~/Applications/MacCleaner.app)"
-echo "  2. Look for 🧹 in your menu bar"
-echo ""
 echo "✅ Installation complete!"
+if [ -n "$SPARKLE_WARNING" ]; then
+    echo ""
+    echo "$SPARKLE_WARNING"
+fi
 echo ""
 echo "Commands:"
-echo "  maccleaner          — show help & available commands"
-echo "  maccleaner preview  — see what will be deleted"
-echo "  maccleaner clean    — interactive cleanup"
-echo "  maccleaner report   — show history"
+echo "  maccleaner            — show help & available commands"
+echo "  maccleaner scan       — see what can be cleaned"
+echo "  maccleaner clean      — interactive cleanup"
+echo "  maccleaner projects   — find stale build artifacts"
+echo "  maccleaner doctor     — check environment health"
+echo "  maccleaner report     — show history"
+echo ""
+echo "For AI agents: maccleaner scan --json  (full contract in AGENTS.md)"
+echo ""
+echo "Menu bar app: open ${CASK_APP:-${INSTALLED_DEST:-$APP_DEST}}  (look for 🧹)"
 echo ""
 echo "Restart your terminal or run: source ~/.zshrc"
 echo ""

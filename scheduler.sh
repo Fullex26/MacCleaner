@@ -1,54 +1,35 @@
 #!/bin/bash
-# MacCleaner Scheduler — install or remove the weekly cron job
+# MacCleaner Scheduler — thin wrapper over `cleaner.py schedule ...`.
+# The scheduling logic lives in the engine (single source of truth, and the
+# app's Settings drives the same code). This wrapper keeps every documented
+# invocation working: weekly | monthly | remove | status.
+
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLEANER="$SCRIPT_DIR/cleaner.py"
-LOG="$SCRIPT_DIR/report.log"
-PYTHON=$(which python3)
+PYTHON="$(command -v python3)"
 
-CRON_WEEKLY="0 9 * * 1 $PYTHON $CLEANER --clean --yes >> $SCRIPT_DIR/cron.log 2>&1"
-CRON_MONTHLY="0 9 1 * * $PYTHON $CLEANER --clean --yes >> $SCRIPT_DIR/cron.log 2>&1"
+if [ -z "$PYTHON" ]; then
+    echo "⚠️  python3 not found on PATH — cannot manage the schedule." >&2
+    exit 1
+fi
 
-install_weekly() {
-    (crontab -l 2>/dev/null | grep -v "cleaner.py"; echo "$CRON_WEEKLY") | crontab -
-    echo "✅ Scheduled: every Monday at 9am"
-    echo "   Log: $SCRIPT_DIR/cron.log"
-}
-
-install_monthly() {
-    (crontab -l 2>/dev/null | grep -v "cleaner.py"; echo "$CRON_MONTHLY") | crontab -
-    echo "✅ Scheduled: 1st of every month at 9am"
-    echo "   Log: $SCRIPT_DIR/cron.log"
-}
-
-uninstall() {
-    crontab -l 2>/dev/null | grep -v "cleaner.py" | crontab -
-    echo "✅ Removed MacCleaner from cron"
-}
-
-status() {
-    echo "── MacCleaner Scheduler Status ──"
-    if crontab -l 2>/dev/null | grep -q "cleaner.py"; then
-        echo "✅ Active:"
-        crontab -l | grep "cleaner.py"
-    else
-        echo "❌ Not scheduled"
-    fi
-}
-
-case "$1" in
-    weekly)   install_weekly ;;
-    monthly)  install_monthly ;;
-    remove)   uninstall ;;
-    status)   status ;;
+case "${1:-}" in
+    weekly|monthly) exec "$PYTHON" "$CLEANER" schedule "$1" ;;
+    remove)         exec "$PYTHON" "$CLEANER" schedule off ;;
+    status)         exec "$PYTHON" "$CLEANER" schedule status ;;
     *)
-        echo "MacCleaner Scheduler"
+        echo "MacCleaner Scheduler (launchd)"
         echo ""
         echo "Usage: ./scheduler.sh [command]"
         echo ""
-        echo "  weekly   — Run cleanup every Monday at 9am"
-        echo "  monthly  — Run cleanup 1st of every month"
-        echo "  remove   — Remove scheduled job"
+        echo "  weekly   — Clean every Monday at 9am + hourly low-disk check"
+        echo "  monthly  — Clean on the 1st of each month + hourly low-disk check"
+        echo "  remove   — Remove the scheduled agents"
         echo "  status   — Show current schedule"
+        echo ""
+        echo "An existing cron schedule is migrated to launchd automatically"
+        echo "when you pick weekly or monthly. (Same as: maccleaner schedule ...)"
         ;;
 esac

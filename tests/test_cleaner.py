@@ -1,0 +1,7277 @@
+#!/usr/bin/env python3
+"""MacCleaner test suite — stdlib unittest only, no external deps.
+
+Run:  python3 -m unittest discover -s tests -v
+"""
+
+import contextlib
+import datetime
+import io
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+import cleaner  # noqa: E402
+
+
+class TestFormatting(unittest.TestCase):
+    def test_fmt_size(self):
+        self.assertEqual(cleaner.fmt_size(0), "0.0 B")
+        self.assertEqual(cleaner.fmt_size(1023), "1023.0 B")
+        self.assertEqual(cleaner.fmt_size(1024), "1.0 KB")
+        self.assertEqual(cleaner.fmt_size(1024 ** 2), "1.0 MB")
+        self.assertEqual(cleaner.fmt_size(int(2.5 * 1024 ** 3)), "2.5 GB")
+        self.assertEqual(cleaner.fmt_size(1024 ** 4), "1.0 TB")
+
+    def test_slugify(self):
+        self.assertEqual(cleaner.slugify("Xcode DerivedData"), "xcode-deriveddata")
+        self.assertEqual(cleaner.slugify("Log: My App.log"), "log-my-app-log")
+        self.assertEqual(cleaner.slugify("a//b__c"), "a-b-c")
+
+
+class TestConfig(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.orig_config_path = cleaner.CONFIG_PATH
+        cleaner.CONFIG_PATH = self.tmp / "config.json"
+
+    def tearDown(self):
+        cleaner.CONFIG_PATH = self.orig_config_path
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_defaults_when_missing(self):
+        cfg = cleaner.load_config()
+        self.assertEqual(cfg["enabled_categories"], cleaner.ALL_CATEGORIES)
+        self.assertEqual(cfg["delete_mode"], "rm")
+
+    def test_merge_missing_keys(self):
+        cleaner.CONFIG_PATH.write_text('{"enabled_categories": ["node"]}')
+        cfg = cleaner.load_config()
+        # Pre-v2.5 configs get new categories auto-enabled
+        self.assertEqual(cfg["enabled_categories"], ["node", "tmp", "simulators", "leftovers"])
+        self.assertIn("project_roots", cfg)
+        self.assertEqual(cfg["log_threshold_mb"], 100)
+
+    def test_defaults_are_copies(self):
+        cfg = cleaner.load_config()
+        cfg["enabled_categories"].append("bogus")
+        self.assertNotIn("bogus", cleaner.DEFAULT_CONFIG["enabled_categories"])
+
+    def test_set_key_parses_json(self):
+        cleaner.CONFIG_PATH.write_text(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg = cleaner.load_config()
+        cleaner.cmd_config_set_key(cfg, "project_min_age_days", "60")
+        reloaded = json.loads(cleaner.CONFIG_PATH.read_text())
+        self.assertEqual(reloaded["project_min_age_days"], 60)
+        cleaner.cmd_config_set_key(cfg, "delete_mode", "trash")
+        reloaded = json.loads(cleaner.CONFIG_PATH.read_text())
+        self.assertEqual(reloaded["delete_mode"], "trash")
+
+    def test_corrupt_config_loads_as_defaults_with_warning(self):
+        """A1: a torn write (crash mid-save, two Settings clicks racing before
+        save_config became atomic) can leave invalid JSON on disk. load_config
+        must never traceback -- it should warn on stderr and fall back to
+        DEFAULT_CONFIG (with known_categories stamped, same as the fresh-
+        install path) instead of propagating json.JSONDecodeError."""
+        cleaner.CONFIG_PATH.write_text('{"broken')
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            cfg = cleaner.load_config()
+        self.assertEqual(cfg["enabled_categories"], cleaner.ALL_CATEGORIES)
+        self.assertEqual(cfg["delete_mode"], "rm")
+        self.assertEqual(cfg["known_categories"], list(cleaner.ALL_CATEGORIES))
+        self.assertIn("corrupt", buf.getvalue().lower())
+
+    def test_save_config_is_atomic(self):
+        """A1: save_config must write via temp-file + os.replace() (the same
+        pattern as _atomic_write_json, already used for report.log/
+        snapshots.log) rather than truncating the file in place -- so a
+        concurrent reader (or a crash mid-write) never sees a partial file.
+        We can't easily interrupt os.replace() mid-flight in a unit test, but
+        we can assert the observable contract: no leftover temp file, and the
+        file on disk parses cleanly and round-trips the data after save."""
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg["log_threshold_mb"] = 42
+        cleaner.save_config(cfg)
+        leftover = list(self.tmp.glob(".config.json.*.tmp"))
+        self.assertEqual(leftover, [], "atomic write must not leave a temp file behind")
+        reloaded = json.loads(cleaner.CONFIG_PATH.read_text())
+        self.assertEqual(reloaded["log_threshold_mb"], 42)
+
+
+class TestTargets(unittest.TestCase):
+    def setUp(self):
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+
+    def test_ids_unique_and_slug_shaped(self):
+        targets = cleaner.get_targets(self.cfg, all_categories=True)
+        ids = [t["id"] for t in targets]
+        self.assertEqual(len(ids), len(set(ids)), "duplicate target IDs")
+        for tid in ids:
+            self.assertRegex(tid, r"^[a-z0-9][a-z0-9-]*$", f"bad id: {tid}")
+
+    def test_all_categories_known(self):
+        targets = cleaner.get_targets(self.cfg, all_categories=True)
+        for t in targets:
+            self.assertIn(t["category"], cleaner.ALL_CATEGORIES)
+
+    def test_every_category_described(self):
+        for cat in cleaner.ALL_CATEGORIES:
+            self.assertIn(cat, cleaner.CATEGORY_DESCRIPTIONS)
+
+    def test_disabled_category_excluded(self):
+        self.cfg["enabled_categories"] = ["node"]
+        targets = cleaner.get_targets(self.cfg)
+        self.assertTrue(all(t["category"] == "node" for t in targets))
+        self.assertTrue(any(t["id"] == "npm-cache" for t in targets))
+
+    def test_skip_paths(self):
+        self.cfg["skip_paths"] = ["~/.npm"]
+        targets = cleaner.get_targets(self.cfg)
+        ids = {t["id"] for t in targets}
+        self.assertNotIn("npm-cache", ids)
+        self.assertNotIn("npx-cache", ids)
+        self.assertIn("yarn-cache", ids)
+
+    def test_dangerous_targets_are_review(self):
+        targets = {t["id"]: t for t in cleaner.get_targets(self.cfg, all_categories=True)}
+        for tid in ["trash", "ios-backups", "xcode-archives", "maven-repo",
+                    "huggingface-hub", "ollama-models", "general-caches"]:
+            self.assertFalse(targets[tid]["safe"], f"{tid} must be review-level")
+
+    def test_empty_only_flags(self):
+        targets = {t["id"]: t for t in cleaner.get_targets(self.cfg, all_categories=True)}
+        self.assertTrue(targets["trash"]["empty_only"])
+        self.assertTrue(targets["general-caches"]["empty_only"])
+
+    def test_codex_session_targets_exist_and_are_review(self):
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        targets = {t["id"]: t for t in cleaner.get_targets(cfg)}
+        for tid in ("codex-sessions", "codex-archived-sessions"):
+            self.assertIn(tid, targets)
+            self.assertFalse(targets[tid]["safe"])
+            self.assertEqual(targets[tid]["category"], "ai")
+
+
+class TestV210Targets(unittest.TestCase):
+    """The ten targets added in 2.10.0. Each was verified to exist with real
+    size on a working developer Mac before being added -- these tests pin the
+    id, category, safety level, and exact path so a later refactor can't
+    silently relocate or re-classify one."""
+
+    # (id, category, safe, path-or-glob)
+    EXPECTED = [
+        ("chrome-http-cache", "caches", True, "~/Library/Caches/Google/Chrome"),
+        ("clang-module-cache", "caches", True, "~/.cache/clang"),
+        ("electron-updater-pending", "caches", True, "~/Library/Caches/*electron-updater/pending"),
+        ("typescript-cache", "node", True, "~/Library/Caches/typescript"),
+        ("rustup-downloads", "rust", True, "~/.rustup/downloads"),
+        ("ollama-updates", "ai", True, "~/Library/Caches/ollama/updates"),
+        ("codex-sparkle-updates", "ai", True,
+         "~/Library/Caches/com.openai.codex/org.sparkle-project.Sparkle"),
+        ("codex-runtimes", "ai", False, "~/.cache/codex-runtimes"),
+        ("antigravity-browser-profile", "ai", False, "~/.gemini/antigravity-browser-profile"),
+    ]
+
+    def setUp(self):
+        self.targets = {t["id"]: t
+                        for t in cleaner.get_targets(cleaner.DEFAULT_CONFIG,
+                                                     all_categories=True)}
+
+    def test_all_ten_exist_with_expected_category_and_safety(self):
+        for tid, category, safe, _ in self.EXPECTED:
+            self.assertIn(tid, self.targets, f"{tid} missing")
+            self.assertEqual(self.targets[tid]["category"], category, tid)
+            self.assertEqual(self.targets[tid]["safe"], safe, tid)
+
+    def test_paths_resolve_to_the_documented_locations(self):
+        for tid, _, _, raw in self.EXPECTED:
+            t = self.targets[tid]
+            expected = os.path.expanduser(raw)
+            actual = t["glob"] if t["glob"] else str(t["path"])
+            self.assertEqual(actual, expected, tid)
+
+    def test_every_new_target_has_a_description(self):
+        """The description is what the TUI/app shows to justify a delete."""
+        for tid, _, _, _ in self.EXPECTED + [("spotify-browser-cache", None, None, None)]:
+            self.assertTrue(self.targets[tid]["description"].strip(),
+                            f"{tid} needs a description")
+
+    def test_spotify_target_takes_only_the_two_real_cache_dirs(self):
+        """~/Library/Caches/com.spotify.client is NOT an HTTP cache dir -- it is
+        the Spotify desktop app's embedded-Chromium profile root, holding
+        Default/Login Data, Default/Cookies, Browser/Cookies, Local State and
+        the WidevineCdm DRM module alongside the actual caches. A safe target
+        pointed at the root would let an unattended `clean --yes` destroy live
+        session state, so this target names the two regenerable subdirectories
+        explicitly instead."""
+        t = self.targets["spotify-browser-cache"]
+        self.assertTrue(t["safe"])
+        self.assertEqual(t["category"], "caches")
+        root = os.path.expanduser("~/Library/Caches/com.spotify.client")
+        self.assertEqual([str(p) for p in cleaner._target_paths(t)],
+                         [f"{root}/Browser/Cache", f"{root}/Data"])
+        self.assertIsNone(t["path"], "must use the multi-path form, not a single root path")
+        self.assertNotIn("spotify-http-cache", self.targets,
+                         "the over-broad root-path target must be gone, not merely renamed")
+
+    def test_no_target_points_at_a_chromium_profile_root(self):
+        """Generalises the Spotify finding: a directory holding `Login Data`
+        or a `Cookies` DB is a live profile, never an auto-deletable cache."""
+        for t in self.targets.values():
+            if not t["safe"]:
+                continue
+            for p in cleaner._target_paths(t):
+                for marker in ("Login Data", "Cookies", "Local State"):
+                    self.assertFalse(
+                        (p / marker).exists(),
+                        f"safe target {t['id']} points at {p}, which holds {marker}")
+
+    def test_labels_are_unique(self):
+        """Two targets sharing a label render as indistinguishable rows in the
+        TUI checklist and the app's target list."""
+        seen = {}
+        for t in self.targets.values():
+            self.assertNotIn(t["label"], seen,
+                             f"{t['id']} reuses the label of {seen.get(t['label'])}")
+            seen[t["label"]] = t["id"]
+
+    def test_runtime_and_profile_targets_are_review_level(self):
+        """codex-runtimes is an executable runtime and antigravity's profile
+        holds live browser session state -- neither is a regenerable cache in
+        the way `--yes` assumes, so both must stay opt-in."""
+        self.assertFalse(self.targets["codex-runtimes"]["safe"])
+        self.assertFalse(self.targets["antigravity-browser-profile"]["safe"])
+
+    def test_no_new_target_duplicates_an_existing_path(self):
+        """Two targets pointing at one path would double-count reclaimable
+        bytes and race each other during a clean."""
+        seen = {}
+        for t in self.targets.values():
+            keys = ([t["glob"]] if t["glob"]
+                    else [str(p) for p in cleaner._target_paths(t)])
+            for key in keys:
+                self.assertNotIn(key, seen,
+                                 f"{t['id']} duplicates {seen.get(key)} at {key}")
+                seen[key] = t["id"]
+
+    def test_new_caches_targets_are_narrower_than_general_caches(self):
+        """They live under ~/Library/Caches, which `general-caches` also owns
+        as a review-level empty_only sweep. That is the point -- a user can
+        take the specific safe one without the broad review-level one -- but
+        none of them may BE the general target's own path."""
+        general = str(self.targets["general-caches"]["path"])
+        for tid in ("chrome-http-cache", "spotify-browser-cache", "typescript-cache"):
+            for path in cleaner._target_paths(self.targets[tid]):
+                self.assertTrue(str(path).startswith(general + os.sep), tid)
+                self.assertNotEqual(str(path), general, tid)
+
+    def test_static_target_count(self):
+        """83 before 2.10.0, +10 in 2.10.0, +1 in 2.11.0
+        (xcode-derived-data-custom) = 94. Bump deliberately when adding a
+        target; a DROP here means one was lost by accident. `logs` is
+        filtered because those targets are generated per oversized
+        ~/Library/Logs folder, so an unfiltered count differs per machine."""
+        static = [t for t in self.targets.values() if t["category"] != "logs"]
+        self.assertEqual(len(static), 94)
+
+
+class TestReclaimableTotalDeduplication(unittest.TestCase):
+    """"Total reclaimable" is the headline number in the CLI, the app header
+    and the menu bar. It was a plain sum over targets, but 27 targets nest
+    inside `general-caches` (the review-level sweep of all of ~/Library/Caches),
+    so every one of their bytes was counted twice -- 2.5 GB of overstatement on
+    a real machine, more on a fuller one. A user cannot free the same byte
+    twice, so the total must be a union, not a sum."""
+
+    def _t(self, tid, path, size):
+        return {"id": tid, "category": "caches", "label": tid, "description": "",
+                "path": Path(path), "paths": None, "glob": None, "skip": [],
+                "safe": True, "cmd": None, "estimate_cmd": None,
+                "estimate_parser": None, "empty_only": False, "size": size}
+
+    def test_nested_target_is_not_double_counted(self):
+        outer = self._t("outer", "/x/Caches", 1000)
+        inner = self._t("inner", "/x/Caches/Chrome", 400)
+        self.assertEqual(cleaner.reclaimable_total([outer, inner]), 1000)
+
+    def test_order_does_not_matter(self):
+        outer = self._t("outer", "/x/Caches", 1000)
+        inner = self._t("inner", "/x/Caches/Chrome", 400)
+        self.assertEqual(cleaner.reclaimable_total([inner, outer]),
+                         cleaner.reclaimable_total([outer, inner]))
+
+    def test_siblings_both_count(self):
+        a = self._t("a", "/x/Caches/A", 300)
+        b = self._t("b", "/x/Caches/B", 700)
+        self.assertEqual(cleaner.reclaimable_total([a, b]), 1000)
+
+    def test_sibling_prefix_collision_is_not_treated_as_nesting(self):
+        """"/x/Caches2" starts with the string "/x/Caches" but is not inside
+        it -- a naive startswith() would wrongly drop it."""
+        a = self._t("a", "/x/Caches", 1000)
+        b = self._t("b", "/x/Caches2", 500)
+        self.assertEqual(cleaner.reclaimable_total([a, b]), 1500)
+
+    def test_cmd_targets_still_count(self):
+        cmd = {"id": "brew", "category": "homebrew", "label": "brew", "description": "",
+               "path": None, "paths": None, "glob": None, "skip": [], "safe": True,
+               "cmd": "brew cleanup", "estimate_cmd": None, "estimate_parser": None,
+               "empty_only": False, "size": 2000}
+        self.assertEqual(cleaner.reclaimable_total([cmd]), 2000)
+
+    def test_missing_size_is_treated_as_zero(self):
+        t = self._t("a", "/x/A", None)
+        self.assertEqual(cleaner.reclaimable_total([t]), 0)
+
+    def test_scan_json_uses_the_deduplicated_total(self):
+        outer = self._t("outer", "/x/Caches", 1000)
+        inner = self._t("inner", "/x/Caches/Chrome", 400)
+        with mock.patch.object(cleaner, "measure_targets", side_effect=lambda t: t):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cleaner.scan_json([outer, inner])
+            d = json.loads(buf.getvalue())
+        self.assertEqual(d["total_reclaimable_bytes"], 1000,
+                         "JSON total must be the union, not the sum")
+
+
+class TestSystemTempAdvisory(unittest.TestCase):
+    """macOS's per-user temp directory (`$TMPDIR`,
+    /private/var/folders/<..>/<..>/T) accumulated 20 GB across ~15,000
+    orphaned entries on a real machine -- more than every cleanable target
+    combined -- and nothing surfaced it. It sits outside $HOME so the engine
+    will never delete from it, and it should not: macOS clears it on restart.
+    So it is advisory-only, exactly like Swap: report it, name the remedy,
+    never touch it, never fail the aggregate `ok`."""
+
+    def test_reports_size_and_entry_count_above_the_floor(self):
+        with mock.patch.object(cleaner, "_system_temp_usage",
+                               return_value={"path": "/var/folders/x/y/T",
+                                             "bytes": 20 * 1024 ** 3,
+                                             "entries": 14999}):
+            r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
+        c = next(c for c in r["checks"] if c["name"] == "System temp")
+        self.assertTrue(c["advisory"], "must never gate the aggregate ok")
+        self.assertFalse(c["ok"], "20 GB is over the floor, so it is flagged")
+        self.assertIn("20.0 GB", c["status"])
+        self.assertIn("14,999", c["status"])
+        self.assertIn("restart", c["status"].lower(),
+                      "the remedy is a restart, not a delete")
+
+    def test_quiet_below_both_floors(self):
+        with mock.patch.object(cleaner, "_system_temp_usage",
+                               return_value={"path": "/var/folders/x/y/T",
+                                             "bytes": 100 * 1024 ** 2, "entries": 12}):
+            r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
+        names = [c["name"] for c in r["checks"]]
+        self.assertNotIn("System temp", names,
+                         "a normal-sized temp dir is not worth a row")
+
+    def test_entry_count_alone_is_enough_to_flag(self):
+        """Size alone under-reports this. A real machine showed 16,289 entries
+        holding only 3 GB -- but that same directory had been 20 GB hours
+        earlier. The entry count is the signal that tools are leaking scratch;
+        the size just depends on when you happen to look."""
+        with mock.patch.object(cleaner, "_system_temp_usage",
+                               return_value={"path": "/var/folders/x/y/T",
+                                             "bytes": 3 * 1024 ** 3, "entries": 16289}):
+            r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
+        c = next(c for c in r["checks"] if c["name"] == "System temp")
+        self.assertFalse(c["ok"])
+        self.assertTrue(c["advisory"])
+        self.assertIn("16,289", c["status"])
+
+    def test_advisory_never_flips_top_level_ok(self):
+        with mock.patch.object(cleaner, "_system_temp_usage",
+                               return_value={"path": "/var/folders/x/y/T",
+                                             "bytes": 50 * 1024 ** 3, "entries": 99999}):
+            r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
+        non_advisory = [c for c in r["checks"] if not c.get("advisory")]
+        self.assertEqual(r["ok"], all(c["ok"] for c in non_advisory))
+
+    def test_degrades_quietly_when_it_cannot_measure(self):
+        with mock.patch.object(cleaner, "_system_temp_usage", return_value=None):
+            r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
+        self.assertNotIn("System temp", [c["name"] for c in r["checks"]])
+
+    def test_never_becomes_a_target(self):
+        """It must stay report-only -- no id, nothing cleanable points at it."""
+        targets = cleaner.get_targets(cleaner.DEFAULT_CONFIG, all_categories=True)
+        for t in targets:
+            for p in cleaner._target_paths(t):
+                self.assertNotIn("/var/folders/", str(p),
+                                 f"{t['id']} must not target the system temp dir")
+
+
+class TestGetSizePartialOutput(unittest.TestCase):
+    """du exits NON-ZERO when any subdirectory is unreadable — while still
+    printing a correct total for everything it could read. get_size() treated
+    that exit code as failure and discarded the number, so ~/Library/Caches
+    (one unreadable com.apple.* subdir inside) measured 0 bytes against a
+    real 6.7 GB, deterministically — found by the V3 dual-engine soak on its
+    first real run, because the Swift engine parsed the partial total and the
+    Python engine didn't. A partial total is the honest answer; 0 is not."""
+
+    def _run(self, rc, stdout):
+        def fake(argv, **kw):
+            return subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr="du: x: Permission denied")
+        return fake
+
+    def test_partial_total_survives_nonzero_exit(self):
+        with mock.patch.object(cleaner.subprocess, "run",
+                               side_effect=self._run(1, "6697524\t/x\n")):
+            with mock.patch.object(Path, "exists", return_value=True):
+                self.assertEqual(cleaner.get_size(Path("/x")), 6697524 * 1024)
+
+    def test_zero_only_when_stdout_unusable(self):
+        with mock.patch.object(cleaner.subprocess, "run",
+                               side_effect=self._run(1, "")):
+            with mock.patch.object(Path, "exists", return_value=True):
+                self.assertEqual(cleaner.get_size(Path("/x")), 0)
+
+    def test_clean_exit_still_works(self):
+        with mock.patch.object(cleaner.subprocess, "run",
+                               side_effect=self._run(0, "8\t/x\n")):
+            with mock.patch.object(Path, "exists", return_value=True):
+                self.assertEqual(cleaner.get_size(Path("/x")), 8 * 1024)
+
+
+class TestGetSizeDoesNotCrossMounts(unittest.TestCase):
+    """get_size() measures every target. Without -x it walks into mounted disk
+    images and counts their contents on top of the image file -- the same flaw
+    that made a directory measure 106 GB against a real 11 GB. Currently
+    harmless only because no target path happens to contain a mount point,
+    which is not a property anyone checks when adding a target."""
+
+    def test_du_is_invoked_with_x(self):
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout="8\t/x\n", stderr="")
+        with mock.patch.object(cleaner.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(Path, "exists", return_value=True):
+                cleaner.get_size(Path("/x"))
+        self.assertEqual(seen["argv"][0], "du")
+        flags = "".join(a for a in seen["argv"] if a.startswith("-"))
+        self.assertIn("x", flags, "get_size must not descend into mounted volumes")
+        self.assertIn("k", flags, "still reports KB")
+
+    def test_still_returns_bytes(self):
+        def fake_run(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, stdout="8\t/x\n", stderr="")
+        with mock.patch.object(cleaner.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(Path, "exists", return_value=True):
+                self.assertEqual(cleaner.get_size(Path("/x")), 8 * 1024)
+
+
+class TestCustomDerivedData(unittest.TestCase):
+    """`xcode-derived-data` only knows Xcode's default location. A project
+    configured with a custom DerivedData path (Xcode > Settings > Locations,
+    or an -derivedDataPath build flag) puts gigabytes of pure build output in
+    ~/Library/Developer/<Name>DerivedData, which MacCleaner walked straight
+    past -- on one real machine it reported 190 MB reclaimable while 6.2 GB
+    of build output sat there untouched."""
+
+    def setUp(self):
+        self.targets = {t["id"]: t
+                        for t in cleaner.get_targets(cleaner.DEFAULT_CONFIG,
+                                                     all_categories=True)}
+
+    def test_target_exists_and_is_safe(self):
+        t = self.targets["xcode-derived-data-custom"]
+        self.assertEqual(t["category"], "xcode")
+        self.assertTrue(t["safe"], "build output is rebuildable by definition")
+        self.assertTrue(t["description"].strip())
+
+    def test_glob_targets_sibling_derived_data_dirs(self):
+        t = self.targets["xcode-derived-data-custom"]
+        self.assertEqual(t["glob"],
+                         os.path.expanduser("~/Library/Developer/*DerivedData*"))
+
+    def test_does_not_overlap_the_default_location(self):
+        """~/Library/Developer/Xcode/DerivedData is a level deeper, so the
+        glob cannot match it -- the two targets must never double-count."""
+        default = str(self.targets["xcode-derived-data"]["path"])
+        self.assertEqual(default,
+                         os.path.expanduser("~/Library/Developer/Xcode/DerivedData"))
+        # Must be checked with glob, not fnmatch: fnmatch's "*" happily spans
+        # "/" while glob's does not, and glob is what _target_paths() actually
+        # uses to expand this pattern.
+        import glob as globmod
+        self.assertNotIn(default,
+                         globmod.glob(self.targets["xcode-derived-data-custom"]["glob"]))
+
+    def test_matches_a_real_custom_layout(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            dev = tmp / "Library" / "Developer"
+            (dev / "RecovrDerivedData" / "Build").mkdir(parents=True)
+            (dev / "RecovrDerivedData-clone" / "Build").mkdir(parents=True)
+            (dev / "Xcode" / "DerivedData").mkdir(parents=True)
+            pattern = str(dev / "*DerivedData*")
+            import glob as globmod
+            hits = sorted(Path(p).name for p in globmod.glob(pattern))
+            self.assertEqual(hits, ["RecovrDerivedData", "RecovrDerivedData-clone"])
+            self.assertNotIn("Xcode", hits, "must not swallow the Xcode dir itself")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestStorageMap(unittest.TestCase):
+    """`storage-map` is the whole-disk browser: one level of children with
+    real on-disk sizes, categorised, read-only. It exists because a cache
+    cleaner scoped to $HOME cannot answer "where did my disk go"."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "big").mkdir()
+        (self.tmp / "big" / "blob").write_bytes(b"x" * (3 * 1024 * 1024))
+        (self.tmp / "small").mkdir()
+        (self.tmp / "small" / "blob").write_bytes(b"x" * 4096)
+        (self.tmp / "loose.bin").write_bytes(b"x" * (1024 * 1024))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_lists_children_largest_first_with_sizes(self):
+        r = cleaner.scan_storage_map(str(self.tmp))
+        names = [c["name"] for c in r["children"]]
+        self.assertEqual(names[0], "big", "largest child must sort first")
+        self.assertIn("loose.bin", names)
+        self.assertIn("small", names)
+        by = {c["name"]: c for c in r["children"]}
+        self.assertGreaterEqual(by["big"]["size_bytes"], 3 * 1024 * 1024)
+        self.assertGreater(by["big"]["size_bytes"], by["small"]["size_bytes"])
+        self.assertEqual(by["big"]["kind"], "dir")
+        self.assertEqual(by["loose.bin"]["kind"], "file")
+
+    def test_reports_root_and_total(self):
+        r = cleaner.scan_storage_map(str(self.tmp))
+        self.assertEqual(r["root"], str(self.tmp))
+        self.assertGreaterEqual(r["total_bytes"], 4 * 1024 * 1024)
+        self.assertTrue(r["total_human"])
+
+    def test_min_bytes_filters(self):
+        r = cleaner.scan_storage_map(str(self.tmp), min_bytes=2 * 1024 * 1024)
+        self.assertEqual([c["name"] for c in r["children"]], ["big"])
+
+    def test_does_not_cross_mount_points(self):
+        """The whole reason this exists. `du` without -x walks INTO a mounted
+        disk image and counts its contents on top of the image file, reporting
+        the same bytes twice -- measured by hand that way, one directory on a
+        real machine read 106 GB when it actually held 11 GB. The command must
+        carry -x."""
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout="4\t%s\n" % self.tmp, stderr="")
+        with mock.patch.object(cleaner.subprocess, "run", side_effect=fake_run):
+            cleaner.scan_storage_map(str(self.tmp))
+        self.assertEqual(seen["argv"][0], "du")
+        # -x may be bundled with other short flags (`-xkd`), so check the
+        # option characters rather than looking for a standalone "-x".
+        flags = "".join(a for a in seen["argv"] if a.startswith("-"))
+        self.assertIn("x", flags, "du must not descend into mounted volumes")
+
+    def test_missing_root_is_an_empty_result_not_a_crash(self):
+        r = cleaner.scan_storage_map(str(self.tmp / "nope"))
+        self.assertEqual(r["children"], [])
+        self.assertEqual(r["total_bytes"], 0)
+
+    def test_categories_are_assigned_for_known_locations(self):
+        self.assertEqual(cleaner._storage_category(Path("/Applications/Foo.app")), "applications")
+        self.assertEqual(cleaner._storage_category(Path.home() / "Documents"), "documents")
+        self.assertEqual(cleaner._storage_category(Path.home() / "Library" / "Caches"), "caches")
+        self.assertEqual(cleaner._storage_category(Path("/System/Library")), "system")
+        self.assertEqual(cleaner._storage_category(Path.home() / "Library" / "Developer"), "developer")
+        self.assertEqual(cleaner._storage_category(Path("/wherever/else")), "other")
+
+    def test_read_only_never_deletes(self):
+        before = sorted(p.name for p in self.tmp.iterdir())
+        cleaner.scan_storage_map(str(self.tmp))
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), before)
+
+    def test_cli_json_end_to_end(self):
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "storage-map", str(self.tmp), "--json"],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = json.loads(r.stdout)
+        self.assertEqual(d["root"], str(self.tmp))
+        self.assertIn("version", d)
+        self.assertEqual(d["children"][0]["name"], "big")
+
+    def test_cli_defaults_to_home_when_no_path_given(self):
+        # HOME is redirected at a temp dir on purpose. This used to measure
+        # the developer's real home directory, which made a unit test's
+        # runtime a function of how full the machine was -- it passed at 33s
+        # and later blew a 300s timeout on the same code.
+        fake_home = self.tmp / "fakehome"
+        (fake_home / "stuff").mkdir(parents=True)
+        (fake_home / "stuff" / "f").write_bytes(b"x" * 2048)
+        env = {**os.environ, "HOME": str(fake_home)}
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "storage-map", "--json"],
+                           capture_output=True, text=True, timeout=120, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["root"], str(fake_home))
+
+
+class TestLegacyTranslation(unittest.TestCase):
+    def t(self, argv):
+        return cleaner.translate_legacy(argv)
+
+    def test_flag_modes(self):
+        self.assertEqual(self.t(["--preview"]), ["scan"])
+        self.assertEqual(self.t(["--clean"]), ["clean"])
+        self.assertEqual(self.t(["--clean", "--yes"]), ["clean", "--yes"])
+        self.assertEqual(self.t(["--report"]), ["report"])
+        self.assertEqual(self.t(["--json"]), ["scan", "--json"])
+
+    def test_category_passthrough(self):
+        self.assertEqual(self.t(["--preview", "--category", "xcode"]),
+                         ["scan", "--category", "xcode"])
+        self.assertEqual(self.t(["--json", "--category", "node"]),
+                         ["scan", "--json", "--category", "node"])
+
+    def test_config_flags(self):
+        self.assertEqual(self.t(["--config-show"]), ["config", "show"])
+        self.assertEqual(self.t(["--config-enable", "docker"]), ["config", "enable", "docker"])
+        self.assertEqual(self.t(["--config-disable", "ruby"]), ["config", "disable", "ruby"])
+        self.assertEqual(self.t(["--install-deps"]), ["install-deps"])
+
+    def test_subcommand_aliases(self):
+        self.assertEqual(self.t(["preview"]), ["scan"])
+        self.assertEqual(self.t(["history"]), ["report"])
+
+    def test_new_style_untouched(self):
+        self.assertEqual(self.t(["scan", "--json"]), ["scan", "--json"])
+        self.assertEqual(self.t(["clean", "--targets", "npm-cache"]),
+                         ["clean", "--targets", "npm-cache"])
+        self.assertEqual(self.t(["--version"]), ["--version"])
+
+
+class TestDeleteSafety(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.fake_home = self.tmp / "home"
+        self.fake_home.mkdir()
+        self.orig_home = cleaner.HOME
+        cleaner.HOME = self.fake_home
+
+    def tearDown(self):
+        cleaner.HOME = self.orig_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def target(self, path, **kw):
+        base = {"id": "test", "category": "test", "label": "test", "description": "",
+                "path": Path(path) if path is not None else None,
+                "glob": None, "safe": True, "cmd": None,
+                "estimate_cmd": None, "estimate_parser": None, "empty_only": False}
+        base.update(kw)
+        return base
+
+    def test_refuses_outside_home(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "file").write_text("data")
+        freed, err = cleaner.delete_target(self.target(outside))
+        self.assertIsNotNone(err)
+        self.assertIn("refused", err)
+        self.assertTrue(outside.exists(), "outside-home path must survive")
+
+    def test_refuses_home_itself(self):
+        self.assertFalse(cleaner._safe_to_delete(self.fake_home))
+        self.assertFalse(cleaner._safe_to_delete(Path("/")))
+
+    def test_deletes_dir_inside_home(self):
+        victim = self.fake_home / "cache"
+        victim.mkdir()
+        (victim / "blob").write_text("x" * 1000)
+        freed, err = cleaner.delete_target(self.target(victim))
+        self.assertIsNone(err)
+        self.assertFalse(victim.exists())
+
+    def test_symlink_unlinked_not_followed(self):
+        real = self.tmp / "real_data"
+        real.mkdir()
+        (real / "precious").write_text("keep me")
+        link = self.fake_home / "link"
+        link.symlink_to(real)
+        freed, err = cleaner.delete_target(self.target(link))
+        self.assertIsNone(err)
+        self.assertFalse(link.is_symlink(), "symlink should be removed")
+        self.assertTrue((real / "precious").exists(), "symlink target must survive")
+
+    def test_empty_only_keeps_dir(self):
+        d = self.fake_home / "Caches"
+        d.mkdir()
+        (d / "a").write_text("1")
+        (d / "sub").mkdir()
+        freed, err = cleaner.delete_target(self.target(d, empty_only=True))
+        self.assertIsNone(err)
+        self.assertTrue(d.exists(), "empty_only must keep the directory itself")
+        self.assertEqual(list(d.iterdir()), [])
+
+    def test_trash_mode_moves(self):
+        victim = self.fake_home / "npmcache"
+        victim.mkdir()
+        (victim / "blob").write_text("x")
+        freed, err = cleaner.delete_target(self.target(victim), mode="trash")
+        self.assertIsNone(err)
+        self.assertFalse(victim.exists())
+        trashed = list((self.fake_home / ".Trash").iterdir())
+        self.assertEqual(len(trashed), 1)
+        self.assertTrue((trashed[0] / "blob").exists())
+
+    def test_trash_target_always_hard_deletes(self):
+        trash = self.fake_home / ".Trash"
+        trash.mkdir()
+        (trash / "old").write_text("x")
+        t = self.target(trash, empty_only=True)
+        t["id"] = "trash"
+        freed, err = cleaner.delete_target(t, mode="trash")
+        self.assertIsNone(err)
+        self.assertTrue(trash.exists())
+        self.assertEqual(list(trash.iterdir()), [], "Trash must end up empty")
+
+    def test_glob_target(self):
+        base = self.fake_home / "profiles"
+        for name in ["p1", "p2"]:
+            (base / name / "cache2").mkdir(parents=True)
+            (base / name / "cache2" / "f").write_text("x")
+        t = self.target(None, glob=str(base / "*" / "cache2"))
+        freed, err = cleaner.delete_target(t)
+        self.assertIsNone(err)
+        self.assertFalse((base / "p1" / "cache2").exists())
+        self.assertFalse((base / "p2" / "cache2").exists())
+        self.assertTrue((base / "p1").exists())
+
+    def test_glob_respects_skip_paths(self):
+        base = self.fake_home / "profiles"
+        for name in ["keep", "clean"]:
+            (base / name / "cache2").mkdir(parents=True)
+        t = self.target(None, glob=str(base / "*" / "cache2"),
+                        skip=[str(base / "keep")])
+        freed, err = cleaner.delete_target(t)
+        self.assertIsNone(err)
+        self.assertTrue((base / "keep" / "cache2").exists(), "skip_paths must protect glob matches")
+        self.assertFalse((base / "clean" / "cache2").exists())
+
+    def test_refuses_path_through_symlinked_intermediate_directory(self):
+        # The bug: _safe_to_delete used to check path.absolute() (lexical
+        # only), so a glob/path that is lexically inside $HOME but reaches
+        # its target through a symlinked ANCESTOR directory could smuggle a
+        # delete through to somewhere physically outside $HOME.
+        real_outside = self.tmp / "real_outside_data"
+        real_outside.mkdir()
+        (real_outside / "precious").write_text("keep me")
+        symlinked_ancestor = self.fake_home / "Library" / "Caches" / "Vendor"
+        symlinked_ancestor.parent.mkdir(parents=True)
+        symlinked_ancestor.symlink_to(real_outside)
+        # Lexically "~/Library/Caches/Vendor/precious" -- physically
+        # "<tmp>/real_outside_data/precious", outside fake_home.
+        victim = symlinked_ancestor / "precious"
+        self.assertFalse(cleaner._safe_to_delete(victim))
+        freed, err = cleaner.delete_target(self.target(victim))
+        self.assertIsNotNone(err)
+        self.assertIn("refused", err)
+        self.assertTrue((real_outside / "precious").exists(),
+                        "data reached through a symlinked ancestor must survive")
+
+    def test_glob_through_symlinked_intermediate_directory_refused(self):
+        # Same escape, but through the glob path -- the vector actually
+        # named in the finding ("a glob expansion whose intermediate
+        # directory is a symlink").
+        real_outside = self.tmp / "real_outside_profiles"
+        (real_outside / "p1" / "cache2").mkdir(parents=True)
+        (real_outside / "p1" / "cache2" / "f").write_text("x")
+        profiles_link = self.fake_home / "profiles"
+        profiles_link.symlink_to(real_outside)
+        t = self.target(None, glob=str(profiles_link / "*" / "cache2"))
+        freed, err = cleaner.delete_target(t)
+        self.assertIsNotNone(err)
+        self.assertIn("refused", err)
+        self.assertTrue((real_outside / "p1" / "cache2" / "f").exists(),
+                        "glob match reached through a symlinked ancestor must survive")
+
+    def test_refuses_literal_dotdot_leaf(self):
+        # p.name is left unresolved by design (see the leaf-symlink
+        # invariant test below), but a leaf that is literally ".." must
+        # still be caught explicitly -- p.parent.resolve() / ".." collapses
+        # right back to the parent's parent, which can walk straight out of
+        # $HOME (e.g. "<home>/Library/.." resolves to <home> itself, and
+        # "<home>/.." resolves to <home>'s parent).
+        self.assertFalse(cleaner._safe_to_delete(self.fake_home / "Library" / ".."))
+        self.assertFalse(cleaner._safe_to_delete(self.fake_home / ".."))
+
+    def test_leaf_symlink_outside_home_still_safe_to_delete(self):
+        # Pin the invariant the fix must NOT break: _remove() unlinks a
+        # symlink leaf rather than following it, so a symlink whose OWN
+        # directory entry is inside $HOME is always safe to remove even if
+        # it points somewhere outside $HOME -- only the link is removed,
+        # never the target. This is what test_symlink_unlinked_not_followed
+        # exercises end-to-end; this pins it at the _safe_to_delete unit.
+        real = self.tmp / "real_data"
+        real.mkdir()
+        link = self.fake_home / "link"
+        link.symlink_to(real)
+        self.assertTrue(cleaner._safe_to_delete(link))
+
+    def test_trash_name_collisions_never_nest(self):
+        for i in range(3):
+            victim = self.fake_home / "cache"
+            victim.mkdir()
+            (victim / f"round{i}").write_text("x")
+            freed, err = cleaner.delete_target(self.target(victim), mode="trash")
+            self.assertIsNone(err)
+        trashed = sorted((self.fake_home / ".Trash").iterdir())
+        self.assertEqual(len(trashed), 3, f"each trashed copy must be a sibling, got {trashed}")
+        for d in trashed:
+            children = [c.name for c in d.iterdir()]
+            self.assertEqual(len(children), 1, "trashed dirs must not nest into each other")
+
+
+class TestProjectsScanner(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "Code"
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        old = 1_000_000_000  # well in the past
+
+        # Valid stale artifact: node_modules with package.json sibling
+        app = self.root / "webapp"
+        (app / "node_modules" / "lodash").mkdir(parents=True)
+        (app / "package.json").write_text("{}")
+        # Nested artifact inside an artifact must not be double-reported;
+        # create it BEFORE back-dating so the parent's mtime stays old
+        (app / "node_modules" / "dep" / "node_modules").mkdir(parents=True)
+        os.utime(app / "node_modules", (old, old))
+
+        # node_modules WITHOUT manifest — must be ignored
+        bogus = self.root / "random"
+        (bogus / "node_modules").mkdir(parents=True)
+        os.utime(bogus / "node_modules", (old, old))
+
+        # Fresh artifact — must be ignored at default min_age
+        fresh = self.root / "activeapp"
+        (fresh / "node_modules").mkdir(parents=True)
+        (fresh / "package.json").write_text("{}")
+
+        # Rust target with Cargo.toml
+        rusty = self.root / "rusty"
+        (rusty / "target" / "debug").mkdir(parents=True)
+        (rusty / "Cargo.toml").write_text("[package]")
+        os.utime(rusty / "target", (old, old))
+
+        # 'target' dir with no Cargo.toml — a regular folder, must be ignored
+        docs = self.root / "website"
+        (docs / "target").mkdir(parents=True)
+        os.utime(docs / "target", (old, old))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_finds_only_manifest_backed_stale_artifacts(self):
+        hits, roots, min_age = cleaner.scan_projects(self.cfg, roots=[str(self.root)])
+        kinds = {(h["kind"], Path(h["project"]).name) for h in hits}
+        self.assertIn(("node_modules", "webapp"), kinds)
+        self.assertIn(("target", "rusty"), kinds)
+        self.assertNotIn(("node_modules", "random"), kinds)
+        self.assertNotIn(("node_modules", "activeapp"), kinds)
+        self.assertNotIn(("target", "website"), kinds)
+        self.assertNotIn(("node_modules", "dep"), kinds)
+        self.assertEqual(len(hits), 2)
+
+    def test_min_age_zero_includes_fresh(self):
+        hits, _, _ = cleaner.scan_projects(self.cfg, roots=[str(self.root)], min_age_days=0)
+        kinds = {(h["kind"], Path(h["project"]).name) for h in hits}
+        self.assertIn(("node_modules", "activeapp"), kinds)
+
+    def test_missing_root_is_skipped(self):
+        hits, roots, _ = cleaner.scan_projects(self.cfg, roots=[str(self.tmp / "nope")])
+        self.assertEqual(hits, [])
+        self.assertEqual(roots, [])
+
+    def test_projects_to_targets(self):
+        hits, _, _ = cleaner.scan_projects(self.cfg, roots=[str(self.root)])
+        targets = cleaner.projects_to_targets(hits)
+        for t in targets:
+            self.assertFalse(t["safe"], "project artifacts must be review-level")
+            self.assertTrue(t["id"].startswith("project-"))
+        self.assertEqual(len({t["id"] for t in targets}), len(targets))
+
+
+class TestCLIIntegration(unittest.TestCase):
+    """End-to-end subprocess tests against a sandboxed HOME."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.home = cls.tmp / "home"
+        (cls.home / ".npm" / "_cacache").mkdir(parents=True)
+        (cls.home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        cls.tmproot = cls.tmp / "tmproot"
+        cls.tmproot.mkdir()
+        # known_categories must be stamped, otherwise load_config()'s
+        # migration auto-enables tmp/simulators (not requested here) on top
+        # of "node" -- which would make a plain `scan`/`clean` shell out to
+        # the real /private/tmp and real simctl on this machine (F4).
+        # MACCLEANER_TMP_ROOT is set anyway as defense in depth.
+        cfg = {"enabled_categories": ["node"], "log_threshold_mb": 100,
+               "known_categories": list(cleaner.ALL_CATEGORIES)}
+        cls.cfg_path = cls.tmp / "config.json"
+        cls.cfg_path.write_text(json.dumps(cfg))
+        cls.env = {**os.environ,
+                   "HOME": str(cls.home),
+                   "MACCLEANER_CONFIG": str(cls.cfg_path),
+                   "MACCLEANER_LOG": str(cls.tmp / "report.log"),
+                   "MACCLEANER_SNAPSHOTS": str(cls.tmp / "snapshots.log"),
+                   "MACCLEANER_TMP_ROOT": str(cls.tmproot)}
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_version(self):
+        r = self.run_cli("--version")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn(cleaner.VERSION, r.stdout)
+
+    def test_scan_json_schema(self):
+        r = self.run_cli("scan", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        for key in ["version", "timestamp", "disk", "disk_stats",
+                    "total_reclaimable_bytes", "total_reclaimable_human", "targets"]:
+            self.assertIn(key, data)
+        for t in data["targets"]:
+            for key in ["id", "category", "label", "description",
+                        "size_bytes", "size_human", "safe", "exists"]:
+                self.assertIn(key, t)
+
+    def test_disk_string_agrees_with_disk_stats(self):
+        """A3 regression: the legacy `disk` string used to come from `df -h /`
+        (the read-only system volume) while `disk_stats` uses shutil on the
+        data volume -- two different numbers in the same payload. `disk` must
+        now be derived from disk_stats() so the used/total bytes it reports
+        match, not just look plausible independently."""
+        r = self.run_cli("scan", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        ds = data["disk_stats"]
+        expected = (f"Used: {cleaner.fmt_size(ds['used_bytes'])} / "
+                    f"{cleaner.fmt_size(ds['total_bytes'])} "
+                    f"({ds['percent_used']:.0f}%)")
+        self.assertEqual(data["disk"], expected,
+                         "disk string must be derived from disk_stats, not a separate df call")
+
+    def test_legacy_bare_json_is_scan(self):
+        """The menu bar app contract: `cleaner.py --json` = scan --json."""
+        r = self.run_cli("--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertIn("total_reclaimable_bytes", data)
+        self.assertIn("targets", data)
+
+    def test_clean_targets_json(self):
+        r = self.run_cli("clean", "--targets", "npm-cache", "--yes", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["items"][0]["id"], "npm-cache")
+        self.assertEqual(data["items"][0]["status"], "deleted")
+        self.assertFalse((self.home / ".npm" / "_cacache").exists())
+
+    def test_unknown_target_exits_1(self):
+        r = self.run_cli("clean", "--targets", "not-a-thing", "--yes")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Unknown target", r.stderr)
+
+    def test_unknown_category_exits_1(self):
+        r = self.run_cli("scan", "--category", "warp-drive")
+        self.assertEqual(r.returncode, 1)
+
+    def test_doctor_json(self):
+        r = self.run_cli("doctor", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertIn("checks", data)
+        self.assertTrue(any(c["name"] == "Python" for c in data["checks"]))
+
+    def test_categories_json(self):
+        r = self.run_cli("categories", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        names = [c["name"] for c in data["categories"]]
+        self.assertEqual(names, cleaner.ALL_CATEGORIES)
+
+    def test_categories_json_includes_leftovers_with_zero_targets(self):
+        # leftovers is entirely dynamic (like tmp/simulators) -- categories
+        # deliberately calls get_targets() alone, so it must be listed with
+        # zero targets, never with unstable per-run leftover-<id> entries.
+        r = self.run_cli("categories", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        cat = next(c for c in data["categories"] if c["name"] == "leftovers")
+        self.assertEqual(cat["targets"], [])
+
+    def test_report_after_clean(self):
+        r = self.run_cli("report", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertIn("runs", data)
+
+    def test_scan_records_snapshot(self):
+        r = self.run_cli("scan", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(Path(self.env["MACCLEANER_SNAPSHOTS"]).exists())
+
+    def test_report_json_has_disk_history(self):
+        self.run_cli("scan", "--json")
+        r = self.run_cli("report", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertIn("disk_history", data)
+        self.assertIn("current", data["disk_history"])
+        self.assertIn("snapshots", data["disk_history"])
+        self.assertIn("runs", data)  # existing key untouched
+
+
+class TestTmpE2E(unittest.TestCase):
+    """F5: the only end-to-end round trip for the tmp scanner + clean path.
+    Everything else exercising MACCLEANER_TMP_ROOT does so via direct
+    in-process calls to scan_tmp_artifacts()/collect_targets() -- nothing
+    else in the suite drives it through a real subprocess and main()'s
+    dynamic-id selection (`clean --targets <tmp-scanned-id>`), which is the
+    actual path a user or agent hits."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
+        self.derived = self.tmproot / "e2e-derived"
+        (self.derived / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        (self.derived / "Build" / "Intermediates.noindex" / "f").write_bytes(b"x" * 4096)
+        old = time.time() - 5 * 86400
+        os.utime(self.derived, (old, old))
+        cfg = {"enabled_categories": ["tmp"],
+               "known_categories": list(cleaner.ALL_CATEGORIES)}
+        self.cfg_path = self.tmp / "config.json"
+        self.cfg_path.write_text(json.dumps(cfg))
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_scan_then_targeted_clean_round_trip(self):
+        scan = self.run_cli("scan", "--json")
+        self.assertEqual(scan.returncode, 0, scan.stderr)
+        data = json.loads(scan.stdout)
+        tmp_targets = [t for t in data["targets"] if t["id"].startswith("tmp-")]
+        self.assertEqual(len(tmp_targets), 1, "the aged DerivedData fixture must surface exactly once")
+        target_id = tmp_targets[0]["id"]
+        self.assertFalse(tmp_targets[0]["safe"], "tmp targets are review-only")
+
+        # A bare `clean --yes` (no explicit selection) must never sweep a
+        # review-only tmp target -- confirms before we prove the targeted
+        # path actually deletes it.
+        bare = self.run_cli("clean", "--yes", "--json")
+        self.assertEqual(bare.returncode, 0, bare.stderr)
+        self.assertTrue(self.derived.exists(),
+                        "bare clean --yes must not touch review-only tmp targets")
+
+        clean = self.run_cli("clean", "--targets", target_id, "--yes", "--json")
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        clean_data = json.loads(clean.stdout)
+        item = next(i for i in clean_data["items"] if i["id"] == target_id)
+        self.assertEqual(item["status"], "deleted")
+        self.assertFalse(self.derived.exists(), "explicitly-targeted clean must delete it")
+
+
+class TestLeftoverE2E(unittest.TestCase):
+    """The only end-to-end round trip for the app-leftover scanner + clean
+    path, mirroring TestTmpE2E: everything else exercising
+    MACCLEANER_LEFTOVER_LIBRARY_ROOT does so via direct in-process calls to
+    scan_app_leftovers()/collect_targets() -- nothing else drives it through
+    a real subprocess and main()'s dynamic-id selection."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.apps_dir = self.tmp / "Applications"
+        self.apps_dir.mkdir()
+        # Must live under $HOME: delete_target/run_dry_run's home-only
+        # safety check (_safe_to_delete) would otherwise reject every path
+        # here, since the leftover scanner has no carve-out (unlike tmp) --
+        # every real root it scans is already strictly inside $HOME.
+        self.lib_root = self.home / "Library"
+        self.lib_root.mkdir()
+        self.orphan = self.lib_root / "Caches" / "com.example.gonezo"
+        self.orphan.mkdir(parents=True)
+        old = time.time() - 10 * 86400
+        os.utime(self.orphan, (old, old))
+        cfg = {"enabled_categories": ["leftovers"],
+               "known_categories": list(cleaner.ALL_CATEGORIES),
+               "app_leftover_min_age_days": 7}
+        self.cfg_path = self.tmp / "config.json"
+        self.cfg_path.write_text(json.dumps(cfg))
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_INSTALLED_APPS_DIRS": str(self.apps_dir),
+                    "MACCLEANER_LEFTOVER_LIBRARY_ROOT": str(self.lib_root)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_scan_json_surfaces_leftover_target(self):
+        r = self.run_cli("scan", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        hits = [t for t in data["targets"] if t["id"].startswith("leftover-")]
+        self.assertEqual(len(hits), 1, "the fabricated orphan must surface exactly once")
+        self.assertFalse(hits[0]["safe"], "leftover targets are review-only")
+
+    def test_dry_run_json_surfaces_leftover_target(self):
+        # A bare `clean --dry-run` only previews safe targets (leftovers are
+        # review-only), same rule TestBareDryRun pins for tmp/other review
+        # categories -- so name it explicitly via --targets, same pattern as
+        # test_targets_dry_run_previews_named_review_target.
+        scan = self.run_cli("scan", "--json")
+        target_id = next(t["id"] for t in json.loads(scan.stdout)["targets"]
+                          if t["id"].startswith("leftover-"))
+        r = self.run_cli("clean", "--dry-run", "--targets", target_id, "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        hits = [i for i in data["items"] if i["id"] == target_id]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["status"], "would-delete")
+        self.assertTrue(hits[0]["paths"])
+        self.assertTrue(self.orphan.exists(), "dry run must not delete anything")
+
+    def test_bare_clean_yes_never_touches_leftovers(self):
+        r = self.run_cli("clean", "--yes", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.orphan.exists(),
+                        "unscoped clean --yes must never sweep a review-only leftover target")
+
+    def test_targeted_clean_deletes_leftover(self):
+        scan = self.run_cli("scan", "--json")
+        target_id = next(t["id"] for t in json.loads(scan.stdout)["targets"]
+                          if t["id"].startswith("leftover-"))
+        r = self.run_cli("clean", "--targets", target_id, "--yes", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        item = next(i for i in json.loads(r.stdout)["items"] if i["id"] == target_id)
+        self.assertEqual(item["status"], "deleted")
+        self.assertFalse(self.orphan.exists())
+
+
+class TestDoctorSchedule(unittest.TestCase):
+    """`doctor`'s Schedule check used to glob the LaunchAgents directory and
+    report ✅ purely from a plist's existence, even if launchd never
+    successfully loaded it (finding I1). It must ask launchd directly."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.agents = self.home / "Library" / "LaunchAgents"
+        self.agents.mkdir(parents=True)
+        self.cfg_path = self.tmp / "config.json"
+        self.cfg_path.write_text("{}")
+        self.bindir = self.tmp / "bin"
+        self.bindir.mkdir()
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    # The dev machine may have a real MacCleaner.app in the
+                    # real /Applications (e.g. from a prior `--install`) --
+                    # without this override, "app not installed" assertions
+                    # would depend on the real machine's state instead of
+                    # this test's fabricated sandbox.
+                    "MACCLEANER_SYSTEM_APPLICATIONS_DIR": str(self.tmp / "sysapps"),
+                    "PATH": f"{self.bindir}:{os.environ['PATH']}"}
+        # A real crontab may exist on the dev machine; use a stub so this
+        # test's outcome depends only on the fabricated LaunchAgents/launchctl.
+        stub_crontab = self.bindir / "crontab"
+        stub_crontab.write_text('#!/bin/sh\nexit 1\n')
+        stub_crontab.chmod(0o755)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write_launchctl(self, body):
+        stub = self.bindir / "launchctl"
+        stub.write_text(body)
+        stub.chmod(0o755)
+
+    def run_doctor(self):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), "doctor", "--json"],
+                              capture_output=True, text=True, env=self.env, timeout=60)
+
+    def test_plist_present_but_not_loaded_is_not_ok(self):
+        (self.agents / "com.fullex.maccleaner.clean.plist").write_text("<plist/>")
+        # Real `launchctl list <unknown-label>` prints this and exits 113 --
+        # the stub used to `exit 1`, which conflated "launchd says no such
+        # service" with "launchctl could not be asked at all" (2.14.1).
+        self.write_launchctl(
+            '#!/bin/sh\necho \'Could not find service "x" in domain for port\' >&2\nexit 113\n')
+        r = self.run_doctor()
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        sched = next(c for c in data["checks"] if c["name"] == "Schedule")
+        self.assertFalse(sched["ok"], "a plist launchd hasn't loaded must not read as healthy")
+        self.assertIn("not loaded", sched["status"].lower())
+
+    def test_plist_loaded_is_ok(self):
+        (self.agents / "com.fullex.maccleaner.clean.plist").write_text("<plist/>")
+        self.write_launchctl('#!/bin/sh\nexit 0\n')  # `launchctl list <label>` always succeeds
+        r = self.run_doctor()
+        data = json.loads(r.stdout)
+        sched = next(c for c in data["checks"] if c["name"] == "Schedule")
+        self.assertTrue(sched["ok"])
+        self.assertIn("launchd:", sched["status"])
+
+    def test_unreachable_launchctl_is_not_reported_as_broken(self):
+        """2.14.1: a launchctl failure that is NOT "no such service" (missing
+        binary, no GUI session, timeout) means we could not ask -- not that
+        the agent is unloaded. Reporting it as a MacCleaner-owned fault sent
+        users to reinstall a schedule that was running fine."""
+        (self.agents / "com.fullex.maccleaner.clean.plist").write_text("<plist/>")
+        self.write_launchctl('#!/bin/sh\necho "Could not find domain" >&2\nexit 112\n')
+        r = self.run_doctor()
+        data = json.loads(r.stdout)
+        sched = next(c for c in data["checks"] if c["name"] == "Schedule")
+        self.assertTrue(sched["ok"], "could-not-verify must not read as a broken schedule")
+        self.assertIn("could not", sched["status"].lower())
+        self.assertNotIn("not loaded", sched["status"].lower())
+        self.assertTrue(data["ok"], "an unverifiable schedule must not fail doctor overall")
+
+    def test_no_plist_at_all_reports_not_scheduled(self):
+        r = self.run_doctor()
+        data = json.loads(r.stdout)
+        sched = next(c for c in data["checks"] if c["name"] == "Schedule")
+        self.assertTrue(sched["ok"])
+        self.assertIn("not scheduled", sched["status"].lower())
+
+    def _write_app_info_plist(self, version):
+        app_contents = self.home / "Applications" / "MacCleaner.app" / "Contents"
+        app_contents.mkdir(parents=True)
+        with open(app_contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleShortVersionString": version}, f)
+
+    def test_engine_app_version_mismatch_warns(self):
+        """A6: Sparkle updates the app bundle but never the installed engine
+        at ~/mac-cleaner/cleaner.py. doctor must compare this engine's
+        VERSION against the app's CFBundleShortVersionString and flag a
+        mismatch with the re-run-install.sh remedy."""
+        self._write_app_info_plist("0.0.1")
+        r = self.run_doctor()
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        c = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNotNone(c, "a version mismatch must produce an Engine/App version check")
+        self.assertFalse(c["ok"])
+        self.assertIn("install.sh", c["status"])
+        self.assertFalse(data["ok"], "a version mismatch must fail the overall doctor check")
+
+    def test_engine_app_version_match_is_silent(self):
+        self._write_app_info_plist(cleaner.VERSION)
+        r = self.run_doctor()
+        data = json.loads(r.stdout)
+        c = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNone(c, "matching versions must not add a warning row")
+
+    def test_engine_app_version_check_absent_without_app(self):
+        # No Info.plist at all (app not installed) -- must degrade silently,
+        # not raise or add a spurious check.
+        r = self.run_doctor()
+        data = json.loads(r.stdout)
+        c = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNone(c)
+
+    def test_engine_app_version_check_absent_with_unreadable_plist(self):
+        app_contents = self.home / "Applications" / "MacCleaner.app" / "Contents"
+        app_contents.mkdir(parents=True)
+        (app_contents / "Info.plist").write_text("not a plist")
+        r = self.run_doctor()
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        c = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNone(c, "an unparseable Info.plist must degrade silently, not crash doctor")
+
+
+class TestNewTargetsV21(unittest.TestCase):
+    """Engine v2.1: new categories and targets."""
+
+    def setUp(self):
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        self.targets = {t["id"]: t
+                        for t in cleaner.get_targets(self.cfg, all_categories=True)}
+
+    def test_new_categories_registered(self):
+        for cat in ["flutter", "php", "vms"]:
+            self.assertIn(cat, cleaner.ALL_CATEGORIES)
+            self.assertIn(cat, cleaner.CATEGORY_DESCRIPTIONS)
+
+    def test_new_target_ids_present(self):
+        for tid in ["dart-pub-cache", "composer-cache", "colima-vm", "vagrant-boxes",
+                    "minikube-cache", "yarn-global-cache", "npm-logs", "conda-clean",
+                    "sccache-cache", "lm-studio-models", "whisper-models",
+                    "xcode-doc-cache", "cypress-cache", "teams-cache", "zoom-updater",
+                    "terraform-plugin-cache", "expo-cache"]:
+            self.assertIn(tid, self.targets, f"missing target {tid}")
+
+    def test_new_review_flags(self):
+        for tid in ["colima-vm", "vagrant-boxes", "lm-studio-models",
+                    "whisper-models", "cypress-cache"]:
+            self.assertFalse(self.targets[tid]["safe"], f"{tid} must be review-level")
+        for tid in ["dart-pub-cache", "composer-cache", "minikube-cache",
+                    "conda-clean", "teams-cache", "yarn-global-cache", "npm-logs",
+                    "sccache-cache", "xcode-doc-cache", "zoom-updater",
+                    "terraform-plugin-cache", "expo-cache"]:
+            self.assertTrue(self.targets[tid]["safe"], f"{tid} should be safe")
+
+    def test_conda_is_cmd_target(self):
+        t = self.targets["conda-clean"]
+        self.assertIsNone(t["path"])
+        self.assertIn("conda clean", t["cmd"])
+        self.assertIn("--dry-run", t["estimate_cmd"])
+
+    def test_conda_estimate_parser(self):
+        out = ("Will remove 132 (1.5 GB) tarball(s).\n"
+               "Will remove 10 index cache(s).\n"
+               "Will remove 200 (512.0 MB) package(s).\n")
+        self.assertEqual(cleaner._parse_conda_estimate(out),
+                         int(1.5 * 1024**3) + int(512.0 * 1024**2))
+
+
+class TestSnapshots(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.orig = cleaner.SNAPSHOTS_PATH
+        cleaner.SNAPSHOTS_PATH = self.tmp / "snapshots.log"
+
+    def tearDown(self):
+        cleaner.SNAPSHOTS_PATH = self.orig
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_record_creates_file_with_fields(self):
+        cleaner.record_snapshot(1234, {"node": 1234})
+        snaps = cleaner.load_snapshots()
+        self.assertEqual(len(snaps), 1)
+        for key in ["ts", "disk_total_bytes", "disk_free_bytes",
+                    "reclaimable_bytes", "categories"]:
+            self.assertIn(key, snaps[0])
+        self.assertEqual(snaps[0]["reclaimable_bytes"], 1234)
+
+    def test_partial_records_null_fields(self):
+        cleaner.record_snapshot()
+        s = cleaner.load_snapshots()[0]
+        self.assertIsNone(s["reclaimable_bytes"])
+        self.assertIsNone(s["categories"])
+        self.assertGreater(s["disk_free_bytes"], 0)
+
+    def test_same_day_replaces(self):
+        cleaner.record_snapshot(100, {})
+        cleaner.record_snapshot(200, {})
+        snaps = cleaner.load_snapshots()
+        self.assertEqual(len(snaps), 1, "same-day snapshots must replace, not append")
+        self.assertEqual(snaps[0]["reclaimable_bytes"], 200)
+
+    def test_cap_365(self):
+        # Spaced a day apart (not an hour) so each entry is distinct under the
+        # daily dedupe key — otherwise this wouldn't actually test a cap of
+        # 365 *distinct* days, just 365 pre-written rows that happen to survive
+        # because record_snapshot only ever compares against the last one.
+        base = datetime.datetime(2025, 1, 1)
+        snaps = [{"ts": (base + datetime.timedelta(days=i)).isoformat(),
+                  "disk_total_bytes": 1, "disk_free_bytes": 1,
+                  "reclaimable_bytes": i, "categories": {}} for i in range(365)]
+        cleaner.SNAPSHOTS_PATH.write_text(json.dumps(snaps))
+        cleaner.record_snapshot(999, {})
+        out = cleaner.load_snapshots()
+        self.assertEqual(len(out), 365)
+        self.assertEqual(out[-1]["reclaimable_bytes"], 999)
+        self.assertEqual(out[0]["reclaimable_bytes"], 1, "oldest entry must drop")
+
+    def test_corrupt_file_recovers(self):
+        cleaner.SNAPSHOTS_PATH.write_text("{not json")
+        # Capture stderr to verify warning is emitted
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stderr(stderr_capture):
+            cleaner.record_snapshot(42, {})
+        stderr_output = stderr_capture.getvalue()
+        # Verify the recovery worked
+        snaps = cleaner.load_snapshots()
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0]["reclaimable_bytes"], 42)
+        # Verify warning was emitted exactly once (in load_snapshots during recovery)
+        self.assertIn("Warning: corrupt or unparseable", stderr_output)
+        self.assertIn(str(cleaner.SNAPSHOTS_PATH), stderr_output)
+
+    def test_partially_malformed_list_recovers(self):
+        """A list containing a non-dict element must not get load_snapshots
+        (and therefore record_snapshot) permanently stuck: snaps[-1].get(...)
+        on a non-dict would raise every future run otherwise."""
+        cleaner.SNAPSHOTS_PATH.write_text(json.dumps([
+            {"ts": "2025-01-01T00:00:00", "disk_total_bytes": 1, "disk_free_bytes": 1,
+             "reclaimable_bytes": 1, "categories": {}},
+            "not-a-dict-entry",
+            42,
+            None,
+        ]))
+        cleaner.record_snapshot(42, {"node": 42})
+        snaps = cleaner.load_snapshots()
+        self.assertTrue(all(isinstance(s, dict) for s in snaps),
+                        "non-dict entries must be dropped, not crash the reader")
+        self.assertEqual(snaps[-1]["reclaimable_bytes"], 42)
+        self.assertEqual(len(snaps), 2, "the one valid pre-existing entry plus the new one")
+
+    def test_partially_malformed_list_warns_with_count(self):
+        """Dropping malformed entries silently would permanently lose trend
+        history (90% garbage in -> 90% gone forever on the next write) with
+        no visible trace. load_snapshots must warn how many were discarded."""
+        cleaner.SNAPSHOTS_PATH.write_text(json.dumps([
+            {"ts": "2025-01-01T00:00:00", "disk_total_bytes": 1, "disk_free_bytes": 1,
+             "reclaimable_bytes": 1, "categories": {}},
+            "not-a-dict-entry",
+            42,
+            None,
+        ]))
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stderr(stderr_capture):
+            snaps = cleaner.load_snapshots()
+        self.assertEqual(len(snaps), 1)
+        stderr_output = stderr_capture.getvalue()
+        self.assertIn("Warning: discarded 3 malformed snapshot entries", stderr_output)
+        self.assertIn(str(cleaner.SNAPSHOTS_PATH), stderr_output)
+
+    def test_fully_valid_list_does_not_warn(self):
+        cleaner.record_snapshot(1, {})
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stderr(stderr_capture):
+            cleaner.load_snapshots()
+        self.assertEqual(stderr_capture.getvalue(), "")
+
+    def test_snapshot_fields_sums(self):
+        targets = [{"category": "node", "size": 100}, {"category": "node", "size": 50},
+                   {"category": "xcode", "size": 25}]
+        total, cats = cleaner.snapshot_fields(targets)
+        self.assertEqual(total, 175)
+        self.assertEqual(cats, {"node": 150, "xcode": 25})
+
+    def test_format_disk_trend_needs_two(self):
+        self.assertIsNone(cleaner.format_disk_trend([]))
+        cleaner.record_snapshot(1, {})
+        self.assertIsNone(cleaner.format_disk_trend(cleaner.load_snapshots()))
+
+    def test_format_disk_trend_lines(self):
+        now = datetime.datetime.now()
+        snaps = [{"ts": (now - datetime.timedelta(days=8)).isoformat(),
+                  "disk_total_bytes": 100, "disk_free_bytes": 50,
+                  "reclaimable_bytes": None, "categories": None},
+                 {"ts": (now - datetime.timedelta(days=1)).isoformat(),
+                  "disk_total_bytes": 100, "disk_free_bytes": 60,
+                  "reclaimable_bytes": None, "categories": None}]
+        lines = cleaner.format_disk_trend(snaps)
+        self.assertTrue(lines[0].startswith("Free now:"))
+        self.assertTrue(any("8d ago" in ln for ln in lines))
+
+
+class TestGitAwareProjects(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "Code"
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        self.old = 1_000_000_000
+        # Isolate from the user's global git config (gpgsign, hooks, etc.)
+        self.git_env = {**os.environ,
+                        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+                        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _git(self, cwd, *args):
+        subprocess.run(["git", "-C", str(cwd), *args],
+                       capture_output=True, check=True, env=self.git_env)
+
+    def make_project(self, name):
+        proj = self.root / name
+        (proj / "node_modules" / "x").mkdir(parents=True)
+        (proj / "package.json").write_text("{}")
+        os.utime(proj / "node_modules", (self.old, self.old))
+        return proj
+
+    def make_repo(self, name, dirty=False, pushed=True, unpushed_commit=False):
+        proj = self.make_project(name)
+        (proj / ".gitignore").write_text("node_modules/\n")
+        self._git(proj, "init", "-q")
+        self._git(proj, "add", ".gitignore", "package.json")
+        self._git(proj, "commit", "-qm", "init")
+        if pushed:
+            remote = self.tmp / f"{name}-remote.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(remote)],
+                           capture_output=True, check=True, env=self.git_env)
+            self._git(proj, "remote", "add", "origin", str(remote))
+            self._git(proj, "push", "-q", "origin", "HEAD")
+        if unpushed_commit:
+            (proj / "more.txt").write_text("more work, never pushed")
+            self._git(proj, "add", "more.txt")
+            self._git(proj, "commit", "-qm", "more")
+        if dirty:
+            (proj / "wip.txt").write_text("uncommitted")
+        return proj
+
+    def test_unpushed_detected_with_real_remote_present(self):
+        """make_repo(pushed=False) never creates a remote at all, so the
+        no-remote branch of `unpushed` is the only one that scenario exercises.
+        This covers the actual rev-list predicate against a repo that HAS a
+        remote and has pushed to it, plus one local commit made afterward —
+        a miswritten revision range would still slip past the no-remote case."""
+        self.make_repo("aheadproj", dirty=False, pushed=True, unpushed_commit=True)
+        self.make_repo("fullypushedproj", dirty=False, pushed=True)
+        hits, _, _ = cleaner.scan_projects(self.cfg, roots=[str(self.root)])
+        by_name = {Path(h["project"]).name: h for h in hits}
+        self.assertEqual(by_name["aheadproj"]["git"], {"dirty": False, "unpushed": True})
+        self.assertEqual(by_name["fullypushedproj"]["git"], {"dirty": False, "unpushed": False})
+
+    def test_git_states_detected(self):
+        self.make_repo("cleanproj", dirty=False, pushed=True)
+        self.make_repo("dirtyproj", dirty=True, pushed=True)
+        self.make_repo("unpushedproj", dirty=False, pushed=False)
+        self.make_project("norepo")
+        hits, _, _ = cleaner.scan_projects(self.cfg, roots=[str(self.root)])
+        by_name = {Path(h["project"]).name: h for h in hits}
+        self.assertEqual(by_name["cleanproj"]["git"], {"dirty": False, "unpushed": False})
+        self.assertEqual(by_name["dirtyproj"]["git"], {"dirty": True, "unpushed": False})
+        self.assertEqual(by_name["unpushedproj"]["git"], {"dirty": False, "unpushed": True})
+        self.assertIsNone(by_name["norepo"]["git"])
+
+    def test_git_check_disabled_by_config(self):
+        self.make_repo("dirtyproj", dirty=True)
+        self.cfg["project_git_check"] = False
+        hits, _, _ = cleaner.scan_projects(self.cfg, roots=[str(self.root)])
+        self.assertTrue(all(h["git"] is None for h in hits))
+
+    def test_flagged_targets_get_badges_and_flag(self):
+        self.make_repo("dirtyproj", dirty=True, pushed=True)
+        hits, _, _ = cleaner.scan_projects(self.cfg, roots=[str(self.root)])
+        t = cleaner.projects_to_targets(hits)[0]
+        self.assertIn("[dirty]", t["label"])
+        self.assertTrue(cleaner._git_flagged(t))
+        self.assertEqual(t["git"], {"dirty": True, "unpushed": False})
+
+    def test_clean_repo_not_flagged(self):
+        self.make_repo("cleanproj", dirty=False, pushed=True)
+        hits, _, _ = cleaner.scan_projects(self.cfg, roots=[str(self.root)])
+        t = cleaner.projects_to_targets(hits)[0]
+        self.assertNotIn("[", t["label"])
+        self.assertFalse(cleaner._git_flagged(t))
+
+    def test_yes_never_sweeps_flagged(self):
+        self.make_repo("dirtyproj", dirty=True, pushed=True)
+        self.make_repo("cleanproj", dirty=False, pushed=True)
+        cfg_path = self.tmp / "config.json"
+        cfg_path.write_text(json.dumps({"project_roots": [str(self.root)],
+                                        "project_min_age_days": 0}))
+        env = {**os.environ, "HOME": str(self.tmp),
+               "MACCLEANER_CONFIG": str(cfg_path),
+               "MACCLEANER_LOG": str(self.tmp / "report.log"),
+               "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log")}
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "projects", "--clean", "--yes", "--json"],
+                           capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue((self.root / "dirtyproj" / "node_modules").exists(),
+                        "dirty project must survive --yes")
+        self.assertFalse((self.root / "cleanproj" / "node_modules").exists(),
+                         "clean project should be swept by --yes")
+        self.assertIn("dirtyproj", r.stderr, "skip note should name the project")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                      "root bypasses file permission checks")
+    def test_git_info_degrades_to_none_on_partial_failure(self):
+        # rev-parse only checks whether the dir is a work tree; it doesn't
+        # touch the index. Revoking read access to .git/index leaves
+        # rev-parse succeeding while `git status` fails outright (nonzero
+        # exit, empty stdout) — exactly the "readable enough to pass
+        # rev-parse but fails later" scenario the fix must catch.
+        proj = self.make_repo("corruptproj", dirty=False, pushed=True)
+        index_path = proj / ".git" / "index"
+        self.assertTrue(index_path.exists())
+        os.chmod(index_path, 0o000)
+        try:
+            sanity = subprocess.run(
+                ["git", "-C", str(proj), "rev-parse", "--is-inside-work-tree"],
+                capture_output=True, text=True, env=self.git_env)
+            self.assertEqual(sanity.returncode, 0)
+            self.assertEqual(sanity.stdout.strip(), "true")
+
+            broken = subprocess.run(
+                ["git", "-C", str(proj), "status", "--porcelain"],
+                capture_output=True, text=True, env=self.git_env)
+            self.assertNotEqual(broken.returncode, 0)
+            self.assertEqual(broken.stdout.strip(), "")
+
+            self.assertIsNone(cleaner._git_info(proj),
+                               "a git failure after rev-parse must degrade to None, "
+                               "never report a false clean/pushed state")
+        finally:
+            os.chmod(index_path, 0o644)
+
+    def test_targets_override_cleans_flagged_project(self):
+        self.make_repo("dirtyproj", dirty=True, pushed=True)
+        cfg_path = self.tmp / "config.json"
+        cfg_path.write_text(json.dumps({"project_roots": [str(self.root)],
+                                        "project_min_age_days": 0}))
+        env = {**os.environ, "HOME": str(self.tmp),
+               "MACCLEANER_CONFIG": str(cfg_path),
+               "MACCLEANER_LOG": str(self.tmp / "report.log"),
+               "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log")}
+
+        # Resolve the generated target id from the same sandboxed env (HOME
+        # is the tempdir here, so ids computed elsewhere wouldn't match).
+        scan = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                               "projects", "--json"],
+                              capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(scan.returncode, 0)
+        artifacts = json.loads(scan.stdout)["artifacts"]
+        self.assertEqual(len(artifacts), 1)
+        target_id = artifacts[0]["id"]
+
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "projects", "--clean", "--yes",
+                            "--targets", target_id, "--json"],
+                           capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse((self.root / "dirtyproj" / "node_modules").exists(),
+                         "explicitly named flagged project must still be cleaned by --targets")
+
+
+class TestProjectsDryRun(unittest.TestCase):
+    """projects --dry-run must mirror exactly what `projects --clean --yes`
+    would sweep: git-flagged projects excluded unless named via --targets,
+    and (like every dry run) nothing deleted, no report.log/snapshots.log."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "Code"
+        # Isolate from the user's global git config (gpgsign, hooks, etc.)
+        self.git_env = {**os.environ,
+                        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+                        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        cfg_path = self.tmp / "config.json"
+        cfg_path.write_text(json.dumps({"project_roots": [str(self.root)],
+                                        "project_min_age_days": 0}))
+        self.log_path = self.tmp / "report.log"
+        self.snap_path = self.tmp / "snapshots.log"
+        self.env = {**os.environ, "HOME": str(self.tmp),
+                    "MACCLEANER_CONFIG": str(cfg_path),
+                    "MACCLEANER_LOG": str(self.log_path),
+                    "MACCLEANER_SNAPSHOTS": str(self.snap_path)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _git(self, cwd, *args):
+        subprocess.run(["git", "-C", str(cwd), *args],
+                       capture_output=True, check=True, env=self.git_env)
+
+    def make_project(self, name):
+        proj = self.root / name
+        (proj / "node_modules" / "x").mkdir(parents=True)
+        (proj / "package.json").write_text("{}")
+        old = 1_000_000_000
+        os.utime(proj / "node_modules", (old, old))
+        return proj
+
+    def make_repo(self, name, dirty=False, pushed=True):
+        proj = self.make_project(name)
+        (proj / ".gitignore").write_text("node_modules/\n")
+        self._git(proj, "init", "-q")
+        self._git(proj, "add", ".gitignore", "package.json")
+        self._git(proj, "commit", "-qm", "init")
+        if pushed:
+            remote = self.tmp / f"{name}-remote.git"
+            subprocess.run(["git", "init", "-q", "--bare", str(remote)],
+                           capture_output=True, check=True, env=self.git_env)
+            self._git(proj, "remote", "add", "origin", str(remote))
+            self._git(proj, "push", "-q", "origin", "HEAD")
+        if dirty:
+            (proj / "wip.txt").write_text("uncommitted")
+        return proj
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_dry_run_excludes_git_flagged_projects(self):
+        self.make_repo("dirtyproj", dirty=True, pushed=True)
+        self.make_repo("cleanproj", dirty=False, pushed=True)
+
+        r = self.run_cli("projects", "--dry-run", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        ids = [i["id"] for i in data["items"]]
+        self.assertEqual(len(ids), 1, ids)
+        self.assertIn("cleanproj", ids[0])
+        self.assertTrue(all("dirtyproj" not in i for i in ids),
+                        "git-flagged project must be excluded from the preview")
+
+        # a dry run never deletes, regardless of a target's flagged status
+        self.assertTrue((self.root / "dirtyproj" / "node_modules").exists())
+        self.assertTrue((self.root / "cleanproj" / "node_modules").exists())
+        self.assertFalse(self.log_path.exists(), "dry run must not write report.log")
+        self.assertFalse(self.snap_path.exists(), "dry run must not record snapshots")
+
+    def test_dry_run_targets_override_includes_flagged(self):
+        self.make_repo("dirtyproj", dirty=True, pushed=True)
+
+        # Resolve the generated target id from the same sandboxed env (HOME
+        # is the tempdir here, so ids computed elsewhere wouldn't match).
+        scan = self.run_cli("projects", "--json")
+        self.assertEqual(scan.returncode, 0, scan.stderr)
+        artifacts = json.loads(scan.stdout)["artifacts"]
+        self.assertEqual(len(artifacts), 1)
+        target_id = artifacts[0]["id"]
+
+        r = self.run_cli("projects", "--dry-run", "--targets", target_id, "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual([i["id"] for i in data["items"]], [target_id],
+                          "explicitly named flagged project must appear in the preview")
+
+        self.assertTrue((self.root / "dirtyproj" / "node_modules").exists(),
+                        "dry run must not delete, even for an explicitly named flagged project")
+        self.assertFalse(self.log_path.exists(), "dry run must not write report.log")
+        self.assertFalse(self.snap_path.exists(), "dry run must not record snapshots")
+
+
+class TestDryRun(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        (self.home / ".npm" / "_cacache").mkdir(parents=True)
+        (self.home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
+        cfg_path = self.tmp / "config.json"
+        # known_categories stamped so the migration can't auto-enable
+        # tmp/simulators here and reach the real filesystem/simctl (F4).
+        cfg_path.write_text(json.dumps({"enabled_categories": ["node"],
+                                        "known_categories": list(cleaner.ALL_CATEGORIES)}))
+        self.log_path = self.tmp / "report.log"
+        self.snap_path = self.tmp / "snapshots.log"
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(cfg_path),
+                    "MACCLEANER_LOG": str(self.log_path),
+                    "MACCLEANER_SNAPSHOTS": str(self.snap_path),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_dry_run_deletes_nothing_and_reports(self):
+        r = self.run_cli("clean", "--dry-run", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["dry_run"])
+        self.assertTrue((self.home / ".npm" / "_cacache").exists(),
+                        "dry run must not delete")
+        npm = next(i for i in data["items"] if i["id"] == "npm-cache")
+        self.assertEqual(npm["status"], "would-delete")
+        self.assertTrue(npm["paths"])
+        self.assertIn("_cacache", npm["paths"][0]["path"])
+        self.assertGreater(npm["paths"][0]["size_bytes"], 0)
+        self.assertGreater(data["freed_bytes"], 0)
+
+    def test_dry_run_writes_no_logs(self):
+        r = self.run_cli("clean", "--dry-run", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(self.log_path.exists(), "dry run must not write report.log")
+        self.assertFalse(self.snap_path.exists(), "dry run must not record snapshots")
+
+    def test_dry_run_respects_targets(self):
+        r = self.run_cli("clean", "--dry-run", "--targets", "npm-cache", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertEqual([i["id"] for i in data["items"]], ["npm-cache"])
+
+    def test_dry_run_human_output(self):
+        r = self.run_cli("clean", "--dry-run")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("Dry run", r.stdout)
+        self.assertIn("Would free", r.stdout)
+        self.assertTrue((self.home / ".npm" / "_cacache").exists())
+
+
+class TestDryRunSafeOnlyFilter(unittest.TestCase):
+    """TestDryRun only enables 'node', where every path target is safe=True,
+    so a regression leaking review targets into a bare `clean --dry-run`
+    preview would pass unnoticed. Use 'xcode', which has both safe and
+    review-level targets, to actually exercise the filter."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        derived = self.home / "Library/Developer/Xcode/DerivedData/App-abc123"
+        derived.mkdir(parents=True)
+        (derived / "blob").write_text("x" * 4096)
+        archive_dir = self.home / "Library/Developer/Xcode/Archives"
+        archive = archive_dir / "2026-01-01" / "App.xcarchive"
+        archive.mkdir(parents=True)
+        (archive / "blob").write_text("y" * 4096)
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
+        cfg_path = self.tmp / "config.json"
+        # known_categories stamped so the migration can't auto-enable
+        # tmp/simulators here and reach the real filesystem/simctl (F4).
+        cfg_path.write_text(json.dumps({"enabled_categories": ["xcode"],
+                                        "known_categories": list(cleaner.ALL_CATEGORIES)}))
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_bare_dry_run_previews_safe_only(self):
+        r = self.run_cli("clean", "--dry-run", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        ids = {i["id"] for i in data["items"]}
+        self.assertIn("xcode-derived-data", ids)
+        self.assertNotIn("xcode-archives", ids,
+                         "review targets must not leak into a bare dry-run preview")
+
+    def test_targets_dry_run_previews_named_review_target(self):
+        r = self.run_cli("clean", "--dry-run", "--targets", "xcode-archives", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual([i["id"] for i in data["items"]], ["xcode-archives"],
+                         "naming a review target via --targets must preview it")
+
+
+class TestDryRunExpansion(unittest.TestCase):
+    """AGENTS.md promises empty_only targets list their top-level children,
+    and cmd targets report would-run with the command, never executing it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        caches = self.home / "Library/Caches"
+        (caches / "child_a").mkdir(parents=True)
+        (caches / "child_a" / "f").write_text("x" * 4096)
+        (caches / "child_b").mkdir(parents=True)
+        (caches / "child_b" / "f").write_text("y" * 4096)
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
+        cfg_path = self.tmp / "config.json"
+        # known_categories stamped so the migration can't auto-enable
+        # tmp/simulators here and reach the real filesystem/simctl (F4).
+        cfg_path.write_text(json.dumps({"enabled_categories": ["caches", "docker"],
+                                        "known_categories": list(cleaner.ALL_CATEGORIES)}))
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_empty_only_lists_top_level_children(self):
+        r = self.run_cli("clean", "--dry-run", "--targets", "general-caches", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        item = next(i for i in data["items"] if i["id"] == "general-caches")
+        names = {Path(p["path"]).name for p in item["paths"]}
+        self.assertEqual(names, {"child_a", "child_b"})
+        self.assertTrue((self.home / "Library/Caches").exists(),
+                        "dry run must not actually delete anything")
+
+    def test_cmd_target_reports_would_run_without_executing(self):
+        r = self.run_cli("clean", "--dry-run", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        item = next(i for i in data["items"] if i["id"] == "docker-prune")
+        self.assertEqual(item["status"], "would-run")
+        self.assertIn("docker system prune", item["cmd"])
+        self.assertEqual(item["paths"], [])
+
+
+class TestSnapshotScope(unittest.TestCase):
+    """run_clean's snapshot_scope='full' remaining-targets computation must
+    exclude what was cleaned and retain what wasn't."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.fake_home = self.tmp / "home"
+        self.fake_home.mkdir()
+        self.orig_home = cleaner.HOME
+        self.orig_log = cleaner.LOG_PATH
+        self.orig_snap = cleaner.SNAPSHOTS_PATH
+        cleaner.HOME = self.fake_home
+        cleaner.LOG_PATH = self.tmp / "report.log"
+        cleaner.SNAPSHOTS_PATH = self.tmp / "snapshots.log"
+
+    def tearDown(self):
+        cleaner.HOME = self.orig_home
+        cleaner.LOG_PATH = self.orig_log
+        cleaner.SNAPSHOTS_PATH = self.orig_snap
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def target(self, tid, category, path, safe=True):
+        return {"id": tid, "category": category, "label": tid, "description": "",
+                "path": Path(path), "glob": None, "safe": safe, "cmd": None,
+                "estimate_cmd": None, "estimate_parser": None, "empty_only": False}
+
+    def test_full_scope_non_null_and_excludes_cleaned_retains_uncleaned(self):
+        a = self.fake_home / "a"
+        a.mkdir()
+        (a / "f").write_text("x" * 4096)
+        b = self.fake_home / "b"
+        b.mkdir()
+        (b / "f").write_text("y" * 4096)
+        targets = [self.target("clean-me", "node", a, safe=True),
+                   self.target("keep-me", "python", b, safe=False)]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cleaner.run_clean(targets, auto_approve=True, json_mode=True, explicit=False,
+                              snapshot_scope="full")
+        snaps = cleaner.load_snapshots()
+        self.assertEqual(len(snaps), 1)
+        self.assertIsNotNone(snaps[0]["reclaimable_bytes"])
+        self.assertIsNotNone(snaps[0]["categories"])
+        self.assertNotIn("node", snaps[0]["categories"],
+                         "the cleaned (safe) target's category must be excluded")
+        self.assertIn("python", snaps[0]["categories"],
+                      "the skipped (review) target's category must be retained")
+        self.assertFalse(a.exists())
+        self.assertTrue(b.exists())
+
+    def test_partial_scope_records_null(self):
+        a = self.fake_home / "a"
+        a.mkdir()
+        (a / "f").write_text("x" * 4096)
+        targets = [self.target("clean-me", "node", a, safe=True)]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cleaner.run_clean(targets, auto_approve=True, json_mode=True, explicit=False,
+                              snapshot_scope="partial")
+        snaps = cleaner.load_snapshots()
+        self.assertEqual(len(snaps), 1)
+        self.assertIsNone(snaps[0]["reclaimable_bytes"])
+        self.assertIsNone(snaps[0]["categories"])
+
+
+class TestScanSnapshotScope(unittest.TestCase):
+    """Nothing previously asserted that an unscoped `scan` records non-null
+    reclaimable_bytes/categories while a scoped one nulls them out."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        (self.home / ".npm" / "_cacache").mkdir(parents=True)
+        (self.home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
+        cfg_path = self.tmp / "config.json"
+        # known_categories stamped so the migration can't auto-enable
+        # tmp/simulators here and reach the real filesystem/simctl (F4).
+        cfg_path.write_text(json.dumps({"enabled_categories": ["node"],
+                                        "known_categories": list(cleaner.ALL_CATEGORIES)}))
+        self.snap_path = self.tmp / "snapshots.log"
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(cfg_path),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.snap_path)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_unscoped_scan_records_non_null(self):
+        r = self.run_cli("scan", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        snaps = json.loads(self.snap_path.read_text())
+        self.assertEqual(len(snaps), 1)
+        self.assertIsNotNone(snaps[0]["reclaimable_bytes"])
+        self.assertIsNotNone(snaps[0]["categories"])
+
+    def test_category_scoped_scan_records_null(self):
+        r = self.run_cli("scan", "--category", "node", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        snaps = json.loads(self.snap_path.read_text())
+        self.assertEqual(len(snaps), 1)
+        self.assertIsNone(snaps[0]["reclaimable_bytes"])
+        self.assertIsNone(snaps[0]["categories"])
+
+    def test_min_size_scoped_scan_records_null(self):
+        r = self.run_cli("scan", "--min-size", "0", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        snaps = json.loads(self.snap_path.read_text())
+        self.assertEqual(len(snaps), 1)
+        self.assertIsNone(snaps[0]["reclaimable_bytes"])
+        self.assertIsNone(snaps[0]["categories"])
+
+
+class TestEmptyCategoryFilter(unittest.TestCase):
+    """F2: a category name that's valid but legitimately produces zero
+    targets right now (tmp/simulators are the first categories that can be
+    enabled and empty -- clean /tmp, no Xcode installed) is not an error.
+    AGENTS.md promises exit 0 covers "nothing to clean"; exit 1 stays
+    reserved for a genuinely unknown category name."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
+        cfg = {"enabled_categories": ["tmp"],
+               "known_categories": list(cleaner.ALL_CATEGORIES)}
+        self.cfg_path = self.tmp / "config.json"
+        self.cfg_path.write_text(json.dumps(cfg))
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=120)
+
+    def test_scan_empty_category_exits_zero_with_json(self):
+        r = self.run_cli("scan", "--category", "tmp", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["targets"], [])
+        self.assertEqual(data["total_reclaimable_bytes"], 0)
+        self.assertIn("enabled but no targets found", r.stderr)
+
+    def test_clean_empty_category_exits_zero_with_json(self):
+        r = self.run_cli("clean", "--category", "tmp", "--yes", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["items"], [])
+        self.assertEqual(data["freed_bytes"], 0)
+
+    def test_unknown_category_still_exits_1(self):
+        r = self.run_cli("scan", "--category", "warp-drive", "--json")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Unknown categories", r.stderr)
+
+
+class TestStatePathFallback(unittest.TestCase):
+    """SNAPSHOTS_PATH/LOG_PATH must fall back to
+    ~/Library/Application Support/MacCleaner when the directory beside
+    cleaner.py isn't writable (the bundled-engine-in-a-signed-.app case),
+    while the env override always wins regardless."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.fake_home = self.tmp / "home"
+        self.fake_home.mkdir()
+        self.orig_home = cleaner.HOME
+        cleaner.HOME = self.fake_home
+
+    def tearDown(self):
+        cleaner.HOME = self.orig_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                      "root bypasses directory write-permission checks")
+    def test_falls_back_when_script_dir_not_writable(self):
+        readonly_dir = self.tmp / "bundle_resources"
+        readonly_dir.mkdir()
+        os.chmod(readonly_dir, 0o555)
+        try:
+            path = cleaner._resolve_state_path("MACCLEANER_LOG_TEST_UNSET", "report.log",
+                                               script_dir=readonly_dir)
+            expected = self.fake_home / "Library/Application Support/MacCleaner/report.log"
+            self.assertEqual(path, expected)
+            self.assertTrue(expected.parent.is_dir(), "fallback dir must be created")
+        finally:
+            os.chmod(readonly_dir, 0o755)
+
+    def test_uses_script_dir_when_writable(self):
+        writable_dir = self.tmp / "mac-cleaner"
+        writable_dir.mkdir()
+        path = cleaner._resolve_state_path("MACCLEANER_LOG_TEST_UNSET", "report.log",
+                                           script_dir=writable_dir)
+        self.assertEqual(path, writable_dir / "report.log")
+
+    def test_falls_back_when_inside_app_bundle_even_if_writable(self):
+        # A user-owned .app's Contents/Resources is drwxr-xr-x (writable),
+        # but state files must never land inside the bundle.
+        bundle_resources = self.tmp / "MacCleaner.app" / "Contents" / "Resources"
+        bundle_resources.mkdir(parents=True)
+        self.assertTrue(os.access(bundle_resources, os.W_OK))
+        path = cleaner._resolve_state_path("MACCLEANER_LOG_TEST_UNSET", "report.log",
+                                           script_dir=bundle_resources)
+        expected = self.fake_home / "Library/Application Support/MacCleaner/report.log"
+        self.assertEqual(path, expected)
+        self.assertTrue(expected.parent.is_dir(), "fallback dir must be created")
+
+    def test_env_override_wins_even_when_inside_app_bundle(self):
+        bundle_resources = self.tmp / "MacCleaner.app" / "Contents" / "Resources"
+        bundle_resources.mkdir(parents=True)
+        override = str(self.tmp / "custom-report.log")
+        os.environ["MACCLEANER_LOG_TEST_OVERRIDE"] = override
+        try:
+            path = cleaner._resolve_state_path("MACCLEANER_LOG_TEST_OVERRIDE", "report.log",
+                                               script_dir=bundle_resources)
+            self.assertEqual(path, Path(override))
+        finally:
+            os.environ.pop("MACCLEANER_LOG_TEST_OVERRIDE", None)
+
+    def test_is_inside_app_bundle_detection(self):
+        self.assertTrue(cleaner._is_inside_app_bundle(
+            Path("/Applications/MacCleaner.app/Contents/Resources")))
+        self.assertTrue(cleaner._is_inside_app_bundle(
+            Path.home() / "Downloads/MacCleaner.app/Contents/Resources"))
+        self.assertFalse(cleaner._is_inside_app_bundle(
+            Path.home() / "mac-cleaner"))
+        self.assertFalse(cleaner._is_inside_app_bundle(
+            Path("/Users/dev/Code/MacCleaner")))
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                      "root bypasses directory write-permission checks")
+    def test_env_override_wins_even_when_script_dir_not_writable(self):
+        readonly_dir = self.tmp / "bundle_resources2"
+        readonly_dir.mkdir()
+        os.chmod(readonly_dir, 0o555)
+        override = str(self.tmp / "custom-report.log")
+        os.environ["MACCLEANER_LOG_TEST_OVERRIDE"] = override
+        try:
+            path = cleaner._resolve_state_path("MACCLEANER_LOG_TEST_OVERRIDE", "report.log",
+                                               script_dir=readonly_dir)
+            self.assertEqual(path, Path(override))
+        finally:
+            os.environ.pop("MACCLEANER_LOG_TEST_OVERRIDE", None)
+            os.chmod(readonly_dir, 0o755)
+
+
+class TestDryRunPermissionGuard(unittest.TestCase):
+    """run_dry_run's empty_only expansion must guard p.iterdir() the same way
+    delete_target guards the equivalent loop — a PermissionError previewing
+    one target must not abort the whole preview with a traceback."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.fake_home = self.tmp / "home"
+        self.fake_home.mkdir()
+        self.orig_home = cleaner.HOME
+        cleaner.HOME = self.fake_home
+
+    def tearDown(self):
+        cleaner.HOME = self.orig_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                      "root bypasses directory permission checks")
+    def test_empty_only_permission_error_does_not_abort_preview(self):
+        d = self.fake_home / "Caches"
+        d.mkdir()
+        (d / "readable").mkdir()
+        os.chmod(d, 0o000)  # no read/execute -> p.iterdir() raises PermissionError
+        try:
+            t = {"id": "t", "category": "test", "label": "t", "description": "",
+                 "path": d, "glob": None, "safe": True, "cmd": None,
+                 "estimate_cmd": None, "estimate_parser": None, "empty_only": True}
+            with contextlib.redirect_stdout(io.StringIO()):
+                total, items = cleaner.run_dry_run([t])
+            self.assertEqual(total, 0)
+            self.assertEqual(items[0]["paths"], [])
+        finally:
+            os.chmod(d, 0o755)
+
+
+class TestNotify(unittest.TestCase):
+    def test_new_config_defaults(self):
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        self.assertTrue(cfg["notifications"])
+        self.assertTrue(cfg["low_disk_alerts"])
+        self.assertEqual(cfg["low_disk_threshold_gb"], 10)
+        self.assertEqual(cfg["full_refresh_hours"], 6)
+
+    def test_new_keys_merge_into_old_config(self):
+        tmp = Path(tempfile.mkdtemp())
+        orig = cleaner.CONFIG_PATH
+        cleaner.CONFIG_PATH = tmp / "config.json"
+        try:
+            cleaner.CONFIG_PATH.write_text('{"enabled_categories": ["node"]}')
+            cfg = cleaner.load_config()
+            # Pre-v2.5 configs get new categories auto-enabled
+            self.assertEqual(cfg["enabled_categories"], ["node", "tmp", "simulators", "leftovers"])
+            self.assertTrue(cfg["low_disk_alerts"])
+            self.assertEqual(cfg["low_disk_threshold_gb"], 10)
+        finally:
+            cleaner.CONFIG_PATH = orig
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_alerts_path_resolution(self):
+        """The override wins; otherwise alerts.json sits beside cleaner.py.
+
+        The "installed" directory is a real tempdir rather than ~/mac-cleaner:
+        the sibling-directory branch requires the directory to exist and be
+        writable, so pointing at a path that happens to exist on a developer's
+        machine but not on a fresh CI runner would fall through to the
+        Application Support fallback and fail there only."""
+        tmp = Path(tempfile.mkdtemp())
+        override = tmp / "override.json"
+        try:
+            self.assertEqual(
+                cleaner._resolve_state_path("MACCLEANER_ALERTS", "alerts.json", tmp),
+                tmp / "alerts.json")
+            os.environ["MACCLEANER_ALERTS"] = str(override)
+            try:
+                self.assertEqual(
+                    cleaner._resolve_state_path("MACCLEANER_ALERTS", "alerts.json", tmp),
+                    override)
+            finally:
+                del os.environ["MACCLEANER_ALERTS"]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_escape_applescript(self):
+        self.assertEqual(cleaner._escape_applescript('say "hi"'), 'say \\"hi\\"')
+        self.assertEqual(cleaner._escape_applescript(r"back\slash"), r"back\\slash")
+        self.assertEqual(cleaner._escape_applescript("plain"), "plain")
+
+    def test_notify_argv_shape(self):
+        argv = cleaner._notify_argv("MacCleaner freed 1.0 GB", 'a "quoted" note')
+        self.assertEqual(argv[0], "osascript")
+        self.assertEqual(argv[1], "-e")
+        self.assertIn('display notification "a \\"quoted\\" note"', argv[2])
+        self.assertIn('with title "MacCleaner freed 1.0 GB"', argv[2])
+        self.assertEqual(len(argv), 3)
+
+    def test_notify_survives_missing_binary(self):
+        """A notification failure must never raise into the caller."""
+        orig = cleaner._notify_argv
+        cleaner._notify_argv = lambda t, m: ["definitely-not-a-real-binary-xyz"]
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                result = cleaner._notify("t", "m")
+            self.assertFalse(result)
+            self.assertIn("notif", err.getvalue().lower())
+        finally:
+            cleaner._notify_argv = orig
+
+
+class TestCleanNotify(unittest.TestCase):
+    """--notify must be observable without posting a real notification: the
+    tests capture the argv _notify would have used by swapping the primitive."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        (self.home / ".npm" / "_cacache").mkdir(parents=True)
+        (self.home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        self.tmproot = self.tmp / "tmproot"
+        self.tmproot.mkdir()
+        self.cfg_path = self.tmp / "config.json"
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_ALERTS": str(self.tmp / "alerts.json"),
+                    "MACCLEANER_TMP_ROOT": str(self.tmproot)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write_cfg(self, **extra):
+        # known_categories stamped so the migration can't auto-enable
+        # tmp/simulators here and reach the real filesystem/simctl (F4).
+        cfg = {"enabled_categories": ["node"],
+               "known_categories": list(cleaner.ALL_CATEGORIES)}
+        cfg.update(extra)
+        self.cfg_path.write_text(json.dumps(cfg))
+
+    def run_cli(self, *args, fake_osascript=True):
+        """Run the CLI with a stub `osascript` early on PATH that records its
+        argv to a file, so we can assert on the notification without posting."""
+        env = dict(self.env)
+        if fake_osascript:
+            bindir = self.tmp / "bin"
+            bindir.mkdir(exist_ok=True)
+            recorded = self.tmp / "notified.txt"
+            stub = bindir / "osascript"
+            stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$RECORD_FILE"\n')
+            stub.chmod(0o755)
+            env["PATH"] = f"{bindir}:{env['PATH']}"
+            env["RECORD_FILE"] = str(recorded)
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=env, timeout=120)
+
+    def notified_text(self):
+        f = self.tmp / "notified.txt"
+        return f.read_text() if f.exists() else ""
+
+    def test_notify_posts_after_clean(self):
+        self.write_cfg()
+        r = self.run_cli("clean", "--yes", "--notify", "--json")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertGreater(data["freed_bytes"], 0)
+        self.assertIn("display notification", self.notified_text())
+        self.assertIn("MacCleaner", self.notified_text())
+
+    def test_notifications_disabled_suppresses(self):
+        self.write_cfg(notifications=False)
+        r = self.run_cli("clean", "--yes", "--notify", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(self.notified_text(), "",
+                         "notifications:false must suppress the notification")
+        self.assertFalse((self.home / ".npm" / "_cacache").exists(),
+                         "the clean itself must still happen")
+
+    def test_no_flag_no_notification(self):
+        self.write_cfg()
+        r = self.run_cli("clean", "--yes", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(self.notified_text(), "")
+
+    def test_dry_run_never_notifies(self):
+        self.write_cfg()
+        r = self.run_cli("clean", "--dry-run", "--notify", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(self.notified_text(), "")
+        self.assertTrue((self.home / ".npm" / "_cacache").exists())
+
+
+class TestLowDiskThrottle(unittest.TestCase):
+    """_low_disk_decision is pure: (alerts, now, free, threshold) -> (notify?, state)."""
+
+    def setUp(self):
+        self.now = datetime.datetime(2026, 7, 30, 12, 0, 0)
+        self.threshold = 10 * 1024**3
+
+    def decide(self, alerts, free, now=None):
+        return cleaner._low_disk_decision(alerts, now or self.now, free, self.threshold)
+
+    def test_first_dip_notifies(self):
+        notify, state = self.decide({}, 5 * 1024**3)
+        self.assertTrue(notify)
+        self.assertEqual(state["state"], "below")
+        self.assertEqual(state["last_notified"], self.now.isoformat())
+
+    def test_above_threshold_never_notifies(self):
+        notify, state = self.decide({}, 500 * 1024**3)
+        self.assertFalse(notify)
+        self.assertEqual(state["state"], "above")
+
+    def test_still_below_within_24h_stays_quiet(self):
+        alerts = {"low_disk": {"state": "below",
+                               "last_notified": (self.now - datetime.timedelta(hours=3)).isoformat()}}
+        notify, state = self.decide(alerts, 5 * 1024**3)
+        self.assertFalse(notify, "must not re-notify hourly")
+        self.assertEqual(state["state"], "below")
+
+    def test_still_below_after_24h_renotifies(self):
+        alerts = {"low_disk": {"state": "below",
+                               "last_notified": (self.now - datetime.timedelta(hours=25)).isoformat()}}
+        notify, state = self.decide(alerts, 5 * 1024**3)
+        self.assertTrue(notify)
+        self.assertEqual(state["last_notified"], self.now.isoformat())
+
+    def test_recovery_then_new_dip_notifies_immediately(self):
+        recovered = {"low_disk": {"state": "below",
+                                  "last_notified": (self.now - datetime.timedelta(hours=1)).isoformat()}}
+        notify, state = self.decide(recovered, 500 * 1024**3)
+        self.assertFalse(notify)
+        self.assertEqual(state["state"], "above")
+        notify2, _ = self.decide({"low_disk": state}, 5 * 1024**3)
+        self.assertTrue(notify2, "a fresh dip after recovery must notify at once")
+
+    def test_corrupt_last_notified_notifies(self):
+        alerts = {"low_disk": {"state": "below", "last_notified": "not-a-timestamp"}}
+        notify, _ = self.decide(alerts, 5 * 1024**3)
+        self.assertTrue(notify)
+
+    def test_below_state_missing_stamp_notifies(self):
+        """A hand-edited or partially written alerts.json can have `state`
+        present but no `last_notified` at all — distinct from a corrupt
+        (non-empty but unparseable) stamp. Must still notify."""
+        alerts = {"low_disk": {"state": "below", "last_notified": None}}
+        notify, state = self.decide(alerts, 5 * 1024**3)
+        self.assertTrue(notify)
+        self.assertEqual(state["last_notified"], self.now.isoformat())
+
+    def test_still_below_at_exact_renotify_boundary_renotifies(self):
+        """elapsed >= LOW_DISK_RENOTIFY_HOURS uses >=, so exactly 24h must
+        renotify, not just times strictly greater than it."""
+        alerts = {"low_disk": {"state": "below",
+                               "last_notified": (self.now - datetime.timedelta(
+                                   hours=cleaner.LOW_DISK_RENOTIFY_HOURS)).isoformat()}}
+        notify, state = self.decide(alerts, 5 * 1024**3)
+        self.assertTrue(notify, "exactly the renotify window must still renotify")
+        self.assertEqual(state["last_notified"], self.now.isoformat())
+
+
+class TestRunDiskCheckPersistence(unittest.TestCase):
+    """run_disk_check's own persistence decisions (M3, M5) — direct calls
+    against a swapped ALERTS_PATH, not a subprocess, so _notify can be
+    monkeypatched to simulate a failure."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.orig_alerts_path = cleaner.ALERTS_PATH
+        cleaner.ALERTS_PATH = self.tmp / "alerts.json"
+
+    def tearDown(self):
+        cleaner.ALERTS_PATH = self.orig_alerts_path
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_failed_notification_does_not_stamp_throttle(self):
+        """A failed notification used to stamp last_notified anyway,
+        suppressing retries for 24h after a banner the user never saw
+        (finding M5). It must be retried on the very next run instead."""
+        orig_notify = cleaner._notify
+        cleaner._notify = lambda title, message: False
+        try:
+            cfg = {"low_disk_alerts": True, "low_disk_threshold_gb": 10_000_000}
+            with contextlib.redirect_stdout(io.StringIO()):
+                r1 = cleaner.run_disk_check(cfg, json_mode=True)
+            self.assertTrue(r1["below_threshold"])
+            self.assertFalse(r1["notified"])
+            self.assertFalse(cleaner.ALERTS_PATH.exists(),
+                             "a failed notification must not persist a stamp")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                r2 = cleaner.run_disk_check(cfg, json_mode=True)
+            self.assertFalse(r2["notified"], "the stub keeps failing")
+            self.assertFalse(cleaner.ALERTS_PATH.exists(),
+                             "still no stamp — the next run (with a working "
+                             "notifier) will retry immediately")
+        finally:
+            cleaner._notify = orig_notify
+
+
+class TestDiskCheck(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.alerts = self.tmp / "alerts.json"
+        self.log = self.tmp / "report.log"
+        self.snaps = self.tmp / "snapshots.log"
+        self.cfg_path = self.tmp / "config.json"
+        self.env = {**os.environ, "HOME": str(self.tmp),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.log),
+                    "MACCLEANER_SNAPSHOTS": str(self.snaps),
+                    "MACCLEANER_ALERTS": str(self.alerts)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args, **cfg):
+        self.cfg_path.write_text(json.dumps(cfg) if cfg else "{}")
+        bindir = self.tmp / "bin"
+        bindir.mkdir(exist_ok=True)
+        stub = bindir / "osascript"
+        stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$RECORD_FILE"\n')
+        stub.chmod(0o755)
+        env = {**self.env, "PATH": f"{bindir}:{os.environ['PATH']}",
+               "RECORD_FILE": str(self.tmp / "notified.txt")}
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=env, timeout=60)
+
+    def notified(self):
+        f = self.tmp / "notified.txt"
+        return f.read_text() if f.exists() else ""
+
+    def test_json_shape_and_exit_zero(self):
+        r = self.run_cli("disk-check", "--json")
+        self.assertEqual(r.returncode, 0, "disk-check is a monitor: always exit 0")
+        data = json.loads(r.stdout)
+        for key in ["free_bytes", "free_human", "threshold_bytes",
+                    "below_threshold", "notified", "should_notify"]:
+            self.assertIn(key, data)
+        self.assertIsInstance(data["below_threshold"], bool)
+
+    def test_no_post_skips_notification_but_shares_the_throttle(self):
+        """--no-post is how the app claims delivery itself (real icon via
+        NotificationManager) instead of the generic-icon osascript path --
+        but it must still consume the 24h throttle, so the standalone
+        launchd disk-check agent doesn't also fire for the same dip."""
+        r = self.run_cli("disk-check", "--no-post", "--json",
+                         low_disk_threshold_gb=10_000_000)
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["below_threshold"])
+        self.assertTrue(data["should_notify"], "the app must be told to post its own alert")
+        self.assertFalse(data["notified"], "--no-post must never post one itself")
+        self.assertEqual(self.notified(), "", "no osascript call must happen under --no-post")
+        self.assertTrue(self.alerts.exists(), "the throttle must still be stamped")
+
+        # A follow-up normal run must now stay quiet -- same 24h window.
+        r2 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        data2 = json.loads(r2.stdout)
+        self.assertFalse(data2["notified"], "must be throttled by the --no-post run above")
+        self.assertFalse(data2["should_notify"])
+
+    def test_should_notify_false_when_alerts_disabled(self):
+        r = self.run_cli("disk-check", "--no-post", "--json",
+                         low_disk_threshold_gb=10_000_000, low_disk_alerts=False)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["below_threshold"], "numbers still reported")
+        self.assertFalse(data["should_notify"], "low_disk_alerts=false must still gate --no-post")
+        self.assertFalse(data["notified"])
+        self.assertFalse(self.alerts.exists())
+
+    def test_should_notify_false_when_above_threshold(self):
+        r = self.run_cli("disk-check", "--no-post", "--json", low_disk_threshold_gb=0)
+        data = json.loads(r.stdout)
+        self.assertFalse(data["below_threshold"])
+        self.assertFalse(data["should_notify"])
+        self.assertFalse(data["notified"])
+
+    def test_huge_threshold_triggers_notification(self):
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["below_threshold"])
+        self.assertTrue(data["notified"])
+        self.assertIn("display notification", self.notified())
+        self.assertTrue(self.alerts.exists())
+        state = json.loads(self.alerts.read_text())["low_disk"]
+        self.assertEqual(state["state"], "below")
+
+    def test_alerts_disabled_reports_but_stays_quiet(self):
+        r = self.run_cli("disk-check", "--json",
+                         low_disk_threshold_gb=10_000_000, low_disk_alerts=False)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["below_threshold"], "numbers still reported")
+        self.assertFalse(data["notified"])
+        self.assertEqual(self.notified(), "")
+        self.assertFalse(self.alerts.exists(),
+                          "disabled alerts must not persist a stamp, so re-enabling "
+                          "later doesn't inherit a stale 'already warned' state")
+
+    def test_malformed_threshold_falls_back_and_warns(self):
+        """A non-numeric low_disk_threshold_gb (e.g. hand-edited via `config set`
+        with no type validation) must degrade to the documented 10 GB default
+        instead of crashing the hourly monitor."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb="high")
+        self.assertEqual(r.returncode, 0, "disk-check must always exit 0")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertEqual(data["free_human"], cleaner.fmt_size(data["free_bytes"]),
+                          "numbers must still be usable, not just present")
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("high", r.stderr)
+
+    def test_structurally_wrong_threshold_falls_back_and_warns(self):
+        """A list or null (TypeError from float()) must also degrade cleanly,
+        not just a non-numeric string (ValueError)."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=None)
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+
+    def test_numeric_string_threshold_still_works(self):
+        """Happy path must be unchanged: a numeric string like "15" still
+        parses via float() with no warning."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb="15")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], int(15 * 1024**3))
+        self.assertNotIn("low_disk_threshold_gb", r.stderr)
+
+    def test_nan_threshold_falls_back_and_warns(self):
+        """json permits the NaN literal, and `config set low_disk_threshold_gb NaN`
+        writes a real float('nan') that round-trips through load_config(). float(nan)
+        doesn't raise, so this must be caught before int(nan * 1024**3), which raises
+        ValueError: cannot convert float NaN to integer."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=float("nan"))
+        self.assertEqual(r.returncode, 0, "disk-check must always exit 0")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertEqual(data["free_human"], cleaner.fmt_size(data["free_bytes"]),
+                          "numbers must still be usable, not just present")
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("nan", r.stderr.lower())
+
+    def test_infinity_threshold_falls_back_and_warns(self):
+        """float(inf) doesn't raise either, but int(inf * 1024**3) raises
+        OverflowError: cannot convert float infinity to integer — a third
+        exception type that must also be caught."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=float("inf"))
+        self.assertEqual(r.returncode, 0, "disk-check must always exit 0")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertEqual(data["free_human"], cleaner.fmt_size(data["free_bytes"]))
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("inf", r.stderr.lower())
+
+    def test_negative_infinity_threshold_falls_back_and_warns(self):
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=float("-inf"))
+        self.assertEqual(r.returncode, 0, "disk-check must always exit 0")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertEqual(data["free_human"], cleaner.fmt_size(data["free_bytes"]))
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("inf", r.stderr.lower())
+
+    def test_no_side_effect_files(self):
+        r = self.run_cli("disk-check", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(self.log.exists(), "disk-check must not write report.log")
+        self.assertFalse(self.snaps.exists(), "disk-check must not record a snapshot")
+
+    def test_corrupt_alerts_file_self_heals(self):
+        self.alerts.write_text("{not json")
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(json.loads(r.stdout)["notified"])
+        self.assertIn("low_disk", json.loads(self.alerts.read_text()))
+
+    def test_human_output(self):
+        r = self.run_cli("disk-check")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("free", r.stdout.lower())
+
+    def test_second_run_stays_quiet_immediately_after_first(self):
+        """_low_disk_decision is exhaustively covered as a pure function, but
+        nothing previously invoked disk-check twice in a row, so the wiring in
+        run_disk_check (load_alerts -> decision -> save_alerts under
+        "low_disk" -> the enabled-and-should_notify gate) was only half
+        verified (finding I5)."""
+        r1 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        self.assertTrue(json.loads(r1.stdout)["notified"])
+        notified_path = self.tmp / "notified.txt"
+        if notified_path.exists():
+            notified_path.unlink()
+
+        r2 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        data2 = json.loads(r2.stdout)
+        self.assertTrue(data2["below_threshold"])
+        self.assertFalse(data2["notified"],
+                         "an immediate second run must stay quiet (throttled)")
+        self.assertEqual(self.notified(), "",
+                         "no new notification must be posted while throttled")
+
+    def test_backdated_last_notified_renotifies(self):
+        r1 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        self.assertTrue(json.loads(r1.stdout)["notified"])
+
+        alerts = json.loads(self.alerts.read_text())
+        stale = datetime.datetime.now() - datetime.timedelta(
+            hours=cleaner.LOW_DISK_RENOTIFY_HOURS + 1)
+        alerts["low_disk"]["last_notified"] = stale.isoformat()
+        self.alerts.write_text(json.dumps(alerts))
+        notified_path = self.tmp / "notified.txt"
+        if notified_path.exists():
+            notified_path.unlink()
+
+        r2 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=10_000_000)
+        data2 = json.loads(r2.stdout)
+        self.assertTrue(data2["notified"],
+                        "a back-dated last_notified past the renotify window must renotify")
+        self.assertIn("display notification", self.notified())
+
+    def test_negative_threshold_falls_back_and_warns(self):
+        """math.isfinite(-5) is True, so the NaN/infinity guard alone lets a
+        negative low_disk_threshold_gb (e.g. `config set low_disk_threshold_gb
+        -5`) through, making below_threshold permanently False (finding M8)."""
+        r = self.run_cli("disk-check", "--json", low_disk_threshold_gb=-5)
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["threshold_bytes"], 10 * 1024**3)
+        self.assertIn("low_disk_threshold_gb", r.stderr)
+        self.assertIn("-5", r.stderr)
+
+    def test_unchanged_state_does_not_rewrite_alerts_file(self):
+        """The `above` branch used to stamp alerts.json unconditionally, so an
+        hourly agent rewrote the file every run even when nothing changed
+        (finding M3)."""
+        r1 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=0.0000001)
+        self.assertFalse(json.loads(r1.stdout)["below_threshold"])
+        self.assertTrue(self.alerts.exists())
+        first_mtime = self.alerts.stat().st_mtime_ns
+
+        r2 = self.run_cli("disk-check", "--json", low_disk_threshold_gb=0.0000001)
+        self.assertFalse(json.loads(r2.stdout)["below_threshold"])
+        second_mtime = self.alerts.stat().st_mtime_ns
+        self.assertEqual(first_mtime, second_mtime,
+                         "an unchanged low-disk state must not rewrite alerts.json")
+
+
+class TestScheduler(unittest.TestCase):
+    """scheduler.sh against a sandboxed LaunchAgents dir with stub
+    launchctl/crontab on PATH — never touches the real agents or crontab."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.agents = self.tmp / "LaunchAgents"
+        self.agents.mkdir()
+        self.bindir = self.tmp / "bin"
+        self.bindir.mkdir()
+        self.calls = self.tmp / "calls.txt"
+        self.crontab_file = self.tmp / "crontab.txt"
+        self.crontab_file.write_text("")
+        for name in ("launchctl", "crontab"):
+            stub = self.bindir / name
+            stub.write_text(
+                '#!/bin/sh\n'
+                f'printf "{name} %s\\n" "$*" >> "$CALLS_FILE"\n'
+                'if [ "$1" = "-l" ]; then cat "$CRONTAB_FILE"; exit 0; fi\n'
+                'if [ -z "$1" ] || [ "$1" = "-" ]; then cat > "$CRONTAB_FILE"; fi\n'
+                'exit 0\n')
+            stub.chmod(0o755)
+        self.env = {**os.environ,
+                    "PATH": f"{self.bindir}:{os.environ['PATH']}",
+                    "HOME": str(self.tmp),
+                    "MACCLEANER_LAUNCH_AGENTS_DIR": str(self.agents),
+                    "CALLS_FILE": str(self.calls),
+                    "CRONTAB_FILE": str(self.crontab_file)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def sched(self, *args):
+        return subprocess.run(["bash", str(REPO / "scheduler.sh"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=60)
+
+    def plist(self, label):
+        return self.agents / f"com.fullex.maccleaner.{label}.plist"
+
+    def test_weekly_installs_both_agents(self):
+        r = self.sched("weekly")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.plist("clean").exists(), "clean agent missing")
+        self.assertTrue(self.plist("diskwatch").exists(), "diskwatch agent missing")
+
+    def test_plists_are_valid(self):
+        self.sched("weekly")
+        for label in ("clean", "diskwatch"):
+            lint = subprocess.run(["plutil", "-lint", str(self.plist(label))],
+                                  capture_output=True, text=True)
+            self.assertEqual(lint.returncode, 0, f"{label}: {lint.stdout}{lint.stderr}")
+
+    def test_clean_agent_content(self):
+        self.sched("weekly")
+        body = self.plist("clean").read_text()
+        self.assertIn("com.fullex.maccleaner.clean", body)
+        self.assertIn("cleaner.py", body)
+        self.assertIn("--notify", body)
+        self.assertIn("StartCalendarInterval", body)
+        self.assertIn("<key>Weekday</key>", body)
+
+    def test_monthly_uses_day_not_weekday(self):
+        self.sched("monthly")
+        body = self.plist("clean").read_text()
+        self.assertIn("<key>Day</key>", body)
+        self.assertNotIn("<key>Weekday</key>", body)
+
+    def test_diskwatch_agent_content(self):
+        self.sched("weekly")
+        body = self.plist("diskwatch").read_text()
+        self.assertIn("disk-check", body)
+        self.assertIn("StartInterval", body)
+        self.assertIn("3600", body)
+
+    def test_agents_carry_tool_path(self):
+        """Both agents must set EnvironmentVariables/PATH to the same list the
+        app's CleanerBridge.runEngine uses, or cmd-based targets (brew, docker,
+        pnpm, gem, conda, xcrun simctl, ...) silently no-op under a scheduled
+        run because launchd's default PATH is just /usr/bin:/bin:/usr/sbin:/sbin
+        (finding I3)."""
+        self.sched("weekly")
+        for label in ("clean", "diskwatch"):
+            body = self.plist(label).read_text()
+            self.assertIn("EnvironmentVariables", body)
+            self.assertIn("/opt/homebrew/bin", body)
+            self.assertIn("/usr/local/bin", body)
+
+    def test_remove_deletes_both(self):
+        self.sched("weekly")
+        r = self.sched("remove")
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(self.plist("clean").exists())
+        self.assertFalse(self.plist("diskwatch").exists())
+
+    def test_reinstall_replaces_not_stacks(self):
+        self.sched("weekly")
+        self.sched("monthly")
+        body = self.plist("clean").read_text()
+        self.assertIn("<key>Day</key>", body)
+        self.assertEqual(len(list(self.agents.glob("*.plist"))), 2)
+
+    def test_migrates_cron_weekly(self):
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        r = self.sched("weekly")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("migrat", (r.stdout + r.stderr).lower())
+        self.assertTrue(self.plist("clean").exists())
+        self.assertIn("<key>Weekday</key>", self.plist("clean").read_text())
+        self.assertNotIn("cleaner.py", self.crontab_file.read_text(),
+                         "the cron line must be removed after migration")
+
+    def test_migration_preserves_monthly(self):
+        """When the requested cadence matches what the old cron line implies,
+        migration must install exactly once (finding I2 — migrate_cron used to
+        call install_schedule itself with its *detected* cadence, and the
+        outer case statement called install_schedule again with the
+        *argument*, printing two, possibly contradictory, schedule lines and
+        bootstrapping each agent twice)."""
+        self.crontab_file.write_text(
+            "0 9 1 * * /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        r = self.sched("monthly")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        output = r.stdout + r.stderr
+        self.assertEqual(output.count("✅ Scheduled"), 1,
+                         "migration must install exactly once")
+        self.assertIn("<key>Day</key>", self.plist("clean").read_text())
+
+    def test_migration_reports_detected_cadence_but_argument_wins(self):
+        """A monthly-shaped cron line migrated via `weekly` must not install
+        monthly behind the scenes — the explicit command always wins, and the
+        cron line's own cadence is only ever reported, never installed
+        (finding I2)."""
+        self.crontab_file.write_text(
+            "0 9 1 * * /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        r = self.sched("weekly")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        output = r.stdout + r.stderr
+        self.assertEqual(output.count("✅ Scheduled"), 1,
+                         "migration must install exactly once, even on a cadence mismatch")
+        self.assertIn("monthly", output.lower(),
+                     "the detected cadence should still be reported for visibility")
+        body = self.plist("clean").read_text()
+        self.assertIn("<key>Weekday</key>", body,
+                     "the requested cadence (weekly) must win, not the detected one (monthly)")
+        self.assertNotIn("<key>Day</key>", body)
+
+    def test_migration_keeps_unrelated_cron_lines(self):
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n"
+            "*/5 * * * * /usr/local/bin/other-job\n")
+        self.sched("weekly")
+        remaining = self.crontab_file.read_text()
+        self.assertIn("other-job", remaining, "unrelated cron jobs must survive")
+        self.assertNotIn("cleaner.py", remaining)
+
+    def test_migration_is_idempotent(self):
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        self.sched("weekly")
+        second = self.sched("weekly")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotIn("migrat", second.stdout.lower(),
+                         "second run has nothing to migrate")
+
+    def test_status_is_read_only_with_legacy_cron(self):
+        """status must only report a legacy cron line, never touch it or
+        install anything — even when one is present (finding 1)."""
+        cron_line = ("0 9 * * 1 /usr/bin/python3 "
+                     "/Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        self.crontab_file.write_text(cron_line)
+        r = self.sched("status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Migrating your cron schedule", r.stdout + r.stderr,
+                         "status must not perform migration")
+        self.assertNotIn("Removed the old cron entry", r.stdout + r.stderr,
+                         "status must not perform migration")
+        self.assertIn("run ./scheduler.sh weekly to migrate",
+                      (r.stdout + r.stderr))
+        self.assertEqual(self.crontab_file.read_text(), cron_line,
+                         "status must not touch the crontab")
+        self.assertEqual(list(self.agents.glob("*.plist")), [],
+                         "status must not create any launchd agents")
+
+    def test_remove_strips_legacy_cron_without_migrating(self):
+        """remove must not install anything, but should strip a legacy
+        cron line since the user's intent is to stop scheduling entirely."""
+        cron_line = ("0 9 * * 1 /usr/bin/python3 "
+                     "/Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        self.crontab_file.write_text(cron_line)
+        r = self.sched("remove")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("migrat", (r.stdout + r.stderr).lower())
+        self.assertNotIn("cleaner.py", self.crontab_file.read_text(),
+                         "remove should strip the legacy cron line")
+        self.assertEqual(list(self.agents.glob("*.plist")), [],
+                         "remove must not install any launchd agents")
+
+    def test_bare_invocation_does_not_migrate(self):
+        cron_line = ("0 9 * * 1 /usr/bin/python3 "
+                     "/Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        self.crontab_file.write_text(cron_line)
+        r = self.sched()
+        self.assertEqual(self.crontab_file.read_text(), cron_line)
+        self.assertEqual(list(self.agents.glob("*.plist")), [])
+
+    def test_status_reports_installed(self):
+        self.sched("weekly")
+        r = self.sched("status")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("maccleaner", r.stdout.lower())
+
+    def test_usage_when_no_command(self):
+        r = self.sched()
+        self.assertIn("weekly", r.stdout)
+        self.assertIn("monthly", r.stdout)
+
+    def test_launchctl_failure_surfaces_message_and_propagates(self):
+        """A launchctl that fails to load an agent must surface its real
+        stderr diagnostic and make scheduler.sh exit non-zero, instead of
+        printing a generic warning immediately followed by a success
+        banner (finding 2)."""
+        failing = self.bindir / "launchctl"
+        failing.write_text(
+            '#!/bin/sh\n'
+            f'printf "launchctl %s\\n" "$*" >> "$CALLS_FILE"\n'
+            'case "$1" in\n'
+            '  bootstrap|load)\n'
+            '    echo "Load failed: 5: Input/output error" >&2\n'
+            '    exit 1\n'
+            '    ;;\n'
+            'esac\n'
+            'exit 0\n')
+        failing.chmod(0o755)
+
+        r = self.sched("weekly")
+
+        self.assertNotEqual(r.returncode, 0,
+                            "a failed launchctl load must not exit 0")
+        self.assertIn("Load failed: 5: Input/output error", r.stderr,
+                     "the real launchctl diagnostic must be surfaced")
+        self.assertNotIn("✅ Scheduled", r.stdout,
+                         "must not print a success banner after a load failure")
+        # The plist is still written so the user can load it manually.
+        self.assertTrue(self.plist("clean").exists())
+
+    def test_status_does_not_checkmark_a_plist_launchd_has_not_loaded(self):
+        """A plist can exist on disk (bootstrap once succeeded, or it was
+        written but never loaded) without launchd actually having the job
+        loaded right now. status used to check only `-f plist`, so it kept
+        showing ✅ seconds after scheduler.sh itself printed a load failure.
+        It must instead ask launchd directly (finding I1)."""
+        self.sched("weekly")
+        not_loaded = self.bindir / "launchctl"
+        not_loaded.write_text(
+            '#!/bin/sh\n'
+            f'printf "launchctl %s\\n" "$*" >> "$CALLS_FILE"\n'
+            # 113 + "Could not find service" is what real launchctl says
+            # for a label it does not have; a bare `exit 1` would now mean
+            # "could not ask" instead of "not loaded" (2.14.1).
+            'if [ "$1" = "list" ]; then echo \'Could not find service\' >&2; exit 113; fi\n'
+            'exit 0\n')
+        not_loaded.chmod(0o755)
+
+        r = self.sched("status")
+
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("✅", r.stdout,
+                         "must not show a checkmark when launchctl list fails")
+        self.assertIn("not loaded", (r.stdout + r.stderr).lower())
+        # Still distinguishable from "nothing installed at all".
+        self.assertNotIn("Not scheduled", r.stdout)
+
+    def test_third_party_cron_line_survives_migration(self):
+        """An unanchored `grep -v cleaner.py` would also strip a user's own
+        `db-cleaner.py` cron job. Only MacCleaner's own line may be touched
+        (finding I6)."""
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n"
+            "0 3 * * * /Users/x/bin/db-cleaner.py\n")
+        r = self.sched("weekly")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        remaining = self.crontab_file.read_text()
+        self.assertIn("db-cleaner.py", remaining,
+                     "a third-party cron job must survive migration")
+        self.assertNotIn("mac-cleaner/cleaner.py", remaining)
+
+    def test_third_party_cron_line_survives_remove(self):
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n"
+            "0 3 * * * /Users/x/bin/db-cleaner.py\n")
+        r = self.sched("remove")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        remaining = self.crontab_file.read_text()
+        self.assertIn("db-cleaner.py", remaining,
+                     "a third-party cron job must survive remove")
+        self.assertNotIn("mac-cleaner/cleaner.py", remaining)
+
+    def test_status_ignores_third_party_cleaner_script(self):
+        self.crontab_file.write_text("0 3 * * * /Users/x/bin/db-cleaner.py\n")
+        r = self.sched("status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("legacy cron entry", (r.stdout + r.stderr).lower())
+
+
+class TestScheduleSubcommand(unittest.TestCase):
+    """`cleaner.py schedule ...` against a fully sandboxed environment.
+    Never touches the real crontab, agents, or launchd."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.agents = self.tmp / "LaunchAgents"
+        self.agents.mkdir()
+        self.bindir = self.tmp / "bin"
+        self.bindir.mkdir()
+        self.crontab_file = self.tmp / "crontab.txt"
+        self.crontab_file.write_text("")
+        self.loaded_flag = self.tmp / "loaded"   # exists => launchctl list succeeds
+        self.loaded_flag.write_text("")
+        launchctl = self.bindir / "launchctl"
+        launchctl.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = "list" ]; then [ -e "$LOADED_FLAG" ] && exit 0 || exit 1; fi\n'
+            'exit 0\n')
+        launchctl.chmod(0o755)
+        crontab = self.bindir / "crontab"
+        crontab.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = "-l" ]; then cat "$CRONTAB_FILE"; exit 0; fi\n'
+            'if [ -z "$1" ] || [ "$1" = "-" ]; then cat > "$CRONTAB_FILE"; fi\n'
+            'exit 0\n')
+        crontab.chmod(0o755)
+        self.env = {**os.environ,
+                    "PATH": f"{self.bindir}:{os.environ['PATH']}",
+                    "HOME": str(self.tmp),
+                    "MACCLEANER_LAUNCH_AGENTS_DIR": str(self.agents),
+                    "MACCLEANER_CONFIG": str(self.tmp / "config.json"),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_ALERTS": str(self.tmp / "alerts.json"),
+                    "CRONTAB_FILE": str(self.crontab_file),
+                    "LOADED_FLAG": str(self.loaded_flag)}
+        (self.tmp / "config.json").write_text("{}")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"), *args],
+                              capture_output=True, text=True, env=self.env, timeout=60)
+
+    def status_json(self):
+        r = self.run_cli("schedule", "status", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def plist(self, label):
+        return self.agents / f"com.fullex.maccleaner.{label}.plist"
+
+    # ── status shapes ──────────────────────────────────────────────────────
+
+    def test_status_empty(self):
+        d = self.status_json()
+        self.assertIsNone(d["schedule"])
+        self.assertEqual(d["agents"], [])
+        self.assertFalse(d["legacy_cron"])
+
+    def test_status_after_weekly_install(self):
+        r = self.run_cli("schedule", "weekly", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = self.status_json()
+        self.assertEqual(d["schedule"], "weekly")
+        labels = {a["label"]: a for a in d["agents"]}
+        self.assertEqual(set(labels), {"com.fullex.maccleaner.clean",
+                                       "com.fullex.maccleaner.diskwatch"})
+        for a in labels.values():
+            self.assertTrue(a["plist_present"])
+            self.assertTrue(a["loaded"])
+
+    def test_status_monthly(self):
+        self.run_cli("schedule", "monthly", "--json")
+        self.assertEqual(self.status_json()["schedule"], "monthly")
+
+    def test_status_present_but_not_loaded(self):
+        self.run_cli("schedule", "weekly", "--json")
+        self.loaded_flag.unlink()          # launchctl list now exits 1
+        d = self.status_json()
+        self.assertEqual(d["schedule"], "weekly")
+        for a in d["agents"]:
+            self.assertTrue(a["plist_present"])
+            self.assertFalse(a["loaded"])
+
+    def test_status_reports_legacy_cron(self):
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        d = self.status_json()
+        self.assertTrue(d["legacy_cron"])
+        # status is read-only: the cron line must survive
+        self.assertIn("mac-cleaner/cleaner.py", self.crontab_file.read_text())
+        self.assertEqual(list(self.agents.glob("*.plist")), [])
+
+    # ── install ────────────────────────────────────────────────────────────
+
+    def test_install_writes_valid_plists(self):
+        self.run_cli("schedule", "weekly", "--json")
+        for label in ("clean", "diskwatch"):
+            lint = subprocess.run(["plutil", "-lint", str(self.plist(label))],
+                                  capture_output=True, text=True)
+            self.assertEqual(lint.returncode, 0, lint.stdout + lint.stderr)
+
+    def test_plists_are_mode_644(self):
+        """tempfile.mkstemp creates 0600 and os.replace preserves it — every
+        real plist in ~/Library/LaunchAgents (including MacCleaner's own
+        live agents) is 0644, so the atomic-write path must restore that
+        mode before the swap."""
+        self.run_cli("schedule", "weekly", "--json")
+        for label in ("clean", "diskwatch"):
+            mode = oct(self.plist(label).stat().st_mode & 0o777)
+            self.assertEqual(mode, oct(0o644), f"{label} plist has mode {mode}, expected 0o644")
+
+    def test_venv_shaped_python3_first_on_path_is_not_used_in_plist(self):
+        """Reproduces the real hazard end-to-end through `schedule weekly`:
+        a venv-shaped python3 placed first on PATH (as an activated venv
+        would do) must never be embedded in the plist. Either the real
+        stable/base interpreter is used instead, or installation refuses
+        outright — but the venv path itself must never be written."""
+        fake_python = self.bindir / "python3"
+        fake_python.write_text("#!/bin/sh\necho fake\n")
+        fake_python.chmod(0o755)
+        (self.tmp / "pyvenv.cfg").write_text("home = /usr/bin\n")
+
+        r = self.run_cli("schedule", "weekly", "--json")
+        if r.returncode == 0:
+            import plistlib
+            with open(self.plist("clean"), "rb") as f:
+                p = plistlib.load(f)
+            interpreter = p["ProgramArguments"][0]
+            self.assertNotEqual(interpreter, str(fake_python),
+                                "venv-shaped python3 must never be embedded in the plist")
+            self.assertFalse(cleaner._is_venv_interpreter(interpreter))
+        else:
+            # No usable non-venv interpreter was found anywhere -- refusing
+            # outright is correct too, as long as nothing was written.
+            self.assertFalse(self.plist("clean").exists())
+            self.assertIn("virtualenv", r.stderr.lower())
+
+    def test_clean_plist_content(self):
+        self.run_cli("schedule", "weekly", "--json")
+        import plistlib
+        with open(self.plist("clean"), "rb") as f:
+            p = plistlib.load(f)
+        self.assertEqual(p["Label"], "com.fullex.maccleaner.clean")
+        self.assertIn("--notify", p["ProgramArguments"])
+        self.assertEqual(p["StartCalendarInterval"]["Weekday"], 1)
+        self.assertEqual(p["StartCalendarInterval"]["Hour"], 9)
+        self.assertIn("/opt/homebrew/bin", p["EnvironmentVariables"]["PATH"])
+        # The interpreter must be the stable, unversioned `python3` that
+        # shutil.which() resolves — not a version-pinned Homebrew path like
+        # .../python@3.14/bin/python3.14, which brew-autoremove can delete
+        # out from under a scheduled agent (finding: fragile interpreter
+        # path). Derive the expectation from shutil.which() so this stays
+        # correct on any machine, rather than hardcoding a path.
+        expected = shutil.which("python3")
+        self.assertIsNotNone(expected, "test host must have python3 on PATH")
+        interpreter = p["ProgramArguments"][0]
+        self.assertEqual(interpreter, expected)
+        self.assertTrue(Path(interpreter).exists())
+        self.assertNotRegex(interpreter, r"python@\d+\.\d+",
+                            "must not be a version-pinned Homebrew formula path")
+        self.assertNotRegex(Path(interpreter).name, r"^python\d+\.\d+$",
+                            "must not be a version-suffixed binary like python3.14")
+        self.assertIn("cleaner.py", p["ProgramArguments"][1])
+
+    def test_monthly_uses_day_not_weekday(self):
+        self.run_cli("schedule", "monthly", "--json")
+        import plistlib
+        with open(self.plist("clean"), "rb") as f:
+            p = plistlib.load(f)
+        self.assertEqual(p["StartCalendarInterval"]["Day"], 1)
+        self.assertNotIn("Weekday", p["StartCalendarInterval"])
+
+    def test_diskwatch_plist_content(self):
+        self.run_cli("schedule", "weekly", "--json")
+        import plistlib
+        with open(self.plist("diskwatch"), "rb") as f:
+            p = plistlib.load(f)
+        self.assertEqual(p["StartInterval"], 3600)
+        self.assertIn("disk-check", p["ProgramArguments"])
+
+    def test_reinstall_replaces(self):
+        self.run_cli("schedule", "weekly", "--json")
+        self.run_cli("schedule", "monthly", "--json")
+        self.assertEqual(self.status_json()["schedule"], "monthly")
+        self.assertEqual(len(list(self.agents.glob("*.plist"))), 2)
+
+    def test_install_json_shape(self):
+        r = self.run_cli("schedule", "weekly", "--json")
+        d = json.loads(r.stdout)
+        self.assertEqual(d["schedule"], "weekly")
+        self.assertFalse(d["migrated_cron"])
+
+    # ── cron migration ─────────────────────────────────────────────────────
+
+    def test_install_migrates_cron(self):
+        self.crontab_file.write_text(
+            "0 9 1 * * /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n"
+            "0 3 * * * /Users/x/bin/db-cleaner.py\n")
+        r = self.run_cli("schedule", "weekly", "--json")
+        d = json.loads(r.stdout)
+        self.assertTrue(d["migrated_cron"])
+        self.assertEqual(d["schedule"], "weekly",
+                         "explicitly requested cadence wins over the detected one")
+        remaining = self.crontab_file.read_text()
+        self.assertNotIn("mac-cleaner/cleaner.py", remaining)
+        self.assertIn("db-cleaner.py", remaining, "unrelated cron lines survive")
+
+    def test_migration_reports_detected_cadence_on_stderr(self):
+        self.crontab_file.write_text(
+            "0 9 1 * * /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        r = self.run_cli("schedule", "weekly", "--json")
+        self.assertIn("monthly", r.stderr, "detected cadence is reported for visibility")
+
+    def test_crontab_write_failure_does_not_claim_migration(self):
+        """`crontab -` exiting non-zero must not be reported as a successful
+        migration — the old code only checked for a raised exception, so a
+        clean non-zero exit slipped through as `migrated_cron: true` with the
+        cron line still present on the real crontab."""
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        crontab = self.bindir / "crontab"
+        crontab.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = "-l" ]; then cat "$CRONTAB_FILE"; exit 0; fi\n'
+            'if [ -z "$1" ] || [ "$1" = "-" ]; then cat > /dev/null; echo "write failed" >&2; exit 1; fi\n'
+            'exit 0\n')
+        crontab.chmod(0o755)
+        r = self.run_cli("schedule", "weekly", "--json")
+        d = json.loads(r.stdout)
+        self.assertFalse(d["migrated_cron"], "a failed crontab write must not be reported as migrated")
+        self.assertIn("Could not rewrite crontab", r.stderr)
+        # The original line is untouched, since our stub crontab never wrote it.
+        self.assertIn("mac-cleaner/cleaner.py", self.crontab_file.read_text())
+
+    def test_off_crontab_write_failure_warns(self):
+        self.run_cli("schedule", "weekly", "--json")
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        crontab = self.bindir / "crontab"
+        crontab.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = "-l" ]; then cat "$CRONTAB_FILE"; exit 0; fi\n'
+            'if [ -z "$1" ] || [ "$1" = "-" ]; then cat > /dev/null; echo "write failed" >&2; exit 1; fi\n'
+            'exit 0\n')
+        crontab.chmod(0o755)
+        r = self.run_cli("schedule", "off", "--json")
+        self.assertEqual(r.returncode, 0, "off still succeeds at removing the agents")
+        self.assertIn("Could not rewrite crontab", r.stderr)
+
+    # ── off ────────────────────────────────────────────────────────────────
+
+    def test_off_removes_everything(self):
+        self.run_cli("schedule", "weekly", "--json")
+        self.crontab_file.write_text(
+            "0 9 * * 1 /usr/bin/python3 /Users/x/mac-cleaner/cleaner.py --clean --yes\n")
+        r = self.run_cli("schedule", "off", "--json")
+        self.assertEqual(r.returncode, 0)
+        d = json.loads(r.stdout)
+        self.assertTrue(d["removed"])
+        self.assertEqual(list(self.agents.glob("*.plist")), [])
+        self.assertNotIn("mac-cleaner", self.crontab_file.read_text())
+
+    def test_off_when_nothing_installed_is_success(self):
+        r = self.run_cli("schedule", "off", "--json")
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(json.loads(r.stdout)["removed"])
+
+    # ── failure propagation ────────────────────────────────────────────────
+
+    def test_failed_load_exits_1_but_writes_plists(self):
+        bad = self.bindir / "launchctl"
+        bad.write_text('#!/bin/sh\necho "Load failed: 5: I/O error" >&2\nexit 1\n')
+        r = self.run_cli("schedule", "weekly")
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("✅ Scheduled", r.stdout)
+        self.assertIn("I/O error", r.stderr, "real launchctl stderr surfaces")
+        self.assertTrue(self.plist("clean").exists(),
+                        "plist still written so manual loading works")
+
+    def test_failed_load_prints_retry_hint(self):
+        """On a failed install, each warning must be followed by a concrete
+        retry suggestion (ported from the bash scheduler.sh, which told the
+        user to fix the issue and run ./scheduler.sh <kind> again)."""
+        bad = self.bindir / "launchctl"
+        bad.write_text('#!/bin/sh\necho "Load failed: 5: I/O error" >&2\nexit 1\n')
+        r = self.run_cli("schedule", "weekly")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("fix the issue above, then run ./scheduler.sh weekly again", r.stderr)
+
+    # ── doctor shares schedule state ─────────────────────────────────────
+
+    def test_doctor_uses_sandboxed_schedule_state(self):
+        self.run_cli("schedule", "weekly", "--json")
+        r = self.run_cli("doctor", "--json")
+        d = json.loads(r.stdout)
+        sched = next(c for c in d["checks"] if c["name"] == "Schedule")
+        self.assertIn("com.fullex.maccleaner.clean", sched["status"])
+
+    def test_doctor_flags_agent_with_missing_interpreter(self):
+        """A plist can stay 'loaded' per launchctl forever even after the
+        interpreter it points at is deleted (e.g. brew-autoremove evicting a
+        version-pinned python@X.Y). Nothing else would ever catch this, so
+        doctor must check the ProgramArguments paths directly."""
+        self.run_cli("schedule", "weekly", "--json")
+        import plistlib
+        clean_plist = self.plist("clean")
+        with open(clean_plist, "rb") as f:
+            p = plistlib.load(f)
+        missing_interpreter = str(self.tmp / "gone" / "python3")
+        p["ProgramArguments"][0] = missing_interpreter
+        with open(clean_plist, "wb") as f:
+            plistlib.dump(p, f)
+        r = self.run_cli("doctor", "--json")
+        d = json.loads(r.stdout)
+        paths = next((c for c in d["checks"] if c["name"] == "Schedule paths"), None)
+        self.assertIsNotNone(paths, "doctor must report a Schedule paths check")
+        self.assertFalse(paths["ok"])
+        self.assertIn(missing_interpreter, paths["status"])
+        self.assertIn("com.fullex.maccleaner.clean", paths["status"])
+
+    def test_doctor_flags_agent_with_missing_engine(self):
+        """Same as the missing-interpreter case above, but for
+        ProgramArguments[1] (the engine script) — a plist can also outlive
+        the cleaner.py it points at, e.g. if the repo checkout it was
+        installed from moved or was deleted."""
+        self.run_cli("schedule", "weekly", "--json")
+        import plistlib
+        clean_plist = self.plist("clean")
+        with open(clean_plist, "rb") as f:
+            p = plistlib.load(f)
+        missing_engine = str(self.tmp / "gone" / "cleaner.py")
+        p["ProgramArguments"][1] = missing_engine
+        with open(clean_plist, "wb") as f:
+            plistlib.dump(p, f)
+        r = self.run_cli("doctor", "--json")
+        d = json.loads(r.stdout)
+        paths = next((c for c in d["checks"] if c["name"] == "Schedule paths"), None)
+        self.assertIsNotNone(paths, "doctor must report a Schedule paths check")
+        self.assertFalse(paths["ok"])
+        self.assertIn(missing_engine, paths["status"])
+        self.assertIn("com.fullex.maccleaner.clean", paths["status"])
+        self.assertIn("engine", paths["status"])
+
+    def test_doctor_schedule_paths_absent_when_everything_exists(self):
+        self.run_cli("schedule", "weekly", "--json")
+        r = self.run_cli("doctor", "--json")
+        d = json.loads(r.stdout)
+        paths = next((c for c in d["checks"] if c["name"] == "Schedule paths"), None)
+        self.assertIsNone(paths, "no Schedule paths check should be emitted when nothing's missing")
+
+
+class TestAgentPython(unittest.TestCase):
+    """_agent_python() picks the interpreter embedded in scheduled agents'
+    plists — must prefer the stable `python3` on PATH over the (possibly
+    version-pinned) running interpreter, and must never fall back to a
+    virtualenv interpreter."""
+
+    def test_prefers_stable_python3_on_path(self):
+        with mock.patch("cleaner.shutil.which", return_value="/usr/bin/python3"):
+            self.assertEqual(cleaner._agent_python(), "/usr/bin/python3")
+
+    def test_falls_back_to_sys_executable_when_not_a_venv(self):
+        with mock.patch("cleaner.shutil.which", return_value=None), \
+             mock.patch.object(cleaner.sys, "prefix", "/usr"), \
+             mock.patch.object(cleaner.sys, "base_prefix", "/usr"):
+            self.assertEqual(cleaner._agent_python(), sys.executable)
+
+    def test_refuses_venv_interpreter_when_no_stable_python3(self):
+        with mock.patch("cleaner.shutil.which", return_value=None), \
+             mock.patch.object(cleaner.sys, "prefix", "/Users/x/project/.venv"), \
+             mock.patch.object(cleaner.sys, "base_prefix", "/usr"):
+            with self.assertRaises(RuntimeError):
+                cleaner._agent_python()
+
+    def test_rejects_venv_shaped_interpreter_first_on_path(self):
+        """Reproduces the real hazard, not just the unreachable fallback
+        branch: activating a venv puts its bin/ first on PATH, so
+        shutil.which('python3') resolves the venv interpreter *directly* —
+        the old code only checked for a venv on the fallback branch, so this
+        candidate sailed through unchecked and got baked into both plists.
+        Build a venv-shaped fixture (bin/python3 + a sibling pyvenv.cfg)
+        instead of a real venv, so this stays fast and hermetic."""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            venv_python = tmp / "myproject" / ".venv" / "bin" / "python3"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("#!/bin/sh\n")
+            venv_python.chmod(0o755)
+            (venv_python.parent.parent / "pyvenv.cfg").write_text("home = /usr/bin\n")
+
+            base_python = tmp / "base" / "bin" / "python3"
+            base_python.parent.mkdir(parents=True)
+            base_python.write_text("#!/bin/sh\n")
+            base_python.chmod(0o755)
+
+            # Empty the well-known-locations list so this test exercises the
+            # sys.base_prefix fallback specifically; the real ordering (stable
+            # locations first) is covered by
+            # test_prefers_stable_location_over_versioned_base_prefix.
+            with mock.patch("cleaner.shutil.which", return_value=str(venv_python)), \
+                 mock.patch.object(cleaner, "STABLE_PYTHON_CANDIDATES", ()), \
+                 mock.patch.object(cleaner.sys, "base_prefix", str(tmp / "base")):
+                result = cleaner._agent_python()
+
+            self.assertEqual(result, str(base_python))
+            self.assertNotIn(".venv", result)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_raises_when_path_python3_is_venv_and_no_base_fallback(self):
+        """When PATH's python3 is a venv AND sys.base_prefix has no usable
+        python3 either, refuse outright rather than silently falling through
+        to something else."""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            venv_python = tmp / ".venv" / "bin" / "python3"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("#!/bin/sh\n")
+            venv_python.chmod(0o755)
+            (venv_python.parent.parent / "pyvenv.cfg").write_text("home = /usr/bin\n")
+
+            with mock.patch("cleaner.shutil.which", return_value=str(venv_python)), \
+                 mock.patch.object(cleaner, "STABLE_PYTHON_CANDIDATES", ()), \
+                 mock.patch.object(cleaner.sys, "base_prefix", str(tmp / "nonexistent")):
+                with self.assertRaises(RuntimeError):
+                    cleaner._agent_python()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_prefers_stable_location_over_versioned_base_prefix(self):
+        """A venv created from Homebrew python has a *version-pinned*
+        sys.base_prefix (…/python@3.14/Frameworks/…/3.14/bin/python3), so
+        falling straight back to it would trade the venv hazard for the
+        brew-autoremove one this function exists to avoid. A stable
+        unversioned location must win."""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            venv_python = tmp / ".venv" / "bin" / "python3"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("#!/bin/sh\n")
+            (venv_python.parent.parent / "pyvenv.cfg").write_text("home = /usr/bin\n")
+
+            stable = tmp / "stable" / "bin" / "python3"
+            stable.parent.mkdir(parents=True)
+            stable.write_text("#!/bin/sh\n")
+
+            versioned_base = tmp / "python@3.14" / "bin" / "python3"
+            versioned_base.parent.mkdir(parents=True)
+            versioned_base.write_text("#!/bin/sh\n")
+
+            with mock.patch("cleaner.shutil.which", return_value=str(venv_python)), \
+                 mock.patch.object(cleaner, "STABLE_PYTHON_CANDIDATES", (str(stable),)), \
+                 mock.patch.object(cleaner.sys, "base_prefix", str(tmp / "python@3.14")):
+                result = cleaner._agent_python()
+
+            self.assertEqual(result, str(stable))
+            self.assertNotIn("python@", result)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_is_venv_interpreter_detects_pyvenv_cfg_sibling(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            venv_python = tmp / ".venv" / "bin" / "python3"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("#!/bin/sh\n")
+            self.assertFalse(cleaner._is_venv_interpreter(str(venv_python)))
+            (venv_python.parent.parent / "pyvenv.cfg").write_text("home = /usr/bin\n")
+            self.assertTrue(cleaner._is_venv_interpreter(str(venv_python)))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestCategoryMigration(unittest.TestCase):
+    def _load_with(self, cfg_dict):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "config.json"
+            p.write_text(json.dumps(cfg_dict))
+            with mock.patch.object(cleaner, "CONFIG_PATH", p):
+                return cleaner.load_config()
+
+    def test_new_categories_auto_enable_for_pre25_config(self):
+        cfg = self._load_with({"enabled_categories": list(cleaner.V24_CATEGORIES)})
+        self.assertIn("tmp", cfg["enabled_categories"])
+        self.assertIn("simulators", cfg["enabled_categories"])
+        self.assertEqual(cfg["known_categories"], list(cleaner.ALL_CATEGORIES))
+
+    def test_user_disabled_category_stays_disabled(self):
+        old = [c for c in cleaner.V24_CATEGORIES if c != "docker"]
+        cfg = self._load_with({"enabled_categories": old})
+        self.assertNotIn("docker", cfg["enabled_categories"])
+        self.assertIn("tmp", cfg["enabled_categories"])
+
+    def test_known_categories_respected_once_written(self):
+        cfg = self._load_with({
+            "enabled_categories": ["node"],
+            "known_categories": list(cleaner.ALL_CATEGORIES),
+        })
+        # tmp/simulators already known -> a user who disabled them stays disabled
+        self.assertNotIn("tmp", cfg["enabled_categories"])
+
+    def test_new_config_keys_default(self):
+        cfg = self._load_with({"enabled_categories": []})
+        # 1 since 2.15.0 (was 3): tmp targets are review-only, so the age
+        # gate only needs to shield an ACTIVE task's workspace.
+        self.assertEqual(cfg["tmp_min_age_days"], 1)
+        self.assertEqual(cfg["simulator_stale_days"], 30)
+
+    def test_fresh_install_disable_survives_reload(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "config.json"
+            with mock.patch.object(cleaner, "CONFIG_PATH", p):
+                cfg = cleaner.load_config()          # no file on disk
+                cfg["enabled_categories"].remove("tmp")
+                cleaner.save_config(cfg)
+                cfg2 = cleaner.load_config()
+        self.assertNotIn("tmp", cfg2["enabled_categories"])
+        self.assertIn("known_categories", cfg2)
+
+    def test_leftovers_category_present(self):
+        self.assertIn("leftovers", cleaner.ALL_CATEGORIES)
+
+    def test_leftovers_auto_enabled_for_pre27_config(self):
+        cfg = self._load_with({"enabled_categories": list(cleaner.ALL_CATEGORIES[:-1]),
+                                "known_categories": cleaner.ALL_CATEGORIES[:-1]})
+        self.assertIn("leftovers", cfg["enabled_categories"])
+
+
+class TestCompletions(unittest.TestCase):
+    """The completion files are hand-written, so they can drift from the
+    parser silently. This test is the tripwire: adding a subcommand or flag
+    without updating both completion files fails the suite."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.zsh = (REPO / "completions" / "_maccleaner").read_text()
+        cls.bash = (REPO / "completions" / "maccleaner.bash").read_text()
+        cls.parser = cleaner.build_parser()
+
+    def _subparser_action(self):
+        import argparse
+        for action in self.parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                return action
+        self.fail("no subparsers found in build_parser()")
+
+    def test_every_subcommand_in_both_files(self):
+        for name in self._subparser_action().choices:
+            self.assertIn(name, self.zsh, f"zsh completion missing subcommand {name}")
+            self.assertIn(name, self.bash, f"bash completion missing subcommand {name}")
+
+    def test_every_flag_in_both_files(self):
+        missing = []
+        for name, sub in self._subparser_action().choices.items():
+            for action in sub._actions:
+                for flag in action.option_strings:
+                    if flag in ("-h", "--help"):
+                        continue
+                    if flag not in self.zsh:
+                        missing.append(f"zsh: {name} {flag}")
+                    if flag not in self.bash:
+                        missing.append(f"bash: {name} {flag}")
+        self.assertEqual(missing, [], "completion files are stale:\n" + "\n".join(missing))
+
+    def test_schedule_actions_present(self):
+        """schedule's positional choices are values, not flags — easy to miss."""
+        for action in self._subparser_action().choices["schedule"]._actions:
+            if action.dest == "action":
+                for choice in action.choices:
+                    self.assertIn(choice, self.zsh, f"zsh missing schedule {choice}")
+                    self.assertIn(choice, self.bash, f"bash missing schedule {choice}")
+                return
+        self.fail("schedule subparser has no 'action' positional")
+
+    def test_config_subcommands_present(self):
+        for action in self._subparser_action().choices["config"]._actions:
+            if action.choices and "show" in action.choices:
+                for choice in action.choices:
+                    self.assertIn(choice, self.zsh, f"zsh missing config {choice}")
+                    self.assertIn(choice, self.bash, f"bash missing config {choice}")
+                return
+        self.fail("config subparser has no sub-subparsers")
+
+
+class TestConfigPathResolution(unittest.TestCase):
+    def test_env_override_wins(self):
+        with mock.patch.dict(os.environ, {"MACCLEANER_CONFIG": "/x/y/config.json"}):
+            p = cleaner._resolve_state_path("MACCLEANER_CONFIG", "config.json")
+        self.assertEqual(p, Path("/x/y/config.json"))
+
+    def test_bundle_resident_engine_routes_to_app_support(self):
+        bundle_dir = Path("/Applications/MacCleaner.app/Contents/Resources")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MACCLEANER_CONFIG", None)
+            p = cleaner._resolve_state_path("MACCLEANER_CONFIG", "config.json",
+                                            script_dir=bundle_dir)
+        self.assertEqual(
+            p, cleaner.HOME / "Library/Application Support/MacCleaner/config.json")
+
+
+class TestConfigPathBundleFallback(unittest.TestCase):
+    """F6: CONFIG_PATH has one rule beyond the shared _resolve_state_path
+    logic every other state file (report.log/snapshots.log/alerts.json)
+    uses -- an EXISTING sibling config.json wins even when the script
+    directory isn't writable, so a shared/admin-owned install (e.g.
+    /opt/mac-cleaner, owned by an admin, readable but not writable by this
+    user) keeps reading its shared config instead of silently falling back
+    to a fresh per-user Application Support default. That fallback was a
+    regression vs 2.4 behavior for exactly this case. These run the real
+    CLI as a subprocess against a copy of cleaner.py placed at each of the
+    three script-dir shapes, since CONFIG_PATH is computed once at import
+    time from Path(__file__).parent and can't be poked via mock.patch on
+    an already-running process."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _engine_copy(self, dest_dir):
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        engine = dest_dir / "cleaner.py"
+        shutil.copy(REPO / "cleaner.py", engine)
+        return engine
+
+    def run_config_path(self, engine):
+        env = {**os.environ, "HOME": str(self.home)}
+        env.pop("MACCLEANER_CONFIG", None)
+        return subprocess.run([sys.executable, str(engine), "config", "path"],
+                              capture_output=True, text=True, env=env, timeout=60)
+
+    def test_bundle_resident_engine_routes_to_app_support(self):
+        engine = self._engine_copy(self.tmp / "Fake.app" / "Contents" / "Resources")
+        r = self.run_config_path(engine)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        expected = self.home / "Library/Application Support/MacCleaner/config.json"
+        self.assertEqual(r.stdout.strip(), str(expected))
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                      "root bypasses directory write-permission checks")
+    def test_readonly_dir_with_existing_sibling_config_uses_sibling(self):
+        engine_dir = self.tmp / "opt-install"
+        engine = self._engine_copy(engine_dir)
+        sibling_cfg = engine_dir / "config.json"
+        sibling_cfg.write_text("{}")
+        os.chmod(engine_dir, 0o555)
+        try:
+            r = self.run_config_path(engine)
+        finally:
+            os.chmod(engine_dir, 0o755)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), str(sibling_cfg))
+
+    def test_writable_dir_no_sibling_uses_sibling_path(self):
+        # Beside-script remains the default for a writable non-bundle dir
+        # with no pre-existing config (the ~/mac-cleaner fresh-install
+        # case) -- today's behavior is kept.
+        engine_dir = self.tmp / "mac-cleaner"
+        engine = self._engine_copy(engine_dir)
+        r = self.run_config_path(engine)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), str(engine_dir / "config.json"))
+
+
+class TestTmpScanner(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self._patch = mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root)
+        self._patch.start()
+        self.cfg = {"tmp_min_age_days": 3}
+
+    def tearDown(self):
+        self._patch.stop()
+        self.td.cleanup()
+
+    def _age(self, p, days=5):
+        old = time.time() - days * 86400
+        os.utime(p, (old, old))
+
+    def _derived(self, name):
+        d = self.root / name
+        (d / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        self._age(d)
+        return d
+
+    def _repo_clone(self, name):
+        d = self.root / name
+        (d / ".git").mkdir(parents=True)
+        (d / "package.json").write_text("{}")
+        (d / "node_modules").mkdir()
+        self._age(d)
+        return d
+
+    def test_derived_data_layout_classified(self):
+        self._derived("SomethingDerivedData")
+        hits = cleaner.scan_tmp_artifacts(self.cfg)
+        self.assertEqual([h["kind"] for h in hits], ["derived-data"])
+
+    def test_xcactivitylog_layout_classified(self):
+        d = self.root / "build-logs"
+        (d / "Logs" / "Build").mkdir(parents=True)
+        (d / "Logs" / "Build" / "1.xcactivitylog").write_bytes(b"x")
+        self._age(d)
+        self.assertEqual(cleaner._classify_tmp_dir(d), "derived-data")
+
+    def test_repo_clone_classified(self):
+        self._repo_clone("myproj-session-42")
+        hits = cleaner.scan_tmp_artifacts(self.cfg)
+        self.assertEqual([h["kind"] for h in hits], ["repo-clone"])
+
+    def test_plain_dir_not_classified(self):
+        d = self.root / "innocent"; d.mkdir(); self._age(d)
+        self.assertEqual(cleaner.scan_tmp_artifacts(self.cfg), [])
+
+    def test_git_without_build_artifacts_not_classified(self):
+        d = self.root / "clean-checkout"
+        (d / ".git").mkdir(parents=True)
+        (d / "package.json").write_text("{}")
+        self._age(d)
+        self.assertEqual(cleaner.scan_tmp_artifacts(self.cfg), [])
+
+    def test_young_dir_skipped(self):
+        self._derived("fresh")  # then reset mtime to now
+        os.utime(self.root / "fresh", None)
+        self.assertEqual(cleaner.scan_tmp_artifacts(self.cfg), [])
+
+    def test_symlink_skipped(self):
+        real = self._derived("real-dd")
+        (self.root / "sneaky-link").symlink_to(real)
+        hits = cleaner.scan_tmp_artifacts(self.cfg)
+        self.assertEqual([h["path"].name for h in hits], ["real-dd"])
+
+    def test_claude_session_dirs_skipped(self):
+        d = self.root / "claude-501"
+        (d / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        self._age(d)
+        self.assertEqual(cleaner.scan_tmp_artifacts(self.cfg), [])
+
+    def test_skip_paths_excludes_matching_dir(self):
+        # AGENTS.md documents skip_paths as "never touch" -- the tmp scanner
+        # must honor it exactly like the static get_targets()/add() path
+        # already does (finding F1). Uses an expanduser-style ~ prefix, same
+        # shape as add()'s skip logic, to exercise the expansion too.
+        skipped = self._derived("skip-me")
+        kept = self._derived("keep-me")
+        cfg = dict(self.cfg, skip_paths=[str(skipped)])
+        hits = cleaner.scan_tmp_artifacts(cfg)
+        self.assertEqual([h["path"].name for h in hits], ["keep-me"])
+        self.assertTrue(kept.exists())
+
+    def test_targets_are_review_only_with_marker_and_unique_ids(self):
+        self._derived("foo-bar"); self._repo_clone("foo_bar")  # slugify collision
+        targets = cleaner.tmp_to_targets(cleaner.scan_tmp_artifacts(self.cfg))
+        self.assertEqual(len(targets), 2)
+        self.assertTrue(all(t["safe"] is False for t in targets))
+        self.assertTrue(all(t["tmp_scan"] for t in targets))
+        self.assertTrue(all(t["category"] == "tmp" for t in targets))
+        self.assertTrue(all(not t["empty_only"] for t in targets),
+                        "tmp targets delete the whole dir, never empty_only")
+        self.assertEqual(len({t["id"] for t in targets}), 2)
+
+
+class TestNestedTmpTargetsAreActuallyDeletable(unittest.TestCase):
+    """2.14.0 started offering a build tree nested one level inside a /tmp
+    workspace, but left `_tmp_scan_path_allowed` requiring a DIRECT child of
+    the scan root -- so every nested target it surfaced was discovered, sized,
+    shown to the user, and then refused at delete time with "outside home".
+    The feature reported reclaimable space it could never reclaim.
+
+    Whatever the scanner offers must be deletable; these two must not drift
+    apart again."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.root = Path(self.td.name)
+        self._p = mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self.td.cleanup()
+
+    def _nested_workspace(self, name="myrepo-task-abc"):
+        ws = self.root / name
+        (ws / "derived" / "Build").mkdir(parents=True)
+        (ws / "derived" / "Index.noindex").mkdir()
+        (ws / "derived" / "ModuleCache.noindex").mkdir()
+        (ws / "run.log").write_text("evidence worth keeping")
+        old = time.time() - 5 * 86400
+        for p in (ws, ws / "derived"):
+            os.utime(p, (old, old))
+        return ws
+
+    def test_every_offered_tmp_target_passes_the_carve_out(self):
+        self._nested_workspace()
+        targets = cleaner.tmp_to_targets(cleaner.scan_tmp_artifacts({"tmp_min_age_days": 3}))
+        self.assertTrue(targets, "the nested build tree must still be found")
+        for t in targets:
+            self.assertTrue(
+                cleaner._tmp_scan_path_allowed(t["path"]),
+                f"{t['id']} is offered to the user but would be refused at delete time")
+
+    def test_nested_build_tree_actually_deletes_and_siblings_survive(self):
+        ws = self._nested_workspace()
+        t = cleaner.tmp_to_targets(cleaner.scan_tmp_artifacts({"tmp_min_age_days": 3}))[0]
+        cleaner.delete_target(t, "rm")
+        self.assertFalse((ws / "derived").exists(), "the build tree should be gone")
+        self.assertTrue((ws / "run.log").exists(),
+                        "sibling logs are exactly what nesting the target was meant to preserve")
+
+    def test_three_levels_deep_is_still_refused(self):
+        """The carve-out widens by exactly one level, not to 'anywhere under
+        /tmp'. Nothing generates such a path today; this pins the boundary."""
+        deep = self.root / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+        self.assertFalse(cleaner._tmp_scan_path_allowed(deep))
+
+    def test_marker_is_still_required_for_a_nested_path(self):
+        """Widening the path rule must not weaken the second gate: a target
+        without the tmp_scan marker is still refused outside $HOME."""
+        ws = self._nested_workspace()
+        t = dict(cleaner.tmp_to_targets(cleaner.scan_tmp_artifacts({"tmp_min_age_days": 3}))[0])
+        t["tmp_scan"] = False
+        freed, status = cleaner.delete_target(t, "rm")
+        self.assertIn("refused", status)
+        self.assertTrue((ws / "derived").exists())
+
+
+class TestLaunchdLoadState(unittest.TestCase):
+    """`_launchd_is_loaded` returned a plain bool, so ANY launchctl failure
+    -- binary missing, no Aqua session, timeout -- became "not loaded". The
+    schedule then read as broken while both agents were running fine, and
+    the JSON told the app the same thing (2.14.1)."""
+
+    def _run(self, **kw):
+        with mock.patch.object(cleaner.subprocess, "run", **kw) as m:
+            return cleaner._launchd_is_loaded("com.fullex.maccleaner.clean"), m
+
+    def test_zero_exit_is_loaded(self):
+        state, _ = self._run(return_value=mock.Mock(returncode=0, stderr=""))
+        self.assertIs(state, True)
+
+    def test_service_not_found_is_definitively_not_loaded(self):
+        state, _ = self._run(return_value=mock.Mock(
+            returncode=113, stderr='Could not find service "x" in domain for port'))
+        self.assertIs(state, False)
+
+    def test_other_nonzero_is_unknown(self):
+        state, _ = self._run(return_value=mock.Mock(
+            returncode=112, stderr="Could not find domain for port"))
+        self.assertIsNone(state, "an unexplained launchctl failure is not proof of anything")
+
+    def test_missing_launchctl_is_unknown(self):
+        state, _ = self._run(side_effect=FileNotFoundError("launchctl"))
+        self.assertIsNone(state)
+
+    def test_timeout_is_unknown(self):
+        state, _ = self._run(side_effect=subprocess.TimeoutExpired("launchctl", 5))
+        self.assertIsNone(state)
+
+
+class TestScheduleStateLoadState(unittest.TestCase):
+    """JSON contract: `loaded` must stay a plain bool (the Swift app decodes
+    it as non-optional `Bool` in CleanerBridge.ScheduleAgent), so the
+    tri-state is exposed additively as `load_state`."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        d = Path(self.td.name)
+        for label in (cleaner.CLEAN_LABEL, cleaner.WATCH_LABEL):
+            (d / f"{label}.plist").write_bytes(b"<plist/>")
+        self._p = mock.patch.object(cleaner, "LAUNCH_AGENTS_DIR", d)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self.td.cleanup()
+
+    def _state(self, value):
+        with mock.patch.object(cleaner, "_launchd_is_loaded", return_value=value), \
+             mock.patch.object(cleaner, "_read_crontab", return_value=""):
+            return cleaner._schedule_state()
+
+    def test_unknown_keeps_loaded_false_but_flags_load_state(self):
+        agents = self._state(None)["agents"]
+        self.assertTrue(all(a["loaded"] is False for a in agents))
+        self.assertTrue(all(a["load_state"] == "unknown" for a in agents))
+
+    def test_loaded_and_not_loaded_map_to_load_state(self):
+        self.assertTrue(all(a["load_state"] == "loaded"
+                            for a in self._state(True)["agents"]))
+        self.assertTrue(all(a["load_state"] == "not_loaded"
+                            for a in self._state(False)["agents"]))
+        self.assertTrue(all(a["loaded"] is True for a in self._state(True)["agents"]))
+
+
+class TestTmpDeletionCarveOut(unittest.TestCase):
+    """The single, narrow exception to the home-only delete guarantee:
+    marker (tmp_scan=True, set only by tmp_to_targets) AND a path that is a
+    DIRECT child of TMP_SCAN_ROOT. Both are required; either alone refuses."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self._patch = mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self.td.cleanup()
+
+    def _tmp_target(self, path):
+        return {"id": "tmp-x", "category": "tmp", "label": "x", "description": "",
+                "path": path, "glob": None, "skip": [], "safe": False,
+                "cmd": None, "estimate_cmd": None, "estimate_parser": None,
+                "empty_only": False, "tmp_scan": True}
+
+    def test_marker_plus_tmp_child_is_deleted(self):
+        d = self.root / "junk"; (d / "Build").mkdir(parents=True)
+        (d / "Build" / "f").write_bytes(b"x" * 100)
+        freed, err = cleaner.delete_target(self._tmp_target(d))
+        self.assertIsNone(err)
+        self.assertFalse(d.exists())
+
+    def test_no_marker_refuses_tmp_path(self):
+        d = self.root / "junk2"; d.mkdir()
+        t = self._tmp_target(d); del t["tmp_scan"]
+        freed, err = cleaner.delete_target(t)
+        self.assertIn("refused", err or "")
+        self.assertTrue(d.exists())
+
+    def test_marker_with_non_tmp_path_refused(self):
+        with tempfile.TemporaryDirectory() as other:
+            d = Path(other) / "elsewhere"; d.mkdir()
+            freed, err = cleaner.delete_target(self._tmp_target(d))
+            self.assertIn("refused", err or "")
+            self.assertTrue(d.exists())
+
+    def test_marker_with_one_level_nested_path_allowed(self):
+        """DELIBERATELY REVERSED in 2.14.1. This previously asserted that a
+        nested path was refused. 2.14.0 began offering the build tree INSIDE
+        a workspace (/tmp/<repo>-<task-id>/derived) so the sibling logs
+        survive, but left this rule at direct-children-only -- so every
+        nested target it surfaced was refused at delete time and the feature
+        could not reclaim a byte. The carve-out now spans exactly two levels;
+        the marker requirement below is unchanged, and three levels is still
+        refused (test_three_levels_deep_is_still_refused)."""
+        d = self.root / "top" / "nested"; d.mkdir(parents=True)
+        freed, err = cleaner.delete_target(self._tmp_target(d))
+        self.assertIsNone(err)
+        self.assertFalse(d.exists())
+
+    def test_marker_with_two_levels_nested_path_refused(self):
+        d = self.root / "top" / "mid" / "nested"; d.mkdir(parents=True)
+        freed, err = cleaner.delete_target(self._tmp_target(d))
+        self.assertIn("refused", err or "")
+        self.assertTrue(d.exists())
+
+    def test_root_itself_refused(self):
+        # Pins the `rp != root` clause: a tmp_scan target whose path IS
+        # TMP_SCAN_ROOT itself (not a child of it) must never be deletable —
+        # otherwise a misconfigured/mis-scanned target could wipe /tmp itself.
+        freed, err = cleaner.delete_target(self._tmp_target(self.root))
+        self.assertIn("refused", err or "")
+        self.assertTrue(self.root.exists())
+
+    def test_symlink_child_pointing_outside_refused(self):
+        # The .resolve() in _tmp_scan_path_allowed must dereference symlinks:
+        # a symlink directly under TMP_SCAN_ROOT that points somewhere else
+        # (e.g. into $HOME) must not let that somewhere-else get deleted just
+        # because the symlink's own path looks like a direct child.
+        with tempfile.TemporaryDirectory() as other:
+            real_dir = Path(other) / "real-target"
+            real_dir.mkdir()
+            (real_dir / "f").write_bytes(b"x" * 100)
+            link = self.root / "escape-link"
+            link.symlink_to(real_dir)
+            freed, err = cleaner.delete_target(self._tmp_target(link))
+            self.assertIn("refused", err or "")
+            self.assertTrue(real_dir.exists())
+
+    def test_collect_targets_merges_tmp_when_enabled(self):
+        (self.root / "dd" / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        old = time.time() - 5 * 86400
+        os.utime(self.root / "dd", (old, old))
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        # This test is about tmp merging, not simulators -- DEFAULT_CONFIG
+        # enables "simulators" too, and collect_targets() would otherwise
+        # shell out to the real `xcrun simctl` on this machine (F4).
+        with mock.patch.object(cleaner, "scan_simulator_targets", return_value=[]):
+            targets = cleaner.collect_targets(cfg)
+            self.assertTrue(any(t.get("tmp_scan") for t in targets))
+            cfg["enabled_categories"] = ["node"]
+            targets = cleaner.collect_targets(cfg)
+            self.assertFalse(any(t.get("tmp_scan") for t in targets))
+
+    def test_collect_targets_respects_skip_paths(self):
+        # End-to-end version of F1: a skip-listed dir under TMP_SCAN_ROOT
+        # must never surface as a target via the same collect_targets() path
+        # scan/clean actually call, while an unrelated sibling still does.
+        skipped = self.root / "skip-me"
+        (skipped / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        old = time.time() - 5 * 86400
+        os.utime(skipped, (old, old))
+        kept = self.root / "keep-me"
+        (kept / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        os.utime(kept, (old, old))
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg["skip_paths"] = [str(skipped)]
+        with mock.patch.object(cleaner, "scan_simulator_targets", return_value=[]):
+            targets = cleaner.collect_targets(cfg)
+        tmp_ids = {t["id"] for t in targets if t.get("tmp_scan")}
+        self.assertNotIn("tmp-skip-me", tmp_ids)
+        self.assertIn("tmp-keep-me", tmp_ids)
+
+    def test_clean_yes_never_touches_tmp_targets(self):
+        # safe=False + auto_approve without explicit selection: run_clean
+        # must skip review targets, never delete them (adapted to the real
+        # run_clean signature at cleaner.py:980 — auto_approve/json_mode/
+        # explicit; LOG_PATH/SNAPSHOTS_PATH patched so this never touches the
+        # real report.log/snapshots.log next to cleaner.py).
+        d = self.root / "dd2"; (d / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        t = self._tmp_target(d)
+        t["size"] = 1
+        with tempfile.TemporaryDirectory() as state_dir:
+            with mock.patch.object(cleaner, "LOG_PATH", Path(state_dir) / "report.log"), \
+                 mock.patch.object(cleaner, "SNAPSHOTS_PATH", Path(state_dir) / "snapshots.log"), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                cleaner.run_clean([t], auto_approve=True, json_mode=True, explicit=False)
+        self.assertTrue(d.exists())
+
+    def test_dry_run_previews_tmp_target_correctly(self):
+        # run_dry_run has its own _safe_to_delete path-safety check, separate
+        # from delete_target's — it needs the same carve-out or dry-run
+        # misreports 0 bytes/no paths for a tmp target a real clean would
+        # actually delete (found while sanity-checking `clean --dry-run
+        # --targets <tmp-id>`; not in the original brief's step 3, but the
+        # same narrow marker+direct-child guard, just applied to the preview
+        # path instead of the delete path — dry-run deletes nothing either way).
+        d = self.root / "dd3"; (d / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        (d / "Build" / "Intermediates.noindex" / "f").write_bytes(b"x" * 4096)
+        t = self._tmp_target(d)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            total, items = cleaner.run_dry_run([t], json_mode=True)
+        self.assertGreater(total, 0)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["status"], "would-delete")
+        self.assertTrue(items[0]["paths"])
+        self.assertTrue(d.exists())  # dry-run must not delete anything
+
+
+SIMCTL_DEVICES = {"devices": {
+    # Real simctl UDIDs are full hex UUIDs (>=8 chars) -- _SIMCTL_UDID_RE
+    # requires that shape, so these use repeated-letter UUID-style values
+    # (still uniquely matched by the "AAA"/"BBB"/"CCC" substring assertions
+    # below) rather than the 3-char placeholders a real device would never have.
+    "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+        {"udid": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", "name": "iPhone 17 Pro",
+         "state": "Booted",
+         "lastBootedAt": "2026-08-09T00:00:00Z", "dataPath": "/dev/null"},
+        {"udid": "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB", "name": "iPhone Air",
+         "state": "Shutdown",
+         "lastBootedAt": "2026-01-01T00:00:00Z", "dataPath": "/dev/null"},
+    ],
+    "com.apple.CoreSimulator.SimRuntime.iOS-18-1": [
+        {"udid": "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC", "name": "old phone",
+         "state": "Shutdown",
+         "dataPath": "/dev/null"},  # no lastBootedAt -> falls back to dataPath mtime
+    ],
+}}
+SIMCTL_RUNTIMES = {"runtimes": [
+    {"identifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+     "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+     "state": "Ready", "sizeBytes": 5000000000},
+    {"identifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
+     "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
+     "state": "Ready", "sizeBytes": 6000000000},
+]}
+
+
+# Real `simctl runtime list -j` output from Xcode 26 (verified on a live
+# machine): a bare dict keyed by image UUID, where "identifier" is that UUID
+# and the com.apple.CoreSimulator.SimRuntime.* string lives in a SEPARATE
+# "runtimeIdentifier" field. SIMCTL_RUNTIMES above still models the older
+# shape where both fields carried the reverse-DNS string; keeping both
+# fixtures is the point -- the scanner has to handle either.
+SIMCTL_RUNTIMES_UUID_SHAPE = {
+    "8F2D0371-60AE-4D92-B93E-D5EA487B3BA2": {
+        "identifier": "8F2D0371-60AE-4D92-B93E-D5EA487B3BA2",
+        "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+        "state": "Ready", "sizeBytes": 5000000000, "deletable": True},
+    "7EC20E6E-F277-4A98-A693-EFAD7A8BA74F": {
+        "identifier": "7EC20E6E-F277-4A98-A693-EFAD7A8BA74F",
+        "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-1",
+        "state": "Ready", "sizeBytes": 8000000000, "deletable": True},
+}
+
+
+class TestSimulatorRuntimeIdentifierShapes(unittest.TestCase):
+    """Regression for a real miss: on Xcode 26 the unused-runtime target
+    never appeared, because the scanner validated `identifier` against a
+    pattern that only matches the reverse-DNS form while that field actually
+    carries a UUID. Every runtime failed the check and was silently dropped,
+    so 8 GB of genuinely unused runtime stayed invisible to scan and clean
+    alike -- with no warning, since a dropped candidate looks identical to
+    'nothing to clean'."""
+
+    def _scan(self, runtimes):
+        devices = {"devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+                {"udid": "AAAAAAAA-0000-0000-0000-000000000001",
+                 "name": "iPhone 17", "state": "Shutdown",
+                 "lastBootedAt": "2026-08-20T00:00:00Z"}]}}
+
+        def fake(args):
+            return devices if args[:2] == ["list", "devices"] else runtimes
+        with mock.patch.object(cleaner, "_simctl_json", side_effect=fake):
+            with mock.patch.object(cleaner, "get_size", return_value=0):
+                return cleaner.scan_simulator_targets({"simulator_stale_days": 30})
+
+    def test_uuid_identifier_shape_still_yields_the_unused_runtime(self):
+        targets = self._scan(SIMCTL_RUNTIMES_UUID_SHAPE)
+        unused = [t for t in targets if t["id"] == "simulator-unused-runtimes"]
+        self.assertEqual(len(unused), 1,
+                         "iOS 18.1 has no devices and must be offered")
+        t = unused[0]
+        self.assertIn("7EC20E6E-F277-4A98-A693-EFAD7A8BA74F", t["cmd"])
+        self.assertNotIn("8F2D0371", t["cmd"], "the in-use runtime must be left alone")
+        self.assertEqual(t["precomputed_bytes"], 8000000000)
+        self.assertFalse(t["safe"])
+
+    def test_reverse_dns_identifier_shape_still_works(self):
+        """The older shape must keep working -- this fix widens what is
+        accepted, it does not swap one shape for another."""
+        targets = self._scan(SIMCTL_RUNTIMES)
+        unused = [t for t in targets if t["id"] == "simulator-unused-runtimes"]
+        self.assertEqual(len(unused), 1)
+        self.assertIn("com.apple.CoreSimulator.SimRuntime.iOS-18-6", unused[0]["cmd"])
+
+    def test_junk_identifiers_are_still_rejected(self):
+        """The validation exists because these strings are interpolated into a
+        shell command. Widening it must not let a shell metacharacter through."""
+        evil = {"x": {"identifier": "abc; rm -rf ~", "runtimeIdentifier": "x",
+                      "state": "Ready", "sizeBytes": 1, "deletable": True},
+                "y": {"identifier": "$(whoami)", "runtimeIdentifier": "y",
+                      "state": "Ready", "sizeBytes": 1, "deletable": True},
+                "z": {"identifier": "../../etc/passwd", "runtimeIdentifier": "z",
+                      "state": "Ready", "sizeBytes": 1, "deletable": True}}
+        targets = self._scan(evil)
+        self.assertEqual([t for t in targets if t["id"] == "simulator-unused-runtimes"], [],
+                         "no target at all rather than one built from junk")
+
+
+class TestSimulatorTargets(unittest.TestCase):
+    def setUp(self):
+        # On this machine (Darwin devfs) /dev/null's mtime always reads back
+        # as "now", not a fixed old timestamp -- stat()ing it can't exercise
+        # the dataPath-mtime fallback deterministically. Give device "CCC"
+        # (the one with no lastBootedAt/lastUsedAt) a real file with a
+        # pinned old mtime instead, so the fallback path is actually tested.
+        self.td = tempfile.TemporaryDirectory()
+        self.old_datapath = str(Path(self.td.name) / "old_datapath")
+        Path(self.old_datapath).write_bytes(b"")
+        old = time.time() - 400 * 86400
+        os.utime(self.old_datapath, (old, old))
+        self.devices = {"devices": {
+            k: [dict(d, dataPath=self.old_datapath)
+                if d["udid"].startswith("CCC") else d
+                for d in v]
+            for k, v in SIMCTL_DEVICES["devices"].items()
+        }}
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _scan(self, devices=None, runtimes=SIMCTL_RUNTIMES):
+        devices = self.devices if devices is None else devices
+
+        def fake(args):
+            return devices if args[:2] == ["list", "devices"] else runtimes
+        with mock.patch.object(cleaner, "_simctl_json", side_effect=fake):
+            with mock.patch.object(cleaner, "get_size", return_value=123):
+                return cleaner.scan_simulator_targets({"simulator_stale_days": 30})
+
+    def test_stale_devices_target_built(self):
+        targets = self._scan()
+        stale = [t for t in targets if t["id"] == "simulator-stale-devices"]
+        self.assertEqual(len(stale), 1)
+        self.assertIn("BBB", stale[0]["cmd"])
+        self.assertIn("CCC", stale[0]["cmd"])       # missing lastBootedAt counts via mtime
+        self.assertNotIn("AAA", stale[0]["cmd"])    # booted device never stale
+        self.assertFalse(stale[0]["safe"])
+        self.assertEqual(stale[0]["category"], "simulators")
+
+    def test_unused_runtimes_target_built(self):
+        targets = self._scan()
+        rt = [t for t in targets if t["id"] == "simulator-unused-runtimes"]
+        self.assertEqual(len(rt), 1)
+        self.assertIn("iOS-18-6", rt[0]["cmd"])     # zero devices reference it
+        self.assertNotIn("iOS-26-5", rt[0]["cmd"])  # has devices
+        self.assertEqual(rt[0]["precomputed_bytes"], 6000000000)
+        self.assertFalse(rt[0]["safe"])
+        self.assertEqual(rt[0]["category"], "simulators")
+
+    def test_no_simctl_degrades_to_empty(self):
+        with mock.patch.object(cleaner, "_simctl_json", return_value=None):
+            self.assertEqual(cleaner.scan_simulator_targets({}), [])
+
+    def test_unused_runtimes_uid_keyed_dict_shape(self):
+        # `xcrun simctl runtime list -j` on real (current-Xcode) machines
+        # returns a bare dict keyed by runtime UUID -- {uuid: {...}, ...} --
+        # with no top-level "runtimes" wrapper key at all, unlike the
+        # wrapped-list shape used elsewhere in this test class. Confirmed
+        # against the actual `xcrun simctl runtime list -j` output on this
+        # development machine.
+        uid_keyed_runtimes = {
+            "7EC20E6E-F277-4A98-A693-EFAD7A8BA74F": {
+                "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+                "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+                "state": "Ready", "sizeBytes": 5000000000,
+            },
+            "8F2D0371-60AE-4D92-B93E-D5EA487B3BA2": {
+                "identifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
+                "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
+                "state": "Ready", "sizeBytes": 6000000000,
+            },
+        }
+        targets = self._scan(runtimes=uid_keyed_runtimes)
+        rt = [t for t in targets if t["id"] == "simulator-unused-runtimes"]
+        self.assertEqual(len(rt), 1)
+        self.assertIn("iOS-18-6", rt[0]["cmd"])
+        self.assertNotIn("iOS-26-5", rt[0]["cmd"])
+        self.assertEqual(rt[0]["precomputed_bytes"], 6000000000)
+        # "; "-joined with per-command suppression, not "&&" -- one failing
+        # delete must not short-circuit and skip every later identifier.
+        self.assertEqual(
+            rt[0]["cmd"],
+            "xcrun simctl runtime delete "
+            "com.apple.CoreSimulator.SimRuntime.iOS-18-6 2>/dev/null; true")
+        self.assertNotIn("&&", rt[0]["cmd"])
+
+    def test_malicious_udid_dropped_before_reaching_cmd(self):
+        # A udid that doesn't look like a UDID (whatever produced this JSON --
+        # a compromised/buggy simctl, a MITM'd subprocess, anything) must
+        # never make it into the shell=True cmd string delete_target runs.
+        devices = {"devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+                {"udid": "AAA; rm -rf ~", "name": "evil", "state": "Shutdown",
+                 "lastBootedAt": "2026-01-01T00:00:00Z", "dataPath": "/dev/null"},
+                {"udid": "DEADBEEF-CAFE-BABE-0000-000000000001",
+                 "name": "legit", "state": "Shutdown",
+                 "lastBootedAt": "2026-01-01T00:00:00Z", "dataPath": "/dev/null"},
+            ],
+        }}
+        targets = self._scan(devices=devices)
+        stale = [t for t in targets if t["id"] == "simulator-stale-devices"]
+        self.assertEqual(len(stale), 1)
+        self.assertNotIn("rm -rf", stale[0]["cmd"])
+        self.assertNotIn("AAA; rm -rf ~", stale[0]["cmd"])
+        self.assertIn("DEADBEEF-CAFE-BABE-0000-000000000001", stale[0]["cmd"])
+        # dropped entirely, not just kept out of the cmd -- byte accounting
+        # must not include the rejected device's data either.
+        self.assertEqual(stale[0]["precomputed_bytes"], 123)
+
+    def test_malicious_runtime_identifier_dropped_before_reaching_cmd(self):
+        # "all"/"--outdated"/"--unusable" are real `xcrun simctl runtime
+        # delete` arguments -- "delete all" wipes every runtime image on the
+        # machine. A regex that only checks character class (no required
+        # com.apple.CoreSimulator.SimRuntime. prefix) would let these
+        # letters-and-hyphens-only strings straight through to the shell
+        # cmd (finding F3).
+        runtimes = {"runtimes": [
+            {"identifier": "bad id $(evil)", "runtimeIdentifier": "bad id $(evil)",
+             "state": "Ready", "sizeBytes": 999},
+            {"identifier": "all", "runtimeIdentifier": "all",
+             "state": "Ready", "sizeBytes": 111},
+            {"identifier": "--outdated", "runtimeIdentifier": "--outdated",
+             "state": "Ready", "sizeBytes": 222},
+            {"identifier": "--unusable", "runtimeIdentifier": "--unusable",
+             "state": "Ready", "sizeBytes": 333},
+            {"identifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
+             "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
+             "state": "Ready", "sizeBytes": 6000000000},
+        ]}
+        targets = self._scan(runtimes=runtimes)
+        rt = [t for t in targets if t["id"] == "simulator-unused-runtimes"]
+        self.assertEqual(len(rt), 1)
+        self.assertNotIn("evil", rt[0]["cmd"])
+        self.assertNotIn("bad id", rt[0]["cmd"])
+        self.assertNotIn("delete all", rt[0]["cmd"])
+        self.assertNotIn("--outdated", rt[0]["cmd"])
+        self.assertNotIn("--unusable", rt[0]["cmd"])
+        self.assertIn("iOS-18-6", rt[0]["cmd"])
+        # size must come from the same filtered (valid-only) list as the
+        # cmd/ids, not sum the rejected runtimes' sizeBytes in too.
+        self.assertEqual(rt[0]["precomputed_bytes"], 6000000000)
+
+    def test_no_stale_devices_no_unused_runtimes_empty(self):
+        # Everything booted or recently booted, and every runtime in use ->
+        # neither target should be synthesized (0 targets, not 2 empty ones).
+        devices = {"devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+                {"udid": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+                 "name": "iPhone 17 Pro", "state": "Booted",
+                 "lastBootedAt": "2026-08-09T00:00:00Z", "dataPath": "/dev/null"},
+            ],
+        }}
+        runtimes = {"runtimes": [
+            {"identifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+             "runtimeIdentifier": "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+             "state": "Ready", "sizeBytes": 5000000000},
+        ]}
+        targets = self._scan(devices=devices, runtimes=runtimes)
+        self.assertEqual(targets, [])
+
+    def test_no_timestamp_and_nonexistent_datapath_excluded_from_stale(self):
+        # A device with neither lastBootedAt/lastUsedAt nor a stat-able
+        # dataPath (already deleted, or simctl reporting a bogus path) must
+        # fall through the os.stat(dataPath) fallback's OSError and be
+        # silently excluded, not crash and not be treated as "always
+        # stale" (M4).
+        devices = {"devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+                {"udid": "EEEEEEEE-EEEE-EEEE-EEEE-EEEEEEEEEEEE",
+                 "name": "ghost phone", "state": "Shutdown",
+                 "dataPath": "/nonexistent/x"},
+            ],
+        }}
+        targets = self._scan(devices=devices)
+        stale = [t for t in targets if t["id"] == "simulator-stale-devices"]
+        self.assertEqual(stale, [],
+                         "no timestamp + unreadable dataPath must not count as stale")
+
+    def test_measure_honors_precomputed_bytes(self):
+        t = {"id": "x", "path": None, "glob": None, "cmd": "true",
+             "estimate_cmd": None, "estimate_parser": None,
+             "precomputed_bytes": 42, "empty_only": False}
+        measured = cleaner.measure_targets([t])
+        self.assertEqual(measured[0]["size"], 42)
+
+    def test_collect_targets_merges_simulators_when_enabled(self):
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg["enabled_categories"] = ["simulators"]
+        with mock.patch.object(cleaner, "scan_simulator_targets",
+                                return_value=[{"id": "simulator-stale-devices"}]):
+            targets = cleaner.collect_targets(cfg)
+        self.assertTrue(any(t.get("id") == "simulator-stale-devices" for t in targets))
+
+    def test_collect_targets_skips_simulators_when_disabled(self):
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg["enabled_categories"] = ["node"]
+        with mock.patch.object(cleaner, "scan_simulator_targets",
+                                return_value=[{"id": "simulator-stale-devices"}]):
+            targets = cleaner.collect_targets(cfg)
+        self.assertFalse(any(t.get("id") == "simulator-stale-devices" for t in targets))
+
+
+class TestScannerScoping(unittest.TestCase):
+    """collect_targets() takes optional categories/target_ids SELECTION HINTS
+    (v2.6): when a hint proves a dynamic scanner's output can't be selected,
+    the scanner is skipped entirely -- a targeted `clean --targets npm-cache`
+    shouldn't pay two simctl calls and a /tmp walk (popover one-click clean
+    latency). Hints never widen anything: enabled_categories still gates as
+    before, and hints=None must behave exactly like pre-2.6."""
+
+    def setUp(self):
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        # known_categories stamped so the F4 auto-enable migration can't
+        # surprise these assertions with a different enabled set.
+        self.cfg["known_categories"] = list(cleaner.ALL_CATEGORIES)
+
+    def _patched(self):
+        tmp = mock.patch.object(cleaner, "scan_tmp_artifacts", return_value=[])
+        sim = mock.patch.object(cleaner, "scan_simulator_targets", return_value=[])
+        return tmp, sim
+
+    def test_leftovers_scanner_scoped_out_by_category(self):
+        leftover = mock.patch.object(cleaner, "scan_app_leftovers", return_value=[])
+        with leftover as mleft:
+            cleaner.collect_targets(self.cfg, categories={"node"})
+        mleft.assert_not_called()
+
+    def test_leftovers_scanner_runs_when_category_included(self):
+        leftover = mock.patch.object(cleaner, "scan_app_leftovers", return_value=[])
+        with leftover as mleft:
+            cleaner.collect_targets(self.cfg, categories={"leftovers"})
+        mleft.assert_called_once()
+
+    def test_unscoped_runs_both(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg)
+        mtmp.assert_called_once()
+        msim.assert_called_once()
+
+    def test_category_scope_excluding_skips_both(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, categories={"node"})
+        mtmp.assert_not_called()
+        msim.assert_not_called()
+
+    def test_category_scope_including_tmp_runs_only_tmp(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, categories={"tmp", "node"})
+        mtmp.assert_called_once()
+        msim.assert_not_called()
+
+    def test_target_ids_scope_simulator_only(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, target_ids={"simulator-stale-devices"})
+        mtmp.assert_not_called()
+        msim.assert_called_once()
+
+    def test_target_ids_npm_only_runs_neither(self):
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, target_ids={"npm-cache"})
+        mtmp.assert_not_called()
+        msim.assert_not_called()
+
+    def test_disabled_category_still_never_runs(self):
+        # Hints only ever narrow -- a category hint that includes "tmp"
+        # can't resurrect a category the config has disabled.
+        self.cfg["enabled_categories"] = ["node"]
+        tmp, sim = self._patched()
+        with tmp as mtmp, sim as msim:
+            cleaner.collect_targets(self.cfg, categories={"tmp"})
+        mtmp.assert_not_called()
+
+    def _sandbox(self, tmp_dir):
+        """Shared F4 sandbox setup: a fake $HOME with a real npm-cache
+        target, an empty tmp scan root, and a config with every category
+        enabled + known_categories stamped (so the migration can't surprise
+        the enabled set and this never reaches the real /private/tmp or a
+        real simctl). Returns the env dict for subprocess.run."""
+        home = tmp_dir / "home"
+        (home / ".npm" / "_cacache").mkdir(parents=True)
+        (home / ".npm" / "_cacache" / "blob").write_text("x" * 4096)
+        tmproot = tmp_dir / "tmproot"
+        tmproot.mkdir()
+        cfg_path = tmp_dir / "config.json"
+        cfg = {"enabled_categories": list(cleaner.ALL_CATEGORIES),
+               "known_categories": list(cleaner.ALL_CATEGORIES)}
+        cfg_path.write_text(json.dumps(cfg))
+        return {**os.environ, "HOME": str(home),
+                "MACCLEANER_CONFIG": str(cfg_path),
+                "MACCLEANER_LOG": str(tmp_dir / "report.log"),
+                "MACCLEANER_SNAPSHOTS": str(tmp_dir / "snapshots.log"),
+                "MACCLEANER_ALERTS": str(tmp_dir / "alerts.json"),
+                "MACCLEANER_TMP_ROOT": str(tmproot)}
+
+    def test_cli_targets_scope_skips_simctl(self):
+        """clean --targets npm-cache must not invoke xcrun: PATH gets a fake
+        xcrun that logs invocations to a file, following the same PATH-stub
+        idiom TestCleanNotify.run_cli uses for osascript (tests/test_cleaner.py
+        ~L1612) -- the log must stay empty."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            env = self._sandbox(tmp_dir)
+
+            bindir = tmp_dir / "bin"
+            bindir.mkdir()
+            recorded = tmp_dir / "xcrun_calls.txt"
+            stub = bindir / "xcrun"
+            stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$RECORD_FILE"\necho "{}"\n')
+            stub.chmod(0o755)
+            env["PATH"] = f"{bindir}:{env['PATH']}"
+            env["RECORD_FILE"] = str(recorded)
+
+            r = subprocess.run(
+                [sys.executable, str(REPO / "cleaner.py"),
+                 "clean", "--targets", "npm-cache", "--dry-run", "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse(recorded.exists(),
+                             "clean --targets npm-cache must never invoke xcrun")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_whitespace_targets_dry_run_is_noop(self):
+        """Regression: --targets " , " parses to an empty target-ID set, but
+        the RAW string is non-empty. Pre-2.6, the downstream filter/explicit
+        block gated on `if args.targets:` (raw string truthiness), so a
+        malformed --targets value filtered the target list down to empty and
+        set explicit=True -- a no-op dry run. Gating that block on the
+        PARSED set's truthiness instead treats "empty parsed set" as
+        "no --targets was given", skipping the filter entirely: explicit
+        stays False and every safe target is previewed, not just nothing."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            env = self._sandbox(tmp_dir)
+            r = subprocess.run(
+                [sys.executable, str(REPO / "cleaner.py"),
+                 "clean", "--targets", " , ", "--dry-run", "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            data = json.loads(r.stdout)
+            self.assertEqual(data["items"], [],
+                             "a whitespace-only --targets must preview nothing, "
+                             "never fall through to a full safe-target preview")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_garbage_targets_yes_deletes_nothing(self):
+        """Same regression as test_whitespace_targets_dry_run_is_noop, but
+        for the real (non-dry-run) --yes path where the consequence is an
+        actual unintended full safe auto-clean rather than just a wrong
+        preview."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            env = self._sandbox(tmp_dir)
+            r = subprocess.run(
+                [sys.executable, str(REPO / "cleaner.py"),
+                 "clean", "--targets", ",,,", "--yes", "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            data = json.loads(r.stdout)
+            self.assertEqual(data["items"], [],
+                             "a garbage --targets value must clean nothing, "
+                             "never fall through to a full safe auto-clean")
+            self.assertTrue((Path(env["HOME"]) / ".npm" / "_cacache").exists(),
+                            "npm-cache must survive a garbage --targets clean")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_empty_string_targets_yes_deletes_nothing(self):
+        """A2 regression: argparse gives args.targets == "" for an explicitly
+        empty `--targets ""`, distinct from None when the flag is absent
+        entirely. Pre-fix the downstream gate was `if raw_targets:` (falsy for
+        ""), so this fell through to "no --targets given" and performed a
+        full safe auto-clean -- exactly the bug CHANGELOG claimed was fixed.
+        The gate must be `raw_targets is not None` so an explicitly-empty
+        value still counts as "targets were given" and filters to nothing."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        try:
+            env = self._sandbox(tmp_dir)
+            r = subprocess.run(
+                [sys.executable, str(REPO / "cleaner.py"),
+                 "clean", "--targets", "", "--yes", "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            data = json.loads(r.stdout)
+            self.assertEqual(data["items"], [],
+                             "clean --targets '' must clean nothing, "
+                             "never fall through to a full safe auto-clean")
+            self.assertTrue((Path(env["HOME"]) / ".npm" / "_cacache").exists(),
+                            "npm-cache must survive a clean --targets '' run")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+class TestDockerEstimateParsing(unittest.TestCase):
+    """`docker system df`'s TYPE column has two-word entries ("Local
+    Volumes", "Build Cache"), which shifts naive whitespace-split column
+    indices. Real output observed in the field (see fix commit) showed the
+    old parser silently reading the SIZE column instead of RECLAIMABLE for
+    single-word rows, and dropping two-word rows entirely -- so the
+    "Docker unused data" target perpetually reported ~total image size as
+    "reclaimable" no matter how many times the safe prune command ran."""
+
+    REAL_OUTPUT = (
+        "TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\n"
+        "Images          10        1         4.202GB   660.3MB (15%)\n"
+        "Containers      1         1         0B        0B\n"
+        "Local Volumes   8         0         2.84GB    2.84GB (100%)\n"
+        "Build Cache     14        0         440.6MB   1.116MB\n"
+    )
+
+    def test_sums_reclaimable_column_not_size_column(self):
+        # Images RECLAIMABLE is 660.3MB, not the 4.202GB SIZE column the
+        # old buggy parser read.
+        result = cleaner._parse_docker_estimate(self.REAL_OUTPUT)
+        self.assertLess(result, 1024 ** 3,
+                         "must not count Images' total SIZE as reclaimable")
+
+    def test_excludes_local_volumes(self):
+        # docker-prune's cmd never passes --volumes (removing volumes can
+        # destroy real data, e.g. database volumes) -- the safe target must
+        # never advertise volume space as something it can reclaim, or the
+        # badge stays stuck at the volumes' size forever after cleaning.
+        result = cleaner._parse_docker_estimate(self.REAL_OUTPUT)
+        self.assertLess(result, 1024 ** 3,
+                         "2.84GB of Local Volumes must not be counted")
+
+    def test_includes_images_containers_and_build_cache_reclaimable(self):
+        # 660.3MB + 0B + 1.116MB, each within float-precision of fmt_size's
+        # own unit math.
+        result = cleaner._parse_docker_estimate(self.REAL_OUTPUT)
+        expected = int(660.3 * 1024**2) + 0 + int(1.116 * 1024**2)
+        self.assertAlmostEqual(result, expected, delta=1024)  # rounding slack
+
+    def test_two_word_type_names_do_not_break_single_word_rows(self):
+        # Containers (single word, 0B) must still parse as 0, not silently
+        # skip or throw, regardless of neighboring two-word rows.
+        only_containers = (
+            "TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\n"
+            "Containers      3         1         120MB     45MB (37%)\n"
+        )
+        self.assertEqual(cleaner._parse_docker_estimate(only_containers),
+                          int(45 * 1024**2))
+
+    def test_empty_output_is_zero(self):
+        self.assertEqual(cleaner._parse_docker_estimate(""), 0)
+
+    def test_header_only_is_zero(self):
+        header = "TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\n"
+        self.assertEqual(cleaner._parse_docker_estimate(header), 0)
+
+    def test_unrecognized_row_is_ignored_not_fatal(self):
+        # A future Docker version adding a new TYPE row must degrade to
+        # "ignored", never raise.
+        weird = self.REAL_OUTPUT + "Future Thing    1         0         5MB       5MB (100%)\n"
+        # Should not raise, and should equal the known-rows-only total.
+        cleaner._parse_docker_estimate(weird)
+
+
+class TestInstalledAppsEnumeration(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.apps_dir = self.tmp / "Applications"
+        self.apps_dir.mkdir()
+        self._patch = mock.patch.dict(
+            os.environ, {"MACCLEANER_INSTALLED_APPS_DIRS": str(self.apps_dir)})
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_app(self, name, bundle_id, plist_bytes=None):
+        contents = self.apps_dir / name / "Contents"
+        contents.mkdir(parents=True)
+        plist_path = contents / "Info.plist"
+        if plist_bytes is not None:
+            plist_path.write_bytes(plist_bytes)
+        else:
+            with open(plist_path, "wb") as f:
+                plistlib.dump({"CFBundleIdentifier": bundle_id}, f)
+
+    def test_reads_bundle_identifier(self):
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        app_path = self.apps_dir / "Slack.app"
+        self.assertEqual(cleaner._app_bundle_identifier(app_path),
+                          "com.tinyspeck.slackmacgap")
+
+    def test_identifier_lowercased(self):
+        self._make_app("Weird.app", "Com.Example.WeirdCasing")
+        app_path = self.apps_dir / "Weird.app"
+        self.assertEqual(cleaner._app_bundle_identifier(app_path),
+                          "com.example.weirdcasing")
+
+    def test_missing_plist_returns_none(self):
+        (self.apps_dir / "Broken.app" / "Contents").mkdir(parents=True)
+        self.assertIsNone(
+            cleaner._app_bundle_identifier(self.apps_dir / "Broken.app"))
+
+    def test_malformed_plist_returns_none(self):
+        contents = self.apps_dir / "Malformed.app" / "Contents"
+        contents.mkdir(parents=True)
+        (contents / "Info.plist").write_text("not a plist")
+        self.assertIsNone(
+            cleaner._app_bundle_identifier(self.apps_dir / "Malformed.app"))
+
+    def test_missing_key_returns_none(self):
+        contents = self.apps_dir / "NoKey.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleName": "NoKey"}, f)
+        self.assertIsNone(
+            cleaner._app_bundle_identifier(self.apps_dir / "NoKey.app"))
+
+    def test_enumeration_collects_all_installed_ids(self):
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        self._make_app("Docker.app", "com.docker.docker")
+        self.assertEqual(cleaner.installed_bundle_ids(),
+                          {"com.tinyspeck.slackmacgap", "com.docker.docker"})
+
+    def test_enumeration_skips_broken_bundles_not_fatal(self):
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        (self.apps_dir / "Broken.app" / "Contents").mkdir(parents=True)
+        self.assertEqual(cleaner.installed_bundle_ids(),
+                          {"com.tinyspeck.slackmacgap"})
+
+    def test_missing_root_dir_skipped_not_fatal(self):
+        with mock.patch.dict(os.environ, {
+                "MACCLEANER_INSTALLED_APPS_DIRS":
+                str(self.tmp / "does-not-exist")}):
+            self.assertEqual(cleaner.installed_bundle_ids(), set())
+
+    def test_multiple_roots_colon_separated(self):
+        second_dir = self.tmp / "SystemApplications"
+        second_dir.mkdir()
+        finder_contents = second_dir / "Finder.app" / "Contents"
+        finder_contents.mkdir(parents=True)
+        with open(finder_contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.apple.finder"}, f)
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        with mock.patch.dict(os.environ, {
+                "MACCLEANER_INSTALLED_APPS_DIRS":
+                "%s:%s" % (self.apps_dir, second_dir)}):
+            self.assertEqual(cleaner.installed_bundle_ids(),
+                              {"com.tinyspeck.slackmacgap", "com.apple.finder"})
+
+    def test_nested_vendor_folder_app_found(self):
+        # Finding 2: some vendors (Adobe et al.) ship the .app one level
+        # inside a wrapper folder instead of directly at the app-root top
+        # level -- installed_bundle_ids() must still find it.
+        contents = (self.apps_dir / "Adobe Vendor Folder" / "Adobe App.app"
+                    / "Contents")
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.adobe.someapp"}, f)
+        self.assertEqual(cleaner.installed_bundle_ids(), {"com.adobe.someapp"})
+
+    def test_nested_scan_finds_multiple_apps_in_one_wrapper(self):
+        contents1 = (self.apps_dir / "Adobe Vendor Folder" / "First.app" / "Contents")
+        contents1.mkdir(parents=True)
+        with open(contents1 / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.adobe.first"}, f)
+        contents2 = (self.apps_dir / "Adobe Vendor Folder" / "Second.app" / "Contents")
+        contents2.mkdir(parents=True)
+        with open(contents2 / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.adobe.second"}, f)
+        self.assertEqual(cleaner.installed_bundle_ids(),
+                          {"com.adobe.first", "com.adobe.second"})
+
+    def test_nesting_bounded_to_one_level(self):
+        # Two levels deep must not be found -- exactly one extra level
+        # beyond the app-root top level is scanned, no further recursion.
+        contents = (self.apps_dir / "Wrapper" / "Nested" / "Deep.app" / "Contents")
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.deep"}, f)
+        self.assertEqual(cleaner.installed_bundle_ids(), set())
+
+    def test_nested_symlink_wrapper_not_followed(self):
+        real = self.tmp / "real-wrapper"
+        contents = real / "Deep.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.deep"}, f)
+        (self.apps_dir / "LinkWrapper").symlink_to(real)
+        self.assertEqual(cleaner.installed_bundle_ids(), set())
+
+    def test_symlinked_app_bundle_still_counts_as_installed(self):
+        # Finding I4 (2nd whole-branch review round): "never follow
+        # symlinks" is a DELETION safety rule that belongs to the
+        # leftover-scanning/deletion path (test_nested_symlink_wrapper_not_
+        # followed above still enforces it there for a symlinked WRAPPER
+        # folder). It must NOT gate this read-only enumeration of what's
+        # installed -- e.g. a symlinked top-level "*.app" (as macOS itself
+        # ships for Safari.app under a Cryptexes redirect, or a Nix/
+        # home-manager-style symlinked install) is a real installed app.
+        # Refusing to follow the symlink here only ever creates MORE false
+        # positives downstream in scan_app_leftovers, never protects
+        # anything.
+        real = self.tmp / "real-app-location"
+        contents = real / "Real.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.symlinked"}, f)
+        (self.apps_dir / "Real.app").symlink_to(real / "Real.app")
+        self.assertEqual(cleaner.installed_bundle_ids(), {"com.example.symlinked"})
+
+    def test_non_app_file_at_top_level_does_not_crash_nested_scan(self):
+        # A stray non-directory file (not a wrapper folder, not a .app)
+        # sitting at the app-root top level must be skipped cleanly.
+        (self.apps_dir / "ReadMe.txt").write_text("x")
+        self._make_app("Slack.app", "com.tinyspeck.slackmacgap")
+        self.assertEqual(cleaner.installed_bundle_ids(),
+                          {"com.tinyspeck.slackmacgap"})
+
+
+class TestTargetPathsMultiPath(unittest.TestCase):
+    def test_paths_branch_returns_list_verbatim(self):
+        p1, p2 = Path("/tmp/a"), Path("/tmp/b")
+        t = {"paths": [p1, p2], "path": None, "glob": None}
+        self.assertEqual(cleaner._target_paths(t), [p1, p2])
+
+    def test_path_branch_unchanged_when_no_paths_key(self):
+        p = Path("/tmp/a")
+        t = {"path": p, "glob": None}
+        self.assertEqual(cleaner._target_paths(t), [p])
+
+    def test_glob_branch_takes_priority_over_paths(self):
+        # glob is checked first in the existing function; paths targets
+        # never set glob, but pin the priority order as documented.
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "x.txt"
+            f.write_text("x")
+            t = {"glob": str(Path(td) / "*.txt"), "skip": [], "paths": [Path("/should/not/appear")]}
+            self.assertEqual(cleaner._target_paths(t), [f])
+
+    def test_empty_paths_list_returns_empty(self):
+        t = {"paths": [], "path": None, "glob": None}
+        self.assertEqual(cleaner._target_paths(t), [])
+
+
+class TestAppLeftoverScanner(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.apps_dir = self.tmp / "Applications"
+        self.apps_dir.mkdir()
+        self.lib_root = self.tmp / "Library"
+        self.lib_root.mkdir()
+        self.env = {
+            "MACCLEANER_INSTALLED_APPS_DIRS": str(self.apps_dir),
+            "MACCLEANER_LEFTOVER_LIBRARY_ROOT": str(self.lib_root),
+        }
+        self._patch = mock.patch.dict(os.environ, self.env)
+        self._patch.start()
+        self.cfg = {"app_leftover_min_age_days": 7}
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _age(self, p, days=10):
+        old = time.time() - days * 86400
+        os.utime(p, (old, old))
+
+    def _leftover_dir(self, root_name, bundle_id, days=10):
+        d = self.lib_root / root_name / bundle_id
+        d.mkdir(parents=True)
+        self._age(d, days)
+        return d
+
+    def _leftover_file(self, root_name, filename, days=10):
+        root = self.lib_root / root_name
+        root.mkdir(parents=True, exist_ok=True)
+        f = root / filename
+        f.write_text("x")
+        self._age(f, days)
+        return f
+
+    def test_orphaned_bundle_id_is_a_hit(self):
+        self._leftover_dir("Caches", "com.example.gonezo")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_installed_app_is_never_a_hit(self):
+        contents = self.apps_dir / "Still.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.still"}, f)
+        self._leftover_dir("Caches", "com.example.still")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_subdomain_of_installed_bundle_id_is_never_a_hit(self):
+        # Finding I3 (2nd whole-branch review round): a candidate that is a
+        # strict sub-domain of an installed bundle ID (e.g. Squirrel.Mac's
+        # ".ShipIt" updater domain, or iTerm2's ".private" domain) is still
+        # genuinely owned by the installed app -- just not an exact
+        # bundle-ID match. Confirmed on the real dev machine: 8 such hits
+        # (com.hnc.discord.shipit under installed com.hnc.discord,
+        # com.googlecode.iterm2.private under installed com.googlecode.
+        # iterm2, etc.) This is still exact-prefix matching against real
+        # installed IDs, not fuzzy matching.
+        contents = self.apps_dir / "Example.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.app"}, f)
+        self._leftover_dir("Caches", "com.example.app.shipit")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_similarly_prefixed_but_not_subdomain_still_a_hit(self):
+        # Guard against an overly-broad fix: "com.example.appfoo" is NOT a
+        # sub-domain of installed "com.example.app" (no dot boundary), so
+        # it must still surface as a hit.
+        contents = self.apps_dir / "Example.app" / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.example.app"}, f)
+        self._leftover_dir("Caches", "com.example.appfoo")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.appfoo"])
+
+    def test_com_apple_never_a_hit_even_if_not_installed(self):
+        # Defense in depth: excluded unconditionally, not just via the
+        # installed-set check.
+        self._leftover_dir("Caches", "com.apple.somethingobscure")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_self_never_a_hit(self):
+        self._leftover_dir("Caches", "com.fullex.maccleaner")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_group_com_apple_never_a_hit_even_if_not_installed(self):
+        # Finding C1 (2nd whole-branch review round): Apple's app-group
+        # preference domains are named "group.com.apple.<x>" (e.g. Mail,
+        # Notes, Calendar) -- that prefix doesn't start with "com.apple.",
+        # so the plain startswith check let these slip through even though
+        # AGENTS.md/CHANGELOG.md promise com.apple.* is "always excluded
+        # regardless of installed state". Mirrors
+        # test_com_apple_never_a_hit_even_if_not_installed: excluded
+        # unconditionally, not just via the installed-set check.
+        self._leftover_dir("Caches", "group.com.apple.mail")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_preferences_plist_suffix_stripped_for_matching(self):
+        self._leftover_file("Preferences", "com.example.gonezo.plist")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_non_bundle_id_shaped_name_ignored(self):
+        self._leftover_dir("Caches", "just-a-random-folder")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_symlink_never_followed_or_matched(self):
+        real = self.tmp / "real-target"
+        real.mkdir()
+        link = self.lib_root / "Caches" / "com.example.gonezo"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(real)
+        # Age the symlink itself (not just its real target) so the min-age
+        # gate can't discard it before the symlink-skip guard ever runs --
+        # otherwise this test would pass even without that guard.
+        old = time.time() - 30 * 86400
+        os.utime(link, (old, old), follow_symlinks=False)
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_survives_only_if_all_locations_are_old(self):
+        # One matched location aged 30 days, one aged 1 day (younger than
+        # the 7-day default gate), same bundle ID -- the bundle must NOT
+        # appear as a hit, because aggregation uses max() (newest wins)
+        # across locations, not min().
+        self._leftover_dir("Caches", "com.example.gonezo", days=30)
+        self._leftover_file("Preferences", "com.example.gonezo.plist", days=1)
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_young_leftover_skipped(self):
+        self._leftover_dir("Caches", "com.example.gonezo", days=1)
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_multiple_locations_grouped_into_one_hit(self):
+        self._leftover_dir("Caches", "com.example.gonezo")
+        self._leftover_file("Preferences", "com.example.gonezo.plist")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(len(hits[0]["paths"]), 2)
+        self.assertEqual(set(hits[0]["locations"]), {"Caches", "Preferences"})
+
+    def test_missing_library_root_returns_empty_not_fatal(self):
+        with mock.patch.dict(os.environ, {
+                "MACCLEANER_LEFTOVER_LIBRARY_ROOT":
+                str(self.tmp / "does-not-exist")}):
+            self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_targets_are_review_only_no_carve_out_marker(self):
+        self._leftover_dir("Caches", "com.example.gonezo")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        targets = cleaner.app_leftovers_to_targets(hits)
+        self.assertEqual(len(targets), 1)
+        t = targets[0]
+        self.assertFalse(t["safe"])
+        self.assertEqual(t["category"], "leftovers")
+        self.assertEqual(t["id"], "leftover-com-example-gonezo")
+        self.assertNotIn("tmp_scan", t)
+
+    def test_target_id_dedup_suffix_on_collision(self):
+        # slugify collapses case/punctuation the same way tmp_to_targets'
+        # collision handling does; construct two hits that slugify equal.
+        hits = [
+            {"bundle_id": "com.example.Dup", "paths": [Path("/x")],
+             "locations": ["Caches"], "mtime": 0},
+            {"bundle_id": "com.example.dup", "paths": [Path("/y")],
+             "locations": ["Caches"], "mtime": 0},
+        ]
+        targets = cleaner.app_leftovers_to_targets(hits)
+        self.assertEqual(len({t["id"] for t in targets}), 2)
+
+    def _install_app(self, name, bundle_id):
+        contents = self.apps_dir / name / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": bundle_id}, f)
+
+    # -- Finding 1 + 3: real macOS naming shapes per root, with a type check
+    # so a wrong-shaped entry is skipped, never misclassified. -------------
+
+    def test_saved_application_state_suffix_stripped_installed_excluded(self):
+        # Real shape: a DIRECTORY named "<bundle-id>.savedState", not the
+        # bare bundle id. Before the fix this suffix was never stripped, so
+        # an installed app's saved state always looked orphaned.
+        self._install_app("Slack.app", "com.tinyspeck.slackmacgap")
+        self._leftover_dir("Saved Application State",
+                            "com.tinyspeck.slackmacgap.savedState")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [],
+                         "installed app's .savedState dir must not be a false positive")
+
+    def test_saved_application_state_suffix_stripped_orphan_included(self):
+        self._leftover_dir("Saved Application State",
+                            "com.example.gonezo.savedState")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_httpstorages_binarycookies_suffix_stripped_installed_excluded(self):
+        # Real shape: a FILE named "<bundle-id>.binarycookies".
+        self._install_app("Slack.app", "com.tinyspeck.slackmacgap")
+        self._leftover_file("HTTPStorages", "com.tinyspeck.slackmacgap.binarycookies")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [],
+                         "installed app's .binarycookies file must not be a false positive")
+
+    def test_httpstorages_binarycookies_suffix_stripped_orphan_included(self):
+        self._leftover_file("HTTPStorages", "com.example.gonezo.binarycookies")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_httpstorages_directory_shape_still_matches(self):
+        # HTTPStorages also legitimately has a directory shape (bare bundle
+        # id, no suffix) -- fixing the suffix bug must not regress this.
+        self._leftover_dir("HTTPStorages", "com.example.gonezo")
+        hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_non_directory_file_under_caches_skipped_not_misclassified(self):
+        # Finding 3: Caches expects a directory; a stray plain file there
+        # must be skipped, not treated as a valid candidate.
+        self._leftover_file("Caches", "com.example.gonezo")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_non_plist_file_under_preferences_skipped(self):
+        self._leftover_file("Preferences", "com.example.gonezo.txt")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_directory_under_preferences_skipped(self):
+        # Preferences expects .plist FILES; a directory shaped like one
+        # must not be misread as a candidate either.
+        self._leftover_dir("Preferences", "com.example.gonezo.plist")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    def test_file_under_saved_application_state_skipped(self):
+        self._leftover_file("Saved Application State",
+                             "com.example.gonezo.savedState")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+    # -- Finding 2: one-level-deep vendor installs -------------------------
+
+    def test_nested_vendor_folder_app_counts_as_installed(self):
+        # Some vendors (Adobe et al.) ship the .app one level inside a
+        # wrapper folder instead of directly at the app-root top level.
+        contents = (self.apps_dir / "Adobe Vendor Folder" / "Adobe App.app"
+                    / "Contents")
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.adobe.someapp"}, f)
+        self._leftover_dir("Caches", "com.adobe.someapp")
+        self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [],
+                         "a one-level-deep vendor install must not false-positive")
+
+    # -- Finding 4: skip_paths ----------------------------------------------
+
+    def test_skip_paths_excludes_configured_path(self):
+        d = self._leftover_dir("Caches", "com.example.gonezo")
+        cfg = dict(self.cfg)
+        cfg["skip_paths"] = [str(d)]
+        self.assertEqual(cleaner.scan_app_leftovers(cfg), [])
+
+    # -- 3rd whole-branch review: Spotlight (mdfind) as a second, more
+    # thorough confirmation signal layered on top of the directory walk. ---
+
+    def test_mdfind_confirmed_candidate_excluded_even_if_not_in_directory_walk(self):
+        # Real machine: Adobe Creative Cloud, Alfred's nested preferences
+        # helper, a Brother printer utility, and several Adobe daemons live
+        # outside the 3 hardcoded app roots (and/or nested more than one
+        # level deep, or nested inside another .app) -- the directory walk
+        # structurally cannot reach them, but Spotlight's index knows about
+        # them regardless of location/depth/nesting. Mock the confirmation
+        # signal directly (mirrors the simulator scanner's
+        # mock.patch.object(cleaner, "_simctl_json", ...) pattern) so this
+        # test doesn't depend on real Spotlight/machine state.
+        self._leftover_dir("Caches", "com.adobe.acc.adobecreativecloud")
+        with mock.patch.object(cleaner, "_mdfind_confirms_installed",
+                                return_value={"com.adobe.acc.adobecreativecloud"}):
+            self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [],
+                              "an mdfind-confirmed installed app must not be a false positive")
+
+    def test_unconfirmed_by_either_signal_still_surfaces(self):
+        # Regression guard against over-exclusion: a candidate mdfind does
+        # NOT confirm (and the directory walk doesn't know about either)
+        # must still surface as a normal hit.
+        self._leftover_dir("Caches", "com.example.gonezo")
+        with mock.patch.object(cleaner, "_mdfind_confirms_installed",
+                                return_value=set()):
+            hits = cleaner.scan_app_leftovers(self.cfg)
+        self.assertEqual([h["bundle_id"] for h in hits], ["com.example.gonezo"])
+
+    def test_directory_walk_installed_check_still_works_independent_of_mdfind(self):
+        # The existing installed_bundle_ids() check must be left completely
+        # untouched by this addition -- an app the directory walk already
+        # finds is still excluded even when mdfind confirms nothing extra.
+        self._install_app("Still.app", "com.example.still")
+        self._leftover_dir("Caches", "com.example.still")
+        with mock.patch.object(cleaner, "_mdfind_confirms_installed",
+                                return_value=set()):
+            self.assertEqual(cleaner.scan_app_leftovers(self.cfg), [])
+
+
+class TestMdfindConfirmsInstalled(unittest.TestCase):
+    """_mdfind_confirms_installed in isolation -- a single batched mdfind
+    call, graceful degradation on any failure, never one subprocess call
+    per candidate."""
+
+    def test_empty_candidates_short_circuits_without_calling_subprocess(self):
+        with mock.patch.object(cleaner.subprocess, "run") as run:
+            self.assertEqual(cleaner._mdfind_confirms_installed([]), set())
+            run.assert_not_called()
+
+    def test_single_batched_call_not_one_per_candidate(self):
+        candidates = ["com.example.one", "com.example.two", "com.example.three"]
+        with mock.patch.object(cleaner.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["mdfind"], returncode=0, stdout="", stderr="")
+            cleaner._mdfind_confirms_installed(candidates)
+            self.assertEqual(run.call_count, 1)
+
+    def test_subprocess_raising_degrades_to_empty_set(self):
+        # e.g. mdfind missing entirely, or the call times out.
+        with mock.patch.object(cleaner.subprocess, "run",
+                                side_effect=OSError("mdfind not found")):
+            self.assertEqual(
+                cleaner._mdfind_confirms_installed(["com.example.gonezo"]), set())
+
+    def test_nonzero_returncode_degrades_to_empty_set(self):
+        with mock.patch.object(cleaner.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["mdfind"], returncode=1, stdout="", stderr="error")
+            self.assertEqual(
+                cleaner._mdfind_confirms_installed(["com.example.gonezo"]), set())
+
+    def test_confirmed_paths_resolved_to_lowercase_bundle_ids(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            contents = tmp / "Found.app" / "Contents"
+            contents.mkdir(parents=True)
+            with open(contents / "Info.plist", "wb") as f:
+                plistlib.dump({"CFBundleIdentifier": "Com.Example.Found"}, f)
+            app_path = tmp / "Found.app"
+            with mock.patch.object(cleaner.subprocess, "run") as run:
+                run.return_value = subprocess.CompletedProcess(
+                    args=["mdfind"], returncode=0,
+                    stdout=str(app_path) + "\n", stderr="")
+                result = cleaner._mdfind_confirms_installed(["com.example.found"])
+            self.assertEqual(result, {"com.example.found"})
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestNewTargetsV28(unittest.TestCase):
+    def setUp(self):
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        self.targets = {t["id"]: t
+                        for t in cleaner.get_targets(self.cfg, all_categories=True)}
+
+    def test_xcodebuildmcp_target(self):
+        t = self.targets["xcodebuildmcp-workspaces"]
+        self.assertEqual(t["category"], "xcode")
+        self.assertTrue(t["safe"])
+        self.assertIsNone(t["glob"])
+        self.assertTrue(str(t["path"]).endswith("Library/Developer/XcodeBuildMCP"))
+
+    def test_chrome_model_store_target_is_review_only(self):
+        # Chrome indexes these models in ~/Library/Application Support/Google/
+        # Chrome/Local State, which MacCleaner never touches -- deleting the
+        # store leaves a live index pointing at missing model directories and
+        # nothing verified Chrome recovers cleanly. Matches how the other
+        # downloaded-model targets (ollama-models, huggingface-hub) are rated.
+        t = self.targets["chrome-optimization-model-store"]
+        self.assertEqual(t["category"], "caches")
+        self.assertFalse(t["safe"])
+        self.assertIsNone(t["glob"])
+        self.assertTrue(str(t["path"]).endswith("optimization_guide_model_store"))
+
+    def test_other_two_new_targets_stay_safe(self):
+        self.assertTrue(self.targets["xcodebuildmcp-workspaces"]["safe"])
+        self.assertTrue(self.targets["chrome-optimization-hint-cache"]["safe"])
+
+    def test_chrome_hint_cache_is_per_profile_glob(self):
+        # Chrome keeps one of these per profile (Default, Profile 1,
+        # Profile 3, ...), so this target must be a glob like the existing
+        # firefox-cache target -- a fixed path would only ever match one
+        # profile.
+        t = self.targets["chrome-optimization-hint-cache"]
+        self.assertEqual(t["category"], "caches")
+        self.assertTrue(t["safe"])
+        self.assertIsNone(t["path"])
+        self.assertIn("*", t["glob"])
+        self.assertTrue(t["glob"].endswith("optimization_guide_hint_cache_store"))
+
+    def test_new_targets_respect_skip_paths(self):
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg["skip_paths"] = ["~/Library/Developer/XcodeBuildMCP"]
+        ids = {t["id"] for t in cleaner.get_targets(cfg, all_categories=True)}
+        self.assertNotIn("xcodebuildmcp-workspaces", ids)
+        self.assertIn("chrome-optimization-model-store", ids)
+
+
+class TestSwapUsageParsing(unittest.TestCase):
+    """macOS keeps swap on the data volume, so heavy swapping is also a
+    disk-space story -- but it is entirely OS-managed and nothing here is
+    deletable, which is why this surfaces as a doctor check rather than a
+    cleanup target."""
+
+    # Verbatim from `sysctl vm.swapusage` on a real machine.
+    REAL_OUTPUT = ("vm.swapusage: total = 16384.00M  used = 15571.88M  "
+                   "free = 812.12M  (encrypted)\n")
+
+    def test_parses_real_sysctl_output(self):
+        s = cleaner._parse_swap_usage(self.REAL_OUTPUT)
+        self.assertEqual(s["total_bytes"], int(16384.00 * 1024 ** 2))
+        self.assertEqual(s["used_bytes"], int(15571.88 * 1024 ** 2))
+        self.assertAlmostEqual(s["percent"], 95.0, delta=0.5)
+
+    def test_threshold_is_absolute_disk_consumed_not_a_ratio(self):
+        # sysctl's `total` IS the disk the swapfiles occupy under
+        # /System/Volumes/VM, which is the only swap quantity a storage tool
+        # has any business thresholding on. The used/total ratio was rejected
+        # as a signal: it is non-monotonic in disk consumed.
+        self.assertEqual(cleaner.SWAP_WARN_BYTES, 8 * 1024 ** 3)
+        self.assertFalse(hasattr(cleaner, "SWAP_WARN_PERCENT"),
+                         "the ratio threshold must be gone, not merely unused")
+
+    def test_large_swapfiles_are_at_or_above_threshold(self):
+        # 16 GiB of swapfiles on disk -- over the 8 GiB line regardless of how
+        # much of it is currently paged in.
+        s = cleaner._parse_swap_usage(self.REAL_OUTPUT)
+        self.assertGreaterEqual(s["total_bytes"], cleaner.SWAP_WARN_BYTES)
+
+    def test_small_swapfiles_are_below_threshold_even_at_a_high_ratio(self):
+        # 2 GiB of swapfiles, 97% of it paged in. The old ratio rule would
+        # have alarmed on this; the disk-consumed rule correctly does not.
+        out = ("vm.swapusage: total = 2048.00M  used = 1990.00M  "
+               "free = 58.00M  (encrypted)\n")
+        s = cleaner._parse_swap_usage(out)
+        self.assertLess(s["total_bytes"], cleaner.SWAP_WARN_BYTES)
+        self.assertGreater(s["percent"], 90)
+
+    def test_percent_is_still_reported_as_informational_text(self):
+        # The ratio stays in the payload -- it is useful colour in the status
+        # line even though it no longer drives the threshold.
+        out = "vm.swapusage: total = 4.00G  used = 1.00G  free = 3.00G\n"
+        self.assertEqual(cleaner._parse_swap_usage(out)["percent"], 25.0)
+
+    def test_gigabyte_units(self):
+        out = "vm.swapusage: total = 4.00G  used = 2.00G  free = 2.00G  (encrypted)\n"
+        s = cleaner._parse_swap_usage(out)
+        self.assertEqual(s["total_bytes"], 4 * 1024 ** 3)
+        self.assertEqual(s["percent"], 50.0)
+
+    def test_zero_total_does_not_divide_by_zero(self):
+        # A Mac with swap disabled (or freshly booted) reports 0.00M total.
+        out = "vm.swapusage: total = 0.00M  used = 0.00M  free = 0.00M\n"
+        s = cleaner._parse_swap_usage(out)
+        self.assertEqual(s["total_bytes"], 0)
+        self.assertEqual(s["percent"], 0.0)
+
+    def test_unparseable_returns_none(self):
+        self.assertIsNone(cleaner._parse_swap_usage("nonsense"))
+        self.assertIsNone(cleaner._parse_swap_usage(""))
+
+    def test_malformed_number_returns_none_instead_of_raising(self):
+        # `[0-9.]+` happily matches non-numbers. Real sysctl can't emit these,
+        # but the parser is contractually non-raising: _swap_usage() calls it
+        # outside its own try/except, so a ValueError here would escape
+        # run_doctor() and break doctor's exit-0 guarantee.
+        for bad in ("vm.swapusage: total = 1.2.3M  used = 1.00M  free = 0.00M",
+                    "vm.swapusage: total = .M  used = 1.00M  free = 0.00M",
+                    "vm.swapusage: total = 4.00G  used = ...G  free = 0.00G"):
+            self.assertIsNone(cleaner._parse_swap_usage(bad), bad)
+
+    def test_huge_digit_run_returns_none_instead_of_overflowing(self):
+        # `[0-9.]+` is unbounded and float("9"*400) returns inf WITHOUT
+        # raising, so int(inf) throws OverflowError -- which is NOT a
+        # ValueError and so escaped the guard above, escaped _swap_usage()
+        # (whose try only wraps subprocess.run), escaped run_doctor(), and
+        # made `doctor` traceback with a non-zero exit.
+        for bad in ("vm.swapusage: total = %sM  used = 1.00M  free = 0.00M" % ("9" * 400),
+                    "vm.swapusage: total = 1.00M  used = %sG  free = 0.00M" % ("8" * 500)):
+            self.assertIsNone(cleaner._parse_swap_usage(bad), bad)
+
+    def test_collector_degrades_when_sysctl_missing(self):
+        with mock.patch.object(cleaner.subprocess, "run",
+                               side_effect=OSError("no sysctl")):
+            self.assertIsNone(cleaner._swap_usage())
+
+    def test_collector_degrades_on_nonzero_exit(self):
+        fake = mock.Mock(returncode=1, stdout="")
+        with mock.patch.object(cleaner.subprocess, "run", return_value=fake):
+            self.assertIsNone(cleaner._swap_usage())
+
+    def test_collector_argv_and_timeout_are_pinned(self):
+        # The parser's regex is written against `sysctl vm.swapusage`
+        # specifically; a bounded timeout is what keeps doctor responsive.
+        fake = mock.Mock(returncode=0, stdout=self.REAL_OUTPUT)
+        with mock.patch.object(cleaner.subprocess, "run",
+                               return_value=fake) as run:
+            cleaner._swap_usage()
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["sysctl", "vm.swapusage"])
+        self.assertEqual(kwargs["timeout"], 5)
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+
+
+class TestHeldOpenDeletedParsing(unittest.TestCase):
+    """When a process holds a deleted file open, its blocks stay allocated
+    until that process exits -- space no cleaner can reclaim and no
+    directory walk can even see. Report-only for exactly that reason."""
+
+    # Trimmed from real `lsof -nPw +c 0 +L1` output. NODE 195277532 appears
+    # under THREE processes (one shared inode) and NODE 195277705 appears
+    # TWICE under one process (txt + fd 22u). Both are the real
+    # double-counting traps this parser exists to avoid -- on the machine
+    # this was captured from, naive summing overstated the total by 65%.
+    REAL_OUTPUT = (
+        "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NLINK NODE NAME\n"
+        "UserEventAgent 115 jordanfuller txt REG 1,18 56216 0 195277532 /a/.plist-cache\n"
+        "SpringBoard 119 jordanfuller txt REG 1,18 56216 0 195277532 /a/.plist-cache\n"
+        "logd 120 jordanfuller txt REG 1,18 56216 0 195277532 /a/.plist-cache\n"
+        "SpringBoard 119 jordanfuller txt REG 1,18 6389760 0 195277705 /a/Poster\n"
+        "SpringBoard 119 jordanfuller 22u REG 1,18 6389760 0 195277705 /a/Poster\n"
+        "diskimages-helper 456 jordanfuller 5u REG 1,18 3221225472 0 999001 /a/symbols.dmg\n"
+    )
+
+    def test_dedupes_one_inode_shared_by_several_processes(self):
+        r = cleaner._parse_held_open_deleted(self.REAL_OUTPUT)
+        self.assertEqual(r["total_bytes"], 56216 + 6389760 + 3221225472)
+
+    def test_dedupes_several_fds_on_one_inode(self):
+        r = cleaner._parse_held_open_deleted(self.REAL_OUTPUT)
+        self.assertEqual(dict(r["by_command"])["SpringBoard"], 6389760)
+
+    def test_per_command_totals_sum_to_grand_total(self):
+        r = cleaner._parse_held_open_deleted(self.REAL_OUTPUT)
+        self.assertEqual(sum(b for _, b in r["by_command"]), r["total_bytes"])
+
+    def test_largest_holder_sorts_first(self):
+        r = cleaner._parse_held_open_deleted(self.REAL_OUTPUT)
+        self.assertEqual(r["by_command"][0][0], "diskimages-helper")
+
+    def test_ignores_non_regular_files_and_offset_rows(self):
+        out = ("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NLINK NODE NAME\n"
+               "someproc 1 u 3u DIR 1,18 1024 0 111 /d\n"
+               "someproc 1 u 4u REG 1,18 0t4096 0 222 /f\n")
+        self.assertEqual(cleaner._parse_held_open_deleted(out)["total_bytes"], 0)
+
+    def test_unescapes_spaces_in_command_names(self):
+        # `+c 0` renders embedded spaces as a literal \x20 escape.
+        out = ("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NLINK NODE NAME\n"
+               "Spotify\\x20Helper 7 u 3u REG 1,18 1048576 0 333 /f\n")
+        r = cleaner._parse_held_open_deleted(out)
+        self.assertEqual(r["by_command"][0][0], "Spotify Helper")
+
+    def test_empty_output_is_zero(self):
+        self.assertEqual(cleaner._parse_held_open_deleted("")["total_bytes"], 0)
+
+    def test_single_volume_reports_one_device(self):
+        self.assertEqual(
+            cleaner._parse_held_open_deleted(self.REAL_OUTPUT)["device_count"], 1)
+
+    # Rows on TWO different DEVICE values with a COLLIDING node number. Inode
+    # numbers are only unique per volume, so (DEVICE, NODE) must key on both
+    # halves -- the single-device fixture above never exercised DEVICE at all.
+    # doctor's Disk row covers the startup volume only, so a total spanning
+    # several mounts has to say so.
+    TWO_VOLUME_OUTPUT = (
+        "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NLINK NODE NAME\n"
+        "bootproc 10 u 3u REG 1,18 1048576 0 4242 /a/boot-file\n"
+        "extproc 11 u 3u REG 1,21 2097152 0 4242 /Volumes/Ext/other-file\n"
+    )
+
+    def test_same_node_on_different_devices_is_not_deduped(self):
+        r = cleaner._parse_held_open_deleted(self.TWO_VOLUME_OUTPUT)
+        self.assertEqual(r["total_bytes"], 1048576 + 2097152)
+        self.assertEqual(dict(r["by_command"]), {"bootproc": 1048576,
+                                                 "extproc": 2097152})
+
+    def test_counts_distinct_devices(self):
+        self.assertEqual(
+            cleaner._parse_held_open_deleted(self.TWO_VOLUME_OUTPUT)["device_count"], 2)
+
+    def test_collector_degrades_when_lsof_missing(self):
+        with mock.patch.object(cleaner.subprocess, "run",
+                               side_effect=OSError("no lsof")):
+            self.assertIsNone(cleaner._held_open_deleted())
+
+    def test_collector_degrades_on_empty_output(self):
+        # lsof exits non-zero with no output when nothing matches +L1.
+        fake = mock.Mock(returncode=1, stdout="")
+        with mock.patch.object(cleaner.subprocess, "run", return_value=fake):
+            self.assertIsNone(cleaner._held_open_deleted())
+
+    def test_collector_argv_and_timeout_are_pinned(self):
+        # The parser depends contractually on these exact flags: `+L1` is what
+        # restricts output to deleted (NLINK 0) files, `+c 0` is what makes
+        # full command names (and the \x20 escape) show up, `-n`/`-P` keep the
+        # NAME column from being rewritten, and `-b` avoids blocking kernel
+        # calls on a wedged mount (`-w` suppresses the warnings that induces).
+        fake = mock.Mock(returncode=0, stdout=self.REAL_OUTPUT)
+        with mock.patch.object(cleaner.subprocess, "run",
+                               return_value=fake) as run:
+            cleaner._held_open_deleted()
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["lsof", "-b", "-nPw", "+c", "0", "+L1"])
+        self.assertEqual(kwargs["timeout"], 10)
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+
+
+class TestDoctorPressureChecks(unittest.TestCase):
+    # Every advisory collector run_doctor() calls. Mocking these is what keeps
+    # this class deterministic: each time a new one was added (system temp in
+    # 2.12.0, Docker in 2.13.0) it leaked the real machine's state in and broke
+    # these tests. A collector missing here silently makes assertions depend on
+    # the developer's own machine -- test_every_advisory_collector_is_mocked
+    # below fails if this list falls behind.
+    COLLECTORS = ("_swap_usage", "_held_open_deleted", "_system_temp_usage",
+                  "_docker_disk_image")
+
+    def _doctor(self, swap=None, held=None, stmp=None, docker=None):
+        values = {"_swap_usage": swap, "_held_open_deleted": held,
+                  "_system_temp_usage": stmp, "_docker_disk_image": docker}
+        buf = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for name in self.COLLECTORS:
+                stack.enter_context(
+                    mock.patch.object(cleaner, name, return_value=values[name]))
+            stack.enter_context(contextlib.redirect_stdout(buf))
+            cleaner.run_doctor(json.loads(json.dumps(cleaner.DEFAULT_CONFIG)),
+                               json_mode=True)
+        return json.loads(buf.getvalue())
+
+    def test_every_advisory_collector_is_mocked(self):
+        """Tripwire for the mistake made twice already: adding an advisory
+        collector to run_doctor() without adding it to COLLECTORS makes every
+        test in this class depend on the running machine."""
+        import inspect
+        src = inspect.getsource(cleaner.run_doctor)
+        called = {n for n in dir(cleaner)
+                  if n.startswith("_") and n.endswith(("_usage", "_deleted", "_image"))
+                  and callable(getattr(cleaner, n)) and (n + "()") in src}
+        self.assertEqual(called - set(self.COLLECTORS), set(),
+                         "new advisory collector must be added to COLLECTORS")
+
+    def _checks(self, **kw):
+        return {c["name"]: c for c in self._doctor(**kw)["checks"]}
+
+    # ── Swap: absolute disk-consumed threshold ────────────────────────────
+    def test_swap_ok_when_swapfiles_are_small(self):
+        checks = self._checks(swap={"total_bytes": 2 * 1024 ** 3,
+                                    "used_bytes": 512 * 1024 ** 2,
+                                    "percent": 25.0})
+        self.assertTrue(checks["Swap"]["ok"])
+
+    def test_swap_ok_when_ratio_is_high_but_swapfiles_are_small(self):
+        # THE regression this redesign exists for: 2 GiB of swapfiles that
+        # happen to be 97% paged in is not a storage problem, and the old
+        # ratio rule alarmed on exactly this shape.
+        checks = self._checks(swap={"total_bytes": 2 * 1024 ** 3,
+                                    "used_bytes": int(1.94 * 1024 ** 3),
+                                    "percent": 97.0})
+        self.assertTrue(checks["Swap"]["ok"])
+
+    def test_swap_flags_large_swapfiles_even_at_a_low_ratio(self):
+        # 13 GiB of real swapfiles on disk with only 40% paged in: the ratio
+        # rule stayed silent here; the disk-consumed rule correctly speaks up.
+        checks = self._checks(swap={"total_bytes": 13 * 1024 ** 3,
+                                    "used_bytes": int(5.2 * 1024 ** 3),
+                                    "percent": 40.0})
+        self.assertFalse(checks["Swap"]["ok"])
+
+    def test_swap_threshold_is_inclusive_at_the_boundary(self):
+        at = self._checks(swap={"total_bytes": cleaner.SWAP_WARN_BYTES,
+                                "used_bytes": 0, "percent": 0.0})
+        below = self._checks(swap={"total_bytes": cleaner.SWAP_WARN_BYTES - 1,
+                                   "used_bytes": 0, "percent": 0.0})
+        self.assertFalse(at["Swap"]["ok"])
+        self.assertTrue(below["Swap"]["ok"])
+
+    def test_swap_status_is_storage_framed_and_keeps_the_ratio(self):
+        checks = self._checks(swap={"total_bytes": 13 * 1024 ** 3,
+                                    "used_bytes": int(5.2 * 1024 ** 3),
+                                    "percent": 40.0})
+        status = checks["Swap"]["status"]
+        self.assertIn("swapfiles use", status)
+        self.assertIn("of disk", status)
+        self.assertIn("paged in", status)
+        self.assertIn("40.0%", status)
+        self.assertIn("macOS manages this", status)
+        # "restart to free it" is misleading remediation -- a restart frees
+        # the swapfiles for minutes, not durably.
+        self.assertNotIn("restart", status.lower())
+
+    def test_swap_reports_unknown_rather_than_failing(self):
+        self.assertTrue(self._checks(swap=None)["Swap"]["ok"])
+
+    def test_swap_zero_total_reported_without_dividing(self):
+        checks = self._checks(swap={"total_bytes": 0, "used_bytes": 0,
+                                    "percent": 0.0})
+        self.assertTrue(checks["Swap"]["ok"])
+        self.assertIn("no swapfiles", checks["Swap"]["status"])
+
+    # ── Held-open files: display logic ────────────────────────────────────
+    def test_held_open_omitted_below_threshold(self):
+        checks = self._checks(held={"total_bytes": 5 * 1024 ** 2,
+                                    "by_command": [("foo", 5 * 1024 ** 2)],
+                                    "device_count": 1})
+        self.assertNotIn("Held-open files", checks)
+
+    def test_held_open_flags_and_names_process_above_threshold(self):
+        checks = self._checks(held={"total_bytes": 3 * 1024 ** 3,
+                                    "by_command": [("diskimages-helper", 3 * 1024 ** 3)],
+                                    "device_count": 1})
+        self.assertFalse(checks["Held-open files"]["ok"])
+        self.assertIn("diskimages-helper", checks["Held-open files"]["status"])
+
+    def test_held_open_names_biggest_when_none_clear_per_process_floor(self):
+        many = [("p%d" % i, 6 * 1024 ** 2) for i in range(100)]
+        checks = self._checks(held={"total_bytes": 600 * 1024 ** 2,
+                                    "by_command": many, "device_count": 1})
+        self.assertIn("Held-open files", checks)
+        self.assertIn("p0", checks["Held-open files"]["status"])
+
+    def test_held_open_more_count_includes_holders_below_the_naming_floor(self):
+        # Two holders clear the 10 MB naming floor; five do not. The suffix
+        # counted only the named-eligible ones, so every sub-floor holder was
+        # invisible in BOTH the names and the count -- "+0 more" on 5 hidden.
+        by_command = [("big1", 400 * 1024 ** 2), ("big2", 200 * 1024 ** 2)]
+        by_command += [("small%d" % i, 1024 ** 2) for i in range(5)]
+        checks = self._checks(held={"total_bytes": 605 * 1024 ** 2,
+                                    "by_command": by_command, "device_count": 1})
+        status = checks["Held-open files"]["status"]
+        self.assertIn("big1", status)
+        self.assertIn("big2", status)
+        self.assertNotIn("small0", status)
+        self.assertIn("+5 more processes", status)
+
+    def test_held_open_caps_named_processes_and_counts_the_rest(self):
+        by_command = [("p%d" % i, (50 - i) * 1024 ** 2) for i in range(6)]
+        checks = self._checks(held={"total_bytes": 600 * 1024 ** 2,
+                                    "by_command": by_command, "device_count": 1})
+        status = checks["Held-open files"]["status"]
+        self.assertEqual(cleaner.HELD_OPEN_MAX_NAMED, 3)
+        for named in ("p0", "p1", "p2"):
+            self.assertIn(named, status)
+        self.assertNotIn("p3 (", status)
+        self.assertIn("+3 more processes", status)
+
+    def test_held_open_more_suffix_is_singular_for_one_extra(self):
+        by_command = [("p%d" % i, 150 * 1024 ** 2) for i in range(4)]
+        checks = self._checks(held={"total_bytes": 600 * 1024 ** 2,
+                                    "by_command": by_command, "device_count": 1})
+        status = checks["Held-open files"]["status"]
+        self.assertIn("+1 more process", status)
+        self.assertNotIn("+1 more processes", status)
+
+    def test_held_open_no_suffix_when_everything_is_named(self):
+        by_command = [("p%d" % i, 300 * 1024 ** 2) for i in range(2)]
+        checks = self._checks(held={"total_bytes": 600 * 1024 ** 2,
+                                    "by_command": by_command, "device_count": 1})
+        self.assertNotIn("more process", checks["Held-open files"]["status"])
+
+    def test_held_open_flags_when_the_total_spans_several_volumes(self):
+        # doctor's Disk row above reports the startup volume only, so a total
+        # silently summed across mounts would read as boot-disk usage.
+        checks = self._checks(held={"total_bytes": 3 * 1024 ** 3,
+                                    "by_command": [("foo", 3 * 1024 ** 3)],
+                                    "device_count": 3})
+        self.assertIn("across 3 volumes", checks["Held-open files"]["status"])
+
+    def test_held_open_omits_volume_qualifier_on_a_single_volume(self):
+        checks = self._checks(held={"total_bytes": 3 * 1024 ** 3,
+                                    "by_command": [("foo", 3 * 1024 ** 3)],
+                                    "device_count": 1})
+        self.assertNotIn("volume", checks["Held-open files"]["status"])
+
+    def test_held_open_wording_does_not_overstate_attribution(self):
+        # Each deduped inode is attributed to the FIRST command seen holding
+        # it, but the blocks only come back when EVERY holder of that inode
+        # exits -- so the message must not promise the space returns when the
+        # named processes exit.
+        checks = self._checks(held={"total_bytes": 3 * 1024 ** 3,
+                                    "by_command": [("foo", 3 * 1024 ** 3)],
+                                    "device_count": 1})
+        status = checks["Held-open files"]["status"]
+        self.assertIn("every process holding them exits", status)
+        self.assertNotIn("frees itself when they exit", status)
+
+    # ── Advisory: report-only checks are excluded from top-level ok ───────
+    def _advisory_names(self, **kw):
+        return {c["name"] for c in self._doctor(**kw)["checks"] if c.get("advisory")}
+
+    def test_both_new_checks_are_marked_advisory(self):
+        names = self._advisory_names(
+            swap={"total_bytes": 13 * 1024 ** 3, "used_bytes": 1024 ** 3, "percent": 7.9},
+            held={"total_bytes": 3 * 1024 ** 3,
+                  "by_command": [("foo", 3 * 1024 ** 3)], "device_count": 1})
+        self.assertEqual(names, {"Swap", "Held-open files"})
+
+    def test_swap_is_advisory_in_every_branch(self):
+        self.assertIn("Swap", self._advisory_names(swap=None))
+        self.assertIn("Swap", self._advisory_names(
+            swap={"total_bytes": 0, "used_bytes": 0, "percent": 0.0}))
+        self.assertIn("Swap", self._advisory_names(
+            swap={"total_bytes": 1024 ** 3, "used_bytes": 0, "percent": 0.0}))
+        self.assertIn("Swap", self._advisory_names(
+            swap={"total_bytes": 13 * 1024 ** 3, "used_bytes": 0, "percent": 0.0}))
+
+    def test_advisory_key_never_appears_on_pre_existing_checks(self):
+        # Purely additive: the key must be absent (not False) everywhere else,
+        # so already-installed consumers see byte-identical entries.
+        doc = self._doctor(swap=None, held=None)
+        for c in doc["checks"]:
+            if c["name"] in ("Swap", "Held-open files"):
+                continue
+            self.assertNotIn("advisory", c, c["name"])
+        self.assertEqual(set(c["name"] for c in doc["checks"] if "advisory" in c),
+                         {"Swap"})
+
+    def test_failing_advisory_check_does_not_flip_top_level_ok(self):
+        # Compare a run where both advisory checks fail against one where
+        # neither is present. Anything else about this machine is identical
+        # between the two runs, so a difference could only come from the
+        # advisory entries.
+        clean = self._doctor(swap=None, held=None)
+        failing = self._doctor(
+            swap={"total_bytes": 13 * 1024 ** 3, "used_bytes": 1024 ** 3, "percent": 7.9},
+            held={"total_bytes": 3 * 1024 ** 3,
+                  "by_command": [("foo", 3 * 1024 ** 3)], "device_count": 1})
+        failed = [c for c in failing["checks"] if not c["ok"]]
+        self.assertEqual({c["name"] for c in failed} & {"Swap", "Held-open files"},
+                         {"Swap", "Held-open files"},
+                         "both advisory checks must actually be failing here")
+        self.assertEqual(failing["ok"], clean["ok"],
+                         "advisory failures must not move the aggregate")
+
+    def test_non_advisory_failing_check_still_flips_top_level_ok(self):
+        # The counterpart guarantee: `ok` still means "a MacCleaner-owned
+        # problem with a remedy". Invalid config JSON is exactly that.
+        tmp = tempfile.mkdtemp()
+        try:
+            bad = Path(tmp) / "config.json"
+            bad.write_text("{ not json")
+            env = dict(os.environ, MACCLEANER_CONFIG=str(bad))
+            r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                                "doctor", "--json"],
+                               capture_output=True, text=True, env=env)
+            data = json.loads(r.stdout)
+            cfg = next(c for c in data["checks"] if c["name"] == "Config")
+            self.assertFalse(cfg["ok"])
+            self.assertNotIn("advisory", cfg)
+            self.assertFalse(data["ok"],
+                             "a non-advisory failure must fail the aggregate")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_doctor_still_exits_zero_with_a_failing_check(self):
+        # run_doctor returns {"ok", "checks"} but main() deliberately discards
+        # it, so
+        # `doctor` always exits 0. CI's smoke test runs bare
+        # `python3 cleaner.py doctor` -- wiring ok=False to an exit code would
+        # break the build. Deterministically MAKE a check fail (invalid config
+        # JSON) and assert both halves: something really did fail, AND the
+        # exit code is still 0. Without the first half this test passed
+        # vacuously on an all-green machine.
+        tmp = tempfile.mkdtemp()
+        try:
+            bad = Path(tmp) / "config.json"
+            bad.write_text("{ this is not valid json")
+            env = dict(os.environ, MACCLEANER_CONFIG=str(bad))
+            r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                                "doctor", "--json"],
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            data = json.loads(r.stdout)
+            # Assert on the fixture's OWN row, not on "any failing row" -- the
+            # two advisory checks (Swap, Held-open files) fail on plenty of
+            # real machines, so an any() guard would be satisfied by them and
+            # go green even if the invalid-config fixture stopped working.
+            config_check = next(c for c in data["checks"] if c["name"] == "Config")
+            self.assertFalse(config_check["ok"],
+                             "the fixture must actually produce a failing check")
+            # …and the plain (non-JSON) path exits 0 too, which is the exact
+            # invocation CI smoke-tests.
+            r2 = subprocess.run([sys.executable, str(REPO / "cleaner.py"), "doctor"],
+                                capture_output=True, text=True, env=env)
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestStorageInsightsScanner(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.docs = self.tmp / "Documents"
+        self.downloads = self.tmp / "Downloads"
+        self.desktop = self.tmp / "Desktop"
+        for d in (self.docs, self.downloads, self.desktop):
+            d.mkdir()
+        self._patch = mock.patch.dict(os.environ, {
+            "MACCLEANER_STORAGE_INSIGHTS_ROOTS":
+                f"{self.docs}:{self.downloads}:{self.desktop}"
+        })
+        self._patch.start()
+        self.cfg = {}
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_file(self, root, name, mb):
+        p = root / name
+        p.write_bytes(b"\0" * (mb * 1024 * 1024))
+        return p
+
+    def test_finds_file_above_floor(self):
+        self._make_file(self.docs, "big.mov", 150)
+        hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["path"], self.docs / "big.mov")
+        self.assertEqual(hits[0]["size_bytes"], 150 * 1024 * 1024)
+
+    def test_excludes_file_below_floor(self):
+        self._make_file(self.docs, "small.pdf", 50)
+        self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
+
+    def test_scans_all_three_roots(self):
+        self._make_file(self.docs, "a.mov", 120)
+        self._make_file(self.downloads, "b.dmg", 130)
+        self._make_file(self.desktop, "c.zip", 140)
+        hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual({h["path"].name for h in hits}, {"a.mov", "b.dmg", "c.zip"})
+
+    def test_sorted_largest_first(self):
+        self._make_file(self.docs, "small.mov", 110)
+        self._make_file(self.docs, "big.mov", 500)
+        hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual([h["path"].name for h in hits], ["big.mov", "small.mov"])
+
+    def test_caps_at_max_results(self):
+        for i in range(cleaner.STORAGE_INSIGHTS_MAX_RESULTS + 5):
+            self._make_file(self.docs, f"f{i}.bin", 101)
+        hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual(len(hits), cleaner.STORAGE_INSIGHTS_MAX_RESULTS)
+
+    def test_skips_dev_artifact_directory(self):
+        nm = self.docs / "some-project" / "node_modules"
+        nm.mkdir(parents=True)
+        self._make_file(nm, "bundle.js", 120)
+        self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
+
+    def test_reports_the_bundle_itself_never_its_contents(self):
+        # Pre-2.13 this asserted []: bundles were skipped entirely, which is
+        # why /Applications (zero loose large files, a dozen multi-GB apps)
+        # showed nothing at all. The bundle is now one row carrying its whole
+        # size -- but its internals must still never be listed individually.
+        app_contents = self.docs / "SomeApp.app" / "Contents" / "MacOS"
+        app_contents.mkdir(parents=True)
+        self._make_file(app_contents, "SomeApp", 200)
+        hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual([h["path"].name for h in hits], ["SomeApp.app"])
+        self.assertTrue(hits[0]["is_bundle"])
+
+    def test_symlinked_directory_not_followed(self):
+        real = self.tmp / "real_outside"
+        real.mkdir()
+        self._make_file(real, "huge.bin", 300)
+        link = self.docs / "linked"
+        link.symlink_to(real)
+        self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
+
+    def test_symlinked_file_not_reported(self):
+        real_file = self._make_file(self.tmp, "real.bin", 200)
+        link = self.docs / "link.bin"
+        link.symlink_to(real_file)
+        self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
+
+    def test_symlinked_root_is_followed(self):
+        # Configured roots are trusted entry points (this is what makes the
+        # scanner work for macOS's iCloud Desktop & Documents sync, which
+        # replaces ~/Documents and ~/Desktop with symlinks) -- unlike a
+        # symlink discovered mid-walk, a symlinked ROOT is followed.
+        real_docs = self.tmp / "real_icloud_documents"
+        real_docs.mkdir()
+        self._make_file(real_docs, "big.mov", 150)
+        docs_link = self.tmp / "Documents_symlinked_root"
+        docs_link.symlink_to(real_docs)
+        with mock.patch.dict(os.environ, {
+                "MACCLEANER_STORAGE_INSIGHTS_ROOTS": str(docs_link)}):
+            hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["path"].name, "big.mov")
+
+    def test_missing_root_not_fatal(self):
+        with mock.patch.dict(os.environ, {
+                "MACCLEANER_STORAGE_INSIGHTS_ROOTS":
+                str(self.tmp / "does-not-exist")}):
+            self.assertEqual(cleaner.scan_storage_insights(self.cfg), [])
+
+    def test_never_opens_file_contents(self):
+        # The entire iCloud-eviction-safety guarantee rests on this: the
+        # scanner must never call open() on anything it scans. Patching
+        # builtins.open to raise proves it by construction rather than by
+        # inspection.
+        self._make_file(self.docs, "big.mov", 150)
+        with mock.patch("builtins.open", side_effect=AssertionError(
+                "scan_storage_insights must never open file contents")):
+            hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual(len(hits), 1)
+
+    def test_hit_shape_is_not_target_shaped(self):
+        # Pins the spec's core non-goal: entries from this scanner must
+        # never look like get_targets()/collect_targets() targets (no
+        # "id", "safe", or "category" key), since no delete/target
+        # mechanism exists for this data. A future refactor accidentally
+        # adding one of those keys would silently make an entry look
+        # actionable to the delete pipeline's shape expectations.
+        self._make_file(self.docs, "big.mov", 150)
+        hits = cleaner.scan_storage_insights(self.cfg)
+        self.assertEqual(len(hits), 1)
+        keys = set(hits[0].keys())
+        # The invariant is the ABSENCE of target shape, not an exact key set:
+        # pinning the whole set made a purely additive field (is_bundle) fail
+        # a test that has nothing to do with the delete pipeline.
+        self.assertEqual(keys & {"id", "safe", "category", "cmd", "empty_only"}, set())
+        self.assertLessEqual({"path", "size_bytes", "mtime"}, keys)
+
+    def test_default_roots_env_unset(self):
+        # Without the override, the function must fall back to the built-in
+        # default list -- verify it is built correctly rather than raising or
+        # returning None. Widened in 2.13.0 from three roots to six.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MACCLEANER_STORAGE_INSIGHTS_ROOTS", None)
+            roots = cleaner._storage_insights_roots()
+        self.assertEqual(roots, [cleaner.HOME / "Documents",
+                                  cleaner.HOME / "Downloads",
+                                  cleaner.HOME / "Desktop",
+                                  cleaner.HOME / "Library",
+                                  cleaner.HOME / "Applications",
+                                  Path("/Applications")])
+
+
+class TestDockerImageAdvisory(unittest.TestCase):
+    """Docker Desktop's disk image is the largest single item MacCleaner can
+    see and cannot reclaim. `docker system prune` frees space INSIDE the VM,
+    but the host-side .raw only shrinks when Docker's own TRIM runs, which
+    needs Docker running. So this is advisory, like Swap and System temp:
+    report the space, name the remedy, never touch it."""
+
+    def _doctor(self, docker=None):
+        buf = io.StringIO()
+        with mock.patch.object(cleaner, "_swap_usage", return_value=None), \
+             mock.patch.object(cleaner, "_held_open_deleted", return_value=None), \
+             mock.patch.object(cleaner, "_system_temp_usage", return_value=None), \
+             mock.patch.object(cleaner, "_docker_disk_image", return_value=docker), \
+             contextlib.redirect_stdout(buf):
+            cleaner.run_doctor(json.loads(json.dumps(cleaner.DEFAULT_CONFIG)),
+                               json_mode=True)
+        return json.loads(buf.getvalue())
+
+    def test_reports_allocated_size_and_names_the_remedy(self):
+        d = self._doctor({"path": "/x/Docker.raw", "bytes": 10 * 1024 ** 3,
+                          "running": False})
+        c = next(c for c in d["checks"] if c["name"] == "Docker disk image")
+        self.assertTrue(c["advisory"])
+        self.assertFalse(c["ok"])
+        self.assertIn("10.0 GB", c["status"])
+        self.assertIn("Docker", c["status"])
+
+    def test_says_docker_must_be_running_to_reclaim(self):
+        d = self._doctor({"path": "/x/Docker.raw", "bytes": 20 * 1024 ** 3,
+                          "running": False})
+        c = next(c for c in d["checks"] if c["name"] == "Docker disk image")
+        self.assertIn("not running", c["status"].lower())
+
+    def test_quiet_below_the_floor(self):
+        d = self._doctor({"path": "/x/Docker.raw", "bytes": 100 * 1024 ** 2,
+                          "running": True})
+        self.assertNotIn("Docker disk image", [c["name"] for c in d["checks"]])
+
+    def test_absent_when_docker_is_not_installed(self):
+        d = self._doctor(None)
+        self.assertNotIn("Docker disk image", [c["name"] for c in d["checks"]])
+
+    def test_never_flips_top_level_ok(self):
+        d = self._doctor({"path": "/x/Docker.raw", "bytes": 99 * 1024 ** 3,
+                          "running": False})
+        non_advisory = [c for c in d["checks"] if not c.get("advisory")]
+        self.assertEqual(d["ok"], all(c["ok"] for c in non_advisory))
+
+    def test_measures_allocated_not_apparent_size(self):
+        """Docker.raw is sparse: 1.0 TB apparent against ~10 GB allocated.
+        Reporting apparent size would claim a terabyte on a 460 GB disk."""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            raw = tmp / "Docker.raw"
+            with open(raw, "wb") as f:
+                f.seek(500 * 1024 * 1024 * 1024)
+                f.write(b"x")
+            st = os.stat(raw)
+            if st.st_blocks * 512 >= st.st_size:
+                self.skipTest("filesystem did not store the file sparsely")
+            with mock.patch.object(cleaner, "DOCKER_RAW_PATHS", [raw]):
+                info = cleaner._docker_disk_image()
+            self.assertIsNotNone(info)
+            self.assertLess(info["bytes"], st.st_size)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestScheduleTransparency(unittest.TestCase):
+    """2.15.0: the schedule looked dead because it was invisible. A weekly
+    toggle with no next-run time, no last-run record and no way to fire a run
+    is indistinguishable from a broken feature -- the user reported exactly
+    that against a schedule that was working. `schedule status --json` now
+    says WHEN the next clean fires, and `schedule run` fires one on demand."""
+
+    def test_next_run_weekly_before_monday_9am(self):
+        # Friday 2026-08-28 10:00 -> Monday 2026-08-31 09:00
+        now = datetime.datetime(2026, 8, 28, 10, 0)
+        self.assertEqual(cleaner._next_scheduled_run("weekly", now),
+                         datetime.datetime(2026, 8, 31, 9, 0))
+
+    def test_next_run_weekly_on_monday_before_9(self):
+        now = datetime.datetime(2026, 8, 31, 8, 59)  # a Monday
+        self.assertEqual(cleaner._next_scheduled_run("weekly", now),
+                         datetime.datetime(2026, 8, 31, 9, 0))
+
+    def test_next_run_weekly_on_monday_after_9(self):
+        now = datetime.datetime(2026, 8, 31, 9, 0, 1)
+        self.assertEqual(cleaner._next_scheduled_run("weekly", now),
+                         datetime.datetime(2026, 9, 7, 9, 0))
+
+    def test_next_run_monthly(self):
+        now = datetime.datetime(2026, 8, 28, 10, 0)
+        self.assertEqual(cleaner._next_scheduled_run("monthly", now),
+                         datetime.datetime(2026, 9, 1, 9, 0))
+        # on the 1st before 9am -> today
+        now = datetime.datetime(2026, 9, 1, 8, 0)
+        self.assertEqual(cleaner._next_scheduled_run("monthly", now),
+                         datetime.datetime(2026, 9, 1, 9, 0))
+        # December wraps the year
+        now = datetime.datetime(2026, 12, 15, 12, 0)
+        self.assertEqual(cleaner._next_scheduled_run("monthly", now),
+                         datetime.datetime(2027, 1, 1, 9, 0))
+
+    def test_next_run_none_when_off(self):
+        self.assertIsNone(cleaner._next_scheduled_run(None,
+                                                      datetime.datetime(2026, 8, 28)))
+
+    def test_status_json_carries_next_run(self):
+        fake = {"schedule": "weekly", "agents": [], "legacy_cron": False}
+        buf = io.StringIO()
+        with mock.patch.object(cleaner, "_schedule_state", return_value=dict(fake)), \
+             contextlib.redirect_stdout(buf):
+            cleaner.run_schedule_status(json_mode=True)
+        d = json.loads(buf.getvalue())
+        self.assertIn("next_run", d, "additive key so the app can display it")
+        # parseable ISO timestamp, in the future
+        self.assertGreater(datetime.datetime.fromisoformat(d["next_run"]),
+                           datetime.datetime.now())
+
+    def test_status_json_next_run_null_when_off(self):
+        fake = {"schedule": None, "agents": [], "legacy_cron": False}
+        buf = io.StringIO()
+        with mock.patch.object(cleaner, "_schedule_state", return_value=dict(fake)), \
+             contextlib.redirect_stdout(buf):
+            cleaner.run_schedule_status(json_mode=True)
+        self.assertIsNone(json.loads(buf.getvalue())["next_run"])
+
+    def test_schedule_run_kickstarts_the_clean_agent(self):
+        calls = {}
+
+        def fake_run(argv, **kw):
+            calls["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        buf = io.StringIO()
+        with mock.patch.object(cleaner.subprocess, "run", side_effect=fake_run), \
+             contextlib.redirect_stdout(buf):
+            ok = cleaner.run_schedule_run(json_mode=True)
+        self.assertTrue(ok)
+        self.assertEqual(calls["argv"][0], "launchctl")
+        self.assertIn("kickstart", calls["argv"])
+        self.assertTrue(any(cleaner.CLEAN_LABEL in a for a in calls["argv"]))
+        self.assertTrue(json.loads(buf.getvalue())["started"])
+
+    def test_schedule_run_reports_failure_honestly(self):
+        def fake_run(argv, **kw):
+            return subprocess.CompletedProcess(argv, 113, stdout="",
+                                               stderr="Could not find service")
+        buf = io.StringIO()
+        with mock.patch.object(cleaner.subprocess, "run", side_effect=fake_run), \
+             contextlib.redirect_stdout(buf):
+            ok = cleaner.run_schedule_run(json_mode=True)
+        self.assertFalse(ok)
+        d = json.loads(buf.getvalue())
+        self.assertFalse(d["started"])
+        self.assertIn("error", d)
+
+
+class TestCleanMinFree(unittest.TestCase):
+    """`clean --min-free N`: clean safe targets, largest first, ONLY until N GB
+    are free -- then stop. Built for agents under a fail-closed disk floor
+    (the exact situation a peer session hit): free just enough to clear the
+    floor instead of blowing away every cache on the machine."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        (self.home / ".npm" / "_cacache").mkdir(parents=True)
+        (self.home / ".npm" / "_cacache" / "blob").write_bytes(b"x" * 8192)
+        (self.home / ".npm" / "_npx").mkdir(parents=True)
+        (self.home / ".npm" / "_npx" / "blob").write_bytes(b"x" * 4096)
+        self.cfg_path = self.tmp / "config.json"
+        cfg = {"enabled_categories": ["node"],
+               "known_categories": list(cleaner.ALL_CATEGORIES)}
+        self.cfg_path.write_text(json.dumps(cfg))
+        self.env = {**os.environ, "HOME": str(self.home),
+                    "MACCLEANER_CONFIG": str(self.cfg_path),
+                    "MACCLEANER_LOG": str(self.tmp / "report.log"),
+                    "MACCLEANER_SNAPSHOTS": str(self.tmp / "snapshots.log"),
+                    "MACCLEANER_ALERTS": str(self.tmp / "alerts.json"),
+                    "MACCLEANER_TMP_ROOT": str(self.tmp / "tmproot")}
+        (self.tmp / "tmproot").mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _clean(self, *args):
+        return subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                               "clean", *args, "--json"],
+                              capture_output=True, text=True, env=self.env,
+                              timeout=120)
+
+    def test_already_above_target_cleans_nothing(self):
+        r = self._clean("--min-free", "0.000001", "--yes")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = json.loads(r.stdout)
+        self.assertTrue(d["target_met"])
+        self.assertEqual(d["items"], [], "no deletion when the floor is already met")
+        self.assertTrue((self.home / ".npm" / "_cacache").exists())
+
+    def test_unreachable_target_cleans_everything_and_says_not_met(self):
+        r = self._clean("--min-free", "99999999", "--yes")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = json.loads(r.stdout)
+        self.assertFalse(d["target_met"],
+                         "must not claim success it did not achieve")
+        self.assertGreater(len(d["items"]), 0, "still cleans what it can")
+        self.assertEqual(d["min_free_gb"], 99999999)
+
+    def test_min_free_requires_yes(self):
+        r = self._clean("--min-free", "1")
+        self.assertNotEqual(r.returncode, 0,
+                            "an until-threshold clean is unattended by nature")
+
+    def test_min_free_never_touches_review_targets(self):
+        r = self._clean("--min-free", "99999999", "--yes")
+        d = json.loads(r.stdout)
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        safe_ids = {t["id"] for t in cleaner.get_targets(cfg, all_categories=True)
+                    if t["safe"]}
+        for item in d["items"]:
+            self.assertIn(item["id"], safe_ids,
+                          f"{item['id']} is review-level and must never be swept")
+
+
+class TestStorageMapDepth(unittest.TestCase):
+    """`storage-map --depth N` (1-3): one call giving agents a nested tree
+    instead of N round-trips of drill-down."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "a" / "inner").mkdir(parents=True)
+        (self.tmp / "a" / "inner" / "f").write_bytes(b"x" * (2 * 1024 * 1024))
+        (self.tmp / "b").mkdir()
+        (self.tmp / "b" / "g").write_bytes(b"x" * 1024)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _map(self, *args):
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "storage-map", str(self.tmp), *args, "--json"],
+                           capture_output=True, text=True, timeout=120)
+        return r, (json.loads(r.stdout) if r.returncode == 0 else None)
+
+    def test_default_depth_has_no_nested_children(self):
+        r, d = self._map()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        a = next(c for c in d["children"] if c["name"] == "a")
+        self.assertNotIn("children", a, "depth 1 output must stay byte-compatible")
+
+    def test_depth_2_nests_one_level(self):
+        r, d = self._map("--depth", "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        a = next(c for c in d["children"] if c["name"] == "a")
+        self.assertIn("children", a)
+        self.assertEqual([c["name"] for c in a["children"]], ["inner"])
+        inner = a["children"][0]
+        self.assertNotIn("children", inner, "depth 2 stops at two levels")
+
+    def test_depth_3_nests_two_levels(self):
+        r, d = self._map("--depth", "3")
+        a = next(c for c in d["children"] if c["name"] == "a")
+        inner = a["children"][0]
+        self.assertIn("children", inner)
+        self.assertEqual([c["name"] for c in inner["children"]], ["f"])
+
+    def test_depth_out_of_range_is_a_usage_error(self):
+        r, _ = self._map("--depth", "4")
+        self.assertEqual(r.returncode, 2, "bounded on purpose; 4 is refused")
+        r, _ = self._map("--depth", "0")
+        self.assertEqual(r.returncode, 2)
+
+    def test_files_never_carry_children(self):
+        r, d = self._map("--depth", "3")
+        b = next(c for c in d["children"] if c["name"] == "b")
+        g = b["children"][0]
+        self.assertEqual(g["kind"], "file")
+        self.assertNotIn("children", g)
+
+
+class TestTmpLivenessGuard(unittest.TestCase):
+    """Age alone is not proof a tmp workspace is idle.
+
+    A nested write does not update the parent's mtime, so a directory can
+    read as weeks-stale at its top level while a build writes inside it. This
+    was observed live: /private/tmp/<ws>/DerivedData reported "last written
+    68s / 76s / 84s ago" across three samples -- its mtime going further into
+    the past -- while an xcodebuild process held 7 open handles beneath it and
+    was writing a new .xcresult. A peer session read the same lock state as
+    "idle" and proposed deleting it. Nothing may be offered for deletion while
+    a live process names it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "tmproot"
+        self.root.mkdir()
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        self.cfg["tmp_min_age_days"] = 0
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _derived(self, at):
+        at.mkdir(parents=True, exist_ok=True)
+        for d in ("Build", "Index.noindex", "Logs"):
+            (at / d).mkdir()
+        (at / "Build" / "blob").write_bytes(b"x" * 2048)
+
+    def _scan(self, running=()):
+        with mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root), \
+             mock.patch.object(cleaner, "_running_command_lines",
+                               return_value=list(running)):
+            return cleaner.scan_tmp_artifacts(self.cfg)
+
+    def test_workspace_named_by_a_live_process_is_not_offered(self):
+        ws = self.root / "ws"
+        self._derived(ws)
+        cmd = f"xcodebuild -derivedDataPath {ws} -resultBundlePath {ws}/r.xcresult"
+        self.assertEqual(self._scan(running=[cmd]), [],
+                         "a live build's own output must never be offered")
+
+    def test_nested_tree_named_by_a_live_process_is_not_offered(self):
+        ws = self.root / "session"
+        ws.mkdir()
+        self._derived(ws / "derived")
+        cmd = f"xcodebuild -derivedDataPath {ws}/derived"
+        self.assertEqual(self._scan(running=[cmd]), [])
+
+    def test_still_offered_when_nothing_references_it(self):
+        ws = self.root / "ws"
+        self._derived(ws)
+        self.assertTrue(self._scan(running=["/usr/sbin/cupsd", "loginwindow"]),
+                        "an idle workspace must still be reclaimable")
+
+    def test_unrelated_process_does_not_suppress(self):
+        ws = self.root / "ws"
+        self._derived(ws)
+        other = self.root / "other-ws"
+        self._derived(other)
+        cmd = f"xcodebuild -derivedDataPath {other}"
+        names = {str(h["path"]) for h in self._scan(running=[cmd])}
+        self.assertIn(str(ws), names, "only the referenced path is protected")
+        self.assertNotIn(str(other), names)
+
+    def test_substring_collision_does_not_over_suppress(self):
+        """A path that merely shares a prefix with a busy one must still be
+        offered -- `/tmp/ws` appearing in a command must not shield `/tmp/ws2`."""
+        ws = self.root / "ws"
+        ws2 = self.root / "ws2"
+        self._derived(ws)
+        self._derived(ws2)
+        names = {str(h["path"]) for h in self._scan(running=[f"xcodebuild -x {ws}"])}
+        self.assertIn(str(ws2), names)
+        self.assertNotIn(str(ws), names)
+
+    def test_degrades_open_when_process_list_is_unavailable(self):
+        """If ps can't be read we cannot prove a path is busy. These targets
+        are review-only and never auto-cleaned, so failing closed here would
+        silently hide everything; the age gate remains the guard."""
+        with mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root), \
+             mock.patch.object(cleaner, "_running_command_lines", return_value=None):
+            ws = self.root / "ws"
+            self._derived(ws)
+            self.assertTrue(cleaner.scan_tmp_artifacts(self.cfg))
+
+    def test_own_process_tree_is_excluded(self):
+        """The scan must not see ITSELF as a holder. Observed for real: asking
+        `_path_is_in_use` about a path put that path into the asking shell's
+        own command line, so the answer came back True with nothing actually
+        using it -- the check reporting on its own reflection."""
+        ws = self.root / "ws"
+        self._derived(ws)
+        # A command line containing the path, attributed to this very process.
+        with mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root), \
+             mock.patch.object(cleaner, "_running_command_lines",
+                               return_value=[f"python3 -c print('{ws}')"]), \
+             mock.patch.object(cleaner, "_own_process_tree",
+                               return_value={f"python3 -c print('{ws}')"}):
+            self.assertTrue(cleaner.scan_tmp_artifacts(self.cfg),
+                            "our own command line must not suppress a candidate")
+
+    def test_process_list_is_read_once_per_scan(self):
+        """One ps call for the whole scan, not one per candidate."""
+        for n in range(4):
+            self._derived(self.root / f"ws{n}")
+        with mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root), \
+             mock.patch.object(cleaner, "_running_command_lines",
+                               return_value=[]) as rc:
+            cleaner.scan_tmp_artifacts(self.cfg)
+        self.assertEqual(rc.call_count, 1)
+
+
+class TestTmpNestedBuildOutput(unittest.TestCase):
+    """The tmp scanner classified only the top level, and required an
+    `info.plist` to recognise DerivedData. Both assumptions failed on real
+    output: a 4.2 GB Xcode DerivedData tree sat one level down inside a tmp
+    working directory, in a folder named `derived` with no `info.plist`, and
+    the scanner could not see it AT ANY AGE. Detection stays content-based --
+    never name-based -- so a custom `-derivedDataPath` name is irrelevant."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "tmproot"
+        self.root.mkdir()
+        self.cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        self.cfg["tmp_min_age_days"] = 0
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _derived(self, at, info_plist=True):
+        """A realistic DerivedData tree. `info_plist=False` reproduces the
+        real-world case that defeated the old signature."""
+        at.mkdir(parents=True, exist_ok=True)
+        (at / "Build").mkdir()
+        (at / "Index.noindex").mkdir()
+        (at / "ModuleCache.noindex").mkdir()
+        (at / "Logs").mkdir()
+        (at / "Build" / "blob").write_bytes(b"x" * 4096)
+        if info_plist:
+            (at / "info.plist").write_text("<plist/>")
+
+    def _scan(self):
+        with mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root):
+            return cleaner.scan_tmp_artifacts(self.cfg)
+
+    def test_derived_data_without_info_plist_is_recognised(self):
+        """The real folder had Build/, Index.noindex/ and ModuleCache.noindex/
+        but no info.plist, so the old three-part signature rejected it."""
+        self._derived(self.root / "job", info_plist=False)
+        kinds = {h["kind"] for h in self._scan()}
+        self.assertIn("derived-data", kinds)
+
+    def test_nested_build_output_is_found_one_level_down(self):
+        """The tmp dir itself is not build output -- it CONTAINS it. This is
+        the shape every AI-coding-session working directory had."""
+        job = self.root / "session"
+        job.mkdir()
+        (job / "notes.log").write_bytes(b"x" * 128)
+        self._derived(job / "derived", info_plist=False)
+        hits = self._scan()
+        paths = {str(h["path"]) for h in hits}
+        self.assertIn(str(job / "derived"), paths,
+                      "the nested build tree must be offered")
+        self.assertNotIn(str(job), paths,
+                         "the parent holds logs the user may still want; "
+                         "only the build tree is offered")
+
+    def test_nested_hits_are_review_level(self):
+        job = self.root / "session"
+        job.mkdir()
+        self._derived(job / "derived", info_plist=False)
+        for t in cleaner.tmp_to_targets(self._scan()):
+            self.assertFalse(t["safe"], "never auto-cleaned by --yes")
+
+    def test_detection_is_by_content_not_name(self):
+        """A folder named `derived`, `dd`, or anything else must be found;
+        a folder merely NAMED DerivedData with no build shape must not."""
+        for name in ("derived", "dd", "out"):
+            job = self.root / f"job-{name}"
+            job.mkdir()
+            self._derived(job / name, info_plist=False)
+        decoy = self.root / "job-decoy"
+        (decoy / "DerivedData").mkdir(parents=True)
+        (decoy / "DerivedData" / "readme.txt").write_text("not build output")
+        paths = {str(h["path"]) for h in self._scan()}
+        for name in ("derived", "dd", "out"):
+            self.assertIn(str(self.root / f"job-{name}" / name), paths, name)
+        self.assertNotIn(str(decoy / "DerivedData"), paths,
+                         "name alone must never qualify a directory")
+
+    def test_age_gate_still_applies_to_nested_output(self):
+        """A build may be writing into it right now. The real 4.2 GB case was
+        0.0 days old, and the age gate is what protects a live build."""
+        job = self.root / "fresh"
+        job.mkdir()
+        self._derived(job / "derived", info_plist=False)
+        cfg = json.loads(json.dumps(cleaner.DEFAULT_CONFIG))
+        cfg["tmp_min_age_days"] = 3
+        with mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root):
+            self.assertEqual(cleaner.scan_tmp_artifacts(cfg), [])
+
+    def test_does_not_descend_more_than_one_level(self):
+        """Bounded on purpose: an unbounded walk of every tmp tree would be
+        both slow and far more likely to surface something live."""
+        job = self.root / "job"
+        self._derived(job / "a" / "b" / "deep", info_plist=False)
+        paths = {str(h["path"]) for h in self._scan()}
+        self.assertNotIn(str(job / "a" / "b" / "deep"), paths)
+
+
+class TestStorageInsightsBundlesAndRoots(unittest.TestCase):
+    """2.13.0 widened the large-items scan to Applications and the whole home
+    Library, and made it bundle-aware.
+
+    Bundle-awareness is what makes /Applications useful at all: on a real Mac
+    that directory contains ZERO loose files over the 100 MB floor but twelve
+    .app bundles over 1 GB. Reporting the files *inside* a bundle would be
+    both useless (dozens of rows per app) and actively misleading -- nobody
+    should delete a lone binary out of an app -- so a bundle is one row
+    carrying its whole size, and the scan never descends into it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "Applications"
+        big = self.root / "Big.app" / "Contents" / "MacOS"
+        big.mkdir(parents=True)
+        # Three chunks, none individually over the floor: only the bundle
+        # total clears it, which is exactly the case a file-only scan misses.
+        for n in ("a", "b", "c"):
+            (big / n).write_bytes(b"x" * (40 * 1024 * 1024))
+        (self.root / "Tiny.app" / "Contents").mkdir(parents=True)
+        (self.root / "Tiny.app" / "Contents" / "x").write_bytes(b"x" * 1024)
+        (self.root / "loose.bin").write_bytes(b"x" * (150 * 1024 * 1024))
+        self.env = {"MACCLEANER_STORAGE_INSIGHTS_ROOTS": str(self.root)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _scan(self):
+        with mock.patch.dict(os.environ, self.env):
+            return cleaner.scan_storage_insights(cleaner.DEFAULT_CONFIG)
+
+    def test_bundle_reported_as_one_entry_with_its_total_size(self):
+        hits = {h["path"].name: h for h in self._scan()}
+        self.assertIn("Big.app", hits, "a 120 MB bundle must be reported")
+        self.assertGreaterEqual(hits["Big.app"]["size_bytes"], 120 * 1024 * 1024)
+        self.assertTrue(hits["Big.app"].get("is_bundle"))
+
+    def test_does_not_descend_into_a_bundle(self):
+        names = [h["path"].name for h in self._scan()]
+        for inner in ("a", "b", "c"):
+            self.assertNotIn(inner, names)
+
+    def test_bundle_below_the_floor_is_not_reported(self):
+        self.assertNotIn("Tiny.app", [h["path"].name for h in self._scan()])
+
+    def test_loose_files_still_reported_alongside_bundles(self):
+        names = [h["path"].name for h in self._scan()]
+        self.assertIn("loose.bin", names)
+        self.assertIn("Big.app", names)
+
+    def test_plain_files_are_not_marked_as_bundles(self):
+        loose = next(h for h in self._scan() if h["path"].name == "loose.bin")
+        self.assertFalse(loose.get("is_bundle"))
+
+    def test_default_roots_cover_applications_desktop_documents_and_library(self):
+        os.environ.pop("MACCLEANER_STORAGE_INSIGHTS_ROOTS", None)
+        roots = {str(r) for r in cleaner._storage_insights_roots()}
+        home = str(Path.home())
+        for expected in (f"{home}/Documents", f"{home}/Downloads", f"{home}/Desktop",
+                         f"{home}/Library", f"{home}/Applications", "/Applications"):
+            self.assertIn(expected, roots, f"{expected} must be covered")
+
+    def test_sparse_file_reports_actual_disk_usage_not_apparent_size(self):
+        """Docker.raw is the motivating case: a sparse disk image whose
+        apparent st_size reads 1.0 TB while it actually occupies ~10 GB. A
+        scan ranking by apparent size puts a phantom terabyte at the top of a
+        "largest items" list on a 460 GB disk, which is obvious nonsense and
+        destroys trust in every other number on the page. Rank by allocated
+        blocks, which is what `du` and Finder report."""
+        sparse = self.root / "sparse.img"
+        with open(sparse, "wb") as f:
+            f.seek(900 * 1024 * 1024 * 1024)   # 900 GB apparent
+            f.write(b"x")
+        st = os.stat(sparse)
+        if st.st_blocks * 512 >= st.st_size:
+            self.skipTest("filesystem did not store the file sparsely")
+        hit = next((h for h in self._scan() if h["path"].name == "sparse.img"), None)
+        if hit is not None:
+            self.assertLess(hit["size_bytes"], st.st_size,
+                            "must not report the apparent 900 GB")
+            self.assertLessEqual(hit["size_bytes"], st.st_blocks * 512 + 4096)
+
+    def test_bundle_size_also_uses_allocated_blocks(self):
+        hits = {h["path"].name: h for h in self._scan()}
+        real = int(subprocess.run(["du", "-skx", str(self.root / "Big.app")],
+                                  capture_output=True, text=True).stdout.split()[0]) * 1024
+        # du and a stat-walk can differ slightly on directory overhead; a few
+        # percent is fine, an order of magnitude is the bug this guards.
+        self.assertAlmostEqual(hits["Big.app"]["size_bytes"], real,
+                               delta=max(2 * 1024 * 1024, real * 0.05))
+
+    def test_still_never_opens_file_contents(self):
+        """The iCloud-eviction guarantee must survive bundle measurement --
+        summing a bundle has to stay stat-only, or scanning a cloud-backed
+        folder could trigger downloads of evicted files."""
+        with mock.patch("builtins.open", side_effect=AssertionError("opened a file")):
+            self._scan()
+
+    def test_unreadable_subtree_does_not_kill_the_scan(self):
+        """~/Library and /Applications both contain entries a normal user
+        cannot read. One EACCES must not lose every other result."""
+        blocked = self.root / "blocked"
+        blocked.mkdir()
+        (blocked / "f").write_bytes(b"x" * (200 * 1024 * 1024))
+        os.chmod(blocked, 0o000)
+        try:
+            names = [h["path"].name for h in self._scan()]
+            self.assertIn("Big.app", names)
+            self.assertIn("loose.bin", names)
+        finally:
+            os.chmod(blocked, 0o755)
+
+
+class TestStorageInsightsCommand(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.docs = self.tmp / "Documents"
+        self.docs.mkdir()
+        self._patch = mock.patch.dict(os.environ, {
+            "MACCLEANER_STORAGE_INSIGHTS_ROOTS": str(self.docs)
+        })
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_relative_days_buckets(self):
+        now = time.time()
+        self.assertEqual(cleaner._relative_days(now), "today")
+        self.assertEqual(cleaner._relative_days(now - 86400 * 1.5), "yesterday")
+        self.assertEqual(cleaner._relative_days(now - 86400 * 5), "5 days ago")
+
+    def test_json_output_shape(self):
+        (self.docs / "big.mov").write_bytes(b"\0" * 150 * 1024 * 1024)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cleaner.show_storage_insights({}, json_mode=True)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["version"], cleaner.VERSION)
+        self.assertEqual(len(data["entries"]), 1)
+        entry = data["entries"][0]
+        self.assertEqual(entry["path"], str(self.docs / "big.mov"))
+        self.assertEqual(entry["size_bytes"], 150 * 1024 * 1024)
+        self.assertEqual(entry["size_human"], cleaner.fmt_size(150 * 1024 * 1024))
+        self.assertIn("mtime", entry)
+
+    def test_plain_output_no_crash_when_empty(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cleaner.show_storage_insights({}, json_mode=False)
+        # Derived from STORAGE_INSIGHTS_MIN_BYTES via fmt_size(), not a
+        # hardcoded "100 MB" literal -- fmt_size renders with one decimal
+        # place ("100.0 MB"), so the floor text must match that exactly.
+        self.assertIn(cleaner.fmt_size(cleaner.STORAGE_INSIGHTS_MIN_BYTES), buf.getvalue())
+
+    def test_cli_json_end_to_end(self):
+        (self.docs / "big.mov").write_bytes(b"\0" * 150 * 1024 * 1024)
+        env = dict(os.environ)
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "storage-insights", "--json"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual(len(data["entries"]), 1)
+
+    def test_no_yes_or_targets_flag_exists(self):
+        # This subcommand must never grow a delete-adjacent flag -- it has
+        # nothing to confirm or preview.
+        import argparse
+        parser = cleaner.build_parser()
+        sub_action = next(a for a in parser._actions
+                          if isinstance(a, argparse._SubParsersAction))
+        storage_parser = sub_action.choices["storage-insights"]
+        flags = {opt for action in storage_parser._actions
+                 for opt in action.option_strings}
+        self.assertNotIn("--yes", flags)
+        self.assertNotIn("--targets", flags)
+        self.assertNotIn("--dry-run", flags)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestTmpMinAgeDefault(unittest.TestCase):
+    """2.15.0 lowers tmp_min_age_days from 3 to 1. Rationale: every tmp
+    target is review-only, so the age gate's only job is keeping an ACTIVE
+    task's workspace out of the list -- and a workspace idle for a full day
+    is not active. At 3 days, multi-GB finished workspaces sat invisible on
+    a 90%-full disk for most of a week."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.root = Path(self.td.name)
+        self._p = mock.patch.object(cleaner, "TMP_SCAN_ROOT", self.root)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self.td.cleanup()
+
+    def test_default_config_value_is_one_day(self):
+        self.assertEqual(cleaner.DEFAULT_CONFIG["tmp_min_age_days"], 1)
+
+    def test_two_day_old_workspace_offered_when_config_omits_the_key(self):
+        """Pins the .get() fallback literal inside scan_tmp_artifacts, not
+        just DEFAULT_CONFIG -- an old config.json without the key must get
+        the same default."""
+        d = self.root / "old-workspace"
+        (d / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        old = time.time() - 2 * 86400
+        os.utime(d, (old, old))
+        hits = cleaner.scan_tmp_artifacts({})
+        self.assertEqual([h["path"].name for h in hits], ["old-workspace"])
+
+    def test_twelve_hour_old_workspace_still_protected(self):
+        d = self.root / "active-workspace"
+        (d / "Build" / "Intermediates.noindex").mkdir(parents=True)
+        recent = time.time() - 12 * 3600
+        os.utime(d, (recent, recent))
+        self.assertEqual(cleaner.scan_tmp_artifacts({}), [])
+
+
+class TestWeeklyDigest(unittest.TestCase):
+    """Phase 6 'scheduled scan reports': the scheduled clean is weekly, so
+    its completion notification IS the weekly report -- it now carries a
+    trailing-7-day total alongside the current run. No plist change, so
+    existing installed schedules pick it up on the next engine update."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.log = Path(self.td.name) / "report.log"
+        self._p = mock.patch.object(cleaner, "LOG_PATH", self.log)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self.td.cleanup()
+
+    def _seed(self, entries):
+        now = datetime.datetime.now()
+        data = [{"timestamp": (now - datetime.timedelta(days=age)).isoformat(),
+                 "total_freed_bytes": freed, "items": []}
+                for age, freed in entries]
+        self.log.write_text(json.dumps(data))
+
+    def test_window_is_trailing_seven_days(self):
+        self._seed([(0.1, 100), (3, 200), (10, 400)])
+        freed, runs = cleaner._weekly_digest_totals()
+        self.assertEqual((freed, runs), (300, 2))
+
+    def test_missing_log_is_zero(self):
+        freed, runs = cleaner._weekly_digest_totals()
+        self.assertEqual((freed, runs), (0, 0))
+
+    def test_corrupt_log_is_zero_not_a_crash(self):
+        self.log.write_text("not json{")
+        self.assertEqual(cleaner._weekly_digest_totals(), (0, 0))
+
+    def test_notification_message_carries_week_total(self):
+        """The message builder is what run_clean hands to _notify. The run
+        being notified is already in report.log at that point, so the week
+        clause is always present and always includes this run."""
+        self._seed([(0.01, 512 * 1024 * 1024), (2, 512 * 1024 * 1024)])
+        title, message = cleaner._clean_notification(512 * 1024 * 1024, 3)
+        self.assertIn("freed", title.lower())
+        self.assertIn("this week", message)
+        self.assertIn("2 runs", message)
+        self.assertIn("1.0 GB", message)  # the 7-day total, not just this run
+
+
+class TestReportStats(unittest.TestCase):
+    """Phase 6 'usage analytics (opt-in)', implemented local-first: the
+    aggregation runs over the machine's own report.log and nothing ever
+    leaves the machine -- 'opt-in' is running the command. Answers the
+    question the roadmap item actually asked ('which categories are most
+    valuable') without a telemetry backend."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.log = Path(self.td.name) / "report.log"
+        self._p = mock.patch.object(cleaner, "LOG_PATH", self.log)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self.td.cleanup()
+
+    def _seed_two_runs(self):
+        now = datetime.datetime.now()
+        self.log.write_text(json.dumps([
+            {"timestamp": (now - datetime.timedelta(days=2)).isoformat(),
+             "total_freed_bytes": 300,
+             "items": [
+                 {"id": "npm-cache", "label": "npm cache", "freed": 100, "status": "deleted"},
+                 {"id": "pip-cache", "label": "pip cache", "freed": 200, "status": "deleted"},
+                 {"id": "brew-cleanup", "label": "Homebrew", "freed": 0, "status": "skipped"},
+             ]},
+            {"timestamp": now.isoformat(),
+             "total_freed_bytes": 50,
+             "items": [
+                 {"id": "npm-cache", "label": "npm cache", "freed": 50, "status": "deleted"},
+             ]},
+        ]))
+
+    def test_aggregates_per_target_across_runs(self):
+        self._seed_two_runs()
+        stats = cleaner._aggregate_stats()
+        by_id = {t["id"]: t for t in stats["targets"]}
+        self.assertEqual(by_id["npm-cache"]["freed_bytes"], 150)
+        self.assertEqual(by_id["npm-cache"]["times_cleaned"], 2)
+        self.assertEqual(by_id["pip-cache"]["times_cleaned"], 1)
+        self.assertNotIn("brew-cleanup", by_id,
+                         "a skipped item that freed nothing is not usage")
+
+    def test_targets_ordered_by_freed_desc_and_totals_correct(self):
+        self._seed_two_runs()
+        stats = cleaner._aggregate_stats()
+        freed = [t["freed_bytes"] for t in stats["targets"]]
+        self.assertEqual(freed, sorted(freed, reverse=True))
+        self.assertEqual(stats["total_freed_bytes"], 350)
+        self.assertEqual(stats["runs"], 2)
+
+    def test_targets_carry_category_from_current_table(self):
+        self._seed_two_runs()
+        stats = cleaner._aggregate_stats()
+        by_id = {t["id"]: t for t in stats["targets"]}
+        self.assertEqual(by_id["npm-cache"]["category"], "node")
+        cats = {c["category"]: c for c in stats["categories"]}
+        self.assertEqual(cats["node"]["freed_bytes"], 150)
+
+    def test_empty_log_yields_zeroed_stats(self):
+        stats = cleaner._aggregate_stats()
+        self.assertEqual(stats["runs"], 0)
+        self.assertEqual(stats["total_freed_bytes"], 0)
+        self.assertEqual(stats["targets"], [])
+
+    def test_report_stats_flag_end_to_end(self):
+        """Parser + dispatch + JSON shape via a real subprocess."""
+        self._seed_two_runs()
+        env = {**os.environ, "MACCLEANER_LOG": str(self.log),
+               "MACCLEANER_CONFIG": str(Path(self.td.name) / "config.json"),
+               "MACCLEANER_SNAPSHOTS": str(Path(self.td.name) / "snap.log")}
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "report", "--stats", "--json"],
+                           capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["stats"]["total_freed_bytes"], 350)
+        self.assertIn("version", data)
+
+
+class TestConfigSync(unittest.TestCase):
+    """Phase 6 'iCloud sync for config': config.json optionally lives in
+    iCloud Drive (no entitlements needed) with a symlink at CONFIG_PATH, so
+    the CLI, the app, and launchd agents all read/write it unchanged. The
+    dangerous part is save_config's os.replace(), which would silently
+    replace the symlink with a local file on the first settings change --
+    pinned here."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        base = Path(self.td.name)
+        self.cfg = base / "local" / "config.json"
+        self.cfg.parent.mkdir()
+        self.icloud = base / "icloud"
+        self._p1 = mock.patch.object(cleaner, "CONFIG_PATH", self.cfg)
+        self._p2 = mock.patch.dict(os.environ, {"MACCLEANER_ICLOUD_DIR": str(self.icloud)})
+        self._p1.start(); self._p2.start()
+
+    def tearDown(self):
+        self._p1.stop(); self._p2.stop()
+        self.td.cleanup()
+
+    def test_sync_on_relocates_config_and_leaves_symlink(self):
+        self.cfg.write_text(json.dumps({"log_threshold_mb": 123}))
+        state = cleaner.run_config_sync("on")
+        self.assertTrue(state["enabled"])
+        self.assertTrue(self.cfg.is_symlink())
+        # macOS: /var/folders symlinks to /private/var/folders — compare resolved.
+        self.assertEqual(Path(os.path.realpath(self.cfg)).parent,
+                         Path(os.path.realpath(self.icloud)))
+        self.assertEqual(cleaner.load_config()["log_threshold_mb"], 123)
+
+    def test_sync_on_adopts_existing_icloud_config_and_backs_up_local(self):
+        """Second Mac joining sync: the iCloud copy is the shared truth."""
+        self.icloud.mkdir(parents=True)
+        (self.icloud / "config.json").write_text(json.dumps({"log_threshold_mb": 777}))
+        self.cfg.write_text(json.dumps({"log_threshold_mb": 1}))
+        cleaner.run_config_sync("on")
+        self.assertEqual(cleaner.load_config()["log_threshold_mb"], 777)
+        bak = self.cfg.parent / "config.json.pre-sync.bak"
+        self.assertTrue(bak.exists())
+        self.assertEqual(json.loads(bak.read_text())["log_threshold_mb"], 1)
+
+    def test_sync_on_is_idempotent(self):
+        self.cfg.write_text("{}")
+        cleaner.run_config_sync("on")
+        state = cleaner.run_config_sync("on")
+        self.assertTrue(state["enabled"])
+        self.assertTrue(self.cfg.is_symlink())
+
+    def test_sync_off_restores_regular_file_with_current_content(self):
+        self.cfg.write_text(json.dumps({"log_threshold_mb": 55}))
+        cleaner.run_config_sync("on")
+        state = cleaner.run_config_sync("off")
+        self.assertFalse(state["enabled"])
+        self.assertFalse(self.cfg.is_symlink())
+        self.assertEqual(json.loads(self.cfg.read_text())["log_threshold_mb"], 55)
+        self.assertTrue((self.icloud / "config.json").exists(),
+                        "other Macs may still sync from it; off is local-only")
+
+    def test_save_config_writes_through_the_symlink(self):
+        """THE regression this feature lives or dies on: an atomic save must
+        follow the symlink and update the iCloud copy, never replace the
+        symlink with a plain local file."""
+        self.cfg.write_text("{}")
+        cleaner.run_config_sync("on")
+        cfg = cleaner.load_config()
+        cfg["log_threshold_mb"] = 999
+        cleaner.save_config(cfg)
+        self.assertTrue(self.cfg.is_symlink(), "save_config clobbered the symlink")
+        icloud_copy = json.loads((self.icloud / "config.json").read_text())
+        self.assertEqual(icloud_copy["log_threshold_mb"], 999)
+
+    def test_status_reports_both_states(self):
+        self.cfg.write_text("{}")
+        self.assertFalse(cleaner.run_config_sync("status")["enabled"])
+        cleaner.run_config_sync("on")
+        st = cleaner.run_config_sync("status")
+        self.assertTrue(st["enabled"])
+        self.assertIn("icloud_path", st)
+
+
+class TestContractFixtures(unittest.TestCase):
+    """V3 Stage 1 (docs/V3-SWIFT-ENGINE.md): golden contract fixtures.
+
+    tools/gen_contract_fixtures.py builds a deterministic synthetic HOME,
+    runs the REAL engine as a subprocess against it, normalizes the
+    machine-dependent parts (sandbox paths -> $HOME, timestamps, disk
+    lines), and writes tests/fixtures/*.json. This test regenerates them
+    fresh and diffs against the committed copies — any engine change that
+    moves the JSON contract fails here and forces a conscious fixture
+    update. These fixtures are also the parity oracle the Swift kit
+    (swift/MacCleanerKit) is verified against."""
+
+    FIXTURES = ["scan.json", "categories.json", "dry_run.json",
+                "report_stats.json", "schedule_status.json"]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.outdir = Path(tempfile.mkdtemp())
+        r = subprocess.run([sys.executable, str(REPO / "tools" / "gen_contract_fixtures.py"),
+                            "--out", str(cls.outdir)],
+                           capture_output=True, text=True, timeout=300)
+        cls.gen_rc, cls.gen_err = r.returncode, r.stderr
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.outdir, ignore_errors=True)
+
+    def test_generator_runs_clean(self):
+        self.assertEqual(self.gen_rc, 0, self.gen_err)
+
+    def test_fixtures_are_committed_and_current(self):
+        if self.gen_rc != 0:
+            self.skipTest("generator failed; covered by test_generator_runs_clean")
+        for name in self.FIXTURES:
+            committed = REPO / "tests" / "fixtures" / name
+            fresh = self.outdir / name
+            self.assertTrue(committed.exists(), f"missing committed fixture {name} "
+                            "— run tools/gen_contract_fixtures.py")
+            self.assertTrue(fresh.exists(), f"generator did not produce {name}")
+            self.assertEqual(json.loads(committed.read_text()),
+                             json.loads(fresh.read_text()),
+                             f"{name} drifted from the engine — regenerate "
+                             "tools/gen_contract_fixtures.py output and review the diff")
+
+    def test_scan_fixture_pins_real_sizes(self):
+        """The fixture must exercise measurement, not just shape — at least
+        five synthetic targets exist with nonzero du-measured sizes."""
+        committed = REPO / "tests" / "fixtures" / "scan.json"
+        if not committed.exists():
+            self.fail("scan.json fixture not committed")
+        data = json.loads(committed.read_text())
+        sized = [t for t in data["targets"] if t.get("exists") and t.get("size_bytes", 0) > 0]
+        self.assertGreaterEqual(len(sized), 5, [t["id"] for t in sized])
+
+    def test_categories_fixture_pins_full_table(self):
+        committed = REPO / "tests" / "fixtures" / "categories.json"
+        if not committed.exists():
+            self.fail("categories.json fixture not committed")
+        data = json.loads(committed.read_text())
+        ids = [t["id"] for c in data["categories"] for t in c["targets"]]
+        self.assertEqual(len(ids), 94, "static table size moved — regenerate fixtures "
+                         "AND tools/gen_swift_target_table.py output together")
+        self.assertEqual(len(ids), len(set(ids)))
+
+
+class TestSwiftTableGenerated(unittest.TestCase):
+    """The Swift kit's target table is GENERATED from get_targets()
+    (tools/gen_swift_target_table.py) — this pins that the committed
+    generated file is current, so a target change that forgets the
+    regeneration step fails the suite instead of failing parity later in
+    CI's Swift step (or worse, silently diverging on a machine without
+    swift). Regenerate, never hand-edit."""
+
+    def test_generated_swift_table_is_current(self):
+        committed = (REPO / "swift" / "MacCleanerKit" / "Sources" /
+                     "MacCleanerKit" / "TargetTable.generated.swift")
+        self.assertTrue(committed.exists(), "run tools/gen_swift_target_table.py")
+        before = committed.read_text()
+        r = subprocess.run([sys.executable, str(REPO / "tools" / "gen_swift_target_table.py")],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        after = committed.read_text()
+        if before != after:
+            committed.write_text(before)  # leave the tree as we found it
+            self.fail("TargetTable.generated.swift is stale — commit the "
+                      "regenerated file (tools/gen_swift_target_table.py) "
+                      "and re-run tools/check_swift_parity.py")
+
+
+# ── 2.17.2: iCloud dataless folders, scan time budget, duplicate app copies,
+#           launchd log rotation, install.sh idempotency ─────────────────────
+
+SF_DATALESS = 0x40000000
+
+
+class _DatalessEntry:
+    """Proxy around a real os.DirEntry whose stat() carries macOS's
+    SF_DATALESS flag. The kernel is the only thing that can set that flag
+    (chflags can't), so a test has to fake it -- everything else is the real
+    entry, so is_dir()/is_symlink()/path behave exactly as in production."""
+
+    def __init__(self, entry):
+        self._e = entry
+
+    def __getattr__(self, name):
+        return getattr(self._e, name)
+
+    def stat(self, follow_symlinks=True):
+        st = self._e.stat(follow_symlinks=follow_symlinks)
+        return types.SimpleNamespace(
+            st_mode=st.st_mode, st_size=st.st_size, st_blocks=st.st_blocks,
+            st_mtime=st.st_mtime,
+            st_flags=getattr(st, "st_flags", 0) | SF_DATALESS)
+
+
+class TestStorageInsightsDataless(unittest.TestCase):
+    """An evicted ("dataless") iCloud folder blocks readdir until iCloud
+    materialises it. Observed live: two storage-insights engines wedged in
+    getdirentries64 under ~/Library/Mobile Documents for 20+ minutes at 0%
+    CPU. stat() on such a folder is safe; *enumerating* it is not. So a
+    directory whose stat carries SF_DATALESS must be skipped without ever
+    being listed -- in the main walk and inside a bundle alike."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.docs = self.tmp / "Documents"
+        self.docs.mkdir()
+        self._patch = mock.patch.dict(os.environ, {
+            "MACCLEANER_STORAGE_INSIGHTS_ROOTS": str(self.docs)})
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _big(self, d, name):
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_bytes(b"\0" * (150 * 1024 * 1024))
+
+    def _scan_with_dataless(self, names):
+        real = os.scandir
+        listed = []
+
+        def fake(path="."):
+            listed.append(str(path))
+            return iter([_DatalessEntry(e) if e.name in names else e
+                         for e in real(path)])
+
+        stats = {}
+        with mock.patch("os.scandir", side_effect=fake):
+            hits = cleaner.scan_storage_insights({}, stats=stats)
+        return hits, listed, stats
+
+    def test_dataless_plain_directory_is_never_listed(self):
+        self._big(self.docs / "Evicted", "inside.mov")
+        self._big(self.docs, "local.mov")
+        hits, listed, stats = self._scan_with_dataless({"Evicted"})
+        self.assertEqual([h["path"].name for h in hits], ["local.mov"])
+        self.assertNotIn(str(self.docs / "Evicted"), listed)
+        self.assertEqual(stats["dataless_dirs_skipped"], 1)
+
+    def test_dataless_bundle_is_never_sized(self):
+        self._big(self.docs / "Evicted.app" / "Contents", "big.bin")
+        hits, listed, stats = self._scan_with_dataless({"Evicted.app"})
+        self.assertEqual(hits, [])
+        self.assertFalse(any(p.startswith(str(self.docs / "Evicted.app"))
+                             for p in listed))
+        self.assertEqual(stats["dataless_dirs_skipped"], 1)
+
+    def test_dataless_folder_inside_a_bundle_is_never_listed(self):
+        self._big(self.docs / "Some.app" / "Contents" / "MacOS", "bin")
+        self._big(self.docs / "Some.app" / "Contents" / "Evicted", "more.bin")
+        hits, listed, stats = self._scan_with_dataless({"Evicted"})
+        self.assertEqual([h["path"].name for h in hits], ["Some.app"])
+        self.assertNotIn(str(self.docs / "Some.app" / "Contents" / "Evicted"), listed)
+        self.assertEqual(hits[0]["size_bytes"], 150 * 1024 * 1024,
+                         "the evicted folder occupies no local disk and must not be counted")
+
+    def test_materialised_directories_still_scanned(self):
+        # Sanity: the skip is keyed on the flag, not on the name or on being
+        # a directory at all.
+        self._big(self.docs / "Evicted", "inside.mov")
+        hits, listed, stats = self._scan_with_dataless(set())
+        self.assertEqual([h["path"].name for h in hits], ["inside.mov"])
+        self.assertEqual(stats["dataless_dirs_skipped"], 0)
+
+
+class TestStorageInsightsTimeBudget(unittest.TestCase):
+    """The dataless check removes the known hang, but any single readdir can
+    still stall on a cloud-backed volume the flag doesn't describe. A wall-
+    clock budget bounds the walk: past it, stop and say so rather than pin
+    the app's Large Files panel forever."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.a = self.tmp / "a"
+        self.b = self.tmp / "b"
+        for d in (self.a, self.b):
+            d.mkdir()
+            (d / f"{d.name}.mov").write_bytes(b"\0" * (150 * 1024 * 1024))
+        self._patch = mock.patch.dict(os.environ, {
+            "MACCLEANER_STORAGE_INSIGHTS_ROOTS": f"{self.a}:{self.b}"})
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_walk_stops_at_budget_and_reports_truncation(self):
+        stats = {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            hits = cleaner.scan_storage_insights({}, stats=stats, time_budget_s=0)
+        self.assertTrue(stats["truncated"])
+        self.assertEqual(len(hits), 1, "one root walked, then the budget stopped the second")
+
+    def test_default_budget_completes_a_small_tree(self):
+        stats = {}
+        hits = cleaner.scan_storage_insights({}, stats=stats)
+        self.assertFalse(stats["truncated"])
+        self.assertEqual(len(hits), 2)
+        self.assertGreater(cleaner.STORAGE_INSIGHTS_TIME_BUDGET_S, 0)
+
+    def test_json_carries_truncated_and_dataless_counts(self):
+        # Additive contract keys: the app decodes StorageInsightsReport with
+        # non-optional fields for the existing keys, so new keys must be added,
+        # never renamed -- and the app can now say "partial" honestly.
+        r = subprocess.run([sys.executable, str(REPO / "cleaner.py"),
+                            "storage-insights", "--json"],
+                           capture_output=True, text=True, env=os.environ.copy(), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertIs(data["truncated"], False)
+        self.assertEqual(data["dataless_dirs_skipped"], 0)
+        self.assertEqual(len(data["entries"]), 2)
+
+
+class TestDoctorDuplicateAppCopies(TestDoctorSchedule):
+    """The app can be installed twice -- once by install.sh (~/Applications)
+    and once by the Homebrew cask (/Applications). Sparkle only ever updates
+    the running copy, so the other silently falls behind; doctor used to
+    report whichever it found first and compare the engine against THAT,
+    which after the next update is the stale one."""
+
+    def _write_bundle(self, app, version):
+        contents = app / "Contents"
+        contents.mkdir(parents=True)
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleShortVersionString": version}, f)
+
+    def _caskroom_pointing_at(self, app):
+        caskroom = self.tmp / "Caskroom" / "maccleaner"
+        (caskroom / "2.17.1").mkdir(parents=True)
+        (caskroom / "2.17.1" / "MacCleaner.app").symlink_to(app)
+        self.env["MACCLEANER_CASKROOM_DIR"] = str(caskroom)
+
+    def _menu_bar_check(self):
+        r = self.run_doctor()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        return data, next(x for x in data["checks"] if x["name"] == "Menu bar app")
+
+    def test_single_copy_is_ok(self):
+        home_app = self.home / "Applications" / "MacCleaner.app"
+        self._write_bundle(home_app, cleaner.VERSION)
+        data, c = self._menu_bar_check()
+        self.assertTrue(c["ok"])
+        self.assertIn(str(home_app), c["status"])
+
+    def test_two_copies_fail_the_check_and_name_both(self):
+        home_app = self.home / "Applications" / "MacCleaner.app"
+        sys_app = self.tmp / "sysapps" / "MacCleaner.app"
+        self._write_bundle(home_app, cleaner.VERSION)
+        self._write_bundle(sys_app, cleaner.VERSION)
+        data, c = self._menu_bar_check()
+        self.assertFalse(c["ok"])
+        self.assertIn(str(home_app), c["status"])
+        self.assertIn(str(sys_app), c["status"])
+        self.assertFalse(data["ok"], "a duplicate install is a MacCleaner-owned problem with a remedy")
+
+    def test_homebrew_owned_copy_is_named(self):
+        sys_app = self.tmp / "sysapps" / "MacCleaner.app"
+        self._write_bundle(sys_app, cleaner.VERSION)
+        self._caskroom_pointing_at(sys_app)
+        data, c = self._menu_bar_check()
+        self.assertTrue(c["ok"])
+        self.assertIn("Homebrew", c["status"])
+
+    def test_duplicate_remedy_keeps_the_homebrew_copy(self):
+        home_app = self.home / "Applications" / "MacCleaner.app"
+        sys_app = self.tmp / "sysapps" / "MacCleaner.app"
+        self._write_bundle(home_app, cleaner.VERSION)
+        self._write_bundle(sys_app, cleaner.VERSION)
+        self._caskroom_pointing_at(sys_app)
+        data, c = self._menu_bar_check()
+        self.assertFalse(c["ok"])
+        self.assertIn(f"remove {home_app}", c["status"])
+
+    def test_version_skew_compares_against_the_homebrew_copy(self):
+        # The stale install.sh copy is at 0.0.1; the Homebrew one matches the
+        # engine. The skew row must not fire -- the duplicate row already
+        # carries the remedy, and a false skew warning would send the user
+        # to re-run install.sh, which is what created the duplicate.
+        home_app = self.home / "Applications" / "MacCleaner.app"
+        sys_app = self.tmp / "sysapps" / "MacCleaner.app"
+        self._write_bundle(home_app, "0.0.1")
+        self._write_bundle(sys_app, cleaner.VERSION)
+        self._caskroom_pointing_at(sys_app)
+        data, c = self._menu_bar_check()
+        skew = next((x for x in data["checks"] if x["name"] == "Engine/App version"), None)
+        self.assertIsNone(skew)
+
+
+class TestCronLogTrim(unittest.TestCase):
+    """The hourly diskwatch agent appends to cron.log forever (1,100+ lines
+    of 'BELOW threshold' on one real machine). Trim in place, keeping the
+    tail: launchd holds the file open with O_APPEND, so a rename-based
+    rotation would strand its descriptor on the old inode and every later
+    line would vanish into an unlinked file."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.log = self.tmp / "cron.log"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_oversized_log_is_trimmed_in_place_keeping_the_tail(self):
+        lines = [f"line {i}" for i in range(5000)]
+        self.log.write_text("\n".join(lines) + "\n")
+        ino = os.stat(self.log).st_ino
+        cleaner._trim_cron_log(self.log, max_bytes=1024, keep_lines=100)
+        self.assertEqual(self.log.read_text().splitlines(), lines[-100:])
+        self.assertEqual(os.stat(self.log).st_ino, ino, "must trim in place, never rename")
+
+    def test_small_log_is_left_alone(self):
+        self.log.write_text("a\nb\nc\n")
+        cleaner._trim_cron_log(self.log, max_bytes=1024, keep_lines=100)
+        self.assertEqual(self.log.read_text(), "a\nb\nc\n")
+
+    def test_missing_log_is_not_an_error(self):
+        cleaner._trim_cron_log(self.log, max_bytes=1024, keep_lines=100)
+        self.assertFalse(self.log.exists())
+
+    def test_disk_check_trims_the_agent_log(self):
+        lines = [f"Free: 12.9 GB · BELOW threshold {i}" for i in range(3000)]
+        self.log.write_text("\n".join(lines) + "\n")
+        orig = (cleaner.CRON_LOG_PATH, cleaner.CRON_LOG_MAX_BYTES, cleaner.ALERTS_PATH)
+        cleaner.CRON_LOG_PATH, cleaner.CRON_LOG_MAX_BYTES = self.log, 1024
+        cleaner.ALERTS_PATH = self.tmp / "alerts.json"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cleaner.run_disk_check({"low_disk_alerts": False}, json_mode=True)
+        finally:
+            cleaner.CRON_LOG_PATH, cleaner.CRON_LOG_MAX_BYTES, cleaner.ALERTS_PATH = orig
+        kept = self.log.read_text().splitlines()
+        self.assertEqual(len(kept), cleaner.CRON_LOG_KEEP_LINES)
+        self.assertEqual(kept[-1], lines[-1])
+
+
+class TestInstallScriptHelpers(unittest.TestCase):
+    """install.sh's shell helpers, exercised in isolation: each function's
+    body is sliced out of the script and sourced into a throwaway bash, so
+    no real rc file, home directory, or app bundle is ever touched."""
+
+    SHORTCUT_LINES = (REPO / "completions" / "shell-shortcuts.sh").read_text().splitlines()
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run_fn(self, fn, args, env=None):
+        script = (
+            f'SCRIPT_DIR="{REPO}"\n'
+            'SHORTCUTS_SRC="$SCRIPT_DIR/completions/shell-shortcuts.sh"\n'
+            f'eval "$(sed -n \'/^{fn}()/,/^}}/p\' "$SCRIPT_DIR/install.sh")"\n'
+            f'{fn} "$@"\n')
+        return subprocess.run(["bash", "-c", script, "_", *args],
+                              capture_output=True, text=True,
+                              env={**os.environ, **(env or {})}, timeout=30)
+
+    def test_dedupe_removes_repeated_shortcut_lines_keeping_the_first(self):
+        rc = self.tmp / ".zshrc"
+        rc.write_text(
+            "export PATH=/x:$PATH\n\n# MacCleaner\n"
+            + "\n".join(self.SHORTCUT_LINES[1:]) + "\n\n"
+            "# Fullex Agents\nalias freview='cd \"$FULLEX_DIR\" && npm start review'\n\n"
+            "# MacCleaner\n" + "\n".join(self.SHORTCUT_LINES) + "\n"
+            "alias phanessastatus='ssh phanessa \"btop\"'\n")
+        r = self._run_fn("dedupe_maccleaner_shortcuts", [str(rc)])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = rc.read_text()
+        for line in self.SHORTCUT_LINES:
+            self.assertEqual(text.count(line + "\n"), 1, line)
+        self.assertIn("alias freview=", text)
+        self.assertIn("alias phanessastatus=", text)
+        self.assertIn("export PATH=/x:$PATH", text)
+        self.assertLess(text.index("mclean()"), text.index("maccleaner()"),
+                        "the first occurrence survives; later repeats go")
+
+    def test_dedupe_is_a_byte_for_byte_noop_on_a_clean_rc(self):
+        rc = self.tmp / ".zshrc"
+        original = "# MacCleaner\n" + "\n".join(self.SHORTCUT_LINES) + "\nalias x=y\n"
+        rc.write_text(original)
+        r = self._run_fn("dedupe_maccleaner_shortcuts", [str(rc)])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(rc.read_text(), original)
+
+    def test_dedupe_tolerates_a_missing_rc(self):
+        r = self._run_fn("dedupe_maccleaner_shortcuts", [str(self.tmp / "nope")])
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_cask_app_resolves_the_homebrew_symlink(self):
+        app = self.tmp / "Applications" / "MacCleaner.app"
+        app.mkdir(parents=True)
+        caskroom = self.tmp / "Caskroom" / "maccleaner"
+        (caskroom / "2.17.1").mkdir(parents=True)
+        (caskroom / "2.17.1" / "MacCleaner.app").symlink_to(app)
+        r = self._run_fn("maccleaner_cask_app", [],
+                         env={"MACCLEANER_CASKROOM_DIR": str(caskroom)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), str(app))
+
+    def test_cask_app_is_empty_without_a_cask(self):
+        r = self._run_fn("maccleaner_cask_app", [],
+                         env={"MACCLEANER_CASKROOM_DIR": str(self.tmp / "absent")})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "")
