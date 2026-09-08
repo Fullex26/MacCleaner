@@ -7305,3 +7305,76 @@ class TestRoadmapCurrency(unittest.TestCase):
             f"ROADMAP.md's Current State says v{found.group(1)} but the engine "
             f"is {cleaner.VERSION} — update the heading and add a bullet for "
             "what shipped")
+
+
+class TestProjectsScannerDataless(unittest.TestCase):
+    """Same hang, different scanner. 2.17.2 taught scan_storage_insights to
+    skip evicted iCloud folders, but scan_projects walks RECURSIVELY and its
+    default roots include ~/Documents — which is iCloud-backed on any Mac
+    using "Desktop & Documents Folders" sync with Optimize Mac Storage on.
+    One dataless directory anywhere under a project root wedges the whole
+    walk in getdirentries64, and unlike storage-insights there is no time
+    budget to bail out.
+
+    stat() on such a directory is safe and reports the flag; *listing* it is
+    what blocks. So the fix is to check before descending, exactly as the
+    storage-insights walk does."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "Documents"
+        self.root.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _stale_project(self, parent, name):
+        """A project old enough to qualify: manifest + artifact dir, backdated."""
+        proj = parent / name
+        (proj / "node_modules").mkdir(parents=True)
+        (proj / "package.json").write_text("{}")
+        old = time.time() - (400 * 86400)
+        for p in (proj / "node_modules", proj / "package.json", proj):
+            os.utime(p, (old, old))
+        return proj
+
+    def _scan_with_dataless(self, names):
+        real = os.scandir
+        listed = []
+
+        def fake(path="."):
+            listed.append(str(path))
+            return iter([_DatalessEntry(e) if e.name in names else e
+                         for e in real(path)])
+
+        with mock.patch("os.scandir", side_effect=fake):
+            hits, _roots, _min_age = cleaner.scan_projects(
+                {"project_git_check": False},
+                roots=[str(self.root)], min_age_days=30)
+        return hits, listed
+
+    def test_dataless_directory_is_never_listed(self):
+        """The bug: walk() descends into any directory, evicted or not."""
+        self._stale_project(self.root / "Evicted", "inner")
+        self._stale_project(self.root, "local")
+        hits, listed = self._scan_with_dataless({"Evicted"})
+        self.assertNotIn(
+            str(self.root / "Evicted"), listed,
+            "scan_projects listed an evicted iCloud directory — that call "
+            "blocks in getdirentries64 until iCloud materialises it")
+        self.assertEqual([Path(h["path"]).parent.name for h in hits], ["local"],
+                         "the healthy project alongside it must still be found")
+
+    def test_dataless_directory_is_not_reported_as_an_artifact(self):
+        """An evicted dir that happens to be named like an artifact must not
+        be offered for deletion — its size and contents are unknown."""
+        proj = self.root / "proj"
+        (proj / "node_modules").mkdir(parents=True)
+        (proj / "package.json").write_text("{}")
+        old = time.time() - (400 * 86400)
+        for p in (proj / "node_modules", proj / "package.json", proj):
+            os.utime(p, (old, old))
+        hits, _ = self._scan_with_dataless({"node_modules"})
+        self.assertEqual(
+            hits, [],
+            "an evicted artifact directory must not be offered for deletion")
