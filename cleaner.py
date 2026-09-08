@@ -2195,13 +2195,25 @@ def scan_projects(config, roots=None, min_age_days=None):
             name = e.name
             if name == ".git":
                 continue
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            # An evicted ("dataless") iCloud directory must never be listed and
+            # never be offered. stat() reports the flag cheaply; enumerating the
+            # directory is what blocks in getdirentries64 until iCloud
+            # materialises it -- the same hang 2.17.2 fixed in
+            # scan_storage_insights, reachable here because ~/Documents is a
+            # default project root and is iCloud-backed under "Desktop &
+            # Documents Folders" sync. Skipping also keeps an evicted artifact
+            # dir out of the delete list, whose real size and contents are
+            # unknown until it comes back down.
+            if _is_dataless(st):
+                continue
             if name in ARTIFACT_MANIFESTS:
                 required = ARTIFACT_MANIFESTS[name]
                 if not required or any(m in names for m in required):
-                    try:
-                        age_days = int((now - e.stat(follow_symlinks=False).st_mtime) / 86400)
-                    except OSError:
-                        continue
+                    age_days = int((now - st.st_mtime) / 86400)
                     if age_days >= min_age and e.path not in found:
                         found[e.path] = {
                             "path": e.path,
