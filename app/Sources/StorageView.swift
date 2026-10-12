@@ -21,12 +21,6 @@ struct StorageView: View {
     @State private var pendingTrash: StorageMapEntry?
 
     var body: some View {
-        // Structure mirrors ProjectsView exactly — plain VStack, no manual
-        // frames, no clipped. That view renders correctly inside the split
-        // view on real machines; this one was the only view carrying extra
-        // layout modifiers, and it was also the one that rendered with its
-        // header missing and the list bleeding under the titlebar. Match the
-        // known-good shape instead of theorising.
         VStack(spacing: 0) {
             header
             Divider()
@@ -82,7 +76,15 @@ struct StorageView: View {
             Text("Everything on this Mac, largest first. Read-only — the only way to remove something here is the Trash, so it can always be put back.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+                // NOT .fixedSize(horizontal: false, vertical: true). That was
+                // the root cause of the Storage tab rendering with its header
+                // gone and the sidebar apparently empty (2.11–2.17): under a
+                // narrow width proposal the text wrapped a word per line, the
+                // view's minimum height ran past the window's, and AppKit
+                // centred the oversized content — pushing the top of both
+                // split-view columns off-screen. A line limit can always
+                // shrink. tools/check_app_layout.sh pins this in CI.
+                .lineLimit(2)
 
             HStack(spacing: 8) {
                 Button {
