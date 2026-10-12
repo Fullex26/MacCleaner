@@ -2,8 +2,7 @@ cask "maccleaner" do
   version "2.17.2"
   sha256 "2ac3d4121c015deb54bf549b2509069a3280343000777d56e516226cddf59603"
 
-  url "https://github.com/Fullex26/MacCleaner/releases/download/v#{version}/MacCleaner-v#{version}-macos-universal.zip",
-      verified: "github.com/Fullex26/MacCleaner/"
+  url "https://github.com/Fullex26/MacCleaner/releases/download/v#{version}/MacCleaner-v#{version}-macos-universal.zip"
   name "MacCleaner"
   desc "Developer storage cleanup tool for Xcode, Docker, npm, and more"
   homepage "https://github.com/Fullex26/MacCleaner"
