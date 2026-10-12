@@ -289,13 +289,14 @@ nothing to do with whether the cask itself is correct:
   resolves from GitHub's latest release (`2.0.0`, the last real tag) — again
   an artifact of the version being a forward-looking placeholder, not a
   cask defect.
-- It also flags the `verified:` parameter on the `url` stanza as deprecated.
-  This check (`audit_unnecessary_verified` in Homebrew's own `cask/audit.rb`)
-  is explicitly gated on `new_cask?` — it only fires under `--new`, and the
-  DSL-level deprecation warning for `verified` is still commented out
-  (`# odeprecated ...`) in this Homebrew version, i.e. the parameter is fully
-  supported and non-deprecated in practice. It'll stop firing once the tap
-  audits this cask as an established (non-"new") entry.
+- It flagged the `verified:` parameter on the `url` stanza as deprecated.
+  That one was real, and it has since escalated: Homebrew now emits a
+  DSL-level `odeprecated` warning every time the cask is loaded, not just
+  under `--new`, so it started firing on ordinary `brew install`/`upgrade`.
+  The parameter has been removed from the cask — modern Homebrew verifies
+  GitHub release URLs by default, and `Cask::URL::DEPRECATED_URL_SPECS`
+  strips `verified:` before the `Cask::URL` is even constructed, so dropping
+  it silenced the warning without changing any behaviour. Do not re-add it.
 
 None of these three indicate a problem with the cask's syntax, stanza order,
 or logic. The check that actually validates correctness — style conformance,
@@ -323,7 +324,7 @@ brew untap yourname/scratch
 rm -rf /tmp/scratch-tap
 ```
 
-Use `brew audit --cask --new` (and expect the download/version/`verified`
+Use `brew audit --cask --new` (and expect the download/version
 noise) only once an actual tagged release exists to audit against, not as a
 merge gate on this branch.
 
