@@ -60,6 +60,32 @@ elif case == 'system_temp':
     os.environ['TMPDIR'] = str(temp_root)
     c.subprocess.run = lambda *a, **kw: type('Result', (), {'stdout': '1 test'})()
     assert c._system_temp_usage() is None
+elif case in ('glob_measure', 'glob_delete', 'empty_preview', 'empty_delete'):
+    c.HOME = root
+    directory = root / 'cache'
+    directory.mkdir()
+    sentinel = directory / 'keep.txt'
+    sentinel.write_text('keep')
+    target = {'id': 'fixture', 'label': 'fixture', 'safe': True, 'path': directory}
+    c.get_size = lambda path: 1
+    def mutation(path):
+        raise AssertionError('mutation must not run after failed discovery')
+    c._remove = mutation
+    if case.startswith('glob'):
+        target.update(path=None, glob=str(directory / '*'))
+    else:
+        target.update(empty_only=True, size=1, exists=True)
+        c.Path.iterdir = blocked
+    if case == 'glob_measure':
+        c.measure_targets([target])
+        assert target['size'] == 0
+    elif case.endswith('delete'):
+        freed, error = c.delete_target(target)
+        assert freed == 0 and error
+    else:
+        total, items = c.run_dry_run([target], json_mode=True)
+        assert total == 0 and items[0]['paths'] == []
+    assert sentinel.read_text() == 'keep'
 print('RETURNED', flush=True)
 '''
 
@@ -92,6 +118,11 @@ class TestReadOnlyDeadlines(unittest.TestCase):
     def test_storage_map_returns_after_blocked_read(self): self.check_probe('storage_map')
     def test_log_timeout_preserves_static_targets(self): self.check_probe('logs')
     def test_system_temp_returns_after_blocked_read(self): self.check_probe('system_temp')
+
+    def test_glob_measurement_returns_after_blocked_read(self): self.check_probe('glob_measure')
+    def test_glob_cleanup_reports_discovery_failure(self): self.check_probe('glob_delete')
+    def test_empty_only_preview_returns_after_blocked_read(self): self.check_probe('empty_preview')
+    def test_empty_only_cleanup_reports_discovery_failure(self): self.check_probe('empty_delete')
 
     def test_sizing_subprocess_is_reaped_before_cli_exit(self):
         probe = r'''
