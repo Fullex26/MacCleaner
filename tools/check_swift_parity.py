@@ -111,6 +111,12 @@ def main():
             if sum(tid.startswith(prefix) for tid in collision_py) != expected_count:
                 failures.append(f"collision/{prefix}: unexpected digest-ID count")
 
+        trailing_env = {**env, "MACCLEANER_TMP_ROOT": env["MACCLEANER_TMP_ROOT"] + "/"}
+        trailing_py = by_id(run_json([sys.executable, str(gen.ENGINE), "scan", "--json", "--all"], trailing_env))
+        trailing_sw = by_id(run_json([str(MCK), "scan", "--json", "--all"], trailing_env))
+        if set(trailing_py) != set(trailing_sw) or set(trailing_py) != set(collision_py):
+            failures.append("trailing tmp-root separator changed target IDs")
+
         cfg["enabled_categories"] = ["docker", "homebrew", "node", "python"]
         cfg_path.write_text(json.dumps(cfg))
         for scenario, body in (("failed", "printf 'free approximately 5GB'; exit 1"),

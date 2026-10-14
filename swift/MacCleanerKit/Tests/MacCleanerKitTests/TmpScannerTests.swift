@@ -81,6 +81,11 @@ final class TmpScannerTests: XCTestCase {
         XCTAssertEqual(TmpScanner.slugify("release-v0.9.0"), "release-v0-9-0")
     }
 
+    func testTrailingRootSeparatorDoesNotChangeIdentity() {
+        let hit = TmpHit(path: "/t//foo-bar", kind: .derivedData)
+        XCTAssertEqual(TmpScanner.targets(for: [hit], root: "/t/")[0].id, "tmp-foo-bar")
+    }
+
     func testDuplicateIdsStayDistinctAndNeverRedirect() {
         let hits = [TmpHit(path: "/t/foo-bar", kind: .derivedData),
                     TmpHit(path: "/t/foo_bar", kind: .repoClone)]
