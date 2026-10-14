@@ -39,6 +39,10 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
+- [ ] **Require a persisted app alert claim** — two no-post checks both authorized delivery when a simulated alert-state write failed. Withhold app delivery when the throttle claim cannot be saved, while reporting any notification already posted accurately.
+- [ ] **Bound remaining read-only enumeration** — six isolated blocked-read probes exceeded an external one-second limit in logs, temporary artifacts, installed-app inventory, leftovers, storage map, and doctor’s temp check. Bound entire read-only operations; incomplete installed-app inventory must produce no leftover candidates.
+- [ ] **Measure storage-map loose files by allocation** — a real sparse test file occupied zero allocated bytes but appeared as 1 GiB beneath a correctly measured zero-byte root. Use allocated blocks for loose-file rows, consistent with directory totals.
+
 - [ ] **Disambiguate project artifact IDs** — `foo-bar/node_modules` and `foo_bar/node_modules` produce the same slug; an explicit ID selects both and bypasses both git protections. Use stable path digests for colliding slugs and reject ambiguous legacy IDs. Implemented for the next release.
 - [ ] **Honor project exclusions** — review reproduced `scan_projects` returning an artifact beneath a configured `skip_paths` prefix, contrary to the never-touch contract. Apply exclusions during discovery, including root aliases and artifact parents containing excluded descendants. Implemented in #71, pending release.
 - [ ] **Serialize configuration changes** — two stale config copies applying separate settings reverted `delete_mode` from Trash to permanent deletion. Reload and mutate under one transaction lock for each setting/category update.
