@@ -202,3 +202,5 @@ Cleanup notification success counts include only `deleted` and `trashed`, never 
 Resolve SwiftPM executables with `swift build --show-bin-path` using the same configuration/architectures as the successful build. The current macOS toolchain uses `.build/out/Products/Release`, so a hardcoded `.build/apple/Products/Release` path can silently omit a successfully built soak engine.
 
 Only query/copy a Swift build output after that build succeeds. A failed compiler can leave an old executable at the expected path; existence alone does not prove it belongs to the current sources. Optional soak-engine failure must omit it and let app packaging continue.
+
+Empty-only targets must refuse a symlink leaf before enumerating children. `_safe_to_delete` deliberately permits an in-home symlink leaf because unlinking it is safe, but `iterdir()` follows it; a `Library/Caches -> ~` link can otherwise offer personal files for removal. Refuse without removing the link, and mirror that behavior in dry-run. `TestEmptyOnlySymlinks` covers both general caches and Trash in both deletion modes.

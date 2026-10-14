@@ -9,6 +9,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+- Empty-only cleanup refuses symlink roots before sizing or enumeration, preserving the symlink and its destination in both deletion and Trash modes; dry-run omits those paths.
+
 ---
 
 ## [2.18.0] — 2026-10-15
