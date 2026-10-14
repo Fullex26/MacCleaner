@@ -1112,19 +1112,39 @@ CLEANUP_TIMEOUT_S = 600
 
 @contextmanager
 def _cleanup_termination_signals():
-    # App timeouts send TERM before their hard-kill backstop. Let the main
-    # thread unwind command cleanup so its separate process group stops too.
-    previous = None
-    if threading.current_thread() is threading.main_thread():
-        previous = signal.getsignal(signal.SIGTERM)
-        def terminate(signum, frame):
+    # Record launch-time interruptions until the child handle is inside the
+    # cleanup-protected block. Signal masks would also affect the child.
+    previous = {}
+    pending = []
+    launching = True
+
+    def interrupt(signum, frame):
+        if launching:
+            pending.append((signum, frame))
+        elif signum == signal.SIGTERM:
             raise SystemExit(128 + signum)
-        signal.signal(signal.SIGTERM, terminate)
+        else:
+            handler = previous[signum]
+            if callable(handler):
+                handler(signum, frame)
+            elif handler != signal.SIG_IGN:
+                raise SystemExit(128 + signum)
+
+    def launched():
+        nonlocal launching
+        launching = False
+        for signum, frame in pending:
+            interrupt(signum, frame)
+
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, interrupt)
     try:
-        yield
+        yield launched
     finally:
-        if previous is not None:
-            signal.signal(signal.SIGTERM, previous)
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def delete_target(t, mode="rm"):
@@ -1136,10 +1156,11 @@ def delete_target(t, mode="rm"):
             # targets) exclusively from simctl identifiers that passed
             # _SIMCTL_UDID_RE/_SIMCTL_RUNTIME_ID_RE — never raw user input,
             # so shell=True is safe here
-            with _cleanup_termination_signals():
+            with _cleanup_termination_signals() as launched:
                 process = subprocess.Popen(t["cmd"], shell=True, stdout=subprocess.DEVNULL,
                                            stderr=subprocess.DEVNULL, start_new_session=True)
                 try:
+                    launched()
                     process.wait(timeout=CLEANUP_TIMEOUT_S)
                 except BaseException:
                     # A new session does not receive the caller's Ctrl-C. Stop its

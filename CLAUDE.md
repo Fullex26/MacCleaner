@@ -200,3 +200,5 @@ App engine timeout must send TERM and allow one second for cleanup to unwind bef
 Legacy category-only arguments imply `scan`, including `--category=value`. Keep this fallback after explicit legacy modes (`--clean`, `--preview`, `--report`, config) so it cannot turn a requested command into a scan; argparse still validates the forwarded values.
 
 Cleanup notification success counts include only `deleted` and `trashed`, never every non-skipped status. Share `CleanResult.notificationBody` between selected and automatic cleanup, append failures/skips separately, and retain the engine’s freed-byte title because a failed item can partially reclaim space. The real-bridge capture probe must never post actual notifications.
+
+Cleanup must defer launch-time SIGINT/SIGTERM until Popen has returned and the child handle is inside the group-cleanup try block. Raising from a handler during Popen can strand the newly created group; do not block signals with a mask that children inherit. Restore prior handlers on every exit.

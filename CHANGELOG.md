@@ -9,6 +9,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+- Cleanup also defers launch-time interruption until the child handle can be supervised, closing the spawn-to-assignment shutdown window.
+
 ### Fixed
 - Command-based cleanup now terminates its owned process group on timeout, interruption, or app-requested shutdown. The app allows one second for graceful termination before its hard-kill backstop, preventing descendants from continuing cleanup after failure.
 - Cleanup notifications now count only deleted or trashed items as cleaned and show failed/skipped counts separately. Selected and automatic cleanup share the same summary; reported freed space remains visible even when an item partially fails.
