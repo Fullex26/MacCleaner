@@ -59,7 +59,8 @@ struct NotificationProbe {
                 if automatic { await bridge.autoCleanSafe() }
                 else { await bridge.clean(ids: ["fixture"]) }
                 let messages = NotificationManager.shared.messages
-                let valid = messages.count == 1 && expected.allSatisfy { messages[0].1.contains($0) }
+                let valid = messages.count == 1 && messages[0].0 == "MacCleaner freed 4 KB"
+                    && messages[0].1 == expected.joined(separator: " · ")
                 print("\(valid ? "ok" : "FAIL") automatic=\(automatic) statuses=\(statuses) messages=\(messages)")
                 if !valid { failed = true }
             }
