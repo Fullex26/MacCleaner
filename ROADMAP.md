@@ -37,6 +37,9 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
+- [ ] **Refuse symlink roots for empty-only cleanup** — An isolated fixture with `Library/Caches` linked to home made cleanup attempt personal-file removals and made dry-run list those files. Reject symlink roots before enumeration for general caches and Trash; preserve both link and destination.
+
+
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
 - [ ] **Disambiguate project artifact IDs** — `foo-bar/node_modules` and `foo_bar/node_modules` produce the same slug; an explicit ID selects both and bypasses both git protections. Use stable path digests for colliding slugs and reject ambiguous legacy IDs. Implemented for the next release.
