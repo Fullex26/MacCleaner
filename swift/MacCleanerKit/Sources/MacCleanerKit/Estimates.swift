@@ -69,9 +69,12 @@ enum Estimates {
               posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) == 0,
               posix_spawnattr_setflags(&attrs, Int16(POSIX_SPAWN_SETPGROUP)) == 0,
               posix_spawnattr_setpgroup(&attrs, 0) == 0 else { return 0 }
-        let strings = ["/bin/sh", "-c", command].map { strdup($0) }
+        let arguments: [String] = ["/bin/sh", "-c", command]
+        let strings = arguments.map { $0.withCString { strdup($0) } }
         defer { strings.forEach { free($0) } }
-        let environment = ProcessInfo.processInfo.environment.map { strdup($0.key + "=" + $0.value) }
+        let environment = ProcessInfo.processInfo.environment.map {
+            ($0.key + "=" + $0.value).withCString { strdup($0) }
+        }
         defer { environment.forEach { free($0) } }
         var envp = environment + [nil]
         var argv = strings + [nil]
