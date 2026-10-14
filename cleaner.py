@@ -1501,6 +1501,12 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
     return total_freed, results
 
 
+def _safe_cleanup_candidates(targets):
+    return sorted([t for t in measure_targets(targets)
+                   if t["safe"] and (t.get("exists") or t.get("cmd"))],
+                  key=lambda t: t.get("size") or 0, reverse=True)
+
+
 def run_clean_min_free(targets, min_free_gb, mode="rm", json_mode=False, notify=False):
     """Clean SAFE targets, largest first, only until `min_free_gb` is free.
 
@@ -1512,9 +1518,7 @@ def run_clean_min_free(targets, min_free_gb, mode="rm", json_mode=False, notify=
     reaching the floor is `false`, never a quiet success."""
     threshold = int(min_free_gb * 1024 ** 3)
     say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
-    targets = measure_targets(targets)
-    safe = sorted([t for t in targets if t["safe"] and (t.get("exists") or t.get("cmd"))],
-                  key=lambda x: x["size"] or 0, reverse=True)
+    safe = _safe_cleanup_candidates(targets)
     total_freed, results = 0, []
     say(f"\n🧹 MacCleaner — {disk_free()} · target: {fmt_size(threshold)} free\n")
     for t in safe:
@@ -1555,12 +1559,22 @@ def run_clean_min_free(targets, min_free_gb, mode="rm", json_mode=False, notify=
     return total_freed, results
 
 
-def run_dry_run(targets, mode="rm", json_mode=False):
-    """Resolve exactly what a real clean of `targets` would delete. Deletes
-    nothing, writes no report.log entry, records no snapshot."""
+def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
+    """Resolve cleanup paths without deletion or state writes. Minimum-free
+    previews list eligible candidates: execution may stop before the end."""
     say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
-    targets = measure_targets(targets)
-    targets = [t for t in targets if t.get("exists") or t.get("cmd")]
+    extra = {}
+    if min_free_gb is not None:
+        free = disk_stats()["free_bytes"]
+        met = free >= int(min_free_gb * 1024 ** 3)
+        targets = [] if met else _safe_cleanup_candidates(targets)
+        extra = {"min_free_gb": min_free_gb, "free_bytes": free,
+                 "target_met": met, "selection_is_upper_bound": True}
+        say("Minimum-free preview: eligible safe candidates only; execution may stop earlier. "
+            "Candidate sizes do not predict the change in free space.")
+    else:
+        targets = measure_targets(targets)
+        targets = [t for t in targets if t.get("exists") or t.get("cmd")]
     items, total = [], 0
 
     for t in sorted(targets, key=lambda x: x.get("size") or 0, reverse=True):
@@ -1604,16 +1618,17 @@ def run_dry_run(targets, mode="rm", json_mode=False):
             "freed_human": fmt_size(total),
             "disk_after": disk_free(),
             "items": items,
+            **extra,
         }, indent=2))
     else:
         say("\n🧪 Dry run — nothing will be deleted\n")
         for it in items:
             say(f"  {it['label']} ({fmt_size(it['freed'])})")
             if it.get("cmd"):
-                say(f"      would run: {it['cmd']}")
+                say(f"      {'candidate command' if extra else 'would run'}: {it['cmd']}")
             for e in it["paths"]:
-                say(f"      would delete: {e['path']} ({fmt_size(e['size_bytes'])})")
-        say(f"\n  Would free: {fmt_size(total)}\n")
+                say(f"      {'candidate path' if extra else 'would delete'}: {e['path']} ({fmt_size(e['size_bytes'])})")
+        say(f"\n  {'Candidate size estimate' if extra else 'Would free'}: {fmt_size(total)}\n")
     return total, items
 
 
@@ -4722,6 +4737,9 @@ def main():
     argv = translate_legacy(sys.argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "clean" and args.min_free is not None:
+        if args.min_free < 0 or not math.isfinite(args.min_free * 1024 ** 3):
+            parser.error("--min-free must be a finite, non-negative GiB value within range")
 
     if args.command is None:
         show_welcome()
@@ -4905,8 +4923,11 @@ def main():
         auto = args.yes or config.get("auto_approve", False)
         mode = "trash" if args.trash else config.get("delete_mode", "rm")
         if args.dry_run:
-            selected = [t for t in targets if t["safe"] or explicit]
-            run_dry_run(selected, mode=mode, json_mode=args.json)
+            if args.min_free is not None:
+                run_dry_run(targets, mode=mode, json_mode=args.json, min_free_gb=args.min_free)
+            else:
+                selected = [t for t in targets if t["safe"] or explicit]
+                run_dry_run(selected, mode=mode, json_mode=args.json)
             return
         if args.min_free is not None:
             if not auto:
