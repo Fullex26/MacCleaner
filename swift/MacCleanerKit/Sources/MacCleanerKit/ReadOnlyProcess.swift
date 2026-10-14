@@ -37,13 +37,15 @@ enum ReadOnlyProcess {
         guard posix_spawn(&pid, executable, &actions, &attrs, &argv, &envp) == 0 else { return nil }
         let deadline = ProcessInfo.processInfo.systemUptime + max(0, timeout)
         var status: Int32 = 0
+        defer {
+            kill(-pid, SIGKILL)
+            while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
+        }
         while true {
             let result = waitpid(pid, &status, WNOHANG)
             if result == pid { break }
             if result == -1 && errno != EINTR { return nil }
             if ProcessInfo.processInfo.systemUptime >= deadline {
-                kill(-pid, SIGKILL)
-                while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
                 return nil
             }
             Thread.sleep(forTimeInterval: 0.01)

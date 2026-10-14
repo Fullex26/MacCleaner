@@ -39,6 +39,8 @@ This document tracks planned features and long-term direction. Community input w
 
 - [ ] **Preserve failed Storage-map measurements** — injecting a du timeout into an existing temporary folder returned a zero total without the incomplete flag, bypassing the app warning. Propagate failed or partial measurement status through map results and nested levels. Implemented for the next release.
 
+- [ ] **Clean up Swift probe descendants after shell exit** — an isolated compiled probe returned output while its background sleep remained alive. Terminate the read-only process group on every exit path, including successful shell completion. Implemented for the next release.
+- [ ] **Keep the newest Storage navigation result** — an isolated real-bridge harness completed `/fast` before an earlier `/slow`, then the older result replaced the new destination. Track request generations so stale completions cannot replace the map, error, or busy state.
 - [ ] **Terminate estimate descendants on timeout** — an isolated real-helper probe returned zero after its shell timed out while a PID-recording child remained alive. Supervise read-only estimate commands in their own process group and terminate that group at the deadline or shell completion. Implemented for the next release.
 
 - [ ] **Show incomplete Storage maps as unavailable** — the bounded enumeration fallback in #78 returns `incomplete: true`, but the Swift bridge discards it and displays a nonempty folder as zero bytes. Decode the additive flag and show a partial/unavailable state instead of the empty-folder message. Implemented for the next release.
