@@ -10,8 +10,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ## [Unreleased]
 
 ### Fixed
-- Colliding log, temporary-build, and leftover IDs now use stable identity digests, preventing duplicate selections and IDs redirecting when another candidate disappears. A reserved separator also prevents digest IDs from colliding with literal project names. Ordinary IDs remain unchanged; Python and Swift agree on collision IDs.
-- Colliding project artifact slugs now receive stable path-digest suffixes, so selecting one artifact cannot select a different project with the same normalized name. Ambiguous old IDs are rejected; non-colliding IDs stay unchanged.
+- Dynamic cleanup IDs now bind lossy names to stable identity digests independently of other candidates, preventing duplicate selections and stale IDs redirecting to a different path. Reserved `--` separators prevent literal-name collisions. Rescan after upgrading: old lossy IDs are rejected; canonical log/tmp names remain unchanged. Python and Swift agree on IDs.
+- Colliding project artifact slugs now receive stable path-digest suffixes, so selecting one artifact cannot select a different project with the same normalized name. Ambiguous old IDs are rejected.
 - Project discovery now honors `skip_paths`, including roots reached through symlink aliases. Artifacts containing an excluded descendant are omitted entirely, so cleanup cannot remove that descendant through its parent.
 - Swift process-list, parent-process, simulator, and Spotlight probes now use bounded process-group execution with file-backed output and Python-equivalent deadlines. The shared runner remains internal and read-only.
 - Project directory discovery now has a 120-second daemon deadline, including root validation. A blocked filesystem read returns candidates already discovered with a partial-results warning instead of hanging the CLI; sizing and git checks retain their existing subprocess bounds.

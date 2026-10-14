@@ -41,7 +41,7 @@ case "scan":
         let root = ProcessInfo.processInfo.environment["MACCLEANER_TMP_ROOT"] ?? "/private/tmp"
         let hits = TmpScanner.scan(root: root, minAgeDays: config.tmpMinAgeDays,
                                    skipPaths: config.skipPaths)
-        for t in TmpScanner.targets(for: hits) {
+        for t in TmpScanner.targets(for: hits, root: root) {
             targets.append([
                 "id": t.id, "category": "tmp", "label": t.label,
                 "description": t.desc, "safe": false,

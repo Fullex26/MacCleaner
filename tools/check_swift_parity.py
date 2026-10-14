@@ -107,9 +107,9 @@ def main():
             p, s = collision_py.get(tid), collision_sw.get(tid)
             if p is None or s is None or p.get("size_bytes") != s.get("size_bytes"):
                 failures.append(f"collision/{tid}: presence or size differs")
-        for prefix in ("tmp-foo-bar--", "leftover-com-gone-app--"):
-            if sum(tid.startswith(prefix) for tid in collision_py) != 2:
-                failures.append(f"collision/{prefix}: expected two distinct digest IDs")
+        for prefix, expected_count in (("tmp-foo-bar--", 1), ("leftover-com-gone-app--", 2)):
+            if sum(tid.startswith(prefix) for tid in collision_py) != expected_count:
+                failures.append(f"collision/{prefix}: unexpected digest-ID count")
 
         cfg["enabled_categories"] = ["docker", "homebrew", "node", "python"]
         cfg_path.write_text(json.dumps(cfg))

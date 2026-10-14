@@ -193,9 +193,11 @@ public enum TmpScanner {
     }
 
     /// Mirrors tmp_to_targets' id/label/description derivation.
-    public static func targets(for hits: [TmpHit]) -> [(id: String, label: String, desc: String, path: String)] {
+    public static func targets(for hits: [TmpHit], root: String = "/private/tmp") -> [(id: String, label: String, desc: String, path: String)] {
         let bases = hits.map { "tmp-" + slugify(($0.path as NSString).lastPathComponent) }
-        let ids = TargetIDs.disambiguate(bases, identities: hits.map(\.path))
+        let prefix = root.hasSuffix("/") ? root : root + "/"
+        let identities = hits.map { $0.path.hasPrefix(prefix) ? String($0.path.dropFirst(prefix.count)) : $0.path }
+        let ids = TargetIDs.disambiguate(bases, identities: identities)
         return zip(hits, ids).map { h, tid in
             let name = (h.path as NSString).lastPathComponent
             let kindDesc = h.kind == .derivedData

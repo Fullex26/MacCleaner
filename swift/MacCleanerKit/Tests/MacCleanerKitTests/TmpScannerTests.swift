@@ -87,6 +87,9 @@ final class TmpScannerTests: XCTestCase {
         let ids = TmpScanner.targets(for: hits).map(\.id)
         XCTAssertEqual(Set(ids).count, 2)
         XCTAssertTrue(ids.allSatisfy { $0.hasPrefix("tmp-foo-bar--") })
+        for (hit, id) in zip(hits, ids) {
+            XCTAssertEqual(TmpScanner.targets(for: [hit])[0].id, id)
+        }
         XCTAssertEqual(ids, Array(TmpScanner.targets(for: Array(hits.reversed())).map(\.id).reversed()))
         XCTAssertNotEqual(ids[0], TmpScanner.targets(for: [hits[1]])[0].id)
     }

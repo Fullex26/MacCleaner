@@ -33,7 +33,6 @@ import json
 import math
 import glob as globmod
 import hashlib
-from collections import Counter
 import time
 import shutil
 import tempfile
@@ -534,9 +533,8 @@ def _run_estimate(estimate_cmd, parser):
 
 # ── Target definitions ─────────────────────────────────────────────────────────
 def _target_ids(bases, identities):
-    """Disambiguate every collision without stealing a possible literal slug."""
-    counts = Counter(bases)
-    return [base if counts[base] == 1 else
+    """Bind lossy slugs to identity, independent of other scan candidates."""
+    return [base if identity == slugify(identity) else
             base + "--" + hashlib.sha256(os.fsencode(identity)).hexdigest()
             for base, identity in zip(bases, identities)]
 
@@ -919,7 +917,7 @@ def get_targets(config, all_categories=False):
 
     logs = [t for t in targets if t["category"] == "logs"]
     for target, tid in zip(logs, _target_ids(
-            [t["id"] for t in logs], [os.path.relpath(t["path"], HOME) for t in logs])):
+            [t["id"] for t in logs], [t["path"].name for t in logs])):
         target["id"] = tid
     return targets
 
@@ -2575,7 +2573,9 @@ def scan_tmp_artifacts(config):
 def tmp_to_targets(hits):
     targets = []
     ids = _target_ids(["tmp-" + slugify(h["path"].name) for h in hits],
-                      [str(h["path"]) for h in hits])
+                      [str(h["path"].relative_to(TMP_SCAN_ROOT))
+                       if TMP_SCAN_ROOT in h["path"].parents else str(h["path"])
+                       for h in hits])
     for h, tid in zip(hits, ids):
         kind_desc = ("Xcode-style derived build products"
                      if h["kind"] == "derived-data"

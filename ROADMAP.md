@@ -39,7 +39,7 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
-- [ ] **Stabilize all cleanup identifiers** — temporary fixture logs named `foo-bar` and `foo_bar` shared an ID, and temporary-build/leftover numeric suffixes redirected an old ID when candidates changed. Use stable identity digests for every colliding slug, with a reserved delimiter that cannot collide with a literal slug. Implemented for the next release.
+- [ ] **Stabilize all cleanup identifiers** — temporary fixture logs named `foo-bar` and `foo_bar` shared an ID, and temporary-build/leftover numeric suffixes redirected an old ID when candidates changed. A singleton-to-different-singleton test proved collision-only hashing is insufficient. Bind all lossy names to stable identity digests, with a reserved delimiter that cannot collide with a literal slug; this ID migration requires owner review. Implemented for the next release.
 - [ ] **Require a persisted app alert claim** — two no-post checks both authorized delivery when a simulated alert-state write failed. Withhold app delivery when the throttle claim cannot be saved, while reporting any notification already posted accurately.
 
 - [ ] **Disambiguate project artifact IDs** — `foo-bar/node_modules` and `foo_bar/node_modules` produce the same slug; an explicit ID selects both and bypasses both git protections. Use stable path digests for colliding slugs and reject ambiguous legacy IDs. Implemented for the next release.

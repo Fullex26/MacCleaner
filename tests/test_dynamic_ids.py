@@ -15,6 +15,8 @@ class TestDynamicIDs(unittest.TestCase):
         reverse = {identity(h): t['id'] for h, t in zip(reversed(hits), convert(list(reversed(hits))))}
         self.assertEqual(before, reverse)
         self.assertEqual(len(set(before.values())), len(hits))
+        for hit in hits:
+            self.assertEqual(before[identity(hit)], convert([hit])[0]['id'])
         remaining = convert(hits[1:])[0]['id']
         self.assertNotEqual(before[identity(hits[0])], remaining)
 
