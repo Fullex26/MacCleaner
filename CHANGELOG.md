@@ -11,6 +11,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 - Storage map now sizes loose files by allocated blocks, matching directory totals and storage insights. Sparse files no longer overstate their disk use or incorrectly pass minimum-size filters.
+- Config sync-on/off now shares transaction locks with preference writes. A concurrent change to Trash mode can no longer be replaced by sync-off’s stale copy, and a delayed writer cannot break a newly enabled sync symlink.
 - App-owned low-disk checks no longer authorize notification delivery when saving the shared throttle claim fails. Disk measurements remain available, and a notification already posted by the CLI is still reported honestly.
 - Concurrent setting and category changes now reload and update the configuration under a transaction lock, so a stale caller cannot undo another preference such as Trash mode. Synced configuration symlinks remain intact and share the destination lock.
 - Minimum-free dry runs now apply the execution path’s safe-only selection and return no candidates when the floor is already met. Additive JSON metadata and preview wording identify eligible candidates as an upper bound; execution may stop earlier. Invalid minimum-free thresholds fail before scanning.
