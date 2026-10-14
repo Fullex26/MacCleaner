@@ -53,3 +53,21 @@ class TestMinFreePreview(unittest.TestCase):
                             cleaner.main()
                         self.assertEqual(error.exception.code, 2)
                         collect.assert_not_called()
+
+    def test_unmet_preview_marks_candidates_without_predicting_reclamation(self):
+        result, warning = self.preview(123, '--min-free', '1', '--targets', 'safe,review', '--trash')
+        self.assertEqual([item['id'] for item in result['items']], ['safe'])
+        self.assertTrue(result['selection_is_upper_bound'])
+        self.assertFalse(result['target_met'])
+        self.assertEqual(result['free_bytes'], 123)
+        self.assertEqual(result['min_free_gb'], 1)
+        self.assertIn('execution may stop earlier', warning)
+
+    def test_empty_selection_stays_empty(self):
+        result, _ = self.preview(0, '--min-free', '1', '--targets', '')
+        self.assertEqual(result['items'], [])
+
+    def test_unknown_target_still_fails_when_floor_is_met(self):
+        with self.assertRaises(SystemExit) as error:
+            self.preview(2 * 1024 ** 3, '--min-free', '1', '--targets', 'missing')
+        self.assertEqual(error.exception.code, 1)
