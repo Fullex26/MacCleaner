@@ -37,6 +37,9 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
+- [ ] **Measure sparse Storage-map files by allocated blocks** — A temporary 1 GiB sparse file on this Mac occupied zero allocated bytes but appeared as a 1 GiB child under a zero-byte map total. Use allocated blocks for loose-file rows and size filtering, matching directory measurements and storage insights.
+
+
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
 - [ ] **Disambiguate project artifact IDs** — `foo-bar/node_modules` and `foo_bar/node_modules` produce the same slug; an explicit ID selects both and bypasses both git protections. Use stable path digests for colliding slugs and reject ambiguous legacy IDs. Implemented for the next release.
