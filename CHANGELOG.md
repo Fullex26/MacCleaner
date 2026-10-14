@@ -9,6 +9,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+---
+
+## [2.18.0] — 2026-10-15
+
 ### Fixed
 - The app build locates the Swift soak engine using SwiftPM’s reported output directory for universal and native builds, so toolchains with a different build layout no longer silently omit it. Failed builds cannot contribute a stale executable; optional-engine failures still allow app packaging.
 - Failed config sync transitions preserve the active settings, including Trash mode, until the new local binding can be committed atomically.
@@ -32,6 +36,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Concurrent processes now serialize report, snapshot, and low-disk throttle updates, preventing lost history and duplicate notification claims. Transaction locks have a five-second wait limit and release automatically when a process exits; JSON replacement remains atomic.
 - An explicitly empty `projects --targets ""` selection now cleans or previews nothing, matching `clean`; previously it fell through to all eligible project artifacts.
 - Storage bars now scale to the largest sibling at the displayed level instead of the root total, making relative sizes easier to compare. The largest entry fills its track; existing width clamping remains. The app probe pins unsorted siblings, empty levels, and zero sizes.
+
+### Changed
+- Rebuilt the committed fallback app bundle on macOS with the current engine and read-only Swift kit. Release assets remain built, signed, and notarized by the tag workflow.
 
 ### Added
 - The read-only Swift kit now reports Docker, Homebrew, pnpm, and Conda estimates and preserves simulator device/runtime sizes. Estimate metadata is generated from Python, commands have a 15-second bound, and parity checks now compare command-target sizes and existence rather than presence alone. No deletion API is added.
