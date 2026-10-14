@@ -32,13 +32,19 @@ import stat as statmod
 import json
 import math
 import glob as globmod
+import hashlib
+from collections import Counter
 import time
 import shutil
 import tempfile
 import argparse
 import subprocess
+import signal
 import datetime
 import plistlib
+import threading
+import fcntl
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -138,7 +144,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.17.2"
+VERSION = "2.18.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -276,7 +282,33 @@ def _icloud_config_dir():
     return HOME / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "MacCleaner"
 
 
+@contextmanager
+def _config_transaction(extra_paths=()):
+    # Lock the local binding before resolving it: sync on/off can replace the
+    # leaf while setting writers wait. Shared destinations also serialize
+    # callers using different local symlinks to the same configuration.
+    local = CONFIG_PATH.parent.resolve() / CONFIG_PATH.name
+    with _state_transaction(local):
+        destinations = {CONFIG_PATH.resolve(), *(p.resolve() for p in extra_paths)} - {local}
+        with ExitStack() as locks:
+            for destination in sorted(destinations):
+                locks.enter_context(_state_transaction(destination))
+            yield
+
+
 def run_config_sync(action, json_mode=False):
+    if action not in ("on", "off"):
+        return _run_config_sync(action, json_mode)
+    extra = ()
+    if action == "on":
+        directory = _icloud_config_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        extra = (directory / "config.json",)
+    with _config_transaction(extra):
+        return _run_config_sync(action, json_mode)
+
+
+def _run_config_sync(action, json_mode=False):
     """`config sync on|off|status` — keep config.json in iCloud Drive with a
     symlink at CONFIG_PATH, so the CLI, the app, and the launchd agents all
     read and write the shared copy unchanged.
@@ -321,14 +353,13 @@ def run_config_sync(action, json_mode=False):
             # iCloud copy wins; keep the local settings recoverable beside it.
             if local_is_file:
                 shutil.copy2(CONFIG_PATH, CONFIG_PATH.parent / (CONFIG_PATH.name + ".pre-sync.bak"))
-                CONFIG_PATH.unlink()
-        elif local_is_file:
-            shutil.move(str(CONFIG_PATH), str(icloud_cfg))
         else:
             _atomic_write_json(icloud_cfg, load_config())
-        if CONFIG_PATH.is_symlink():
-            CONFIG_PATH.unlink()
-        os.symlink(str(icloud_cfg), str(CONFIG_PATH))
+        # Keep the active binding until its complete replacement is ready.
+        with tempfile.TemporaryDirectory(dir=CONFIG_PATH.parent, prefix=".config-sync-") as td:
+            link = Path(td) / "config.json"
+            os.symlink(str(icloud_cfg), str(link))
+            os.replace(link, CONFIG_PATH)
         print(f"Config sync on — settings now live in iCloud Drive:\n  {icloud_cfg}")
         return state()
 
@@ -337,7 +368,6 @@ def run_config_sync(action, json_mode=False):
             print("Config sync is not on — nothing to do.")
             return state()
         current = load_config()
-        CONFIG_PATH.unlink()
         _atomic_write_json(CONFIG_PATH, current)
         print("Config sync off — settings are local again "
               "(the iCloud copy remains for other Macs).")
@@ -512,17 +542,34 @@ def _parse_conda_estimate(output):
     return total
 
 
+ESTIMATE_TIMEOUT_S = 15
+
+
 def _run_estimate(estimate_cmd, parser):
     try:
-        r = subprocess.run(estimate_cmd, shell=True, capture_output=True, text=True, timeout=15)
-        if r.returncode != 0:
-            return 0
+        # A pipe can outlive its shell; supervise the group and read a file
+        # only after completion so descendants cannot hold an EOF wait open.
+        with tempfile.TemporaryFile(mode="w+t") as output:
+            process = subprocess.Popen(estimate_cmd, shell=True, stdout=output,
+                                       stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                process.wait(timeout=ESTIMATE_TIMEOUT_S)
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            if process.returncode != 0:
+                return 0
+            output.seek(0)
+            stdout = output.read()
         return {
             "brew_dry_run": _parse_brew_estimate,
             "docker_df":    _parse_docker_estimate,
             "du_path":      _parse_du_estimate,
             "conda_dry_run": _parse_conda_estimate,
-        }.get(parser, lambda _: 0)(r.stdout)
+        }.get(parser, lambda _: 0)(stdout)
     except Exception:
         return 0
 
@@ -1105,17 +1152,20 @@ def cmd_config_set_category(cfg, action, category):
     if category not in ALL_CATEGORIES:
         print(f"Unknown category '{category}'. Valid: {', '.join(ALL_CATEGORIES)}", file=sys.stderr)
         sys.exit(1)
-    cats = cfg["enabled_categories"]
-    if action == "enable" and category not in cats:
-        cats.append(category)
-        save_config(cfg)
-        print(f"Enabled '{category}'.")
-    elif action == "disable" and category in cats:
-        cats.remove(category)
-        save_config(cfg)
-        print(f"Disabled '{category}'.")
-    else:
-        print(f"Category '{category}' already {'enabled' if action == 'enable' else 'disabled'}.")
+    with _config_transaction():
+        cfg.clear()
+        cfg.update(load_config())
+        cats = cfg["enabled_categories"]
+        if action == "enable" and category not in cats:
+            cats.append(category)
+            save_config(cfg)
+            print(f"Enabled '{category}'.")
+        elif action == "disable" and category in cats:
+            cats.remove(category)
+            save_config(cfg)
+            print(f"Disabled '{category}'.")
+        else:
+            print(f"Category '{category}' already {'enabled' if action == 'enable' else 'disabled'}.")
 
 
 def cmd_config_set_key(cfg, key, value):
@@ -1126,8 +1176,11 @@ def cmd_config_set_key(cfg, key, value):
         parsed = json.loads(value)
     except json.JSONDecodeError:
         parsed = value
-    cfg[key] = parsed
-    save_config(cfg)
+    with _config_transaction():
+        cfg.clear()
+        cfg.update(load_config())
+        cfg[key] = parsed
+        save_config(cfg)
     print(f"Set {key} = {json.dumps(parsed)}")
 
 
@@ -1486,6 +1539,12 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
     return total_freed, results
 
 
+def _safe_cleanup_candidates(targets):
+    return sorted([t for t in measure_targets(targets)
+                   if t["safe"] and (t.get("exists") or t.get("cmd"))],
+                  key=lambda t: t.get("size") or 0, reverse=True)
+
+
 def run_clean_min_free(targets, min_free_gb, mode="rm", json_mode=False, notify=False):
     """Clean SAFE targets, largest first, only until `min_free_gb` is free.
 
@@ -1497,9 +1556,7 @@ def run_clean_min_free(targets, min_free_gb, mode="rm", json_mode=False, notify=
     reaching the floor is `false`, never a quiet success."""
     threshold = int(min_free_gb * 1024 ** 3)
     say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
-    targets = measure_targets(targets)
-    safe = sorted([t for t in targets if t["safe"] and (t.get("exists") or t.get("cmd"))],
-                  key=lambda x: x["size"] or 0, reverse=True)
+    safe = _safe_cleanup_candidates(targets)
     total_freed, results = 0, []
     say(f"\n🧹 MacCleaner — {disk_free()} · target: {fmt_size(threshold)} free\n")
     for t in safe:
@@ -1540,12 +1597,22 @@ def run_clean_min_free(targets, min_free_gb, mode="rm", json_mode=False, notify=
     return total_freed, results
 
 
-def run_dry_run(targets, mode="rm", json_mode=False):
-    """Resolve exactly what a real clean of `targets` would delete. Deletes
-    nothing, writes no report.log entry, records no snapshot."""
+def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
+    """Resolve cleanup paths without deletion or state writes. Minimum-free
+    previews list eligible candidates: execution may stop before the end."""
     say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
-    targets = measure_targets(targets)
-    targets = [t for t in targets if t.get("exists") or t.get("cmd")]
+    extra = {}
+    if min_free_gb is not None:
+        free = disk_stats()["free_bytes"]
+        met = free >= int(min_free_gb * 1024 ** 3)
+        targets = [] if met else _safe_cleanup_candidates(targets)
+        extra = {"min_free_gb": min_free_gb, "free_bytes": free,
+                 "target_met": met, "selection_is_upper_bound": True}
+        say("Minimum-free preview: eligible safe candidates only; execution may stop earlier. "
+            "Candidate sizes do not predict the change in free space.")
+    else:
+        targets = measure_targets(targets)
+        targets = [t for t in targets if t.get("exists") or t.get("cmd")]
     items, total = [], 0
 
     for t in sorted(targets, key=lambda x: x.get("size") or 0, reverse=True):
@@ -1589,16 +1656,17 @@ def run_dry_run(targets, mode="rm", json_mode=False):
             "freed_human": fmt_size(total),
             "disk_after": disk_free(),
             "items": items,
+            **extra,
         }, indent=2))
     else:
         say("\n🧪 Dry run — nothing will be deleted\n")
         for it in items:
             say(f"  {it['label']} ({fmt_size(it['freed'])})")
             if it.get("cmd"):
-                say(f"      would run: {it['cmd']}")
+                say(f"      {'candidate command' if extra else 'would run'}: {it['cmd']}")
             for e in it["paths"]:
-                say(f"      would delete: {e['path']} ({fmt_size(e['size_bytes'])})")
-        say(f"\n  Would free: {fmt_size(total)}\n")
+                say(f"      {'candidate path' if extra else 'would delete'}: {e['path']} ({fmt_size(e['size_bytes'])})")
+        say(f"\n  {'Candidate size estimate' if extra else 'Would free'}: {fmt_size(total)}\n")
     return total, items
 
 
@@ -1710,6 +1778,7 @@ def _bundle_size(root, stats=None):
     than aborting: a partial size for one app beats losing the whole scan.
     `stats`, if given, accumulates `dataless_dirs_skipped` (see _is_dataless)."""
     total, stack = 0, [root]
+    seen_files = set()
     if stats is None:
         stats = {}
     while stack:
@@ -1730,6 +1799,10 @@ def _bundle_size(root, stats=None):
                         continue
                     stack.append(e.path)
                 else:
+                    identity = (st.st_dev, st.st_ino)
+                    if identity in seen_files:
+                        continue
+                    seen_files.add(identity)
                     total += _disk_bytes(st)
             except OSError:
                 continue
@@ -1785,7 +1858,7 @@ def _storage_category(path):
     return best[0]
 
 
-def _du_children(root):
+def _du_children(root, stats=None):
     """`du -xkd 1` -- immediate children plus the root's own total, in bytes.
 
     The `-x` is the whole point and must never be dropped: without it du
@@ -1795,15 +1868,20 @@ def _du_children(root):
     on a real machine read 106 GB when it actually held 11 GB -- a threefold
     overstatement that sent a whole storage investigation down the wrong path.
     """
+    if stats is None:
+        stats = {}
+    stats["incomplete"] = False
     try:
         r = subprocess.run(["du", "-xkd", "1", str(root)],
                            capture_output=True, text=True, timeout=600)
     except Exception as e:
         print("Warning: could not measure %s: %s" % (root, e), file=sys.stderr)
+        stats["incomplete"] = True
         return {}, 0
     # du reports partial results plus stderr noise for unreadable subtrees;
     # a non-zero exit is normal there and the readable numbers are still good.
     sizes, total = {}, 0
+    root_seen = False
     root_s = str(root)
     for line in r.stdout.splitlines():
         parts = line.split("\t", 1)
@@ -1816,8 +1894,12 @@ def _du_children(root):
         path = parts[1]
         if path == root_s:
             total = kb * 1024
+            root_seen = True
         else:
             sizes[path] = kb * 1024
+    stats["incomplete"] = r.returncode != 0 or not root_seen
+    if stats["incomplete"]:
+        print(f"Warning: storage map measurement is incomplete: {root}", file=sys.stderr)
     return sizes, total
 
 
@@ -1833,7 +1915,9 @@ def scan_storage_map(root=None, min_bytes=0, depth=1):
     if not root.exists() or not root.is_dir():
         return empty
 
-    sizes, total = _du_children(root)
+    measurement = {}
+    sizes, total = _du_children(root, measurement)
+    incomplete = measurement["incomplete"]
     children = []
     for path, size in sizes.items():
         if size < min_bytes:
@@ -1862,7 +1946,7 @@ def scan_storage_map(root=None, min_bytes=0, depth=1):
             try:
                 if entry.is_dir(follow_symlinks=False):
                     continue
-                size = entry.stat(follow_symlinks=False).st_size
+                size = _disk_bytes(entry.stat(follow_symlinks=False))
             except OSError:
                 continue
             if size < min_bytes:
@@ -1887,8 +1971,12 @@ def scan_storage_map(root=None, min_bytes=0, depth=1):
             if c["kind"] == "dir":
                 sub = scan_storage_map(c["path"], min_bytes=min_bytes, depth=depth - 1)
                 c["children"] = sub["children"]
-    return {"root": str(root), "total_bytes": total, "total_human": fmt_size(total),
-            "category": _storage_category(root), "children": children}
+                incomplete |= sub.get("incomplete", False)
+    result = {"root": str(root), "total_bytes": total, "total_human": fmt_size(total),
+              "category": _storage_category(root), "children": children}
+    if incomplete:
+        result["incomplete"] = True
+    return result
 
 
 def scan_storage_insights(config, stats=None, time_budget_s=None):
@@ -1949,52 +2037,77 @@ def scan_storage_insights(config, stats=None, time_budget_s=None):
     hits = []
     stack = [r for r in _storage_insights_roots() if r.is_dir()]
     walked = 0
-    while stack:
-        if walked and time.monotonic() - started > time_budget_s:
-            stats["truncated"] = True
-            print(f"Warning: storage-insights stopped after {time_budget_s}s with "
-                  f"{len(stack)} director{'y' if len(stack) == 1 else 'ies'} unvisited; "
-                  f"results are partial", file=sys.stderr)
-            break
-        current = stack.pop()
-        walked += 1
-        try:
-            entries = list(os.scandir(current))
-        except OSError:
-            continue
-        for e in entries:
+
+    def _walk():
+        nonlocal walked
+        while stack:
+            if walked and time.monotonic() - started > time_budget_s:
+                stats["truncated"] = True
+                print(f"Warning: storage-insights stopped after {time_budget_s}s with "
+                      f"{len(stack)} director{'y' if len(stack) == 1 else 'ies'} unvisited; "
+                      f"results are partial", file=sys.stderr)
+                return
+            current = stack.pop()
+            walked += 1
             try:
-                if e.is_symlink():
-                    continue
-                if e.is_dir(follow_symlinks=False):
-                    if e.name in _STORAGE_INSIGHTS_SKIP_DIRS:
-                        continue
-                    if _is_dataless(e.stat(follow_symlinks=False)):
-                        # Evicted iCloud folder: listing it blocks on a
-                        # download, and it holds no local bytes. Skip it
-                        # whether it is a bundle or a plain folder.
-                        stats["dataless_dirs_skipped"] += 1
-                        continue
-                    if _is_bundle_dir(e.name):
-                        # One row for the whole bundle; never descend.
-                        size = _bundle_size(e.path, stats)
-                        if size >= STORAGE_INSIGHTS_MIN_BYTES:
-                            st = e.stat(follow_symlinks=False)
-                            hits.append({"path": Path(e.path), "size_bytes": size,
-                                         "mtime": st.st_mtime, "is_bundle": True})
-                        continue
-                    stack.append(Path(e.path))
-                elif e.is_file(follow_symlinks=False):
-                    st = e.stat(follow_symlinks=False)
-                    size = _disk_bytes(st)
-                    if size >= STORAGE_INSIGHTS_MIN_BYTES:
-                        hits.append({"path": Path(e.path), "size_bytes": size,
-                                     "mtime": st.st_mtime, "is_bundle": False})
+                entries = list(os.scandir(current))
             except OSError:
                 continue
+            for e in entries:
+                try:
+                    if e.is_symlink():
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        if e.name in _STORAGE_INSIGHTS_SKIP_DIRS:
+                            continue
+                        if _is_dataless(e.stat(follow_symlinks=False)):
+                            # Evicted iCloud folder: listing it blocks on a
+                            # download, and it holds no local bytes. Skip it
+                            # whether it is a bundle or a plain folder.
+                            stats["dataless_dirs_skipped"] += 1
+                            continue
+                        if _is_bundle_dir(e.name):
+                            # One row for the whole bundle; never descend.
+                            size = _bundle_size(e.path, stats)
+                            if size >= STORAGE_INSIGHTS_MIN_BYTES:
+                                st = e.stat(follow_symlinks=False)
+                                hits.append({"path": Path(e.path), "size_bytes": size,
+                                             "mtime": st.st_mtime, "is_bundle": True})
+                            continue
+                        stack.append(Path(e.path))
+                    elif e.is_file(follow_symlinks=False):
+                        st = e.stat(follow_symlinks=False)
+                        size = _disk_bytes(st)
+                        if size >= STORAGE_INSIGHTS_MIN_BYTES:
+                            hits.append({"path": Path(e.path), "size_bytes": size,
+                                         "mtime": st.st_mtime, "is_bundle": False})
+                except OSError:
+                    continue
+
+    # The walk runs in a DAEMON thread the caller joins with a deadline,
+    # because the budget check above can only fire BETWEEN directories and a
+    # readdir already blocked in the kernel cannot be interrupted from Python.
+    # Observed live: ~/Library/Containers/com.apple.dt.ExternalViewService/Data
+    # is a plain user-owned directory (mode 0700, st_flags == 0, NOT dataless)
+    # on which a bare os.listdir() never returns -- a real scan sat in
+    # os_scandir on it for 12 minutes at 0% CPU. The 2.17.2 dataless guard
+    # cannot catch that, and enumerating classes of blocking directory is a
+    # losing game, so bound the walk itself instead of guessing what might
+    # block. Daemon, so a wedged thread can never keep the process alive; the
+    # hits it already appended stay valid (append is atomic under the GIL) and
+    # partial results beat none.
+    worker = threading.Thread(target=_walk, name="storage-insights-walk", daemon=True)
+    worker.start()
+    worker.join(time_budget_s)
+    if worker.is_alive():
+        stats["truncated"] = True
+        print(f"Warning: storage-insights gave up after {time_budget_s}s — a "
+              f"directory is not responding to readdir; results are partial",
+              file=sys.stderr)
+
     stats["elapsed_s"] = round(time.monotonic() - started, 3)
-    hits.sort(key=lambda h: h["size_bytes"], reverse=True)
-    return hits[:STORAGE_INSIGHTS_MAX_RESULTS]
+    found = sorted(list(hits), key=lambda h: h["size_bytes"], reverse=True)
+    return found[:STORAGE_INSIGHTS_MAX_RESULTS]
 
 
 def _relative_days(mtime):
@@ -2166,20 +2279,31 @@ def _filter_git_flagged(targets, bypass):
     return [t for t in targets if not _git_flagged(t)]
 
 
+PROJECT_SCAN_TIME_BUDGET_S = 120.0
+
+
 def scan_projects(config, roots=None, min_age_days=None):
     """Find stale build-artifact directories under the configured project roots."""
     root_strs = roots if roots else config.get("project_roots", [])
     roots = []
-    for r in root_strs:
-        p = Path(os.path.expanduser(r))
-        if p.exists() and p.is_dir():
-            roots.append(p)
     min_age = config.get("project_min_age_days", 30) if min_age_days is None else min_age_days
     now = time.time()
     found = {}
+    stopped = threading.Event()
+    results_lock = threading.Lock()
+    errors = []
+    skip = []
+
+    def excluded(path, contains_exclusion=False):
+        if not skip:
+            return False
+        resolved = Path(path).resolve()
+        return any(str(resolved).startswith(str(prefix)) or
+                   (contains_exclusion and resolved in prefix.parents)
+                   for prefix in skip)
 
     def walk(dir_path, depth):
-        if depth > PROJECT_SCAN_MAX_DEPTH:
+        if stopped.is_set() or depth > PROJECT_SCAN_MAX_DEPTH or excluded(dir_path):
             return
         try:
             entries = list(os.scandir(dir_path))
@@ -2187,6 +2311,8 @@ def scan_projects(config, roots=None, min_age_days=None):
             return
         names = {e.name for e in entries}
         for e in entries:
+            if stopped.is_set():
+                return
             try:
                 if not e.is_dir(follow_symlinks=False):
                     continue
@@ -2195,29 +2321,77 @@ def scan_projects(config, roots=None, min_age_days=None):
             name = e.name
             if name == ".git":
                 continue
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            # An evicted ("dataless") iCloud directory must never be listed and
+            # never be offered. stat() reports the flag cheaply; enumerating the
+            # directory is what blocks in getdirentries64 until iCloud
+            # materialises it -- the same hang 2.17.2 fixed in
+            # scan_storage_insights, reachable here because ~/Documents is a
+            # default project root and is iCloud-backed under "Desktop &
+            # Documents Folders" sync. Skipping also keeps an evicted artifact
+            # dir out of the delete list, whose real size and contents are
+            # unknown until it comes back down.
+            if _is_dataless(st):
+                continue
             if name in ARTIFACT_MANIFESTS:
                 required = ARTIFACT_MANIFESTS[name]
                 if not required or any(m in names for m in required):
-                    try:
-                        age_days = int((now - e.stat(follow_symlinks=False).st_mtime) / 86400)
-                    except OSError:
-                        continue
-                    if age_days >= min_age and e.path not in found:
-                        found[e.path] = {
+                    age_days = int((now - st.st_mtime) / 86400)
+                    if (age_days >= min_age and e.path not in found
+                            and not excluded(e.path, contains_exclusion=True)):
+                        candidate = {
                             "path": e.path,
                             "kind": name,
                             "project": str(Path(e.path).parent),
                             "age_days": age_days,
                         }
+                        with results_lock:
+                            if not stopped.is_set():
+                                found[e.path] = candidate
                 continue  # never descend into artifact-named dirs
             if name.startswith("."):
                 continue
             walk(e.path, depth + 1)
 
-    for root in roots:
-        walk(root, 0)
+    def discover():
+        try:
+            for raw in config.get("skip_paths", []):
+                prefix = Path(os.path.abspath(os.path.expanduser(raw)))
+                # Protect both the named entry and its destination when the
+                # exclusion itself is a symlink.
+                skip.extend((prefix, prefix.parent.resolve() / prefix.name,
+                             prefix.resolve()))
+            for r in root_strs:
+                if stopped.is_set():
+                    return
+                p = Path(os.path.expanduser(r))
+                if p.exists() and p.is_dir():
+                    with results_lock:
+                        if stopped.is_set():
+                            return
+                        roots.append(p)
+                    walk(p, 0)
+        except Exception as exc:
+            errors.append(exc)
 
-    hits = list(found.values())
+    # A deadline between directories cannot interrupt a blocked stat/readdir.
+    # Only discovery runs here; this daemon never deletes or writes state.
+    worker = threading.Thread(target=discover, name="project-discovery", daemon=True)
+    worker.start()
+    worker.join(PROJECT_SCAN_TIME_BUDGET_S)
+    timed_out = worker.is_alive()
+    with results_lock:
+        stopped.set()
+        hits = list(found.values())
+        roots = list(roots)
+    if timed_out:
+        print(f"Warning: project discovery stopped after {PROJECT_SCAN_TIME_BUDGET_S}s; "
+              "results are partial", file=sys.stderr)
+    elif errors:
+        raise errors[0]
     with ThreadPoolExecutor(max_workers=8) as pool:
         sizes = list(pool.map(lambda h: get_size(Path(h["path"])), hits))
     for h, s in zip(hits, sizes):
@@ -2236,14 +2410,20 @@ def scan_projects(config, roots=None, min_age_days=None):
 
 def projects_to_targets(hits):
     targets = []
-    for h in hits:
+    base_ids = [f"project-{slugify(os.path.relpath(h['path'], str(HOME)))}" for h in hits]
+    counts = Counter(base_ids)
+    for h, base_id in zip(hits, base_ids):
         git = h.get("git")
         flags = [name for name, on in (("dirty", git and git.get("dirty")),
                                        ("unpushed", git and git.get("unpushed"))) if on]
         badge = "".join(f" [{f}]" for f in flags)
         rel = os.path.relpath(h["path"], str(HOME))
+        # Size/order-dependent suffixes could silently select another project
+        # on a later scan. Disambiguate every colliding slug by path instead.
+        tid = base_id if counts[base_id] == 1 else (
+            base_id + "-" + hashlib.sha256(os.fsencode(rel)).hexdigest())
         targets.append({
-            "id": f"project-{slugify(rel)}",
+            "id": tid,
             "category": "projects",
             "label": f"{h['kind']} — {os.path.relpath(h['project'], str(HOME))}{badge}",
             "description": f"Stale {h['kind']} ({h['age_days']} days old)"
@@ -3551,6 +3731,28 @@ def show_categories(config, json_mode=False):
         print(f"{'='*72}\n")
 
 
+STATE_LOCK_TIMEOUT_S = 5.0
+
+
+@contextmanager
+def _state_transaction(path):
+    """Serialize a whole update across processes; never unlink the lock inode."""
+    with open(path.with_name(path.name + ".lock"), "a") as lock:
+        deadline = time.monotonic() + STATE_LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out waiting for {path.name} transaction")
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def _atomic_write_json(path: Path, data):
     """Dump JSON to a temp file beside `path`, then os.replace() it into place.
 
@@ -3580,17 +3782,11 @@ def write_log(total_freed: int, results: list):
         "disk_after": disk_free(),
         "items": results
     }
-    logs = []
-    if LOG_PATH.exists():
-        try:
-            with open(LOG_PATH) as f:
-                logs = json.load(f)
-        except Exception:
-            logs = []
-    logs.append(entry)
-    logs = logs[-50:]  # Keep last 50 runs
     try:
-        _atomic_write_json(LOG_PATH, logs)
+        with _state_transaction(LOG_PATH):
+            logs = _read_report_log()
+            logs.append(entry)
+            _atomic_write_json(LOG_PATH, logs[-50:])
     except Exception as e:
         print(f"Warning: could not write log: {e}", file=sys.stderr)
 
@@ -3768,13 +3964,14 @@ def record_snapshot(reclaimable_bytes=None, categories=None):
             "reclaimable_bytes": reclaimable_bytes,
             "categories": categories,
         }
-        snaps = load_snapshots()
-        if snaps and snaps[-1].get("ts", "")[:10] == entry["ts"][:10]:
-            snaps[-1] = entry
-        else:
-            snaps.append(entry)
-        snaps = snaps[-SNAPSHOT_CAP:]
-        _atomic_write_json(SNAPSHOTS_PATH, snaps)
+        with _state_transaction(SNAPSHOTS_PATH):
+            snaps = load_snapshots()
+            if snaps and snaps[-1].get("ts", "")[:10] == entry["ts"][:10]:
+                snaps[-1] = entry
+            else:
+                snaps.append(entry)
+            snaps = snaps[-SNAPSHOT_CAP:]
+            _atomic_write_json(SNAPSHOTS_PATH, snaps)
     except Exception as e:
         print(f"Warning: could not write snapshot: {e}", file=sys.stderr)
 
@@ -3860,8 +4057,10 @@ def load_alerts():
 def save_alerts(alerts):
     try:
         _atomic_write_json(ALERTS_PATH, alerts)
+        return True
     except Exception as e:
         print(f"Warning: could not write alert state: {e}", file=sys.stderr)
+        return False
 
 
 def _low_disk_decision(alerts, now, free_bytes, threshold_bytes):
@@ -3917,31 +4116,41 @@ def run_disk_check(config, json_mode=False, post=True):
     free = ds["free_bytes"]
     enabled = config.get("low_disk_alerts", True)
 
-    alerts = load_alerts()
-    should_notify, state = _low_disk_decision(alerts, datetime.datetime.now(), free, threshold)
-    notified = False
-    # A decision that doesn't depend on posting a notification (still-above, or
-    # still-below-but-throttled) is accurate regardless of what happens below.
-    persist_state = not should_notify
-    if enabled and should_notify:
-        if post:
-            notified = _notify(
-                f"Low disk space: {fmt_size(free)} free",
-                f"Below your {fmt_size(threshold)} threshold — "
-                f"open MacCleaner to reclaim space.")
-            # Only stamp the throttle when the banner actually posted —
-            # otherwise a failed notification would suppress retries for the
-            # next 24h even though the user never saw anything (finding M5).
-            persist_state = notified
-        else:
-            # The caller is taking over delivery; claim the throttle slot
-            # so the launchd agent doesn't also fire for this same dip.
-            persist_state = True
-    if enabled and persist_state and alerts.get("low_disk") != state:
-        # Skip the write entirely when nothing changed, so an hourly agent
-        # isn't rewriting alerts.json every run for no reason (finding M3).
-        alerts["low_disk"] = state
-        save_alerts(alerts)
+    should_notify = notified = False
+    try:
+        with _state_transaction(ALERTS_PATH):
+            alerts = load_alerts()
+            should_notify, state = _low_disk_decision(alerts, datetime.datetime.now(), free, threshold)
+            notified = False
+            # A decision that doesn't depend on posting a notification (still-above, or
+            # still-below-but-throttled) is accurate regardless of what happens below.
+            persist_state = not should_notify
+            if enabled and should_notify:
+                if post:
+                    notified = _notify(
+                        f"Low disk space: {fmt_size(free)} free",
+                        f"Below your {fmt_size(threshold)} threshold — "
+                        f"open MacCleaner to reclaim space.")
+                    # Only stamp the throttle when the banner actually posted —
+                    # otherwise a failed notification would suppress retries for the
+                    # next 24h even though the user never saw anything (finding M5).
+                    persist_state = notified
+                else:
+                    # The caller is taking over delivery; claim the throttle slot
+                    # so the launchd agent doesn't also fire for this same dip.
+                    persist_state = True
+            if enabled and persist_state and alerts.get("low_disk") != state:
+                # Skip the write entirely when nothing changed, so an hourly agent
+                # isn't rewriting alerts.json every run for no reason (finding M3).
+                alerts["low_disk"] = state
+                if not save_alerts(alerts) and not post:
+                    # The app has not delivered yet. Do not authorize a banner
+                    # unless its throttle claim is durable enough to share.
+                    should_notify = False
+    except (OSError, TimeoutError) as e:
+        # A contending caller must not claim a notification without the lock.
+        should_notify = False
+        print(f"Warning: could not update alert state: {e}", file=sys.stderr)
 
     result = {
         "free_bytes": free,
@@ -4477,6 +4686,8 @@ def translate_legacy(argv):
         return ["scan"] + strip("--preview")
     if "--report" in flags:
         return ["report"] + strip("--report")
+    if any(a == "--category" or a.startswith("--category=") for a in rest):
+        return ["scan"] + rest
     if "--json" in flags and all(a in ("--json", "--category") or rest[i-1] == "--category"
                                  for i, a in enumerate(rest)):
         return ["scan"] + rest  # bare --json [--category X] = menu bar app contract
@@ -4600,6 +4811,9 @@ def main():
     argv = translate_legacy(sys.argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "clean" and args.min_free is not None:
+        if args.min_free < 0 or not math.isfinite(args.min_free * 1024 ** 3):
+            parser.error("--min-free must be a finite, non-negative GiB value within range")
 
     if args.command is None:
         show_welcome()
@@ -4671,7 +4885,8 @@ def main():
         hits, roots, min_age = scan_projects(config, roots=args.roots, min_age_days=args.min_age_days)
         if args.clean or args.dry_run:
             targets = projects_to_targets(hits)
-            if args.targets:
+            targets_given = args.targets is not None
+            if targets_given:
                 wanted = {t.strip() for t in args.targets.split(",") if t.strip()}
                 targets = [t for t in targets if t["id"] in wanted]
                 missing = wanted - {t["id"] for t in targets}
@@ -4680,13 +4895,13 @@ def main():
                     sys.exit(1)
             mode = "trash" if args.trash else config.get("delete_mode", "rm")
             if args.dry_run:
-                selected = _filter_git_flagged(targets, bypass=bool(args.targets))
+                selected = _filter_git_flagged(targets, bypass=targets_given)
                 run_dry_run(selected, mode=mode, json_mode=args.json)
                 return
             if args.yes:
-                targets = _filter_git_flagged(targets, bypass=bool(args.targets))
+                targets = _filter_git_flagged(targets, bypass=targets_given)
             run_clean(targets, auto_approve=args.yes, mode=mode,
-                      json_mode=args.json, explicit=bool(args.targets) or args.yes)
+                      json_mode=args.json, explicit=targets_given or args.yes)
         elif args.json:
             print(json.dumps({
                 "version": VERSION,
@@ -4782,8 +4997,11 @@ def main():
         auto = args.yes or config.get("auto_approve", False)
         mode = "trash" if args.trash else config.get("delete_mode", "rm")
         if args.dry_run:
-            selected = [t for t in targets if t["safe"] or explicit]
-            run_dry_run(selected, mode=mode, json_mode=args.json)
+            if args.min_free is not None:
+                run_dry_run(targets, mode=mode, json_mode=args.json, min_free_gb=args.min_free)
+            else:
+                selected = [t for t in targets if t["safe"] or explicit]
+                run_dry_run(selected, mode=mode, json_mode=args.json)
             return
         if args.min_free is not None:
             if not auto:
