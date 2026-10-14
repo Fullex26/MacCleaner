@@ -184,3 +184,5 @@ Storage map loose-file rows must use `_disk_bytes(stat)` just like storage insig
 For `disk-check --no-post`, authorizing app delivery requires a successful throttle-state save. A failed save must return `should_notify: false`, as a failed transaction lock does. Never rewrite `notified: true` to false after the CLI already posted a banner, even if the subsequent state save failed.
 
 Configuration transactions must lock the local binding before resolving its destination, then lock canonical shared destinations. Sync-on/off and setting/category writers all use `_config_transaction`; destination-only locking cannot protect a symlink being replaced while a writer waits. Status remains read-only. Three real-process tests pin both sync-off orderings and sync-on during a delayed preference write. This serializes local processes, not external iCloud conflict resolution.
+
+Bundle sizing deduplicates `(st_dev, st_ino)` within each traversal while summing allocated blocks. Keep the identity set local to the bundle: separate bundles must retain their own totals even when they share hard links. The walk stays stat-only and never follows symlinks.
