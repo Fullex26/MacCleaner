@@ -4055,8 +4055,10 @@ def load_alerts():
 def save_alerts(alerts):
     try:
         _atomic_write_json(ALERTS_PATH, alerts)
+        return True
     except Exception as e:
         print(f"Warning: could not write alert state: {e}", file=sys.stderr)
+        return False
 
 
 def _low_disk_decision(alerts, now, free_bytes, threshold_bytes):
@@ -4139,7 +4141,10 @@ def run_disk_check(config, json_mode=False, post=True):
                 # Skip the write entirely when nothing changed, so an hourly agent
                 # isn't rewriting alerts.json every run for no reason (finding M3).
                 alerts["low_disk"] = state
-                save_alerts(alerts)
+                if not save_alerts(alerts) and not post:
+                    # The app has not delivered yet. Do not authorize a banner
+                    # unless its throttle claim is durable enough to share.
+                    should_notify = False
     except (OSError, TimeoutError) as e:
         # A contending caller must not claim a notification without the lock.
         should_notify = False
