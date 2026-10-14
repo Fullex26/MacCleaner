@@ -11,6 +11,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 - Swift read-only probes now terminate their process group after every exit, including successful or allowed-failure shell completion, so background descendants cannot outlive the probe.
+- Python read-only estimates now supervise their entire process group and use file-backed output, terminating descendants on timeout or shell completion instead of leaving commands running after the scan returns.
 - The Storage tab now displays incomplete measurements as unavailable, retaining partial rows with a warning rather than presenting a timed-out folder as empty. Complete refreshes clear the warning; older engine payloads remain compatible.
 - Storage insights counts each hard-linked file once within a bundle, avoiding inflated app sizes while preserving independent bundle totals.
 - Storage map now sizes loose files by allocated blocks, matching directory totals and storage insights. Sparse files no longer overstate their disk use or incorrectly pass minimum-size filters.
