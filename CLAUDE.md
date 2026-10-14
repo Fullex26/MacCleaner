@@ -197,3 +197,5 @@ Python read-only estimates use a dedicated process group and file-backed stdout.
 
 Storage navigation requests can overlap across async suspension. Only the current request UUID may publish a map, publish an error, or clear the busy flag. `tools/check_storage_request_order.py` exercises the real bridge with controlled engine completions, including stale success/failure and a latest request that is still pending.
 Storage-map completeness includes the du measurement, not only directory enumeration. A timeout, nonzero du exit, or missing root-total row must mark the result incomplete; preserve usable partial rows and propagate nested failures to the parent. A valid zero root row is complete. Keep the mount boundary flag and the private two-value sizing return compatible.
+
+Legacy category-only arguments imply `scan`, including `--category=value`. Keep this fallback after explicit legacy modes (`--clean`, `--preview`, `--report`, config) so it cannot turn a requested command into a scan; argparse still validates the forwarded values.

@@ -4782,6 +4782,8 @@ def translate_legacy(argv):
         return ["scan"] + strip("--preview")
     if "--report" in flags:
         return ["report"] + strip("--report")
+    if any(a == "--category" or a.startswith("--category=") for a in rest):
+        return ["scan"] + rest
     if "--json" in flags and all(a in ("--json", "--category") or rest[i-1] == "--category"
                                  for i, a in enumerate(rest)):
         return ["scan"] + rest  # bare --json [--category X] = menu bar app contract
