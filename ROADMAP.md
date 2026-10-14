@@ -37,6 +37,8 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
+- [ ] **Count cleanup outcomes accurately in app notifications** — an exact-bridge probe with an error-only response produced “1 items cleaned”. Count deleted/trashed items as successes and report failures separately.
+
 - [ ] **Honor standalone legacy category selection** — a parser-only probe shows documented `--category node` exits 2 while `--preview --category node` works. Translate the standalone spelling into a scan and pin repeatable/category-value variants. Implemented for the next release.
 
 - [ ] **Preserve failed Storage-map measurements** — injecting a du timeout into an existing temporary folder returned a zero total without the incomplete flag, bypassing the app warning. Propagate failed or partial measurement status through map results and nested levels. Implemented for the next release.
