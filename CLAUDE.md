@@ -196,4 +196,5 @@ Storage-map completeness includes the du measurement, not only directory enumera
 
 Legacy category-only arguments imply `scan`, including `--category=value`. Keep this fallback after explicit legacy modes (`--clean`, `--preview`, `--report`, config) so it cannot turn a requested command into a scan; argparse still validates the forwarded values.
 
+Config sync must retain the active local binding until a complete replacement is ready. Sync-off atomically replaces the symlink without unlinking first; sync-on stages a symlink and atomically replaces the local binding, copying rather than moving settings into a new cloud file. Failed writes, link creation, or replacement must not silently reset `delete_mode` to its default.
 Cleanup notification success counts include only `deleted` and `trashed`, never every non-skipped status. Share `CleanResult.notificationBody` between selected and automatic cleanup, append failures/skips separately, and retain the engine’s freed-byte title because a failed item can partially reclaim space. The real-bridge capture probe must never post actual notifications.
