@@ -984,6 +984,13 @@ def collect_targets(config, all_categories=False, categories=None, target_ids=No
     return targets
 
 
+def _cleanup_children(path):
+    children = _read_only_scan(lambda: list(path.iterdir()), None, "cleanup enumeration")
+    if children is None:
+        raise TimeoutError(f"could not enumerate cleanup directory: {path}")
+    return children
+
+
 def _target_paths(t):
     """Concrete filesystem paths for a target (glob patterns expanded).
 
@@ -991,8 +998,12 @@ def _target_paths(t):
     check in add() can only see the pattern, not its expansions."""
     if t.get("glob"):
         skip = t.get("skip", [])
-        return [Path(p) for p in sorted(globmod.glob(t["glob"]))
-                if not any(p.startswith(s) for s in skip)]
+        paths = _read_only_scan(lambda: [Path(p) for p in sorted(globmod.glob(t["glob"]))
+                                        if not any(p.startswith(s) for s in skip)],
+                                None, "target glob expansion")
+        if paths is None:
+            raise TimeoutError(f"could not enumerate target glob: {t['glob']}")
+        return paths
     if t.get("paths"):
         return t["paths"]
     if t.get("path"):
@@ -1007,7 +1018,11 @@ def measure_targets(targets):
         if "size" in t and t["size"] is not None:
             t.setdefault("exists", True)
             return
-        paths = _target_paths(t)
+        try:
+            paths = _target_paths(t)
+        except TimeoutError as exc:
+            t.update(size=0, exists=False, measurement_error=str(exc))
+            return
         existing = [p for p in paths if p.exists()]
         if existing:
             t["size"] = sum(get_size(p) for p in existing)
@@ -1121,17 +1136,30 @@ def delete_target(t, mode="rm"):
 
     freed = 0
     errors = []
-    for path in _target_paths(t):
+    if t.get("measurement_error"):
+        return 0, t["measurement_error"]
+    try:
+        paths = _target_paths(t)
+    except TimeoutError as exc:
+        return 0, str(exc)
+    for path in paths:
         if not path.exists() and not path.is_symlink():
             continue
         if not _safe_to_delete(path):
             if not (t.get("tmp_scan") and _tmp_scan_path_allowed(path)):
                 errors.append(f"refused (outside home): {path}")
                 continue
+        children = None
+        if t.get("empty_only"):
+            try:
+                children = _cleanup_children(path)
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
+                continue
         freed += get_size(path)
         try:
             if t.get("empty_only"):
-                for child in list(path.iterdir()):
+                for child in children:
                     if _safe_to_delete(child):
                         _move_to_trash(child) if mode == "trash" else _remove(child)
             elif mode == "trash":
@@ -1378,12 +1406,18 @@ def reclaimable_total(targets):
 
     cmd-based targets (brew cleanup, docker prune) have no path and always
     count -- there is nothing to nest them inside."""
-    owned = []
+    resolved = []
     for t in targets:
-        owned.extend(str(p) for p in _target_paths(t))
+        if t.get("measurement_error"):
+            continue
+        try:
+            paths = [str(p) for p in _target_paths(t)]
+        except TimeoutError:
+            continue
+        resolved.append((t, paths))
+    owned = [p for _, paths in resolved for p in paths]
     total = 0
-    for t in targets:
-        paths = [str(p) for p in _target_paths(t)]
+    for t, paths in resolved:
         if paths and all(
             any(p != q and p.startswith(q.rstrip(os.sep) + os.sep) for q in owned)
             for p in paths
@@ -1413,6 +1447,7 @@ def scan_json(targets, extra=None):
                 "size_human": fmt_size(t["size"]),
                 "safe": t["safe"],
                 "exists": t.get("exists", False),
+                **({"measurement_error": t["measurement_error"]} if t.get("measurement_error") else {}),
             }
             for t in sorted(targets, key=lambda x: x["size"], reverse=True)
         ]
@@ -1429,7 +1464,7 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
 
     targets = measure_targets(targets)
     # Drop targets with nothing to clean (keep cmd-based, which are always runnable)
-    targets = [t for t in targets if t.get("exists") or t.get("cmd")]
+    targets = [t for t in targets if t.get("exists") or t.get("cmd") or t.get("measurement_error")]
     total_freed = 0
     results = []
 
@@ -1608,7 +1643,7 @@ def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
             "Candidate sizes do not predict the change in free space.")
     else:
         targets = measure_targets(targets)
-        targets = [t for t in targets if t.get("exists") or t.get("cmd")]
+        targets = [t for t in targets if t.get("exists") or t.get("cmd") or t.get("measurement_error")]
     items, total = [], 0
 
     for t in sorted(targets, key=lambda x: x.get("size") or 0, reverse=True):
@@ -1619,7 +1654,11 @@ def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
             total += size
             continue
         paths = []
-        for p in _target_paths(t):
+        try:
+            target_paths = [] if t.get("measurement_error") else _target_paths(t)
+        except TimeoutError:
+            target_paths = []
+        for p in target_paths:
             if not p.exists() and not p.is_symlink():
                 continue
             if t.get("empty_only"):
@@ -1627,7 +1666,7 @@ def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
                 # a PermissionError previewing one target's children must not
                 # abort the whole preview when the real delete would tolerate it.
                 try:
-                    children = list(p.iterdir())
+                    children = _cleanup_children(p)
                 except (PermissionError, FileNotFoundError, OSError):
                     continue
                 paths.extend(c for c in sorted(children) if _safe_to_delete(c))

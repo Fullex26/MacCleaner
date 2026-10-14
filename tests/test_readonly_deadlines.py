@@ -66,7 +66,8 @@ elif case in ('glob_measure', 'glob_delete', 'empty_preview', 'empty_delete'):
     directory.mkdir()
     sentinel = directory / 'keep.txt'
     sentinel.write_text('keep')
-    target = {'id': 'fixture', 'label': 'fixture', 'safe': True, 'path': directory}
+    target = {'id': 'fixture', 'label': 'fixture', 'category': 'node',
+              'description': 'fixture', 'safe': True, 'path': directory}
     c.get_size = lambda path: 1
     def mutation(path):
         raise AssertionError('mutation must not run after failed discovery')
@@ -78,10 +79,22 @@ elif case in ('glob_measure', 'glob_delete', 'empty_preview', 'empty_delete'):
         c.Path.iterdir = blocked
     if case == 'glob_measure':
         c.measure_targets([target])
-        assert target['size'] == 0
+        assert target['size'] == 0 and target['measurement_error']
+        assert c.reclaimable_total([target]) == 0
+        import contextlib, io, json
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            c.scan_json([target])
+        assert json.loads(output.getvalue())['targets'][0]['measurement_error']
+        total, items = c.run_dry_run([target], json_mode=True)
+        assert total == 0 and items[0]['paths'] == []
     elif case.endswith('delete'):
         freed, error = c.delete_target(target)
         assert freed == 0 and error
+        if case == 'glob_delete':
+            c.LOG_PATH, c.SNAPSHOTS_PATH = root / 'report.log', root / 'snapshots.log'
+            freed, items = c.run_clean([target], auto_approve=True, explicit=True, json_mode=True)
+            assert freed == 0 and items[0]['status'] == 'error'
     else:
         total, items = c.run_dry_run([target], json_mode=True)
         assert total == 0 and items[0]['paths'] == []
