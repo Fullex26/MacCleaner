@@ -10,15 +10,38 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ## [Unreleased]
 
 ### Fixed
-- Dynamic cleanup IDs now bind lossy names to stable identity digests independently of other candidates, preventing duplicate selections and stale IDs redirecting to a different path. Reserved `--` separators prevent literal-name collisions. Rescan after upgrading: old lossy IDs are rejected; canonical log/tmp names remain unchanged. Python and Swift agree on IDs.
-- Colliding project artifact slugs now receive stable path-digest suffixes, so selecting one artifact cannot select a different project with the same normalized name. Ambiguous old IDs are rejected.
+- Lossy project, log, temporary-build, and leftover identifiers use stable identity digests independent of candidate membership. This intentionally rejects old ambiguous lossy IDs rather than allowing them to select a different path.
+
+---
+
+## [2.18.0] — 2026-10-15
+
+### Fixed
+- The app build locates the Swift soak engine using SwiftPM’s reported output directory for universal and native builds, so toolchains with a different build layout no longer silently omit it. Failed builds cannot contribute a stale executable; optional-engine failures still allow app packaging.
+- Failed config sync transitions preserve the active settings, including Trash mode, until the new local binding can be committed atomically.
+- Cleanup notifications now count only deleted or trashed items as cleaned and show failed/skipped counts separately. Selected and automatic cleanup share the same summary; reported freed space remains visible even when an item partially fails.
+- Standalone legacy `--category` now selects a scan as documented, including equals and repeated forms. Explicit legacy command modes retain precedence and malformed values still fail argument validation.
+- Storage navigation now accepts only the newest request’s result or error; older completions cannot replace the displayed folder or clear a newer scan’s busy state.
+- Storage map now marks failed or partial disk measurements as incomplete, including nested failures, instead of presenting an unavailable total as complete zero. Successfully measured rows remain available.
+- Swift read-only probes now terminate their process group after every exit, including successful or allowed-failure shell completion, so background descendants cannot outlive the probe.
+- Python read-only estimates now supervise their entire process group and use file-backed output, terminating descendants on timeout or shell completion instead of leaving commands running after the scan returns.
+- The Storage tab now displays incomplete measurements as unavailable, retaining partial rows with a warning rather than presenting a timed-out folder as empty. Complete refreshes clear the warning; older engine payloads remain compatible.
+- Storage insights counts each hard-linked file once within a bundle, avoiding inflated app sizes while preserving independent bundle totals.
+- Storage map now sizes loose files by allocated blocks, matching directory totals and storage insights. Sparse files no longer overstate their disk use or incorrectly pass minimum-size filters.
+- Config sync-on/off now shares transaction locks with preference writes. A concurrent change to Trash mode can no longer be replaced by sync-off’s stale copy, and a delayed writer cannot break a newly enabled sync symlink.
+- App-owned low-disk checks no longer authorize notification delivery when saving the shared throttle claim fails. Disk measurements remain available, and a notification already posted by the CLI is still reported honestly.
+- Concurrent setting and category changes now reload and update the configuration under a transaction lock, so a stale caller cannot undo another preference such as Trash mode. Synced configuration symlinks remain intact and share the destination lock.
 - Minimum-free dry runs now apply the execution path’s safe-only selection and return no candidates when the floor is already met. Additive JSON metadata and preview wording identify eligible candidates as an upper bound; execution may stop earlier. Invalid minimum-free thresholds fail before scanning.
+- Colliding project artifact slugs now receive stable path-digest suffixes, so selecting one artifact cannot select a different project with the same normalized name. Ambiguous old IDs are rejected; non-colliding IDs stay unchanged.
 - Project discovery now honors `skip_paths`, including roots reached through symlink aliases. Artifacts containing an excluded descendant are omitted entirely, so cleanup cannot remove that descendant through its parent.
 - Swift process-list, parent-process, simulator, and Spotlight probes now use bounded process-group execution with file-backed output and Python-equivalent deadlines. The shared runner remains internal and read-only.
 - Project directory discovery now has a 120-second daemon deadline, including root validation. A blocked filesystem read returns candidates already discovered with a partial-results warning instead of hanging the CLI; sizing and git checks retain their existing subprocess bounds.
 - Concurrent processes now serialize report, snapshot, and low-disk throttle updates, preventing lost history and duplicate notification claims. Transaction locks have a five-second wait limit and release automatically when a process exits; JSON replacement remains atomic.
 - An explicitly empty `projects --targets ""` selection now cleans or previews nothing, matching `clean`; previously it fell through to all eligible project artifacts.
 - Storage bars now scale to the largest sibling at the displayed level instead of the root total, making relative sizes easier to compare. The largest entry fills its track; existing width clamping remains. The app probe pins unsorted siblings, empty levels, and zero sizes.
+
+### Changed
+- Rebuilt the committed fallback app bundle on macOS with the current engine and read-only Swift kit. Release assets remain built, signed, and notarized by the tag workflow.
 
 ### Added
 - The read-only Swift kit now reports Docker, Homebrew, pnpm, and Conda estimates and preserves simulator device/runtime sizes. Estimate metadata is generated from Python, commands have a 15-second bound, and parity checks now compare command-target sizes and existence rather than presence alone. No deletion API is added.
