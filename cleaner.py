@@ -2207,9 +2207,18 @@ def scan_projects(config, roots=None, min_age_days=None):
     stopped = threading.Event()
     results_lock = threading.Lock()
     errors = []
+    skip = []
+
+    def excluded(path, contains_exclusion=False):
+        if not skip:
+            return False
+        resolved = Path(path).resolve()
+        return any(str(resolved).startswith(str(prefix)) or
+                   (contains_exclusion and resolved in prefix.parents)
+                   for prefix in skip)
 
     def walk(dir_path, depth):
-        if stopped.is_set() or depth > PROJECT_SCAN_MAX_DEPTH:
+        if stopped.is_set() or depth > PROJECT_SCAN_MAX_DEPTH or excluded(dir_path):
             return
         try:
             entries = list(os.scandir(dir_path))
@@ -2246,7 +2255,8 @@ def scan_projects(config, roots=None, min_age_days=None):
                 required = ARTIFACT_MANIFESTS[name]
                 if not required or any(m in names for m in required):
                     age_days = int((now - st.st_mtime) / 86400)
-                    if age_days >= min_age and e.path not in found:
+                    if (age_days >= min_age and e.path not in found
+                            and not excluded(e.path, contains_exclusion=True)):
                         candidate = {
                             "path": e.path,
                             "kind": name,
@@ -2263,6 +2273,12 @@ def scan_projects(config, roots=None, min_age_days=None):
 
     def discover():
         try:
+            for raw in config.get("skip_paths", []):
+                prefix = Path(os.path.abspath(os.path.expanduser(raw)))
+                # Protect both the named entry and its destination when the
+                # exclusion itself is a symlink.
+                skip.extend((prefix, prefix.parent.resolve() / prefix.name,
+                             prefix.resolve()))
             for r in root_strs:
                 if stopped.is_set():
                     return
