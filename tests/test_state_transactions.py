@@ -87,3 +87,46 @@ class TestStateTransactions(unittest.TestCase):
 
     def test_concurrent_alert_checks_claim_only_once(self):
         self.run_competing('alert')
+
+    def test_lock_wait_is_bounded_and_process_exit_releases_it(self):
+        import time
+        from unittest import mock
+        sys.path.insert(0, str(REPO))
+        import cleaner
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'state.json'
+            code = "import fcntl,sys,time; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); print('locked',flush=True); time.sleep(30)"
+            holder = subprocess.Popen([sys.executable, '-c', code, str(path) + '.lock'],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), 'locked')
+                started = time.monotonic()
+                with mock.patch.object(cleaner, 'STATE_LOCK_TIMEOUT_S', .05):
+                    with self.assertRaises(TimeoutError):
+                        with cleaner._state_transaction(path):
+                            self.fail('entered a locked transaction')
+                self.assertLess(time.monotonic() - started, 1)
+                holder.kill()
+                holder.communicate(timeout=3)
+                with cleaner._state_transaction(path):
+                    pass
+                self.assertTrue(Path(str(path) + '.lock').exists())
+            finally:
+                if holder.poll() is None:
+                    holder.kill()
+                holder.communicate()
+
+    def test_disk_check_lock_timeout_returns_json_without_notification_claim(self):
+        import contextlib
+        import io
+        from unittest import mock
+        import cleaner
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(cleaner, '_trim_cron_log'), mock.patch.object(cleaner, 'disk_stats', return_value={'free_bytes': 1}), mock.patch.object(cleaner, '_state_transaction', side_effect=TimeoutError('busy')), mock.patch.object(cleaner, '_notify') as notify, contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = cleaner.run_disk_check({'low_disk_alerts': True}, json_mode=True)
+        self.assertTrue(result['below_threshold'])
+        self.assertFalse(result['should_notify'])
+        self.assertFalse(result['notified'])
+        self.assertEqual(json.loads(output.getvalue())['should_notify'], False)
+        self.assertIn('could not update alert state', errors.getvalue())
+        notify.assert_not_called()

@@ -10,6 +10,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ## [Unreleased]
 
 ### Fixed
+- Concurrent processes now serialize report, snapshot, and low-disk throttle updates, preventing lost history and duplicate notification claims. Transaction locks have a five-second wait limit and release automatically when a process exits; JSON replacement remains atomic.
 - Storage bars now scale to the largest sibling at the displayed level instead of the root total, making relative sizes easier to compare. The largest entry fills its track; existing width clamping remains. The app probe pins unsorted siblings, empty levels, and zero sizes.
 
 ### Added
