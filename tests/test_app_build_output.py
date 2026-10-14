@@ -22,6 +22,9 @@ class TestAppBuildOutput(unittest.TestCase):
     def test_failed_output_query_remains_optional(self):
         self.check_output("query-failure")
 
+    def test_failed_build_does_not_embed_stale_output(self):
+        self.check_output("stale-output")
+
     def check_output(self, mode):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -56,6 +59,8 @@ else:
     binary = output / 'mck'
     binary.write_text('fixture Swift engine')
     binary.chmod(0o755)
+    if os.environ['FIXTURE_MODE'] == 'stale-output':
+        sys.exit(1)
 ''')
             stub('swiftc', '''import sys
 from pathlib import Path
@@ -74,7 +79,7 @@ if '-output' in sys.argv:
                                     text=True, capture_output=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             embedded = root / 'build/MacCleaner.app/Contents/Resources/mck'
-            if mode in ('unavailable', 'query-failure'):
+            if mode in ('unavailable', 'query-failure', 'stale-output'):
                 self.assertFalse(embedded.exists())
                 self.assertIn('app ships without the V3 soak engine', result.stderr)
                 self.assertTrue((root / 'build/MacCleaner.app/Contents/MacOS/MacCleaner').is_file())
