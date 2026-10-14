@@ -39,6 +39,8 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
+- [ ] **V3 command-target estimates** — implemented for the next release: strict stub-tool parity reproduced 15 field divergences, including four zero estimates and discarded simulator sizes. The read-only kit now carries generated estimate metadata, bounded execution, and full command-target size/existence parity.
+
 - [x] **Shell completions** — hand-written zsh/bash completion for subcommands, flags, config keys, and live category/target IDs (`completions/`), installed by `install.sh` and shipped in the CLI tarball
 - [x] **Notifications** — macOS notification when a scheduled clean finishes (`clean --notify`) or an in-app clean completes, plus low-disk alerts (`disk-check`) when free space drops below a configurable threshold (default 10 GB, throttled to once a day)
 - [x] **Sparkle auto-updater** — installed apps update themselves: a daily background check, an in-app prompt with release notes, "Check for Updates…" in Settings, and an EdDSA-signed appcast (`releases/latest/download/appcast.xml`) published by CI on every release

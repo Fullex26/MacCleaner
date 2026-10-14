@@ -82,6 +82,34 @@ def main():
             for k in ("category", "label", "safe", "exists", "size_bytes"):
                 if p.get(k) != s.get(k):
                     failures.append(f"scan/{tid}.{k}: py={p.get(k)!r} swift={s.get(k)!r}")
+        # Pin independent known totals too: two engines returning zero is not parity.
+        expected = {"docker-prune": 1078984704, "brew-cleanup": 1610612736,
+                    "conda-clean": 1075838976, "pnpm-store": 8192,
+                    "simulator-stale-devices": 16384,
+                    "simulator-unused-runtimes": 8000000000}
+        for tid, size in expected.items():
+            for engine, rows in (("py", ps), ("swift", ss)):
+                if rows.get(tid, {}).get("size_bytes") != size:
+                    failures.append(f"{engine}/{tid}: expected {size} bytes")
+
+        cfg["enabled_categories"] = ["docker", "homebrew", "node", "python"]
+        cfg_path.write_text(json.dumps(cfg))
+        for scenario, body in (("failed", "printf 'free approximately 5GB'; exit 1"),
+                               ("malformed", "printf 'unavailable'"),
+                               ("missing", None)):
+            for tool in samples:
+                script = root / "bin" / tool
+                if body is None:
+                    script.unlink()
+                else:
+                    script.write_text("#!/bin/sh\n" + body + "\n")
+            for engine, cmd in (("py", [sys.executable, str(gen.ENGINE)]),
+                                ("swift", [str(MCK)])):
+                rows = by_id(run_json(cmd + ["scan", "--json", "--all"], env))
+                for tid in ("docker-prune", "brew-cleanup", "conda-clean", "pnpm-store"):
+                    row = rows.get(tid, {})
+                    if row.get("size_bytes") != 0 or row.get("exists") is not True:
+                        failures.append(f"{scenario}/{engine}/{tid}: expected zero bytes, exists=true")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

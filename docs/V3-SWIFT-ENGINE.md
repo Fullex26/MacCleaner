@@ -1,7 +1,8 @@
 # V3: Native Swift Engine — Migration Design
 
-**Status: stages 1–3 landed (read-only), plus Stage 4's guards. Still open: Stage 2's
-cmd-target estimates, Stage 4's deletion callers, Stage 5's cutover.** This is the roadmap's
+**Status: stages 1–3 landed (read-only), plus Stage 4's guards. Stage 2's
+cmd-target estimates are implemented for the next release. Still open: Stage 4's
+deletion callers and Stage 5's cutover.** This is the roadmap's
 "Full Swift rewrite of cleaner engine" item, deliberately staged rather than
 attempted as one rewrite. The Python engine is ~4,500 lines with 490+ tests
 guarding deletion behaviour; a big-bang port cannot be verified to parity, and
@@ -60,10 +61,12 @@ clean evidence over real use (in progress).
    plus fixture-sandbox parity: 4 offered and 5 refused tmp scenarios are
    seeded by `tools/gen_contract_fixtures.py` and pinned in the committed
    fixtures. The **simulators and leftovers ports landed too** (`SimulatorScanner.swift`,
-   `LeftoversScanner.swift`, #45), so the one thing still open within this
-   stage is **cmd-target estimates**: `mck` never executes an estimate command
-   and reports those targets presence-only, which is exactly why
-   `tools/check_swift_parity.py` compares cmd targets for presence alone.
+   `LeftoversScanner.swift`, #45), and **cmd-target estimates are now implemented for the next release**:
+   generated estimate metadata drives the four Python-equivalent parsers,
+   with a 15-second process-group timeout. Simulator precomputed sizes are
+   preserved too. `tools/check_swift_parity.py` compares all target fields,
+   including command sizes/existence, using strict read-only tool stubs.
+   Cleanup commands remain descriptive only; no deletion API exists.
 3. **Dual-engine app.** ✅ Landed (#46): the app bundles `mck` and, after each
    full scan, runs it read-only against the same config, compares both engines'
    target tables and logs any disagreement to `soak.log` (`v3_soak`, default

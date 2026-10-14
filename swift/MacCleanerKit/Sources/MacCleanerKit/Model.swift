@@ -14,12 +14,19 @@ public struct Target {
     public let paths: [String]
     public let glob: String?
     public let cmd: String?
+    public let estimateCommand: String?
+    public let estimateParser: String?
+    public let precomputedBytes: Int64?
 
     public init(id: String, category: String, label: String, desc: String,
-                safe: Bool, emptyOnly: Bool, paths: [String], glob: String?, cmd: String?) {
+                safe: Bool, emptyOnly: Bool, paths: [String], glob: String?, cmd: String?,
+                estimateCommand: String? = nil, estimateParser: String? = nil,
+                precomputedBytes: Int64? = nil) {
         self.id = id; self.category = category; self.label = label; self.desc = desc
         self.safe = safe; self.emptyOnly = emptyOnly
         self.paths = paths; self.glob = glob; self.cmd = cmd
+        self.estimateCommand = estimateCommand; self.estimateParser = estimateParser
+        self.precomputedBytes = precomputedBytes
     }
 }
 

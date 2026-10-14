@@ -9,6 +9,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+- The read-only Swift kit now reports Docker, Homebrew, pnpm, and Conda estimates and preserves simulator device/runtime sizes. Estimate metadata is generated from Python, commands have a 15-second bound, and parity checks now compare command-target sizes and existence rather than presence alone. No deletion API is added.
+
 ---
 
 ## [2.17.3] — 2026-10-12
