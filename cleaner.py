@@ -1860,7 +1860,7 @@ def _storage_category(path):
     return best[0]
 
 
-def _du_children(root):
+def _du_children(root, stats=None):
     """`du -xkd 1` -- immediate children plus the root's own total, in bytes.
 
     The `-x` is the whole point and must never be dropped: without it du
@@ -1870,15 +1870,20 @@ def _du_children(root):
     on a real machine read 106 GB when it actually held 11 GB -- a threefold
     overstatement that sent a whole storage investigation down the wrong path.
     """
+    if stats is None:
+        stats = {}
+    stats["incomplete"] = False
     try:
         r = subprocess.run(["du", "-xkd", "1", str(root)],
                            capture_output=True, text=True, timeout=600)
     except Exception as e:
         print("Warning: could not measure %s: %s" % (root, e), file=sys.stderr)
+        stats["incomplete"] = True
         return {}, 0
     # du reports partial results plus stderr noise for unreadable subtrees;
     # a non-zero exit is normal there and the readable numbers are still good.
     sizes, total = {}, 0
+    root_seen = False
     root_s = str(root)
     for line in r.stdout.splitlines():
         parts = line.split("\t", 1)
@@ -1891,8 +1896,12 @@ def _du_children(root):
         path = parts[1]
         if path == root_s:
             total = kb * 1024
+            root_seen = True
         else:
             sizes[path] = kb * 1024
+    stats["incomplete"] = r.returncode != 0 or not root_seen
+    if stats["incomplete"]:
+        print(f"Warning: storage map measurement is incomplete: {root}", file=sys.stderr)
     return sizes, total
 
 
@@ -1908,7 +1917,9 @@ def scan_storage_map(root=None, min_bytes=0, depth=1):
     if not root.exists() or not root.is_dir():
         return empty
 
-    sizes, total = _du_children(root)
+    measurement = {}
+    sizes, total = _du_children(root, measurement)
+    incomplete = measurement["incomplete"]
     children = []
     for path, size in sizes.items():
         if size < min_bytes:
@@ -1962,8 +1973,12 @@ def scan_storage_map(root=None, min_bytes=0, depth=1):
             if c["kind"] == "dir":
                 sub = scan_storage_map(c["path"], min_bytes=min_bytes, depth=depth - 1)
                 c["children"] = sub["children"]
-    return {"root": str(root), "total_bytes": total, "total_human": fmt_size(total),
-            "category": _storage_category(root), "children": children}
+                incomplete |= sub.get("incomplete", False)
+    result = {"root": str(root), "total_bytes": total, "total_human": fmt_size(total),
+              "category": _storage_category(root), "children": children}
+    if incomplete:
+        result["incomplete"] = True
+    return result
 
 
 def scan_storage_insights(config, stats=None, time_budget_s=None):

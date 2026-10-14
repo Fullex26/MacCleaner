@@ -199,7 +199,7 @@ struct StorageMapReport: Codable {
     var totalLabel: String { incomplete == true ? "Total unavailable" : total_human }
     var measurementWarning: String? {
         incomplete == true
-            ? "Measurement incomplete. Some items could not be read before the scan timed out. Try refreshing."
+            ? "Measurement incomplete. Some items could not be measured. Try refreshing."
             : nil
     }
 }
