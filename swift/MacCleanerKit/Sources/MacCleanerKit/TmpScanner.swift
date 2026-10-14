@@ -71,17 +71,7 @@ public enum TmpScanner {
     /// Mirrors _running_command_lines: nil means "could not ask", which is
     /// NOT evidence of idleness — see pathIsInUse.
     static func runningCommandLines() -> [String]? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = ["ps", "-axo", "command="]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0,
-              let out = String(data: data, encoding: .utf8) else { return nil }
+        guard let out = ReadOnlyProcess.run(["ps", "-axo", "command="], timeout: 10) else { return nil }
         return out.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
     }
 
@@ -90,18 +80,10 @@ public enum TmpScanner {
         var own = Set<String>()
         var pid = ProcessInfo.processInfo.processIdentifier
         for _ in 0..<12 {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            p.arguments = ["ps", "-o", "ppid=,command=", "-p", String(pid)]
-            let pipe = Pipe()
-            p.standardOutput = pipe
-            p.standardError = FileHandle.nullDevice
-            guard (try? p.run()) != nil else { break }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            guard let line = String(data: data, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines),
-                  !line.isEmpty else { break }
+            guard let output = ReadOnlyProcess.run(["ps", "-o", "ppid=,command=", "-p", String(pid)],
+                                                   timeout: 5, allowFailure: true) else { break }
+            let line = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { break }
             let parts = line.split(separator: " ", maxSplits: 1,
                                    omittingEmptySubsequences: true)
             guard parts.count == 2, let ppid = Int32(parts[0]) else { break }
