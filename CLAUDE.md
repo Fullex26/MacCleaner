@@ -202,3 +202,11 @@ Cleanup notification success counts include only `deleted` and `trashed`, never 
 Resolve SwiftPM executables with `swift build --show-bin-path` using the same configuration/architectures as the successful build. The current macOS toolchain uses `.build/out/Products/Release`, so a hardcoded `.build/apple/Products/Release` path can silently omit a successfully built soak engine.
 
 Only query/copy a Swift build output after that build succeeds. A failed compiler can leave an old executable at the expected path; existence alone does not prove it belongs to the current sources. Optional soak-engine failure must omit it and let app packaging continue.
+
+### Remaining read-only walk deadlines
+
+`_read_only_scan` bounds filesystem discovery, including blocked directory reads, using a daemon worker whose result stays private until completion. Tmp, app inventory, leftovers, logs, and System temp enumeration use 120 seconds; each Storage map root/child enumeration uses 600 seconds. Subprocess probes and sizing must stay on the caller thread with their existing timeouts: abandoning a daemon supervising `subprocess.run` can orphan its child when the CLI exits. Nested map levels also run on the caller. Timeout returns an unavailable result and a stderr warning. Installed-app inventory returns `None` on timeout: leftovers must treat that as unknown and offer nothing, never as an empty set proving all apps absent. These workers must remain read-only and must not start subprocesses.
+
+The same read-only deadline also covers `_target_paths` glob expansion and `_cleanup_children` pre-enumeration. Timeout is distinct from an empty directory: cleanup returns an error before accounting or mutation, scans expose `measurement_error`, and previews offer no unresolved paths. Never put `_remove`, Trash moves, or recursive deletion inside an abandoned daemon.
+
+Doctor’s Homebrew cask ownership lookup also runs inside the read-only discovery deadline: globbing version directories or resolving a bundle link may stall. Timeout means unknown ownership (`None`), never a reason to remove or rewrite an installation.

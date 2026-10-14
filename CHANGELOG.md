@@ -9,6 +9,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+- Read-only directory discovery, glob expansion, empty-only pre-enumeration, and Homebrew ownership lookup have deadlines. Incomplete installed-app inventory suppresses leftovers; measurement failures remain visible and cleanup refuses them before mutation.
+
 ---
 
 ## [2.18.0] — 2026-10-15
