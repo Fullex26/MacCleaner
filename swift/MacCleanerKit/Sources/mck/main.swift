@@ -51,14 +51,13 @@ case "scan":
         }
     }
     // Simulators: cmd targets assembled from simctl's own identifiers,
-    // emitted with the same shape static cmd targets use (presence-only in
-    // the parity gate; nothing here ever executes them).
+    // emitted with precomputed sizes; nothing here executes their commands.
     if config.enabledCategories.contains("simulators") {
         for t in SimulatorScanner.scan(staleDays: config.simulatorStaleDays) {
             targets.append([
                 "id": t.id, "category": t.category, "label": t.label,
                 "description": t.desc, "safe": false,
-                "exists": false, "size_bytes": 0,
+                "exists": true, "size_bytes": t.precomputedBytes ?? 0,
                 "cmd": true,
             ])
         }
