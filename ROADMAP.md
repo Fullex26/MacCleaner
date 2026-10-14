@@ -41,6 +41,9 @@ This document tracks planned features and long-term direction. Community input w
 
 - [ ] **Report failed removals honestly** — reproduced on macOS: deleting a cache beneath a non-writable parent returned no error while the directory remained. Implemented in PR #66, awaiting owner review: stop suppressing recursive-removal errors and count only successfully removed paths. Changes to `delete_target` must not be self-merged.
 - [ ] **Serialize state transactions** — two report writers synchronized before their atomic replace left only one of two entries. Atomic replacement prevents torn JSON but does not protect read/modify/write; cover report history, snapshots, and the shared alert throttle with interprocess transaction locks.
+- [ ] **Readable Storage bars** — Jordan's screenshot shows tiny bars when `~/Library` dominates the home map; `StorageView` divides each row by the entire root total. Implemented for the next release: scale against the largest sibling, retain clamping, and pin the behavior in the app probe.
+
+- [ ] **V3 command-target estimates** — implemented for the next release: strict stub-tool parity reproduced 15 field divergences, including four zero estimates and discarded simulator sizes. The read-only kit now carries generated estimate metadata, bounded execution, and full command-target size/existence parity.
 
 - [x] **Shell completions** — hand-written zsh/bash completion for subcommands, flags, config keys, and live category/target IDs (`completions/`), installed by `install.sh` and shipped in the CLI tarball
 - [x] **Notifications** — macOS notification when a scheduled clean finishes (`clean --notify`) or an in-app clean completes, plus low-disk alerts (`disk-check`) when free space drops below a configurable threshold (default 10 GB, throttled to once a day)

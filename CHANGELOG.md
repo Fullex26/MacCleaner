@@ -11,6 +11,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 - Failed filesystem removals now report errors instead of silently reporting success. Freed bytes count completed whole-path removals; empty-only cleanups measure the parent before and after to reflect partial failures without double-counting hard-linked siblings. A failed whole-directory removal contributes zero rather than its original full size.
+- Storage bars now scale to the largest sibling at the displayed level instead of the root total, making relative sizes easier to compare. The largest entry fills its track; existing width clamping remains. The app probe pins unsorted siblings, empty levels, and zero sizes.
+
+### Added
+- The read-only Swift kit now reports Docker, Homebrew, pnpm, and Conda estimates and preserves simulator device/runtime sizes. Estimate metadata is generated from Python, commands have a 15-second bound, and parity checks now compare command-target sizes and existence rather than presence alone. No deletion API is added.
 
 ---
 

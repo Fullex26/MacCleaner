@@ -76,8 +76,10 @@ public enum Scanner {
         var out: [ScannedTarget] = []
         for t in allTargets where enabled.contains(t.category) {
             if t.cmd != nil {
-                // Stage 2 never executes estimate commands; presence only.
-                out.append(ScannedTarget(target: t, exists: false, sizeBytes: 0))
+                let size = t.precomputedBytes ?? t.estimateCommand.map {
+                    Estimates.run($0, parser: t.estimateParser ?? "")
+                } ?? 0
+                out.append(ScannedTarget(target: t, exists: true, sizeBytes: size))
                 continue
             }
             let paths = resolvedPaths(t, skip: config.skipPaths)

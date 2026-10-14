@@ -166,6 +166,7 @@ struct StorageView: View {
                 .foregroundStyle(.secondary)
             Spacer()
         } else if let map = bridge.storageMap {
+            let scale = StorageBarScale(map: map)
             List {
                 if let error = bridge.storageMapError {
                     Label(error, systemImage: "exclamationmark.triangle")
@@ -175,8 +176,7 @@ struct StorageView: View {
                 ForEach(map.children) { entry in
                     StorageRow(
                         entry: entry,
-                        fraction: map.total_bytes > 0
-                            ? Double(entry.size_bytes) / Double(map.total_bytes) : 0,
+                        fraction: scale.fraction(bytes: entry.size_bytes),
                         onOpen: entry.isDirectory ? { drill(into: entry) } : nil,
                         onReveal: { NSWorkspace.shared.selectFile(entry.path, inFileViewerRootedAtPath: "") },
                         onTrash: { pendingTrash = entry }
@@ -318,5 +318,18 @@ private extension Color {
         case "system":       return .gray
         default:             return .secondary
         }
+    }
+}
+
+/// Shared by the rows and the app probe; computed once per displayed level.
+struct StorageBarScale {
+    let maximum: Int
+
+    init(map: StorageMapReport) {
+        maximum = map.children.map(\.size_bytes).max() ?? 0
+    }
+
+    func fraction(bytes: Int) -> Double {
+        maximum > 0 ? Double(bytes) / Double(maximum) : 0
     }
 }
