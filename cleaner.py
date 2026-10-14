@@ -530,9 +530,26 @@ def _run_estimate(estimate_cmd, parser):
         return 0
 
 
+def _exclusion_paths(paths):
+    """Keep the named entry and destination, including symlinked ancestors."""
+    out = set()
+    for raw in paths:
+        path = Path(os.path.abspath(os.path.expanduser(str(raw))))
+        out.update((path, path.parent.resolve() / path.name, path.resolve()))
+    return out
+
+
+def _path_overlaps_exclusion(path, skip):
+    if not skip:
+        return False
+    candidates = _exclusion_paths([path])
+    return any(str(candidate).startswith(str(prefix)) or candidate in prefix.parents
+               for candidate in candidates for prefix in skip)
+
+
 # ── Target definitions ─────────────────────────────────────────────────────────
 def get_targets(config, all_categories=False):
-    skip = [Path(os.path.expanduser(p)) for p in config.get("skip_paths", [])]
+    skip = _exclusion_paths(config.get("skip_paths", []))
     enabled = set(ALL_CATEGORIES) if all_categories else set(config["enabled_categories"])
     targets = []
 
@@ -553,7 +570,7 @@ def get_targets(config, all_categories=False):
             # a skip_paths entry can retire part of a multi-path target
             # without silently taking the whole thing with it.
             multi = [x for x in multi
-                     if not any(str(x).startswith(str(s)) for s in skip)]
+                     if not _path_overlaps_exclusion(x, skip)]
             if not multi:
                 return
         elif path is not None:
@@ -561,7 +578,7 @@ def get_targets(config, all_categories=False):
                 pattern = os.path.expanduser(str(path))
             else:
                 p = Path(os.path.expanduser(str(path)))
-                if any(str(p).startswith(str(s)) for s in skip):
+                if _path_overlaps_exclusion(p, skip):
                     return
         targets.append({
             "id": tid,
@@ -571,7 +588,7 @@ def get_targets(config, all_categories=False):
             "path": p,
             "paths": multi,
             "glob": pattern,
-            "skip": [str(s) for s in skip] if pattern else [],
+            "skip": [str(s) for s in sorted(skip)],
             "safe": safe,
             "cmd": cmd,
             "estimate_cmd": estimate_cmd,
@@ -945,19 +962,21 @@ def collect_targets(config, all_categories=False, categories=None, target_ids=No
 
 
 def _target_paths(t):
-    """Concrete filesystem paths for a target (glob patterns expanded).
+    """Concrete paths, withholding whole candidates that overlap exclusions.
 
-    Glob matches are filtered against skip_paths here because the prefix
-    check in add() can only see the pattern, not its expansions."""
+    This deliberately withholds a broad parent (including empty-only sweeps)
+    rather than risk deleting a protected descendant through that parent.
+    """
     if t.get("glob"):
-        skip = t.get("skip", [])
-        return [Path(p) for p in sorted(globmod.glob(t["glob"]))
-                if not any(p.startswith(s) for s in skip)]
-    if t.get("paths"):
-        return t["paths"]
-    if t.get("path"):
-        return [t["path"]]
-    return []
+        paths = [Path(p) for p in sorted(globmod.glob(t["glob"]))]
+    elif t.get("paths"):
+        paths = t["paths"]
+    elif t.get("path"):
+        paths = [t["path"]]
+    else:
+        return []
+    skip = _exclusion_paths(t.get("skip", []))
+    return [p for p in paths if not _path_overlaps_exclusion(p, skip)]
 
 
 # ── Core actions ───────────────────────────────────────────────────────────────
@@ -2498,7 +2517,7 @@ def scan_tmp_artifacts(config):
     skip prefix, and this scanner must match that, finding F1)."""
     min_age = config.get("tmp_min_age_days", 1)
     cutoff = time.time() - min_age * 86400
-    skip = [Path(os.path.expanduser(p)) for p in config.get("skip_paths", [])]
+    skip = _exclusion_paths(config.get("skip_paths", []))
     hits = []
     try:
         entries = list(os.scandir(TMP_SCAN_ROOT))
@@ -2518,8 +2537,7 @@ def scan_tmp_artifacts(config):
             if st.st_uid != uid or st.st_mtime > cutoff:
                 continue
             resolved = Path(e.path).resolve()
-            if any(resolved == s.resolve() or str(resolved).startswith(str(s.resolve()) + os.sep)
-                   for s in skip):
+            if _path_overlaps_exclusion(Path(e.path), skip):
                 continue
             if _path_is_in_use(Path(e.path), commands, own_cmds):
                 continue
@@ -3048,7 +3066,7 @@ def scan_app_leftovers(config):
     # Resolved once up front (not per-candidate, finding M2): this scanner
     # walks ~2900 entries across 5 roots, vs. scan_tmp_artifacts' single
     # shallow root, so re-resolving on every iteration is a real cost here.
-    skip = [Path(os.path.expanduser(p)).resolve() for p in config.get("skip_paths", [])]
+    skip = _exclusion_paths(config.get("skip_paths", []))
 
     by_id = {}
     for root_name in LEFTOVER_ROOTS:
@@ -3076,8 +3094,7 @@ def scan_app_leftovers(config):
                 resolved = Path(e.path).resolve()
             except OSError:
                 continue
-            if any(resolved == s or str(resolved).startswith(str(s) + os.sep)
-                   for s in skip):
+            if _path_overlaps_exclusion(Path(e.path), skip):
                 continue
             entry = by_id.setdefault(candidate, {"bundle_id": candidate, "paths": [],
                                                   "locations": [], "mtime": 0.0})

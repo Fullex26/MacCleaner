@@ -39,7 +39,7 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
-- [ ] **Protect exclusions from ancestor cleanup** — a temporary dry-run offered `.npm/_cacache` containing an excluded file, and `general-caches` offered an explicitly excluded pip cache. Conservatively withhold overlapping parent targets, including broad sweeps, and share the filtering across concrete paths and read-only Swift scans.
+- [ ] **Protect exclusions from ancestor cleanup** — a temporary dry-run offered `.npm/_cacache` containing an excluded file, and `general-caches` offered an explicitly excluded pip cache. Conservatively withhold overlapping parent targets, including broad sweeps, and share the filtering across concrete paths and read-only Swift scans. Implemented for the next release.
 
 - [ ] **Bound all Swift read-only subprocesses** — a controlled `ps` probe waited 11.3 seconds, exceeding Python's 10-second cap; `ps`, `simctl`, and Spotlight helpers have unbounded reads. Reuse the estimate runner's process-group deadline and file-backed output for these probes. The existing `du` deadline passed a descendant-output probe and is unchanged. Implemented for the next release.
 

@@ -16,10 +16,32 @@ public enum Scanner {
         path.hasPrefix("~") ? home + path.dropFirst() : path
     }
 
+    static func exclusionPaths(_ paths: [String]) -> Set<String> {
+        var out: Set<String> = []
+        for path in paths {
+            let url = URL(fileURLWithPath: expand(path)).standardizedFileURL
+            out.insert(url.path)
+            out.insert(url.deletingLastPathComponent().resolvingSymlinksInPath()
+                .appendingPathComponent(url.lastPathComponent).path)
+            out.insert(url.resolvingSymlinksInPath().path)
+        }
+        return out
+    }
+
+    static func overlapsExclusion(_ path: String, skip: Set<String>) -> Bool {
+        guard !skip.isEmpty else { return false }
+        return exclusionPaths([path]).contains { candidate in
+            skip.contains { prefix in
+                candidate.hasPrefix(prefix) || prefix.hasPrefix(candidate == "/" ? "/" : candidate + "/")
+            }
+        }
+    }
+
     /// Mirrors _target_paths(): glob expansion (sorted, skip-filtered) wins,
     /// then the explicit path list. Uses POSIX glob(3), which matches
     /// Python's glob module for the `*` patterns the table actually uses.
     static func resolvedPaths(_ t: Target, skip: [String]) -> [String] {
+        let exclusions = exclusionPaths(skip)
         if let pattern = t.glob {
             var g = glob_t()
             defer { globfree(&g) }
@@ -28,13 +50,13 @@ public enum Scanner {
             for i in 0..<Int(g.gl_matchc) {
                 if let c = g.gl_pathv[i] { out.append(String(cString: c)) }
             }
-            return out.sorted().filter { p in !skip.contains { p.hasPrefix($0) } }
+            return out.sorted().filter { p in !overlapsExclusion(p, skip: exclusions) }
         }
         // add() drops a skip-prefixed entry per path for the multi-path form,
         // and the whole target for the single-path form — filtering per
         // entry here reproduces both, since a single-path target with its
         // one path skipped resolves to [].
-        return t.paths.map(expand).filter { p in !skip.contains { p.hasPrefix($0) } }
+        return t.paths.map(expand).filter { p in !overlapsExclusion(p, skip: exclusions) }
     }
 
     static func lexists(_ path: String) -> Bool {
@@ -83,6 +105,7 @@ public enum Scanner {
                 continue
             }
             let paths = resolvedPaths(t, skip: config.skipPaths)
+            if t.glob == nil && !t.paths.isEmpty && paths.isEmpty { continue }
             let existing = paths.filter(lexists)
             let size = existing.reduce(Int64(0)) { $0 + duBytes($1) }
             out.append(ScannedTarget(target: t, exists: !existing.isEmpty, sizeBytes: size))
