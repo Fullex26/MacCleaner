@@ -39,6 +39,7 @@ import shutil
 import tempfile
 import argparse
 import subprocess
+import signal
 import datetime
 import plistlib
 import threading
@@ -543,17 +544,34 @@ def _parse_conda_estimate(output):
     return total
 
 
+ESTIMATE_TIMEOUT_S = 15
+
+
 def _run_estimate(estimate_cmd, parser):
     try:
-        r = subprocess.run(estimate_cmd, shell=True, capture_output=True, text=True, timeout=15)
-        if r.returncode != 0:
-            return 0
+        # A pipe can outlive its shell; supervise the group and read a file
+        # only after completion so descendants cannot hold an EOF wait open.
+        with tempfile.TemporaryFile(mode="w+t") as output:
+            process = subprocess.Popen(estimate_cmd, shell=True, stdout=output,
+                                       stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                process.wait(timeout=ESTIMATE_TIMEOUT_S)
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            if process.returncode != 0:
+                return 0
+            output.seek(0)
+            stdout = output.read()
         return {
             "brew_dry_run": _parse_brew_estimate,
             "docker_df":    _parse_docker_estimate,
             "du_path":      _parse_du_estimate,
             "conda_dry_run": _parse_conda_estimate,
-        }.get(parser, lambda _: 0)(r.stdout)
+        }.get(parser, lambda _: 0)(stdout)
     except Exception:
         return 0
 
@@ -1839,6 +1857,7 @@ def _bundle_size(root, stats=None):
     than aborting: a partial size for one app beats losing the whole scan.
     `stats`, if given, accumulates `dataless_dirs_skipped` (see _is_dataless)."""
     total, stack = 0, [root]
+    seen_files = set()
     if stats is None:
         stats = {}
     while stack:
@@ -1859,6 +1878,10 @@ def _bundle_size(root, stats=None):
                         continue
                     stack.append(e.path)
                 else:
+                    identity = (st.st_dev, st.st_ino)
+                    if identity in seen_files:
+                        continue
+                    seen_files.add(identity)
                     total += _disk_bytes(st)
             except OSError:
                 continue
@@ -1914,7 +1937,7 @@ def _storage_category(path):
     return best[0]
 
 
-def _du_children(root):
+def _du_children(root, stats=None):
     """`du -xkd 1` -- immediate children plus the root's own total, in bytes.
 
     The `-x` is the whole point and must never be dropped: without it du
@@ -1924,15 +1947,20 @@ def _du_children(root):
     on a real machine read 106 GB when it actually held 11 GB -- a threefold
     overstatement that sent a whole storage investigation down the wrong path.
     """
+    if stats is None:
+        stats = {}
+    stats["incomplete"] = False
     try:
         r = subprocess.run(["du", "-xkd", "1", str(root)],
                            capture_output=True, text=True, timeout=600)
     except Exception as e:
         print("Warning: could not measure %s: %s" % (root, e), file=sys.stderr)
+        stats["incomplete"] = True
         return {}, 0
     # du reports partial results plus stderr noise for unreadable subtrees;
     # a non-zero exit is normal there and the readable numbers are still good.
     sizes, total = {}, 0
+    root_seen = False
     root_s = str(root)
     for line in r.stdout.splitlines():
         parts = line.split("\t", 1)
@@ -1945,8 +1973,12 @@ def _du_children(root):
         path = parts[1]
         if path == root_s:
             total = kb * 1024
+            root_seen = True
         else:
             sizes[path] = kb * 1024
+    stats["incomplete"] = r.returncode != 0 or not root_seen
+    if stats["incomplete"]:
+        print(f"Warning: storage map measurement is incomplete: {root}", file=sys.stderr)
     return sizes, total
 
 
@@ -1961,12 +1993,13 @@ def scan_storage_map(root=None, min_bytes=0, depth=1):
         return dict(empty, incomplete=True)
     if not valid:
         return empty
-    sizes, total = _du_children(root)
+    measurement = {}
+    sizes, total = _du_children(root, measurement)
     children = _read_only_scan(lambda: _storage_map_children(root, sizes, min_bytes),
                                None, "storage map enumeration", STORAGE_MAP_SCAN_BUDGET_S)
     if children is None:
         return dict(empty, incomplete=True)
-    incomplete = False
+    incomplete = measurement["incomplete"]
     if depth > 1:
         for child in children:
             if child["kind"] == "dir":
@@ -2009,7 +2042,7 @@ def _storage_map_children(root, sizes, min_bytes):
             try:
                 if entry.is_dir(follow_symlinks=False):
                     continue
-                size = entry.stat(follow_symlinks=False).st_size
+                size = _disk_bytes(entry.stat(follow_symlinks=False))
             except OSError:
                 continue
             if size < min_bytes:

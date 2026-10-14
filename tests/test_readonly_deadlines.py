@@ -43,7 +43,11 @@ elif case == 'inventory_safety':
     c._mdfind_confirms_installed = lambda ids: set()
     assert c.scan_app_leftovers({}) == []
 elif case == 'storage_map':
-    c._du_children = lambda path: ({}, 0)
+    def measured_empty(path, stats=None):
+        if stats is not None:
+            stats["incomplete"] = False
+        return {}, 0
+    c._du_children = measured_empty
     result = c.scan_storage_map(root)
     assert result['children'] == [] and result['incomplete'] is True
 elif case == 'logs':

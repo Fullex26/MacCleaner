@@ -37,14 +37,23 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
-- [x] **Bound remaining read-only directory walks (pending release)** — Injected blocked enumeration reproduces indefinite waits in tmp discovery, installed-app inventory, leftovers, dynamic logs, Storage map, and the System temp advisory. Four further probes reproduced blocked glob expansion and empty-only pre-enumeration in measurement, preview, and cleanup. Bound filesystem discovery itself while supervising subprocesses and deletion on the caller; an incomplete installed-app inventory must suppress leftover candidates.
+- [ ] **Bound remaining read-only directory walks (pending owner review)** — Injected blocked enumeration reproduces indefinite waits in tmp discovery, installed-app inventory, leftovers, dynamic logs, Storage map, and the System temp advisory. Four further probes reproduced blocked glob expansion and empty-only pre-enumeration in measurement, preview, and cleanup. Bound filesystem discovery itself while supervising subprocesses and deletion on the caller; an incomplete installed-app inventory must suppress leftover candidates.
+- [ ] **Preserve failed Storage-map measurements** — injecting a du timeout into an existing temporary folder returned a zero total without the incomplete flag, bypassing the app warning. Propagate failed or partial measurement status through map results and nested levels. Implemented for the next release.
+
+- [ ] **Clean up Swift probe descendants after shell exit** — an isolated compiled probe returned output while its background sleep remained alive. Terminate the read-only process group on every exit path, including successful shell completion. Implemented for the next release.
+- [ ] **Keep the newest Storage navigation result** — an isolated real-bridge harness completed `/fast` before an earlier `/slow`, then the older result replaced the new destination. Track request generations so stale completions cannot replace the map, error, or busy state. Implemented for the next release.
+- [ ] **Terminate estimate descendants on timeout** — an isolated real-helper probe returned zero after its shell timed out while a PID-recording child remained alive. Supervise read-only estimate commands in their own process group and terminate that group at the deadline or shell completion. Implemented for the next release.
+
+- [ ] **Show incomplete Storage maps as unavailable** — the bounded enumeration fallback in #78 returns `incomplete: true`, but the Swift bridge discards it and displays a nonempty folder as zero bytes. Decode the additive flag and show a partial/unavailable state instead of the empty-folder message. Implemented for the next release.
+- [ ] **Deduplicate hard links inside bundle sizes** — a temporary app containing an 8 KiB file and a second hard link reports 16 KiB in storage insights while allocated blocks and `du` report 8 KiB. Count each device/inode once within a bundle traversal. Implemented for the next release.
+
+- [x] **Measure sparse Storage-map files by allocated blocks (pending release)** — A temporary 1 GiB sparse file on this Mac occupied zero allocated bytes but appeared as a 1 GiB child under a zero-byte map total. Use allocated blocks for loose-file rows and size filtering, matching directory measurements and storage insights.
 - [x] **Serialize config sync transitions with setting writes (pending release)** — A deterministic temporary-file reproduction showed sync-off restoring `delete_mode: rm` after a concurrent setter successfully selected Trash mode. Lock the local binding as well as shared destinations so sync-on/off cannot race preference writes.
 
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
 - [ ] **Require a persisted app alert claim** — two no-post checks both authorized delivery when a simulated alert-state write failed. Withhold app delivery when the throttle claim cannot be saved, while reporting any notification already posted accurately. Implemented for the next release.
-- [ ] **Measure storage-map loose files by allocation** — a real sparse test file occupied zero allocated bytes but appeared as 1 GiB beneath a correctly measured zero-byte root. Use allocated blocks for loose-file rows, consistent with directory totals.
 
 - [ ] **Disambiguate project artifact IDs** — `foo-bar/node_modules` and `foo_bar/node_modules` produce the same slug; an explicit ID selects both and bypasses both git protections. Use stable path digests for colliding slugs and reject ambiguous legacy IDs. Implemented for the next release.
 - [ ] **Honor project exclusions** — review reproduced `scan_projects` returning an artifact beneath a configured `skip_paths` prefix, contrary to the never-touch contract. Apply exclusions during discovery, including root aliases and artifact parents containing excluded descendants. Implemented in #71, pending release.

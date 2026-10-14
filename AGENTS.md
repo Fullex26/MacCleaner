@@ -331,6 +331,7 @@ Differences from every other command here, all deliberate:
 - **It never deletes, and has no delete flag.** Entries carry no `id` and no `safe` field, are never accepted by `clean --targets`, and are never passed to the delete pipeline. The only removal path offered anywhere for these paths is the macOS Trash, from the app's Storage tab.
 - **`kind`** is `"dir"`, `"file"` or `"link"`. **`category`** is one of `applications`, `documents`, `media`, `developer`, `caches`, `appdata`, `system`, `other` — a display bucket only; nothing downstream branches on it.
 - **Measurement never crosses mount points** (`du -xkd 1`). This matters more than it sounds: without `-x`, `du` descends into any mounted disk image beneath the path and counts that image's contents on top of the image file itself. Measured that way, `/Library/Developer/CoreSimulator` on a real machine reported **106 GB** when it actually held **11 GB**. Any agent reimplementing this measurement must pass `-x`.
+- **`incomplete`** is an optional boolean, emitted only as `true` when disk measurement failed or was partial (including a nested level). Sizes and rows may be partial; a zero total then means unavailable, not an empty folder. Complete measurements omit the key. The app displays unavailable totals explicitly.
 - `--min-size MB` hides entries below the threshold. Exit code is 0 whether or not anything was found.
 
 ### `storage-insights --json`

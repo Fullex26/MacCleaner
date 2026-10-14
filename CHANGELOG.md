@@ -11,6 +11,13 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 - Remaining read-only directory walks now have daemon deadlines for filesystem enumeration: tmp, installed-app inventory, leftovers, logs, Storage map, System temp, glob expansion, and empty-only pre-enumeration. Cleanup enumeration failures report zero freed bytes and an error; failed scan measurements carry additive `measurement_error`. A timed-out app inventory suppresses all leftovers; Storage map adds `incomplete: true` on timeout instead of hanging.
+- Storage navigation now accepts only the newest request’s result or error; older completions cannot replace the displayed folder or clear a newer scan’s busy state.
+- Storage map now marks failed or partial disk measurements as incomplete, including nested failures, instead of presenting an unavailable total as complete zero. Successfully measured rows remain available.
+- Swift read-only probes now terminate their process group after every exit, including successful or allowed-failure shell completion, so background descendants cannot outlive the probe.
+- Python read-only estimates now supervise their entire process group and use file-backed output, terminating descendants on timeout or shell completion instead of leaving commands running after the scan returns.
+- The Storage tab now displays incomplete measurements as unavailable, retaining partial rows with a warning rather than presenting a timed-out folder as empty. Complete refreshes clear the warning; older engine payloads remain compatible.
+- Storage insights counts each hard-linked file once within a bundle, avoiding inflated app sizes while preserving independent bundle totals.
+- Storage map now sizes loose files by allocated blocks, matching directory totals and storage insights. Sparse files no longer overstate their disk use or incorrectly pass minimum-size filters.
 - Config sync-on/off now shares transaction locks with preference writes. A concurrent change to Trash mode can no longer be replaced by sync-off’s stale copy, and a delayed writer cannot break a newly enabled sync symlink.
 - App-owned low-disk checks no longer authorize notification delivery when saving the shared throttle claim fails. Disk measurements remain available, and a notification already posted by the CLI is still reported honestly.
 - Concurrent setting and category changes now reload and update the configuration under a transaction lock, so a stale caller cannot undo another preference such as Trash mode. Synced configuration symlinks remain intact and share the destination lock.
