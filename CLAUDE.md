@@ -178,3 +178,5 @@ Project exclusions retain both lexical and resolved paths inside the bounded dis
 Swift read-only subprocess probes use `ReadOnlyProcess` for process-group deadlines and file-backed stdout. Pass literal argument arrays; only generated estimate commands use `/bin/sh -c`. Match Python timeouts (process list 10s, parent lookup 5s, simctl 60s, Spotlight 5s). `tools/check_swift_process_deadlines.py` has an external backstop so an unbounded helper fails CI instead of hanging it.
 
 Minimum-free dry runs share safe-only candidate filtering with execution, including explicit selections. Their candidate list is an upper bound, not a predicted stopping point: trash, command targets, overlaps, and filesystem allocation prevent predicting free-space changes. `target_met` and `free_bytes` describe the initial reading; ordinary dry-run behavior stays unchanged.
+
+For `disk-check --no-post`, authorizing app delivery requires a successful throttle-state save. A failed save must return `should_notify: false`, as a failed transaction lock does. Never rewrite `notified: true` to false after the CLI already posted a banner, even if the subsequent state save failed.

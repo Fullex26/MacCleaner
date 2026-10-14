@@ -10,6 +10,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ## [Unreleased]
 
 ### Fixed
+- App-owned low-disk checks no longer authorize notification delivery when saving the shared throttle claim fails. Disk measurements remain available, and a notification already posted by the CLI is still reported honestly.
 - Minimum-free dry runs now apply the execution path’s safe-only selection and return no candidates when the floor is already met. Additive JSON metadata and preview wording identify eligible candidates as an upper bound; execution may stop earlier. Invalid minimum-free thresholds fail before scanning.
 - Colliding project artifact slugs now receive stable path-digest suffixes, so selecting one artifact cannot select a different project with the same normalized name. Ambiguous old IDs are rejected; non-colliding IDs stay unchanged.
 - Project discovery now honors `skip_paths`, including roots reached through symlink aliases. Artifacts containing an excluded descendant are omitted entirely, so cleanup cannot remove that descendant through its parent.

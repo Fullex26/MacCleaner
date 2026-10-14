@@ -39,7 +39,7 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
-- [ ] **Require a persisted app alert claim** — two no-post checks both authorized delivery when a simulated alert-state write failed. Withhold app delivery when the throttle claim cannot be saved, while reporting any notification already posted accurately.
+- [ ] **Require a persisted app alert claim** — two no-post checks both authorized delivery when a simulated alert-state write failed. Withhold app delivery when the throttle claim cannot be saved, while reporting any notification already posted accurately. Implemented for the next release.
 - [ ] **Bound remaining read-only enumeration** — six isolated blocked-read probes exceeded an external one-second limit in logs, temporary artifacts, installed-app inventory, leftovers, storage map, and doctor’s temp check. Bound entire read-only operations; incomplete installed-app inventory must produce no leftover candidates.
 - [ ] **Measure storage-map loose files by allocation** — a real sparse test file occupied zero allocated bytes but appeared as 1 GiB beneath a correctly measured zero-byte root. Use allocated blocks for loose-file rows, consistent with directory totals.
 
