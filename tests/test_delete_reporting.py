@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -49,3 +50,17 @@ class TestDeletionReporting(unittest.TestCase):
             self.assertTrue(second.exists())
             self.assertIsNotNone(error)
             self.assertEqual(freed, 4096)
+
+    def test_empty_only_deduplicates_hard_linked_siblings(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            cache = home / "cache"
+            cache.mkdir()
+            first, second = cache / "first", cache / "second"
+            first.write_bytes(b"x" * 8192)
+            os.link(first, second)
+            with mock.patch.object(cleaner, "HOME", home):
+                freed, error = cleaner.delete_target({"id": "fixture", "path": cache, "empty_only": True})
+            self.assertIsNone(error)
+            self.assertEqual(list(cache.iterdir()), [])
+            self.assertEqual(freed, 8192)

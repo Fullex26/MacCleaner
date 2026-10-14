@@ -1088,11 +1088,15 @@ def delete_target(t, mode="rm"):
                 continue
         try:
             if t.get("empty_only"):
-                for child in list(path.iterdir()):
-                    if _safe_to_delete(child):
-                        size = get_size(child)
-                        _move_to_trash(child) if mode == "trash" else _remove(child)
-                        freed += size
+                # Measure the parent as a unit so du deduplicates hard links
+                # shared by siblings. The remainder also captures partial failure.
+                before = get_size(path)
+                try:
+                    for child in list(path.iterdir()):
+                        if _safe_to_delete(child):
+                            _move_to_trash(child) if mode == "trash" else _remove(child)
+                finally:
+                    freed += max(0, before - get_size(path))
             else:
                 size = get_size(path)
                 _move_to_trash(path) if mode == "trash" else _remove(path)
