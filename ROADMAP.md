@@ -37,7 +37,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
-- [ ] **Do not embed failed Swift build output** — a hermetic build left an executable but exited unsuccessfully, and the fallback still embedded it. Require successful native compilation before querying or copying its result; part of the build-output fix.
+- [ ] **Do not embed failed Swift build output** — a hermetic build left an executable but exited unsuccessfully, and the fallback still embedded it. Require successful native compilation before querying or copying its result; part of the build-output fix. Implemented for the next release.
 
 - [ ] **Resolve Swift build output through SwiftPM** — the real macOS build succeeded under `.build/out/Products/Release` but the app script looked under `.build/apple/Products/Release` and omitted the soak engine. Query `--show-bin-path` for the successful build configuration instead of assuming a layout. Implemented for the next release.
 

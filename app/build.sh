@@ -146,10 +146,11 @@ if command -v swift >/dev/null 2>&1; then
         --arch arm64 --arch x86_64 >/dev/null 2>&1; then
         MCK_BIN="$(swift build -c release --package-path "$REPO_DIR/swift/MacCleanerKit" \
             --arch arm64 --arch x86_64 --show-bin-path)/mck" || MCK_BIN=""
-    else
-        swift build -c release --package-path "$REPO_DIR/swift/MacCleanerKit" >/dev/null 2>&1 || true
+    elif swift build -c release --package-path "$REPO_DIR/swift/MacCleanerKit" >/dev/null 2>&1; then
         MCK_BIN="$(swift build -c release --package-path "$REPO_DIR/swift/MacCleanerKit" \
             --show-bin-path)/mck" || MCK_BIN=""
+    else
+        MCK_BIN=""
     fi
     if [ -x "$MCK_BIN" ]; then
         cp "$MCK_BIN" "$BUNDLE/Contents/Resources/mck"
