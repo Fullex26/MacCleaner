@@ -39,6 +39,9 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
+- [ ] **Report failed removals honestly** — reproduced on macOS: deleting a cache beneath a non-writable parent returned no error while the directory remained. Stop suppressing recursive-removal errors and count only successfully removed paths; changes to `delete_target` require owner review.
+- [ ] **Serialize state transactions** — two report writers synchronized before their atomic replace left only one of two entries. Atomic replacement prevents torn JSON but does not protect read/modify/write; cover report history, snapshots, and the shared alert throttle with interprocess transaction locks.
+
 - [x] **Shell completions** — hand-written zsh/bash completion for subcommands, flags, config keys, and live category/target IDs (`completions/`), installed by `install.sh` and shipped in the CLI tarball
 - [x] **Notifications** — macOS notification when a scheduled clean finishes (`clean --notify`) or an in-app clean completes, plus low-disk alerts (`disk-check`) when free space drops below a configurable threshold (default 10 GB, throttled to once a day)
 - [x] **Sparkle auto-updater** — installed apps update themselves: a daily background check, an in-app prompt with release notes, "Check for Updates…" in Settings, and an EdDSA-signed appcast (`releases/latest/download/appcast.xml`) published by CI on every release
