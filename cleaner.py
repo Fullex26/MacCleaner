@@ -32,6 +32,8 @@ import stat as statmod
 import json
 import math
 import glob as globmod
+import hashlib
+from collections import Counter
 import time
 import shutil
 import tempfile
@@ -1548,8 +1550,8 @@ def run_clean_min_free(targets, min_free_gb, mode="rm", json_mode=False, notify=
 
 
 def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
-    """Resolve exactly what a real clean of `targets` would delete. Deletes
-    nothing, writes no report.log entry, records no snapshot."""
+    """Resolve cleanup paths without deletion or state writes. Minimum-free
+    previews list eligible candidates: execution may stop before the end."""
     say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
     extra = {}
     if min_free_gb is not None:
@@ -2340,14 +2342,20 @@ def scan_projects(config, roots=None, min_age_days=None):
 
 def projects_to_targets(hits):
     targets = []
-    for h in hits:
+    base_ids = [f"project-{slugify(os.path.relpath(h['path'], str(HOME)))}" for h in hits]
+    counts = Counter(base_ids)
+    for h, base_id in zip(hits, base_ids):
         git = h.get("git")
         flags = [name for name, on in (("dirty", git and git.get("dirty")),
                                        ("unpushed", git and git.get("unpushed"))) if on]
         badge = "".join(f" [{f}]" for f in flags)
         rel = os.path.relpath(h["path"], str(HOME))
+        # Size/order-dependent suffixes could silently select another project
+        # on a later scan. Disambiguate every colliding slug by path instead.
+        tid = base_id if counts[base_id] == 1 else (
+            base_id + "-" + hashlib.sha256(os.fsencode(rel)).hexdigest())
         targets.append({
-            "id": f"project-{slugify(rel)}",
+            "id": tid,
             "category": "projects",
             "label": f"{h['kind']} — {os.path.relpath(h['project'], str(HOME))}{badge}",
             "description": f"Stale {h['kind']} ({h['age_days']} days old)"
