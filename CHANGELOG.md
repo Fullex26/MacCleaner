@@ -9,6 +9,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Regression coverage
+- Config sync failures must preserve the active settings and Trash mode.
+
 ### Fixed
 - Standalone legacy `--category` now selects a scan as documented, including equals and repeated forms. Explicit legacy command modes retain precedence and malformed values still fail argument validation.
 - Storage navigation now accepts only the newest request’s result or error; older completions cannot replace the displayed folder or clear a newer scan’s busy state.
