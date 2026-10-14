@@ -144,17 +144,7 @@ public enum LeftoversScanner {
         guard !cands.isEmpty else { return [] }
         let query = cands.map { "kMDItemCFBundleIdentifier == '\($0)'c" }
             .joined(separator: " || ")
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = ["mdfind", query]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return [] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0,
-              let out = String(data: data, encoding: .utf8) else { return [] }
+        guard let out = ReadOnlyProcess.run(["mdfind", query], timeout: 5) else { return [] }
         var confirmed = Set<String>()
         for line in out.split(separator: "\n") {
             let path = line.trimmingCharacters(in: .whitespaces)

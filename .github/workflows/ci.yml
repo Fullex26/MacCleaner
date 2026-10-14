@@ -46,6 +46,9 @@ jobs:
         # and reports a green "0 tests" — a suite that silently runs nothing.
         run: swift test --package-path swift/MacCleanerKit --enable-xctest
 
+      - name: Swift subprocess deadline regression
+        run: python3 tools/check_swift_process_deadlines.py
+
       - name: Swift/Python engine parity (tools/check_swift_parity.py)
         run: python3 tools/check_swift_parity.py
 
@@ -90,6 +93,12 @@ jobs:
 
       - name: Layout probe — no section can outgrow the window
         run: bash tools/check_app_layout.sh
+
+      - name: Storage request ordering regression
+        run: python3 tools/check_storage_request_order.py
+
+      - name: Cleanup notification outcome regression
+        run: python3 tools/check_cleanup_notifications.py
 
       - name: Verify bundle structure
         run: |
