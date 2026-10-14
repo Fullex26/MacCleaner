@@ -16,6 +16,12 @@ class TestAppBuildOutput(unittest.TestCase):
     def test_embeds_swift_reported_native_fallback_output(self):
         self.check_output('native')
 
+    def test_failed_swift_build_remains_optional(self):
+        self.check_output("unavailable")
+
+    def test_failed_output_query_remains_optional(self):
+        self.check_output("query-failure")
+
     def check_output(self, mode):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -37,6 +43,8 @@ class TestAppBuildOutput(unittest.TestCase):
             stub('swift', '''import os, sys
 from pathlib import Path
 args = sys.argv[1:]
+if os.environ['FIXTURE_MODE'] == 'unavailable' or (os.environ['FIXTURE_MODE'] == 'query-failure' and '--show-bin-path' in args):
+    sys.exit(1)
 if os.environ['FIXTURE_MODE'] == 'native' and '--arch' in args:
     sys.exit(1)
 package = Path(args[args.index('--package-path') + 1])
@@ -66,5 +74,10 @@ if '-output' in sys.argv:
                                     text=True, capture_output=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             embedded = root / 'build/MacCleaner.app/Contents/Resources/mck'
+            if mode in ('unavailable', 'query-failure'):
+                self.assertFalse(embedded.exists())
+                self.assertIn('app ships without the V3 soak engine', result.stderr)
+                self.assertTrue((root / 'build/MacCleaner.app/Contents/MacOS/MacCleaner').is_file())
+                return
             self.assertTrue(embedded.is_file(), result.stdout + result.stderr)
             self.assertEqual(embedded.read_text(), 'fixture Swift engine')
