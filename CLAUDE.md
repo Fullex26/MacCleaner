@@ -202,3 +202,5 @@ Cleanup notification success counts include only `deleted` and `trashed`, never 
 Resolve SwiftPM executables with `swift build --show-bin-path` using the same configuration/architectures as the successful build. The current macOS toolchain uses `.build/out/Products/Release`, so a hardcoded `.build/apple/Products/Release` path can silently omit a successfully built soak engine.
 
 Only query/copy a Swift build output after that build succeeds. A failed compiler can leave an old executable at the expected path; existence alone does not prove it belongs to the current sources. Optional soak-engine failure must omit it and let app packaging continue.
+
+- **Removal accounting:** `_remove` must propagate filesystem errors. `delete_target` credits a path only after its remove/trash succeeds; empty-only targets measure the parent before and after, including on failure, so hard links across siblings are deduplicated. A failed whole-directory removal can be partial, but its unknown reclaim is conservatively reported as zero, never its original size.
