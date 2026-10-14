@@ -190,3 +190,5 @@ Bundle sizing deduplicates `(st_dev, st_ino)` within each traversal while summin
 
 Swift `ReadOnlyProcess` must terminate its process group on every exit path, not only on timeout. A shell can exit successfully while a background child survives. The standalone process probe checks both success and allowed nonzero exit with an external backstop and cleanup of its fixture groups.
 Python read-only estimates use a dedicated process group and file-backed stdout. Always terminate the group and reap its shell, including successful shell exit: a descendant may retain pipes or keep running after its parent exits. Keep the 15-second deadline and zero-on-failure behavior; this helper is not the cleanup command runner.
+
+Storage navigation requests can overlap across async suspension. Only the current request UUID may publish a map, publish an error, or clear the busy flag. `tools/check_storage_request_order.py` exercises the real bridge with controlled engine completions, including stale success/failure and a latest request that is still pending.
