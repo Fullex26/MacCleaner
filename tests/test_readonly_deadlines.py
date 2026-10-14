@@ -58,6 +58,10 @@ elif case == 'logs':
     rows = c.get_targets({'enabled_categories': ['logs', 'node']})
     assert any(t['id'] == 'npm-cache' for t in rows)
     assert not any(t['category'] == 'logs' for t in rows)
+elif case == 'cask_lookup':
+    os.environ['MACCLEANER_CASKROOM_DIR'] = str(root)
+    c.Path.glob = blocked
+    assert c._homebrew_cask_app() is None
 elif case == 'system_temp':
     temp_root = root / 'var/folders/test/T'
     temp_root.mkdir(parents=True)
@@ -135,6 +139,7 @@ class TestReadOnlyDeadlines(unittest.TestCase):
     def test_storage_map_returns_after_blocked_read(self): self.check_probe('storage_map')
     def test_log_timeout_preserves_static_targets(self): self.check_probe('logs')
     def test_system_temp_returns_after_blocked_read(self): self.check_probe('system_temp')
+    def test_cask_lookup_returns_unknown_after_blocked_glob(self): self.check_probe('cask_lookup')
 
     def test_glob_measurement_returns_after_blocked_read(self): self.check_probe('glob_measure')
     def test_glob_cleanup_reports_discovery_failure(self): self.check_probe('glob_delete')

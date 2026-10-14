@@ -37,6 +37,8 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
+- [ ] **Bound doctor’s Homebrew bundle lookup** — a blocked `Path.glob` fixture in `_homebrew_cask_app` required external termination. Bound the entire read-only lookup and treat timeout as unknown ownership.
+
 - [ ] **Bound remaining read-only directory walks (pending owner review)** — Injected blocked enumeration reproduces indefinite waits in tmp discovery, installed-app inventory, leftovers, dynamic logs, Storage map, and the System temp advisory. Four further probes reproduced blocked glob expansion and empty-only pre-enumeration in measurement, preview, and cleanup. Bound filesystem discovery itself while supervising subprocesses and deletion on the caller; an incomplete installed-app inventory must suppress leftover candidates.
 - [ ] **Preserve failed Storage-map measurements** — injecting a du timeout into an existing temporary folder returned a zero total without the incomplete flag, bypassing the app warning. Propagate failed or partial measurement status through map results and nested levels. Implemented for the next release.
 
