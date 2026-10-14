@@ -169,3 +169,5 @@ Then bump the hardcoded target counts in `run_tests.sh` (the `--targets` 1st/2nd
 `rich` is optional — detected at import, falls back to plain text (`RICH = False`). All output paths have both rich and plain variants.
 
 `projects --targets` must distinguish absence (`None`) from an explicitly empty string. The latter selects nothing in both cleanup and dry-run paths; never use truthiness to decide whether to apply the selection filter.
+
+Project discovery runs in a daemon with a 120-second deadline, including root validation. A stop event and result lock freeze candidates before sizing/git checks; a resumed filesystem operation must not publish more candidates after the timeout. The daemon only discovers paths and never deletes or writes state.

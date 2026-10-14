@@ -37,3 +37,20 @@ class TestProjectWalkDeadline(unittest.TestCase):
                 self.assertIn('partial', errors.getvalue())
             finally:
                 release.set()
+
+    def test_blocked_discovery_does_not_keep_cli_process_alive(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            code = '''
+import sys, threading
+import cleaner
+cleaner.PROJECT_SCAN_TIME_BUDGET_S = .05
+cleaner.os.scandir = lambda path: threading.Event().wait()
+hits, roots, age = cleaner.scan_projects({'project_git_check': False}, roots=[sys.argv[1]], min_age_days=0)
+assert hits == []
+'''
+            result = subprocess.run([sys.executable, '-c', code, td],
+                                    cwd=Path(__file__).resolve().parent.parent,
+                                    capture_output=True, text=True, timeout=3)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('partial', result.stderr)

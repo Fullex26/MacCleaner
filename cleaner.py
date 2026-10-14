@@ -2192,20 +2192,22 @@ def _filter_git_flagged(targets, bypass):
     return [t for t in targets if not _git_flagged(t)]
 
 
+PROJECT_SCAN_TIME_BUDGET_S = 120.0
+
+
 def scan_projects(config, roots=None, min_age_days=None):
     """Find stale build-artifact directories under the configured project roots."""
     root_strs = roots if roots else config.get("project_roots", [])
     roots = []
-    for r in root_strs:
-        p = Path(os.path.expanduser(r))
-        if p.exists() and p.is_dir():
-            roots.append(p)
     min_age = config.get("project_min_age_days", 30) if min_age_days is None else min_age_days
     now = time.time()
     found = {}
+    stopped = threading.Event()
+    results_lock = threading.Lock()
+    errors = []
 
     def walk(dir_path, depth):
-        if depth > PROJECT_SCAN_MAX_DEPTH:
+        if stopped.is_set() or depth > PROJECT_SCAN_MAX_DEPTH:
             return
         try:
             entries = list(os.scandir(dir_path))
@@ -2213,6 +2215,8 @@ def scan_projects(config, roots=None, min_age_days=None):
             return
         names = {e.name for e in entries}
         for e in entries:
+            if stopped.is_set():
+                return
             try:
                 if not e.is_dir(follow_symlinks=False):
                     continue
@@ -2241,21 +2245,49 @@ def scan_projects(config, roots=None, min_age_days=None):
                 if not required or any(m in names for m in required):
                     age_days = int((now - st.st_mtime) / 86400)
                     if age_days >= min_age and e.path not in found:
-                        found[e.path] = {
+                        candidate = {
                             "path": e.path,
                             "kind": name,
                             "project": str(Path(e.path).parent),
                             "age_days": age_days,
                         }
+                        with results_lock:
+                            if not stopped.is_set():
+                                found[e.path] = candidate
                 continue  # never descend into artifact-named dirs
             if name.startswith("."):
                 continue
             walk(e.path, depth + 1)
 
-    for root in roots:
-        walk(root, 0)
+    def discover():
+        try:
+            for r in root_strs:
+                if stopped.is_set():
+                    return
+                p = Path(os.path.expanduser(r))
+                if p.exists() and p.is_dir():
+                    with results_lock:
+                        if stopped.is_set():
+                            return
+                        roots.append(p)
+                    walk(p, 0)
+        except Exception as exc:
+            errors.append(exc)
 
-    hits = list(found.values())
+    # A deadline between directories cannot interrupt a blocked stat/readdir.
+    # Only discovery runs here; this daemon never deletes or writes state.
+    worker = threading.Thread(target=discover, name="project-discovery", daemon=True)
+    worker.start()
+    worker.join(PROJECT_SCAN_TIME_BUDGET_S)
+    with results_lock:
+        stopped.set()
+        hits = list(found.values())
+        roots = list(roots)
+    if worker.is_alive():
+        print(f"Warning: project discovery stopped after {PROJECT_SCAN_TIME_BUDGET_S}s; "
+              "results are partial", file=sys.stderr)
+    elif errors:
+        raise errors[0]
     with ThreadPoolExecutor(max_workers=8) as pool:
         sizes = list(pool.map(lambda h: get_size(Path(h["path"])), hits))
     for h, s in zip(hits, sizes):
