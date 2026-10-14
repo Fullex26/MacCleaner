@@ -195,3 +195,5 @@ Storage navigation requests can overlap across async suspension. Only the curren
 Storage-map completeness includes the du measurement, not only directory enumeration. A timeout, nonzero du exit, or missing root-total row must mark the result incomplete; preserve usable partial rows and propagate nested failures to the parent. A valid zero root row is complete. Keep the mount boundary flag and the private two-value sizing return compatible.
 
 Legacy category-only arguments imply `scan`, including `--category=value`. Keep this fallback after explicit legacy modes (`--clean`, `--preview`, `--report`, config) so it cannot turn a requested command into a scan; argparse still validates the forwarded values.
+
+Cleanup notification success counts include only `deleted` and `trashed`, never every non-skipped status. Share `CleanResult.notificationBody` between selected and automatic cleanup, append failures/skips separately, and retain the engine’s freed-byte title because a failed item can partially reclaim space. The real-bridge capture probe must never post actual notifications.
