@@ -21,7 +21,7 @@ maccleaner clean --category xcode --min-size 500 --yes --json
 maccleaner projects --json
 
 # Delete specific stale artifacts (IDs from projects --json)
-maccleaner projects --clean --targets project-documents-foo-node-modules --yes --json
+maccleaner projects --clean --targets project-documents-foo-node-modules--d34f55561bacdf99792a3ee4317812fc03626af33e649fbf85d9c8bd53cb6da3 --yes --json
 
 # Recoverable clean: move to ~/.Trash instead of deleting
 maccleaner clean --yes --trash --json
@@ -204,13 +204,13 @@ Same envelope shape as `clean --json` (`delete_mode`, `freed_bytes`, `disk_after
       "age_days": 142,
       "size_bytes": 3221225472,
       "git": { "dirty": false, "unpushed": true },
-      "id": "project-documents-old-app-node-modules"
+      "id": "project-documents-old-app-node-modules--a5b957a9eae5ead4e98a12ff4e4a8996593e61f84c9796cbb868b7d00cc6d311"
     }
   ]
 }
 ```
 
-Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets` accepts. When different paths normalize to the same slug, every colliding ID includes a stable path-digest suffix; the ambiguous unsuffixed ID is rejected. Non-colliding IDs are unchanged. `git` is `null` when git status couldn't be determined (not a repo, `git` missing, or any git failure — including a 2-second timeout); otherwise `{"dirty": bool, "unpushed": bool}`. `dirty` means `git status --porcelain` reported changes; `unpushed` means there are commits on local branches that no remote has (a repo with no remotes at all counts as unpushed). Controlled by config `project_git_check` (default `true`); when disabled, `git` is always `null` and no git subprocess is run.
+Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets` accepts. Dynamic IDs whose identity loses information during slug conversion always carry a full SHA-256 digest after a reserved `--` separator, even when no current candidate collides. This includes project relative paths, bundle IDs, nested tmp paths, and non-canonical log/tmp names. IDs are independent of the other candidates present. Rescan after upgrading; old lossy IDs are rejected rather than aliased to a potentially different path. Simple canonical identities retain their existing IDs. `git` is `null` when git status couldn't be determined (not a repo, `git` missing, or any git failure — including a 2-second timeout); otherwise `{"dirty": bool, "unpushed": bool}`. `dirty` means `git status --porcelain` reported changes; `unpushed` means there are commits on local branches that no remote has (a repo with no remotes at all counts as unpushed). Controlled by config `project_git_check` (default `true`); when disabled, `git` is always `null` and no git subprocess is run.
 
 ### `doctor --json`
 

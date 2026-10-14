@@ -9,6 +9,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+- Lossy project, log, temporary-build, and leftover identifiers use stable identity digests independent of candidate membership. This intentionally rejects old ambiguous lossy IDs rather than allowing them to select a different path.
+
 ---
 
 ## [2.18.0] — 2026-10-15
