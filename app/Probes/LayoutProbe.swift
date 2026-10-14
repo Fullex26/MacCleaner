@@ -32,6 +32,30 @@ struct LayoutProbe {
             ("Settings", AnyView(SettingsView())),
         ]
         var failed = false
+        func checkBar(_ name: String, _ actual: Double, _ expected: Double) {
+            let ok = actual.isFinite && abs(actual - expected) < 0.000001
+            print("\(ok ? "ok  " : "FAIL") Storage bar \(name): \(actual), expected \(expected)")
+            if !ok { failed = true }
+        }
+        func entry(_ size: Int) -> StorageMapEntry {
+            StorageMapEntry(path: "/fixture/\(size)", name: "\(size)", size_bytes: size,
+                            size_human: "fixture", kind: "dir", category: "other")
+        }
+        let map = StorageMapReport(root: "/fixture", total_bytes: 1000,
+                                   total_human: "fixture", category: "other",
+                                   children: [entry(100), entry(400), entry(200)])
+        let scale = StorageBarScale(map: map)
+        checkBar("largest sibling", scale.fraction(bytes: 400), 1)
+        checkBar("half largest", scale.fraction(bytes: 200), 0.5)
+        checkBar("quarter largest", scale.fraction(bytes: 100), 0.25)
+        checkBar("zero", scale.fraction(bytes: 0), 0)
+        let empty = StorageMapReport(root: "/fixture", total_bytes: 1000,
+                                     total_human: "fixture", category: "other", children: [])
+        checkBar("empty level", StorageBarScale(map: empty).fraction(bytes: 0), 0)
+        let zero = StorageMapReport(root: "/fixture", total_bytes: 0,
+                                    total_human: "fixture", category: "other", children: [entry(0)])
+        checkBar("zero level", StorageBarScale(map: zero).fraction(bytes: 0), 0)
+
         for (name, view) in sections {
             let host = NSHostingController(rootView: view.environmentObject(bridge))
             for width: CGFloat in [0, 120, 300] {
@@ -42,7 +66,7 @@ struct LayoutProbe {
             }
         }
         if failed {
-            print("A section's minimum height exceeds the window's minHeight (\(Int(windowMinHeight))pt): its top will be pushed off-screen. Look for fixedSize(vertical:) or fixed frames outside a ScrollView/List.")
+            print("App probe failed: inspect the FAIL lines above. Oversized section heights indicate fixedSize(vertical:) or fixed frames outside a ScrollView/List.")
             exit(1)
         }
     }
