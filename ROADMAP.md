@@ -37,6 +37,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
+- [x] **Measure sparse Storage-map files by allocated blocks (pending release)** — A temporary 1 GiB sparse file on this Mac occupied zero allocated bytes but appeared as a 1 GiB child under a zero-byte map total. Use allocated blocks for loose-file rows and size filtering, matching directory measurements and storage insights.
 - [x] **Serialize config sync transitions with setting writes (pending release)** — A deterministic temporary-file reproduction showed sync-off restoring `delete_mode: rm` after a concurrent setter successfully selected Trash mode. Lock the local binding as well as shared destinations so sync-on/off cannot race preference writes.
 
 
@@ -44,7 +45,6 @@ This document tracks planned features and long-term direction. Community input w
 
 - [ ] **Require a persisted app alert claim** — two no-post checks both authorized delivery when a simulated alert-state write failed. Withhold app delivery when the throttle claim cannot be saved, while reporting any notification already posted accurately. Implemented for the next release.
 - [ ] **Bound remaining read-only enumeration** — six isolated blocked-read probes exceeded an external one-second limit in logs, temporary artifacts, installed-app inventory, leftovers, storage map, and doctor’s temp check. Bound entire read-only operations; incomplete installed-app inventory must produce no leftover candidates.
-- [ ] **Measure storage-map loose files by allocation** — a real sparse test file occupied zero allocated bytes but appeared as 1 GiB beneath a correctly measured zero-byte root. Use allocated blocks for loose-file rows, consistent with directory totals.
 
 - [ ] **Disambiguate project artifact IDs** — `foo-bar/node_modules` and `foo_bar/node_modules` produce the same slug; an explicit ID selects both and bypasses both git protections. Use stable path digests for colliding slugs and reject ambiguous legacy IDs. Implemented for the next release.
 - [ ] **Honor project exclusions** — review reproduced `scan_projects` returning an artifact beneath a configured `skip_paths` prefix, contrary to the never-touch contract. Apply exclusions during discovery, including root aliases and artifact parents containing excluded descendants. Implemented in #71, pending release.

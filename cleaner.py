@@ -1914,7 +1914,7 @@ def scan_storage_map(root=None, min_bytes=0, depth=1):
             try:
                 if entry.is_dir(follow_symlinks=False):
                     continue
-                size = entry.stat(follow_symlinks=False).st_size
+                size = _disk_bytes(entry.stat(follow_symlinks=False))
             except OSError:
                 continue
             if size < min_bytes:
