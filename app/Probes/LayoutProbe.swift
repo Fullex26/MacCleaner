@@ -56,6 +56,20 @@ struct LayoutProbe {
                                     total_human: "fixture", category: "other", children: [entry(0)])
         checkBar("zero level", StorageBarScale(map: zero).fraction(bytes: 0), 0)
 
+        // Additive deadline metadata must survive the app's JSON bridge.
+        let incompleteJSON = Data(#"{"root":"/fixture","total_bytes":0,"total_human":"0.0 B","category":"other","children":[],"incomplete":true}"#.utf8)
+        do {
+            let unavailable = try JSONDecoder().decode(StorageMapReport.self, from: incompleteJSON)
+            let encoded = try JSONEncoder().encode(unavailable)
+            let object = try JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+            let preserved = object?["incomplete"] as? Bool == true
+            print("\(preserved ? "ok  " : "FAIL") Storage incomplete measurement metadata")
+            if !preserved { failed = true }
+        } catch {
+            print("FAIL Storage incomplete fixture: \(error)")
+            failed = true
+        }
+
         for (name, view) in sections {
             let host = NSHostingController(rootView: view.environmentObject(bridge))
             for width: CGFloat in [0, 120, 300] {
