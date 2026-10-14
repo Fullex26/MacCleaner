@@ -39,6 +39,8 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
+- [ ] **Empty project selection must select nothing** — reproduced with a temporary project: `projects --targets "" --yes --dry-run` offered one artifact rather than zero, and the same truthiness gate controls real cleanup. Treat selector presence separately from its parsed IDs, matching the regular clean command.
+
 - [ ] **V3 command-target estimates** — implemented for the next release: strict stub-tool parity reproduced 15 field divergences, including four zero estimates and discarded simulator sizes. The read-only kit now carries generated estimate metadata, bounded execution, and full command-target size/existence parity.
 
 - [x] **Shell completions** — hand-written zsh/bash completion for subcommands, flags, config keys, and live category/target IDs (`completions/`), installed by `install.sh` and shipped in the CLI tarball
