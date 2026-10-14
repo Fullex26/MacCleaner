@@ -37,6 +37,8 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
+- [ ] **Resolve Swift build output through SwiftPM** — the real macOS build succeeded under `.build/out/Products/Release` but the app script looked under `.build/apple/Products/Release` and omitted the soak engine. Query `--show-bin-path` for the successful build configuration instead of assuming a layout.
+
 - [ ] **Preserve configuration on failed sync transitions** — injected write/link failures during sync-off and both sync-on branches remove the active config, silently changing Trash mode back to permanent deletion. Commit the local binding atomically only after its replacement is ready. Implemented for the next release.
 - [ ] **Count cleanup outcomes accurately in app notifications** — an exact-bridge probe with an error-only response produced “1 items cleaned”. Count deleted/trashed items as successes and report failures separately. Implemented for the next release.
 
