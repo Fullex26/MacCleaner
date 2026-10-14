@@ -179,3 +179,7 @@ Swift read-only subprocess probes use `ReadOnlyProcess` for process-group deadli
 
 Configuration setting/category commands must lock `CONFIG_PATH.resolve()`, reload inside that lock, then mutate and save. Locking only the atomic write still loses other callers’ changes; locking the resolved destination keeps synced-config aliases on one transaction lock.
 Minimum-free dry runs share safe-only candidate filtering with execution, including explicit selections. Their candidate list is an upper bound, not a predicted stopping point: trash, command targets, overlaps, and filesystem allocation prevent predicting free-space changes. `target_met` and `free_bytes` describe the initial reading; ordinary dry-run behavior stays unchanged.
+
+### Remaining read-only walk deadlines
+
+`_read_only_scan` bounds filesystem discovery, including blocked directory reads, using a daemon worker whose result stays private until completion. Tmp, app inventory, leftovers, logs, and System temp enumeration use 120 seconds; each Storage map root/child enumeration uses 600 seconds. Subprocess probes and sizing must stay on the caller thread with their existing timeouts: abandoning a daemon supervising `subprocess.run` can orphan its child when the CLI exits. Nested map levels also run on the caller. Timeout returns an unavailable result and a stderr warning. Installed-app inventory returns `None` on timeout: leftovers must treat that as unknown and offer nothing, never as an empty set proving all apps absent. These workers must remain read-only and must not start subprocesses.

@@ -92,3 +92,42 @@ class TestReadOnlyDeadlines(unittest.TestCase):
     def test_storage_map_returns_after_blocked_read(self): self.check_probe('storage_map')
     def test_log_timeout_preserves_static_targets(self): self.check_probe('logs')
     def test_system_temp_returns_after_blocked_read(self): self.check_probe('system_temp')
+
+    def test_sizing_subprocess_is_reaped_before_cli_exit(self):
+        probe = r'''
+import os, subprocess, sys
+import cleaner as c
+c.STORAGE_MAP_SCAN_BUDGET_S = .05
+original_run = subprocess.run
+announce = os.dup(1)
+def fake_du(args, **kwargs):
+    child = ('import os,time; '
+             f'os.write({announce}, ("DU_PID=%d\\n" % os.getpid()).encode()); '
+             'time.sleep(10)')
+    kwargs['timeout'] = .2
+    return original_run([sys.executable, '-c', child], pass_fds=(announce,), **kwargs)
+c.subprocess.run = fake_du
+c.scan_storage_map(sys.argv[1])
+print('RETURNED', flush=True)
+'''
+        with tempfile.TemporaryDirectory() as td:
+            process = subprocess.Popen([sys.executable, '-c', probe, td], cwd=REPO,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+            try:
+                try:
+                    out, err = process.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.fail('sizing child survived the CLI or exceeded its timeout')
+                self.assertEqual(process.returncode, 0, out + err)
+                self.assertIn('RETURNED', out)
+                pid = int(next(line.split('=')[1] for line in out.splitlines()
+                               if line.startswith('DU_PID=')))
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+            finally:
+                # A daemon regression can leave children after the CLI exits.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()

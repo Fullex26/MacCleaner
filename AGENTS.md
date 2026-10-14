@@ -306,6 +306,9 @@ New in 2.2.0. Deliberately cheap: one `shutil.disk_usage` call — no `du` measu
 
 ### `storage-map --json`
 
+Each map level’s root validation and child enumeration have a 600-second deadline; `du` retains its own supervised 600-second timeout. An enumeration timeout returns the usual envelope with empty `children`, zero reported totals, and additive `"incomplete": true`, plus a warning on stderr. Those zeros mean unavailable measurement, not an empty disk. Nested timeouts propagate `incomplete: true` to the top-level result. Normal completed output is unchanged.
+
+
 ```json
 {
   "version": "2.17.3",
@@ -538,3 +541,5 @@ Matching is bundle-ID-precise rather than fuzzy, but it still isn't an absolute 
 - **`schedule`** (new in 2.3.0) never touches anything inside `$HOME`'s data — it only writes/removes launchd plists (under `MACCLEANER_LAUNCH_AGENTS_DIR`, default `~/Library/LaunchAgents`), calls `launchctl`, and edits the crontab to strip a legacy MacCleaner line. It writes nothing to `report.log`, `snapshots.log`, or `alerts.json`. The agents it installs (`clean --yes --notify`, `disk-check`) are themselves bound by every safety guarantee above.
 - **`doctor`'s 2.8.0 system-pressure checks** (`Swap`, `Held-open files`) are strictly **read-only reporting**. `Swap` runs one `sysctl vm.swapusage`; `Held-open files` runs one `lsof -b -nPw +c 0 +L1`. Neither deletes a byte, neither creates a target ID, neither offers or accepts a cleanup action, and MacCleaner will never kill a process, unlink a held-open inode, or touch `/System/Volumes/VM`. They exist purely to explain disk space the tool has deliberately decided not to reclaim — which is also why both are `advisory` and excluded from top-level `ok` (§3).
 - `scan`, `projects` (without `--clean`), `doctor`, `report`, `categories`, `config show|path`, and `storage-insights` never delete anything. `scan` and every real `clean`/`projects --clean` run (not `--dry-run`) also record a disk-usage entry to `snapshots.log`; `clean` and `projects --clean` (but not `--dry-run`) additionally append a run entry to `report.log`. `--dry-run` writes to neither log. `storage-insights` writes to no log at all — no `report.log`, `snapshots.log`, or `alerts.json` entry, ever.
+
+Read-only directory discovery for tmp, installed apps, app leftovers, oversized logs, and the System temp advisory has a 120-second discovery deadline, with subprocess probes and sizing retaining their separately supervised timeouts. On timeout the affected candidates/advisory are omitted with a stderr warning. An incomplete installed-app inventory suppresses all app leftovers; it is never treated as proof that apps are uninstalled.

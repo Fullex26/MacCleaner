@@ -37,7 +37,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
-- [ ] **Bound remaining read-only directory walks** — Injected blocked enumeration reproduces indefinite waits in tmp discovery, installed-app inventory, leftovers, dynamic logs, Storage map, and the System temp advisory. Bound the whole read; an incomplete installed-app inventory must suppress leftover candidates.
+- [x] **Bound remaining read-only directory walks (pending release)** — Injected blocked enumeration reproduces indefinite waits in tmp discovery, installed-app inventory, leftovers, dynamic logs, Storage map, and the System temp advisory. Bound filesystem discovery itself while supervising subprocesses on the caller; an incomplete installed-app inventory must suppress leftover candidates.
 
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
