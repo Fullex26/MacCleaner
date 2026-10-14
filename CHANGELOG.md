@@ -9,6 +9,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+- Failed filesystem removals now report errors instead of silently reporting success. Freed bytes count only successfully removed paths, including completed children of an empty-only cleanup; a failed or partly removed directory contributes zero rather than its original full size.
+
 ---
 
 ## [2.17.3] — 2026-10-12

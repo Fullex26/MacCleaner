@@ -1041,7 +1041,7 @@ def _remove(path: Path):
     if path.is_symlink():
         path.unlink(missing_ok=True)
     elif path.is_dir():
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(path)
     else:
         path.unlink(missing_ok=True)
 
@@ -1086,16 +1086,17 @@ def delete_target(t, mode="rm"):
             if not (t.get("tmp_scan") and _tmp_scan_path_allowed(path)):
                 errors.append(f"refused (outside home): {path}")
                 continue
-        freed += get_size(path)
         try:
             if t.get("empty_only"):
                 for child in list(path.iterdir()):
                     if _safe_to_delete(child):
+                        size = get_size(child)
                         _move_to_trash(child) if mode == "trash" else _remove(child)
-            elif mode == "trash":
-                _move_to_trash(path)
+                        freed += size
             else:
-                _remove(path)
+                size = get_size(path)
+                _move_to_trash(path) if mode == "trash" else _remove(path)
+                freed += size
         except Exception as e:
             errors.append(f"{path}: {e}")
     return freed, ("; ".join(errors) if errors else None)
