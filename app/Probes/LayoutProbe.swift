@@ -56,6 +56,16 @@ struct LayoutProbe {
                                     total_human: "fixture", category: "other", children: [entry(0)])
         checkBar("zero level", StorageBarScale(map: zero).fraction(bytes: 0), 0)
 
+        func checkStorageHeight(_ state: String) {
+            let host = NSHostingController(rootView: StorageView().environmentObject(bridge))
+            for width: CGFloat in [0, 120, 300] {
+                let size = host.sizeThatFits(in: CGSize(width: width, height: 0))
+                let ok = size.height <= windowMinHeight
+                print("\(ok ? "ok  " : "FAIL") Storage \(state) @ width \(Int(width)): min height \(Int(size.height))pt")
+                if !ok { failed = true }
+            }
+        }
+
         // Additive deadline metadata must survive the app's JSON bridge.
         let incompleteJSON = Data(#"{"root":"/fixture","total_bytes":0,"total_human":"0.0 B","category":"other","children":[],"incomplete":true}"#.utf8)
         do {
@@ -65,11 +75,41 @@ struct LayoutProbe {
             let preserved = object?["incomplete"] as? Bool == true
             print("\(preserved ? "ok  " : "FAIL") Storage incomplete measurement metadata")
             if !preserved { failed = true }
+            bridge.acceptStorageMap(unavailable)
+            checkStorageHeight("unavailable")
+            if bridge.storageMap?.totalLabel != "Total unavailable" || bridge.storageMapError == nil {
+                print("FAIL Storage unavailable result must show a warning instead of an empty measurement")
+                failed = true
+            }
+            var partial = map
+            partial.incomplete = true
+            bridge.acceptStorageMap(partial)
+            checkStorageHeight("partial")
+            if bridge.storageMap?.children.count != 3 || bridge.storageMapError == nil {
+                print("FAIL Storage partial result must retain rows and warning")
+                failed = true
+            }
+            let legacyJSON = Data(#"{"root":"/fixture","total_bytes":0,"total_human":"0.0 B","category":"other","children":[]}"#.utf8)
+            let legacy = try JSONDecoder().decode(StorageMapReport.self, from: legacyJSON)
+            bridge.acceptStorageMap(legacy)
+            if bridge.storageMapError != nil || bridge.storageMap?.totalLabel != "0.0 B" {
+                print("FAIL Storage complete refresh must clear incomplete state")
+                failed = true
+            }
+            var complete = partial
+            complete.incomplete = false
+            bridge.acceptStorageMap(complete)
+            if bridge.storageMapError != nil || bridge.storageMap?.totalLabel != map.total_human {
+                print("FAIL Storage explicit complete flag must restore the total")
+                failed = true
+            }
         } catch {
             print("FAIL Storage incomplete fixture: \(error)")
             failed = true
         }
 
+        bridge.storageMap = nil
+        bridge.storageMapError = nil
         for (name, view) in sections {
             let host = NSHostingController(rootView: view.environmentObject(bridge))
             for width: CGFloat in [0, 120, 300] {
