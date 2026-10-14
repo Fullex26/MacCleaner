@@ -37,6 +37,9 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
+- [ ] **Bound remaining read-only directory walks** — Injected blocked enumeration reproduces indefinite waits in tmp discovery, installed-app inventory, leftovers, dynamic logs, Storage map, and the System temp advisory. Bound the whole read; an incomplete installed-app inventory must suppress leftover candidates.
+
+
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
 - [ ] **Disambiguate project artifact IDs** — `foo-bar/node_modules` and `foo_bar/node_modules` produce the same slug; an explicit ID selects both and bypasses both git protections. Use stable path digests for colliding slugs and reject ambiguous legacy IDs. Implemented for the next release.
