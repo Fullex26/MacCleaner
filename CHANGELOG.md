@@ -10,6 +10,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ## [Unreleased]
 
 ### Fixed
+- The app build locates the Swift soak engine using SwiftPM’s reported output directory for universal and native builds, so toolchains with a different build layout no longer silently omit it. Failed builds cannot contribute a stale executable; optional-engine failures still allow app packaging.
 - Failed config sync transitions preserve the active settings, including Trash mode, until the new local binding can be committed atomically.
 - Cleanup notifications now count only deleted or trashed items as cleaned and show failed/skipped counts separately. Selected and automatic cleanup share the same summary; reported freed space remains visible even when an item partially fails.
 - Standalone legacy `--category` now selects a scan as documented, including equals and repeated forms. Explicit legacy command modes retain precedence and malformed values still fail argument validation.
