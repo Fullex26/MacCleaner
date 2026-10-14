@@ -175,3 +175,23 @@ print('RETURNED', flush=True)
                 except ProcessLookupError:
                     pass
                 process.communicate()
+
+    def test_minimum_free_reports_failed_measurements(self):
+        import contextlib
+        import io
+        import json
+        from unittest import mock
+        import cleaner
+        target = {'id': 'fixture', 'label': 'fixture', 'safe': True, 'exists': False,
+                  'size': 0, 'measurement_error': 'glob enumeration timed out'}
+        output = io.StringIO()
+        with mock.patch.object(cleaner, 'disk_stats', return_value={'free_bytes': 0}), \
+                mock.patch.object(cleaner, 'disk_free', return_value='fixture disk'), \
+                mock.patch.object(cleaner, 'write_log'), mock.patch.object(cleaner, 'record_snapshot'), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+            cleaner.run_clean_min_free([target], 1, json_mode=True)
+        result = json.loads(output.getvalue())
+        self.assertFalse(result['target_met'])
+        self.assertEqual(result['freed_bytes'], 0)
+        self.assertEqual(len(result['items']), 1)
+        self.assertEqual(result['items'][0]['status'], 'error')

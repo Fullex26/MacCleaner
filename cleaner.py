@@ -1598,7 +1598,7 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
 
 def _safe_cleanup_candidates(targets):
     return sorted([t for t in measure_targets(targets)
-                   if t["safe"] and (t.get("exists") or t.get("cmd"))],
+                   if t["safe"] and (t.get("exists") or t.get("cmd") or t.get("measurement_error"))],
                   key=lambda t: t.get("size") or 0, reverse=True)
 
 
