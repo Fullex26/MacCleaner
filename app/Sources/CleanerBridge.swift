@@ -396,6 +396,7 @@ final class CleanerBridge: ObservableObject {
     /// a notification-gated action) — awaiting it elsewhere just joins the
     /// in-flight (or already-finished) load instead of starting a new one.
     private var settingsLoadTask: Task<Void, Never>?
+    private var storageMapRequestID: UUID?
 
     /// Engine resolution: MACCLEANER_ENGINE env override (development) →
     /// user-installed copy (shares config with the CLI) → bundled fallback.
@@ -766,14 +767,21 @@ final class CleanerBridge: ObservableObject {
     /// Never touches `statusMessage`: this runs concurrently with the Dashboard's
     /// own scan, and a shared banner can't represent two failures at once.
     func scanStorageMap(_ path: String? = nil) async {
+        let requestID = UUID()
+        storageMapRequestID = requestID
         isScanningStorageMap = true
-        defer { isScanningStorageMap = false }
+        defer {
+            if storageMapRequestID == requestID { isScanningStorageMap = false }
+        }
         var args = ["storage-map"]
         if let path { args.append(path) }
         args.append("--json")
         do {
-            acceptStorageMap(try await run(StorageMapReport.self, args))
+            let report = try await run(StorageMapReport.self, args)
+            guard storageMapRequestID == requestID else { return }
+            acceptStorageMap(report)
         } catch {
+            guard storageMapRequestID == requestID else { return }
             // Leave any previously loaded level on screen rather than blanking
             // the browser out from under the user.
             storageMapError = error.localizedDescription

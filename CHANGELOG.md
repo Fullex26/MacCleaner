@@ -11,6 +11,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 - Command-based cleanup now terminates its owned process group on timeout or interruption before returning, preventing descendants from continuing cleanup afterward.
+- Storage navigation now accepts only the newest request’s result or error; older completions cannot replace the displayed folder or clear a newer scan’s busy state.
 - Storage map now marks failed or partial disk measurements as incomplete, including nested failures, instead of presenting an unavailable total as complete zero. Successfully measured rows remain available.
 - Swift read-only probes now terminate their process group after every exit, including successful or allowed-failure shell completion, so background descendants cannot outlive the probe.
 - Python read-only estimates now supervise their entire process group and use file-backed output, terminating descendants on timeout or shell completion instead of leaving commands running after the scan returns.
