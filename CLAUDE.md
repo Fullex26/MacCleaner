@@ -189,3 +189,5 @@ Storage map `incomplete: true` is an unavailable measurement, not an empty folde
 Bundle sizing deduplicates `(st_dev, st_ino)` within each traversal while summing allocated blocks. Keep the identity set local to the bundle: separate bundles must retain their own totals even when they share hard links. The walk stays stat-only and never follows symlinks.
 
 Python read-only estimates use a dedicated process group and file-backed stdout. Always terminate the group and reap its shell, including successful shell exit: a descendant may retain pipes or keep running after its parent exits. Keep the 15-second deadline and zero-on-failure behavior; this helper is not the cleanup command runner.
+
+Storage-map completeness includes the du measurement, not only directory enumeration. A timeout, nonzero du exit, or missing root-total row must mark the result incomplete; preserve usable partial rows and propagate nested failures to the parent. A valid zero root row is complete. Keep the mount boundary flag and the private two-value sizing return compatible.
