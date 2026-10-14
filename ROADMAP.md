@@ -37,6 +37,8 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
+- [ ] **Terminate estimate descendants on timeout** — an isolated real-helper probe returned zero after its shell timed out while a PID-recording child remained alive. Supervise read-only estimate commands in their own process group and terminate that group at the deadline.
+
 - [ ] **Deduplicate hard links inside bundle sizes** — a temporary app containing an 8 KiB file and a second hard link reports 16 KiB in storage insights while allocated blocks and `du` report 8 KiB. Count each device/inode once within a bundle traversal. Implemented for the next release.
 - [ ] **Show incomplete Storage maps as unavailable** — the bounded enumeration fallback in #78 returns `incomplete: true`, but the Swift bridge discards it and displays a nonempty folder as zero bytes. Decode the additive flag and show a partial/unavailable state instead of the empty-folder message.
 

@@ -543,9 +543,12 @@ def _parse_conda_estimate(output):
     return total
 
 
+ESTIMATE_TIMEOUT_S = 15
+
+
 def _run_estimate(estimate_cmd, parser):
     try:
-        r = subprocess.run(estimate_cmd, shell=True, capture_output=True, text=True, timeout=15)
+        r = subprocess.run(estimate_cmd, shell=True, capture_output=True, text=True, timeout=ESTIMATE_TIMEOUT_S)
         if r.returncode != 0:
             return 0
         return {
