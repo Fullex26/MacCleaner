@@ -443,16 +443,17 @@ final class CleanerBridge: ObservableObject {
         }
 
         try process.run()
-        // Same shape as soakCompare's guard: terminate, then SIGKILL in case
-        // the child is blocked somewhere SIGTERM can't reach (a kernel
-        // readdir wait is exactly that). `timedOut` is set before the kill
-        // so the error below can say what happened instead of "exited -9".
+        // TERM gives command cleanup a bounded chance to stop its owned group.
+        // A hard-kill backstop still handles a kernel read that cannot unwind.
+        // Set the flag first so either exit reports the timeout accurately.
         let timedOut = TimedOutFlag()
         let killer = DispatchWorkItem {
             if process.isRunning {
                 timedOut.set()
                 process.terminate()
-                kill(process.processIdentifier, SIGKILL)
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
+                    if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                }
             }
         }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: killer)

@@ -7,17 +7,21 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
+
+import cleaner
 
 REPO = Path(__file__).resolve().parents[1]
 PROBE = r'''
 import cleaner
+import signal
 import shlex
 import subprocess
 import sys
-cleaner.CLEANUP_TIMEOUT_S = 600 if sys.argv[3] == "interrupt" else 0.3
+cleaner.CLEANUP_TIMEOUT_S = 600 if sys.argv[3] in ("interrupt", "terminate") else 0.3
 original_run = subprocess.run
 def short_run(*args, **kwargs):
-    if kwargs.get("timeout") == 600 and sys.argv[3] != "interrupt":
+    if kwargs.get("timeout") == 600 and sys.argv[3] not in ("interrupt", "terminate"):
         kwargs["timeout"] = 0.3
     return original_run(*args, **kwargs)
 cleaner.subprocess.run = short_run
@@ -29,8 +33,10 @@ child = (
     "time.sleep(0.8); marker.write_text('continued after timeout'); time.sleep(10)"
 )
 command = shlex.quote(sys.executable) + " -c " + shlex.quote(child) + " & wait"
+previous_handler = signal.getsignal(signal.SIGTERM)
 freed, error = cleaner.delete_target({"cmd": command})
 assert freed == 0 and error, (freed, error)
+assert signal.getsignal(signal.SIGTERM) == previous_handler
 print("timeout reported", flush=True)
 '''
 
@@ -42,6 +48,15 @@ class TestCleanupProcessGroups(unittest.TestCase):
     def test_interrupt_stops_descendant_before_later_work(self):
         self.check_descendant("interrupt")
 
+    def test_termination_stops_descendant_before_later_work(self):
+        self.check_descendant("terminate")
+
+    def test_restores_signal_handler_after_launch_failure(self):
+        previous = signal.getsignal(signal.SIGTERM)
+        with mock.patch.object(cleaner.subprocess, "Popen", side_effect=OSError("fixture")):
+            self.assertIsNotNone(cleaner.delete_target({"cmd": "unused"})[1])
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+
     def check_descendant(self, mode):
         with tempfile.TemporaryDirectory() as td:
             record, marker = Path(td) / 'pid.json', Path(td) / 'late-write'
@@ -50,19 +65,22 @@ class TestCleanupProcessGroups(unittest.TestCase):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 start_new_session=True)
             try:
-                if mode == "interrupt":
+                if mode in ("interrupt", "terminate"):
                     deadline = time.monotonic() + 3
                     while not record.exists() and time.monotonic() < deadline:
                         time.sleep(0.01)
                     self.assertTrue(record.exists(), 'fixture child must have started')
-                    process.send_signal(signal.SIGINT)
+                    process.send_signal(signal.SIGINT if mode == "interrupt" else signal.SIGTERM)
                 out, err = process.communicate(timeout=4)
                 if mode == "timeout":
                     self.assertEqual(process.returncode, 0, err)
                     self.assertEqual(out.strip(), 'timeout reported')
                 else:
                     self.assertNotEqual(process.returncode, 0)
-                    self.assertIn('KeyboardInterrupt', err)
+                    if mode == 'interrupt':
+                        self.assertIn('KeyboardInterrupt', err)
+                    else:
+                        self.assertEqual(process.returncode, 143)
                 self.assertTrue(record.exists(), 'fixture child must have started')
                 time.sleep(1)
                 self.assertFalse(marker.exists(), 'cleanup continued after timeout or interruption')
