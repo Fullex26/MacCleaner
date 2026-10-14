@@ -2279,11 +2279,12 @@ def scan_projects(config, roots=None, min_age_days=None):
     worker = threading.Thread(target=discover, name="project-discovery", daemon=True)
     worker.start()
     worker.join(PROJECT_SCAN_TIME_BUDGET_S)
+    timed_out = worker.is_alive()
     with results_lock:
         stopped.set()
         hits = list(found.values())
         roots = list(roots)
-    if worker.is_alive():
+    if timed_out:
         print(f"Warning: project discovery stopped after {PROJECT_SCAN_TIME_BUDGET_S}s; "
               "results are partial", file=sys.stderr)
     elif errors:

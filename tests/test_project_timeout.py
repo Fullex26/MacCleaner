@@ -54,3 +54,13 @@ assert hits == []
                                     capture_output=True, text=True, timeout=3)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('partial', result.stderr)
+
+    def test_timeout_warning_survives_worker_exiting_on_cancellation(self):
+        stopped = threading.Event()
+        worker = mock.Mock()
+        worker.is_alive.side_effect = lambda: not stopped.is_set()
+        errors = io.StringIO()
+        with mock.patch.object(cleaner.threading, 'Event', return_value=stopped), mock.patch.object(cleaner.threading, 'Thread', return_value=worker), redirect_stderr(errors):
+            hits, roots, age = cleaner.scan_projects({'project_roots': [], 'project_git_check': False})
+        self.assertEqual(hits, [])
+        self.assertIn('partial', errors.getvalue())
