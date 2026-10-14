@@ -179,3 +179,5 @@ Swift read-only subprocess probes use `ReadOnlyProcess` for process-group deadli
 
 Configuration setting/category commands must lock `CONFIG_PATH.resolve()`, reload inside that lock, then mutate and save. Locking only the atomic write still loses other callers’ changes; locking the resolved destination keeps synced-config aliases on one transaction lock.
 Minimum-free dry runs share safe-only candidate filtering with execution, including explicit selections. Their candidate list is an upper bound, not a predicted stopping point: trash, command targets, overlaps, and filesystem allocation prevent predicting free-space changes. `target_met` and `free_bytes` describe the initial reading; ordinary dry-run behavior stays unchanged.
+
+Storage map loose-file rows must use `_disk_bytes(stat)` just like storage insights; `st_size` makes a 1 GiB sparse file appear under a zero-byte `du` parent. Keep minimum-size filtering on the same allocated-byte figure. `TestStorageMapAllocatedBytes` pins both behaviors with actual sparse temporary files.
