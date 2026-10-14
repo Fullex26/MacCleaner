@@ -202,3 +202,5 @@ Cleanup notification success counts include only `deleted` and `trashed`, never 
 Resolve SwiftPM executables with `swift build --show-bin-path` using the same configuration/architectures as the successful build. The current macOS toolchain uses `.build/out/Products/Release`, so a hardcoded `.build/apple/Products/Release` path can silently omit a successfully built soak engine.
 
 Only query/copy a Swift build output after that build succeeds. A failed compiler can leave an old executable at the expected path; existence alone does not prove it belongs to the current sources. Optional soak-engine failure must omit it and let app packaging continue.
+
+Path exclusions protect both named symlink entries and destinations (including resolved ancestors). Withhold a whole parent cleanup candidate when it contains an excluded descendant, even for empty-only sweeps. Do not let broad cache targets bypass narrower exclusions; Python and Swift must agree on filtered target presence as well as size.

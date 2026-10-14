@@ -9,6 +9,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+- Cleanup target selection honors excluded descendants as well as excluded parents, including lexical and resolved aliases across static and dynamic targets. Swift read-only selection follows the same exclusion policy.
+
 ---
 
 ## [2.18.0] — 2026-10-15
