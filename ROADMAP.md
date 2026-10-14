@@ -37,7 +37,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
-- [ ] **Clean up Swift probe descendants after shell exit** — an isolated compiled probe returned output while its background sleep remained alive. Terminate the read-only process group on every exit path, including successful shell completion.
+- [ ] **Clean up Swift probe descendants after shell exit** — an isolated compiled probe returned output while its background sleep remained alive. Terminate the read-only process group on every exit path, including successful shell completion. Implemented for the next release.
 - [ ] **Preserve failed Storage-map measurements** — injecting a `du` timeout into an existing temporary folder returned a zero total without `incomplete`, bypassing the app warning. Propagate failed or partial measurement status through map results and nested levels.
 - [ ] **Keep the newest Storage navigation result** — an isolated real-bridge harness completed `/fast` before an earlier `/slow`, then the older result replaced the new destination. Track request generations so stale completions cannot replace the map, error, or busy state.
 
