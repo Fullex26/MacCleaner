@@ -39,6 +39,8 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
+- [ ] **Serialize state transactions** — isolated competing processes lost one of two report entries and snapshot days, and both claimed the same low-disk notification. Protect each read/modify/write transaction with a bounded interprocess lock while retaining atomic JSON replacement. Implemented for the next release.
+
 - [ ] **Empty project selection must select nothing** — reproduced with a temporary project: `projects --targets "" --yes --dry-run` offered one artifact rather than zero, and the same truthiness gate controls real cleanup. Treat selector presence separately from its parsed IDs, matching the regular clean command. Implemented in #67, pending release.
 - [ ] **Readable Storage bars** — Jordan's screenshot shows tiny bars when `~/Library` dominates the home map; `StorageView` divides each row by the entire root total. Implemented for the next release: scale against the largest sibling, retain clamping, and pin the behavior in the app probe.
 

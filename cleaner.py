@@ -40,6 +40,8 @@ import subprocess
 import datetime
 import plistlib
 import threading
+import fcntl
+from contextlib import contextmanager
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -3589,6 +3591,28 @@ def show_categories(config, json_mode=False):
         print(f"{'='*72}\n")
 
 
+STATE_LOCK_TIMEOUT_S = 5.0
+
+
+@contextmanager
+def _state_transaction(path):
+    """Serialize a whole update across processes; never unlink the lock inode."""
+    with open(path.with_name(path.name + ".lock"), "a") as lock:
+        deadline = time.monotonic() + STATE_LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out waiting for {path.name} transaction")
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def _atomic_write_json(path: Path, data):
     """Dump JSON to a temp file beside `path`, then os.replace() it into place.
 
@@ -3618,17 +3642,11 @@ def write_log(total_freed: int, results: list):
         "disk_after": disk_free(),
         "items": results
     }
-    logs = []
-    if LOG_PATH.exists():
-        try:
-            with open(LOG_PATH) as f:
-                logs = json.load(f)
-        except Exception:
-            logs = []
-    logs.append(entry)
-    logs = logs[-50:]  # Keep last 50 runs
     try:
-        _atomic_write_json(LOG_PATH, logs)
+        with _state_transaction(LOG_PATH):
+            logs = _read_report_log()
+            logs.append(entry)
+            _atomic_write_json(LOG_PATH, logs[-50:])
     except Exception as e:
         print(f"Warning: could not write log: {e}", file=sys.stderr)
 
@@ -3806,13 +3824,14 @@ def record_snapshot(reclaimable_bytes=None, categories=None):
             "reclaimable_bytes": reclaimable_bytes,
             "categories": categories,
         }
-        snaps = load_snapshots()
-        if snaps and snaps[-1].get("ts", "")[:10] == entry["ts"][:10]:
-            snaps[-1] = entry
-        else:
-            snaps.append(entry)
-        snaps = snaps[-SNAPSHOT_CAP:]
-        _atomic_write_json(SNAPSHOTS_PATH, snaps)
+        with _state_transaction(SNAPSHOTS_PATH):
+            snaps = load_snapshots()
+            if snaps and snaps[-1].get("ts", "")[:10] == entry["ts"][:10]:
+                snaps[-1] = entry
+            else:
+                snaps.append(entry)
+            snaps = snaps[-SNAPSHOT_CAP:]
+            _atomic_write_json(SNAPSHOTS_PATH, snaps)
     except Exception as e:
         print(f"Warning: could not write snapshot: {e}", file=sys.stderr)
 
@@ -3955,31 +3974,38 @@ def run_disk_check(config, json_mode=False, post=True):
     free = ds["free_bytes"]
     enabled = config.get("low_disk_alerts", True)
 
-    alerts = load_alerts()
-    should_notify, state = _low_disk_decision(alerts, datetime.datetime.now(), free, threshold)
-    notified = False
-    # A decision that doesn't depend on posting a notification (still-above, or
-    # still-below-but-throttled) is accurate regardless of what happens below.
-    persist_state = not should_notify
-    if enabled and should_notify:
-        if post:
-            notified = _notify(
-                f"Low disk space: {fmt_size(free)} free",
-                f"Below your {fmt_size(threshold)} threshold — "
-                f"open MacCleaner to reclaim space.")
-            # Only stamp the throttle when the banner actually posted —
-            # otherwise a failed notification would suppress retries for the
-            # next 24h even though the user never saw anything (finding M5).
-            persist_state = notified
-        else:
-            # The caller is taking over delivery; claim the throttle slot
-            # so the launchd agent doesn't also fire for this same dip.
-            persist_state = True
-    if enabled and persist_state and alerts.get("low_disk") != state:
-        # Skip the write entirely when nothing changed, so an hourly agent
-        # isn't rewriting alerts.json every run for no reason (finding M3).
-        alerts["low_disk"] = state
-        save_alerts(alerts)
+    should_notify = notified = False
+    try:
+        with _state_transaction(ALERTS_PATH):
+            alerts = load_alerts()
+            should_notify, state = _low_disk_decision(alerts, datetime.datetime.now(), free, threshold)
+            notified = False
+            # A decision that doesn't depend on posting a notification (still-above, or
+            # still-below-but-throttled) is accurate regardless of what happens below.
+            persist_state = not should_notify
+            if enabled and should_notify:
+                if post:
+                    notified = _notify(
+                        f"Low disk space: {fmt_size(free)} free",
+                        f"Below your {fmt_size(threshold)} threshold — "
+                        f"open MacCleaner to reclaim space.")
+                    # Only stamp the throttle when the banner actually posted —
+                    # otherwise a failed notification would suppress retries for the
+                    # next 24h even though the user never saw anything (finding M5).
+                    persist_state = notified
+                else:
+                    # The caller is taking over delivery; claim the throttle slot
+                    # so the launchd agent doesn't also fire for this same dip.
+                    persist_state = True
+            if enabled and persist_state and alerts.get("low_disk") != state:
+                # Skip the write entirely when nothing changed, so an hourly agent
+                # isn't rewriting alerts.json every run for no reason (finding M3).
+                alerts["low_disk"] = state
+                save_alerts(alerts)
+    except (OSError, TimeoutError) as e:
+        # A contending caller must not claim a notification without the lock.
+        should_notify = False
+        print(f"Warning: could not update alert state: {e}", file=sys.stderr)
 
     result = {
         "free_bytes": free,
