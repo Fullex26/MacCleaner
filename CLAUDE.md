@@ -172,3 +172,5 @@ Persistent state updates require `_state_transaction(path)` around the entire re
 `projects --targets` must distinguish absence (`None`) from an explicitly empty string. The latter selects nothing in both cleanup and dry-run paths; never use truthiness to decide whether to apply the selection filter.
 
 Project discovery runs in a daemon with a 120-second deadline, including root validation. A stop event and result lock freeze candidates before sizing/git checks; a resumed filesystem operation must not publish more candidates after the timeout. The daemon only discovers paths and never deletes or writes state.
+
+Swift read-only subprocess probes use `ReadOnlyProcess` for process-group deadlines and file-backed stdout. Pass literal argument arrays; only generated estimate commands use `/bin/sh -c`. Match Python timeouts (process list 10s, parent lookup 5s, simctl 60s, Spotlight 5s). `tools/check_swift_process_deadlines.py` has an external backstop so an unbounded helper fails CI instead of hanging it.

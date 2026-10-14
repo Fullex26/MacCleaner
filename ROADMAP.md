@@ -39,6 +39,8 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
+- [ ] **Bound all Swift read-only subprocesses** — a controlled `ps` probe waited 11.3 seconds, exceeding Python's 10-second cap; `ps`, `simctl`, and Spotlight helpers have unbounded reads. Reuse the estimate runner's process-group deadline and file-backed output for these probes. The existing `du` deadline passed a descendant-output probe and is unchanged. Implemented for the next release.
+
 - [ ] **Bound project discovery itself** — a blocked `scandir` reproduction held `scan_projects` until the filesystem operation returned despite a requested short budget. Run root validation and the recursive discovery walk in a daemon with a deadline, retain completed candidates, and warn when results are partial. Implemented for the next release.
 - [ ] **Serialize state transactions** — isolated competing processes lost one of two report entries and snapshot days, and both claimed the same low-disk notification. Protect each read/modify/write transaction with a bounded interprocess lock while retaining atomic JSON replacement. Implemented for the next release.
 
