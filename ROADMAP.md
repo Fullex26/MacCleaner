@@ -39,7 +39,7 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
-- [ ] **Disambiguate project artifact IDs** — `foo-bar/node_modules` and `foo_bar/node_modules` produce the same slug; an explicit ID selects both and bypasses both git protections. Use stable path digests for colliding slugs and reject ambiguous legacy IDs.
+- [ ] **Disambiguate project artifact IDs** — `foo-bar/node_modules` and `foo_bar/node_modules` produce the same slug; an explicit ID selects both and bypasses both git protections. Use stable path digests for colliding slugs and reject ambiguous legacy IDs. Implemented for the next release.
 
 - [ ] **Bound project discovery itself** — a blocked `scandir` reproduction held `scan_projects` until the filesystem operation returned despite a requested short budget. Run root validation and the recursive discovery walk in a daemon with a deadline, retain completed candidates, and warn when results are partial. Implemented for the next release.
 - [ ] **Serialize state transactions** — isolated competing processes lost one of two report entries and snapshot days, and both claimed the same low-disk notification. Protect each read/modify/write transaction with a bounded interprocess lock while retaining atomic JSON replacement. Implemented for the next release.

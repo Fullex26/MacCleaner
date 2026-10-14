@@ -172,3 +172,5 @@ Persistent state updates require `_state_transaction(path)` around the entire re
 `projects --targets` must distinguish absence (`None`) from an explicitly empty string. The latter selects nothing in both cleanup and dry-run paths; never use truthiness to decide whether to apply the selection filter.
 
 Project discovery runs in a daemon with a 120-second deadline, including root validation. A stop event and result lock freeze candidates before sizing/git checks; a resumed filesystem operation must not publish more candidates after the timeout. The daemon only discovers paths and never deletes or writes state.
+
+Project artifact IDs must be unique across the discovered hit set. Every colliding slug gets a SHA-256 digest of its relative path; never assign suffixes by scan order or size, which could redirect a later explicit cleanup. The unsuffixed ambiguous ID is deliberately unknown, not an alias for the colliding group.
