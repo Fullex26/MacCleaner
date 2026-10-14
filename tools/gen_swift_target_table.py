@@ -36,7 +36,8 @@ def main():
             "    out.append({'id': t['id'], 'category': t['category'],\n"
             "                'label': t['label'], 'description': t['description'],\n"
             "                'safe': t['safe'], 'empty_only': t['empty_only'],\n"
-            "                'cmd': t['cmd'],\n"
+            "                'cmd': t['cmd'], 'estimate_cmd': t.get('estimate_cmd'),\n"
+            "                'estimate_parser': t.get('estimate_parser'),\n"
             "                'glob': str(t['glob']) if t.get('glob') else None,\n"
             "                'paths': [str(p) for p in (t.get('paths') or ([t['path']] if t.get('path') else []))]})\n"
             "print(json.dumps({'categories': {c: cleaner.CATEGORY_DESCRIPTIONS[c] for c in cleaner.ALL_CATEGORIES},\n"
@@ -74,13 +75,16 @@ def main():
     lines += ["]", "", "public let allTargets: [Target] = ["]
     for t in data["targets"]:
         paths = ", ".join(slit(rel(p)) for p in t["paths"])
+        estimate = (f", estimateCommand: {slit(t['estimate_cmd'])}, "
+                    f"estimateParser: {slit(t['estimate_parser'])}"
+                    if t['estimate_cmd'] else "")
         lines.append(
             f"    Target(id: {slit(t['id'])}, category: {slit(t['category'])}, "
             f"label: {slit(t['label'])}, desc: {slit(t['description'])}, "
             f"safe: {'true' if t['safe'] else 'false'}, "
             f"emptyOnly: {'true' if t['empty_only'] else 'false'}, "
             f"paths: [{paths}], glob: {slit(rel(t['glob']) if t['glob'] else None)}, "
-            f"cmd: {slit(t['cmd'])}),")
+            f"cmd: {slit(t['cmd'])}{estimate}),")
     lines.append("]")
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text("\n".join(lines) + "\n")

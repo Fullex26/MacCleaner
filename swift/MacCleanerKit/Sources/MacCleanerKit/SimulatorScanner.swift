@@ -103,8 +103,8 @@ public enum SimulatorScanner {
                 label: "Stale simulator devices (\(stale.count))",
                 desc: "Not booted in \(Int(staleDays))d: \(names)\(more) — deleted via simctl",
                 safe: false, emptyOnly: false, paths: [], glob: nil,
-                cmd: "xcrun simctl delete \(udids) 2>/dev/null || true"))
-            _ = staleBytes  // sizing surfaced via precomputed_bytes in Stage 3's soak wiring
+                cmd: "xcrun simctl delete \(udids) 2>/dev/null || true",
+                precomputedBytes: staleBytes))
         }
 
         guard let rt = simctlJSON(["runtime", "list"]) else { return targets }
@@ -139,7 +139,8 @@ public enum SimulatorScanner {
                 id: "simulator-unused-runtimes", category: "simulators",
                 label: "Unused simulator runtimes (\(ids.count))",
                 desc: "Runtime images with no simulator devices — re-downloadable in Xcode",
-                safe: false, emptyOnly: false, paths: [], glob: nil, cmd: cmd))
+                safe: false, emptyOnly: false, paths: [], glob: nil, cmd: cmd,
+                precomputedBytes: unused.reduce(Int64(0)) { $0 + (($1["sizeBytes"] as? NSNumber)?.int64Value ?? Int64($1["sizeBytes"] as? String ?? "") ?? 0) }))
         }
         return targets
     }
