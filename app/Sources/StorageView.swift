@@ -326,7 +326,7 @@ struct StorageBarScale {
     let maximum: Int
 
     init(map: StorageMapReport) {
-        maximum = map.total_bytes
+        maximum = map.children.map(\.size_bytes).max() ?? 0
     }
 
     func fraction(bytes: Int) -> Double {

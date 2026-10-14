@@ -39,7 +39,7 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
-- [ ] **Readable Storage bars** — Jordan's screenshot shows tiny bars when `~/Library` dominates the home map; `StorageView` divides each row by the entire root total. Scale against the largest sibling, retain clamping, and pin the behavior in the app probe.
+- [ ] **Readable Storage bars** — Jordan's screenshot shows tiny bars when `~/Library` dominates the home map; `StorageView` divides each row by the entire root total. Implemented for the next release: scale against the largest sibling, retain clamping, and pin the behavior in the app probe.
 
 - [x] **Shell completions** — hand-written zsh/bash completion for subcommands, flags, config keys, and live category/target IDs (`completions/`), installed by `install.sh` and shipped in the CLI tarball
 - [x] **Notifications** — macOS notification when a scheduled clean finishes (`clean --notify`) or an in-app clean completes, plus low-disk alerts (`disk-check`) when free space drops below a configurable threshold (default 10 GB, throttled to once a day)

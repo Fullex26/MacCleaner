@@ -49,6 +49,12 @@ struct LayoutProbe {
         checkBar("half largest", scale.fraction(bytes: 200), 0.5)
         checkBar("quarter largest", scale.fraction(bytes: 100), 0.25)
         checkBar("zero", scale.fraction(bytes: 0), 0)
+        let empty = StorageMapReport(root: "/fixture", total_bytes: 1000,
+                                     total_human: "fixture", category: "other", children: [])
+        checkBar("empty level", StorageBarScale(map: empty).fraction(bytes: 0), 0)
+        let zero = StorageMapReport(root: "/fixture", total_bytes: 0,
+                                    total_human: "fixture", category: "other", children: [entry(0)])
+        checkBar("zero level", StorageBarScale(map: zero).fraction(bytes: 0), 0)
 
         for (name, view) in sections {
             let host = NSHostingController(rootView: view.environmentObject(bridge))
