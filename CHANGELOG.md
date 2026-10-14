@@ -9,6 +9,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+- Command cleanup stops its owned process group on timeout, interruption, or app-requested shutdown. Launch-time signals are deferred until the child handle is supervised; the app allows one second for graceful termination before its hard-kill backstop.
+
 ---
 
 ## [2.18.0] — 2026-10-15

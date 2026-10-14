@@ -202,3 +202,9 @@ Cleanup notification success counts include only `deleted` and `trashed`, never 
 Resolve SwiftPM executables with `swift build --show-bin-path` using the same configuration/architectures as the successful build. The current macOS toolchain uses `.build/out/Products/Release`, so a hardcoded `.build/apple/Products/Release` path can silently omit a successfully built soak engine.
 
 Only query/copy a Swift build output after that build succeeds. A failed compiler can leave an old executable at the expected path; existence alone does not prove it belongs to the current sources. Optional soak-engine failure must omit it and let app packaging continue.
+
+Command cleanup owns a separate process group. On timeout or interruption, terminate that group and reap its shell before returning the error; killing the shell alone allows cleanup descendants to keep modifying storage after the caller reports failure. A separate session does not receive the caller’s Ctrl-C, so exceptional waits must clean up even for `KeyboardInterrupt`. The timeout remains 600 seconds and normal exit-code handling is unchanged. `TestCleanupProcessGroups` uses only a delayed temporary marker write.
+
+App engine timeout must send TERM and allow one second for cleanup to unwind before guarded SIGKILL. Command cleanup temporarily handles TERM on the main thread by raising `SystemExit(143)`, so the owned-group exception path runs; restore the previous handler even when launching fails. Never return to immediate TERM/KILL. The real-bridge probe also pins the hard-stop bound for a TERM-ignoring engine.
+
+Cleanup must defer launch-time SIGINT/SIGTERM until Popen has returned and the child handle is inside the group-cleanup try block. Raising from a handler during Popen can strand the newly created group; do not block signals with a mask that children inherit. Restore prior handlers on every exit.
