@@ -39,7 +39,7 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
-- [ ] **Honor project exclusions** — review reproduced `scan_projects` returning an artifact beneath a configured `skip_paths` prefix, contrary to the never-touch contract. Apply exclusions during discovery, including root aliases and artifact parents containing excluded descendants.
+- [ ] **Honor project exclusions** — review reproduced `scan_projects` returning an artifact beneath a configured `skip_paths` prefix, contrary to the never-touch contract. Apply exclusions during discovery, including root aliases and artifact parents containing excluded descendants. Implemented in #71, pending release.
 - [ ] **Disambiguate project artifact IDs** — `foo-bar/node_modules` and `foo_bar/node_modules` produce the same slug; an explicit ID selects both and bypasses both git protections. Use stable path digests for colliding slugs and reject ambiguous legacy IDs.
 - [ ] **Serialize configuration changes** — two stale config copies applying separate settings reverted `delete_mode` from Trash to permanent deletion. Reload and mutate under one transaction lock for each setting/category update.
 - [ ] **Align minimum-free previews** — an explicit review target appears in `--min-free --dry-run` even though the real minimum-free clean excludes it. Share the safe-only selection policy and preserve dry-run side-effect guarantees.

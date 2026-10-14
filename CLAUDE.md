@@ -172,3 +172,5 @@ Persistent state updates require `_state_transaction(path)` around the entire re
 `projects --targets` must distinguish absence (`None`) from an explicitly empty string. The latter selects nothing in both cleanup and dry-run paths; never use truthiness to decide whether to apply the selection filter.
 
 Project discovery runs in a daemon with a 120-second deadline, including root validation. A stop event and result lock freeze candidates before sizing/git checks; a resumed filesystem operation must not publish more candidates after the timeout. The daemon only discovers paths and never deletes or writes state.
+
+Project exclusions are resolved inside the bounded discovery worker. Skip directories under configured prefixes, and omit an entire artifact if it contains an excluded descendant: deleting the parent would otherwise bypass the exclusion. Resolve root aliases before comparing exclusions; omission applies equally to scanning, dry-run, and cleanup.
