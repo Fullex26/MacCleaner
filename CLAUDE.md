@@ -198,3 +198,5 @@ Command cleanup owns a separate process group. On timeout or interruption, termi
 
 App engine timeout must send TERM and allow one second for cleanup to unwind before guarded SIGKILL. Command cleanup temporarily handles TERM on the main thread by raising `SystemExit(143)`, so the owned-group exception path runs; restore the previous handler even when launching fails. Never return to immediate TERM/KILL. The real-bridge probe also pins the hard-stop bound for a TERM-ignoring engine.
 Legacy category-only arguments imply `scan`, including `--category=value`. Keep this fallback after explicit legacy modes (`--clean`, `--preview`, `--report`, config) so it cannot turn a requested command into a scan; argparse still validates the forwarded values.
+
+Cleanup notification success counts include only `deleted` and `trashed`, never every non-skipped status. Share `CleanResult.notificationBody` between selected and automatic cleanup, append failures/skips separately, and retain the engine’s freed-byte title because a failed item can partially reclaim space. The real-bridge capture probe must never post actual notifications.

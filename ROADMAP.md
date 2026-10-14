@@ -41,9 +41,10 @@ This document tracks planned features and long-term direction. Community input w
 
 - [ ] **Coordinate app timeout with cleanup shutdown** — an isolated probe matching the bridge’s immediate TERM/KILL sequence left a cleanup descendant writing after the engine exited. Give engine-owned cleanup a bounded graceful termination path before the app hard-kills a stuck engine. Implemented, pending owner review in #88.
 - [ ] **Bound doctor’s Homebrew bundle lookup** — a blocked `Path.glob` fixture in `_homebrew_cask_app` required external termination. Bound the entire read-only lookup and treat timeout as unknown ownership.
-- [ ] **Count cleanup outcomes accurately in app notifications** — an exact-bridge probe with an error-only response produced “1 items cleaned”. Count deleted/trashed items as successes and report failures separately.
 
 - [ ] **Stop cleanup descendants at timeout** — an isolated harmless command wrote a marker after `delete_target` returned a timeout error. Supervise command cleanup in its own process group and stop the group before reporting failure; deletion-path changes require owner review. Implemented, pending owner review.
+- [ ] **Count cleanup outcomes accurately in app notifications** — an exact-bridge probe with an error-only response produced “1 items cleaned”. Count deleted/trashed items as successes and report failures separately. Implemented for the next release.
+
 - [ ] **Honor standalone legacy category selection** — a parser-only probe shows documented `--category node` exits 2 while `--preview --category node` works. Translate the standalone spelling into a scan and pin repeatable/category-value variants. Implemented for the next release.
 
 - [ ] **Preserve failed Storage-map measurements** — injecting a du timeout into an existing temporary folder returned a zero total without the incomplete flag, bypassing the app warning. Propagate failed or partial measurement status through map results and nested levels. Implemented for the next release.
