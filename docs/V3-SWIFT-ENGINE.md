@@ -1,7 +1,7 @@
 # V3: Native Swift Engine — Migration Design
 
 **Status: stages 1–3 landed (read-only), plus Stage 4's guards. Stage 2's
-cmd-target estimates are implemented for the next release. Still open: Stage 4's
+cmd-target estimates shipped in v2.18.0. Still open: Stage 4's
 deletion callers and Stage 5's cutover.** This is the roadmap's
 "Full Swift rewrite of cleaner engine" item, deliberately staged rather than
 attempted as one rewrite. The Python engine is ~4,500 lines with 490+ tests
