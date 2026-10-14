@@ -14,11 +14,14 @@ import cleaner
 REPO = Path(__file__).resolve().parents[1]
 PROBE = r'''
 import cleaner
+import os
+from pathlib import Path
+import time
 import signal
 import shlex
 import subprocess
 import sys
-cleaner.CLEANUP_TIMEOUT_S = 600 if sys.argv[3] in ("interrupt", "terminate") else 0.3
+cleaner.CLEANUP_TIMEOUT_S = 600 if sys.argv[3] != "timeout" else 0.3
 original_run = subprocess.run
 def short_run(*args, **kwargs):
     if kwargs.get("timeout") == 600 and sys.argv[3] not in ("interrupt", "terminate"):
@@ -33,6 +36,17 @@ child = (
     "time.sleep(0.8); marker.write_text('continued after timeout'); time.sleep(10)"
 )
 command = shlex.quote(sys.executable) + " -c " + shlex.quote(child) + " & wait"
+if sys.argv[3].endswith("-launch"):
+    original_popen = subprocess.Popen
+    def interrupt_launch(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        deadline = time.monotonic() + 3
+        while not Path(sys.argv[1]).exists() and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert Path(sys.argv[1]).exists(), "fixture child must start"
+        os.kill(os.getpid(), signal.SIGINT if sys.argv[3] == "interrupt-launch" else signal.SIGTERM)
+        return process
+    cleaner.subprocess.Popen = interrupt_launch
 previous_handler = signal.getsignal(signal.SIGTERM)
 freed, error = cleaner.delete_target({"cmd": command})
 assert freed == 0 and error, (freed, error)
@@ -50,6 +64,12 @@ class TestCleanupProcessGroups(unittest.TestCase):
 
     def test_termination_stops_descendant_before_later_work(self):
         self.check_descendant("terminate")
+
+    def test_interrupt_during_launch_stops_descendant(self):
+        self.check_descendant("interrupt-launch")
+
+    def test_termination_during_launch_stops_descendant(self):
+        self.check_descendant("terminate-launch")
 
     def test_restores_signal_handler_after_launch_failure(self):
         previous = signal.getsignal(signal.SIGTERM)
@@ -77,7 +97,7 @@ class TestCleanupProcessGroups(unittest.TestCase):
                     self.assertEqual(out.strip(), 'timeout reported')
                 else:
                     self.assertNotEqual(process.returncode, 0)
-                    if mode == 'interrupt':
+                    if mode.startswith('interrupt'):
                         self.assertIn('KeyboardInterrupt', err)
                     else:
                         self.assertEqual(process.returncode, 143)

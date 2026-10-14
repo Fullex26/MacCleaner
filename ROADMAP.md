@@ -37,6 +37,8 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
+- [ ] **Close the cleanup launch interruption window** — delivering TERM after child creation but before Popen returns leaves a descendant writing after the engine exits. Defer launch-time INT/TERM until the child handle is covered by group cleanup; part of owner-reviewed #88.
+
 - [ ] **Coordinate app timeout with cleanup shutdown** — an isolated probe matching the bridge’s immediate TERM/KILL sequence left a cleanup descendant writing after the engine exited. Give engine-owned cleanup a bounded graceful termination path before the app hard-kills a stuck engine. Implemented, pending owner review in #88.
 - [ ] **Bound doctor’s Homebrew bundle lookup** — a blocked `Path.glob` fixture in `_homebrew_cask_app` required external termination. Bound the entire read-only lookup and treat timeout as unknown ownership.
 - [ ] **Count cleanup outcomes accurately in app notifications** — an exact-bridge probe with an error-only response produced “1 items cleaned”. Count deleted/trashed items as successes and report failures separately.
