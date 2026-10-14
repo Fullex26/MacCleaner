@@ -14,10 +14,10 @@ import cleaner
 import shlex
 import subprocess
 import sys
-cleaner.CLEANUP_TIMEOUT_S = 0.3
+cleaner.CLEANUP_TIMEOUT_S = 600 if sys.argv[3] == "interrupt" else 0.3
 original_run = subprocess.run
 def short_run(*args, **kwargs):
-    if kwargs.get("timeout") == 600:
+    if kwargs.get("timeout") == 600 and sys.argv[3] != "interrupt":
         kwargs["timeout"] = 0.3
     return original_run(*args, **kwargs)
 cleaner.subprocess.run = short_run
@@ -37,19 +37,35 @@ print("timeout reported", flush=True)
 
 class TestCleanupProcessGroups(unittest.TestCase):
     def test_timeout_stops_descendant_before_later_work(self):
+        self.check_descendant("timeout")
+
+    def test_interrupt_stops_descendant_before_later_work(self):
+        self.check_descendant("interrupt")
+
+    def check_descendant(self, mode):
         with tempfile.TemporaryDirectory() as td:
             record, marker = Path(td) / 'pid.json', Path(td) / 'late-write'
             process = subprocess.Popen(
-                [sys.executable, '-c', PROBE, str(record), str(marker)], cwd=REPO,
+                [sys.executable, '-c', PROBE, str(record), str(marker), mode], cwd=REPO,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 start_new_session=True)
             try:
+                if mode == "interrupt":
+                    deadline = time.monotonic() + 3
+                    while not record.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(record.exists(), 'fixture child must have started')
+                    process.send_signal(signal.SIGINT)
                 out, err = process.communicate(timeout=4)
-                self.assertEqual(process.returncode, 0, err)
-                self.assertEqual(out.strip(), 'timeout reported')
+                if mode == "timeout":
+                    self.assertEqual(process.returncode, 0, err)
+                    self.assertEqual(out.strip(), 'timeout reported')
+                else:
+                    self.assertNotEqual(process.returncode, 0)
+                    self.assertIn('KeyboardInterrupt', err)
                 self.assertTrue(record.exists(), 'fixture child must have started')
                 time.sleep(1)
-                self.assertFalse(marker.exists(), 'cleanup continued after reporting timeout')
+                self.assertFalse(marker.exists(), 'cleanup continued after timeout or interruption')
                 pid, _ = json.loads(record.read_text())
                 state = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='],
                                        capture_output=True, text=True, timeout=2)
