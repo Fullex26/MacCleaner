@@ -36,16 +36,8 @@ public enum SimulatorScanner {
     /// `xcrun simctl <args> -j`, parsed; nil on any failure — callers
     /// degrade to no targets, matching how a missing docker degrades.
     static func simctlJSON(_ args: [String]) -> Any? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = ["xcrun", "simctl"] + args + ["-j"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else { return nil }
+        guard let output = ReadOnlyProcess.run(["xcrun", "simctl"] + args + ["-j"], timeout: 60),
+              let data = output.data(using: .utf8) else { return nil }
         return try? JSONSerialization.jsonObject(with: data)
     }
 
