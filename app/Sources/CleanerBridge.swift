@@ -194,6 +194,14 @@ struct StorageMapReport: Codable {
     let total_human: String
     let category: String
     let children: [StorageMapEntry]
+    var incomplete: Bool? = nil
+
+    var totalLabel: String { incomplete == true ? "Total unavailable" : total_human }
+    var measurementWarning: String? {
+        incomplete == true
+            ? "Measurement incomplete. Some items could not be read before the scan timed out. Try refreshing."
+            : nil
+    }
 }
 
 struct DiskCheckReport: Codable {
@@ -764,13 +772,17 @@ final class CleanerBridge: ObservableObject {
         if let path { args.append(path) }
         args.append("--json")
         do {
-            storageMap = try await run(StorageMapReport.self, args)
-            storageMapError = nil
+            acceptStorageMap(try await run(StorageMapReport.self, args))
         } catch {
             // Leave any previously loaded level on screen rather than blanking
             // the browser out from under the user.
             storageMapError = error.localizedDescription
         }
+    }
+
+    func acceptStorageMap(_ report: StorageMapReport) {
+        storageMap = report
+        storageMapError = report.measurementWarning
     }
 
     /// Moves one item to the Trash. Deliberately NOT the cleanup engine's
