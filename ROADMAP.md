@@ -37,7 +37,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
-- [ ] **Preserve configuration on failed sync transitions** — injected write/link failures during sync-off and both sync-on branches remove the active config, silently changing Trash mode back to permanent deletion. Commit the local binding atomically only after its replacement is ready.
+- [ ] **Preserve configuration on failed sync transitions** — injected write/link failures during sync-off and both sync-on branches remove the active config, silently changing Trash mode back to permanent deletion. Commit the local binding atomically only after its replacement is ready. Implemented for the next release.
 
 - [ ] **Honor standalone legacy category selection** — a parser-only probe shows documented `--category node` exits 2 while `--preview --category node` works. Translate the standalone spelling into a scan and pin repeatable/category-value variants. Implemented for the next release.
 

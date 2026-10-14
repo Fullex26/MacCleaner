@@ -9,8 +9,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
-### Regression coverage
-- Config sync failures must preserve the active settings and Trash mode.
+### Fixed
+- Failed config sync transitions preserve the active settings, including Trash mode, until the new local binding can be committed atomically.
 
 ### Fixed
 - Standalone legacy `--category` now selects a scan as documented, including equals and repeated forms. Explicit legacy command modes retain precedence and malformed values still fail argument validation.

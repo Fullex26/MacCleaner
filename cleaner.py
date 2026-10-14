@@ -353,14 +353,13 @@ def _run_config_sync(action, json_mode=False):
             # iCloud copy wins; keep the local settings recoverable beside it.
             if local_is_file:
                 shutil.copy2(CONFIG_PATH, CONFIG_PATH.parent / (CONFIG_PATH.name + ".pre-sync.bak"))
-                CONFIG_PATH.unlink()
-        elif local_is_file:
-            shutil.move(str(CONFIG_PATH), str(icloud_cfg))
         else:
             _atomic_write_json(icloud_cfg, load_config())
-        if CONFIG_PATH.is_symlink():
-            CONFIG_PATH.unlink()
-        os.symlink(str(icloud_cfg), str(CONFIG_PATH))
+        # Keep the active binding until its complete replacement is ready.
+        with tempfile.TemporaryDirectory(dir=CONFIG_PATH.parent, prefix=".config-sync-") as td:
+            link = Path(td) / "config.json"
+            os.symlink(str(icloud_cfg), str(link))
+            os.replace(link, CONFIG_PATH)
         print(f"Config sync on — settings now live in iCloud Drive:\n  {icloud_cfg}")
         return state()
 
@@ -369,7 +368,6 @@ def _run_config_sync(action, json_mode=False):
             print("Config sync is not on — nothing to do.")
             return state()
         current = load_config()
-        CONFIG_PATH.unlink()
         _atomic_write_json(CONFIG_PATH, current)
         print("Config sync off — settings are local again "
               "(the iCloud copy remains for other Macs).")
