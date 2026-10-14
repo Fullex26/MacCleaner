@@ -199,3 +199,4 @@ Storage navigation requests can overlap across async suspension. Only the curren
 Storage-map completeness includes the du measurement, not only directory enumeration. A timeout, nonzero du exit, or missing root-total row must mark the result incomplete; preserve usable partial rows and propagate nested failures to the parent. A valid zero root row is complete. Keep the mount boundary flag and the private two-value sizing return compatible.
 
 Legacy category-only arguments imply `scan`, including `--category=value`. Keep this fallback after explicit legacy modes (`--clean`, `--preview`, `--report`, config) so it cannot turn a requested command into a scan; argparse still validates the forwarded values.
+Doctor’s Homebrew cask ownership lookup also runs inside the read-only discovery deadline: globbing version directories or resolving a bundle link may stall. Timeout means unknown ownership (`None`), never a reason to remove or rewrite an installation.

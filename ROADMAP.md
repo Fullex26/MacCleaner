@@ -37,7 +37,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
-- [ ] **Bound doctor’s Homebrew bundle lookup** — a blocked `Path.glob` fixture in `_homebrew_cask_app` required external termination. Bound the entire read-only lookup and treat timeout as unknown ownership.
+- [ ] **Bound doctor’s Homebrew bundle lookup** — a blocked `Path.glob` fixture in `_homebrew_cask_app` required external termination. Bound the entire read-only lookup and treat timeout as unknown ownership. Implemented in #78, pending owner review.
 
 - [ ] **Bound remaining read-only directory walks (pending owner review)** — Injected blocked enumeration reproduces indefinite waits in tmp discovery, installed-app inventory, leftovers, dynamic logs, Storage map, and the System temp advisory. Four further probes reproduced blocked glob expansion and empty-only pre-enumeration in measurement, preview, and cleanup. Bound filesystem discovery itself while supervising subprocesses and deletion on the caller; an incomplete installed-app inventory must suppress leftover candidates.
 - [ ] **Honor standalone legacy category selection** — a parser-only probe shows documented `--category node` exits 2 while `--preview --category node` works. Translate the standalone spelling into a scan and pin repeatable/category-value variants. Implemented for the next release.

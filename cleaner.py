@@ -2976,6 +2976,10 @@ def _installed_app_bundles():
 
 
 def _homebrew_cask_app():
+    return _read_only_scan(_find_homebrew_cask_app, None, "Homebrew cask lookup")
+
+
+def _find_homebrew_cask_app():
     """The MacCleaner.app the Homebrew cask manages, or None.
 
     Homebrew leaves a `<Caskroom>/maccleaner/<version>/MacCleaner.app`
