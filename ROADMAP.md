@@ -37,7 +37,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
-- [ ] **Serialize config sync transitions with setting writes** — A deterministic temporary-file reproduction showed sync-off restoring `delete_mode: rm` after a concurrent setter successfully selected Trash mode. Lock the local binding as well as shared destinations so sync-on/off cannot race preference writes.
+- [x] **Serialize config sync transitions with setting writes (pending release)** — A deterministic temporary-file reproduction showed sync-off restoring `delete_mode: rm` after a concurrent setter successfully selected Trash mode. Lock the local binding as well as shared destinations so sync-on/off cannot race preference writes.
 
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
