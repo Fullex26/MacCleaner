@@ -39,7 +39,7 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
-- [ ] **Protect exclusions from ancestor cleanup** — a temporary dry-run offered `.npm/_cacache` containing an excluded file, and `general-caches` offered an explicitly excluded pip cache. Conservatively withhold overlapping parent targets, including broad sweeps, and share the filtering across concrete paths and read-only Swift scans. Implemented for the next release.
+- [ ] **Protect exclusions from ancestor cleanup** — a temporary dry-run offered `.npm/_cacache` containing an excluded file, and `general-caches` offered an explicitly excluded pip cache. Conservatively withhold overlapping parent targets, including broad sweeps, and share the filtering across concrete paths and read-only Swift scans. A temporary log-folder regression also reproduced the same bypass in dynamically discovered logs. Implemented for the next release.
 
 - [ ] **Honor project exclusions** — review reproduced `scan_projects` returning an artifact beneath a configured `skip_paths` prefix, contrary to the never-touch contract. Apply exclusions during discovery, including root aliases and artifact parents containing excluded descendants. Implemented in #71, pending release.
 - [ ] **Disambiguate project artifact IDs** — `foo-bar/node_modules` and `foo_bar/node_modules` produce the same slug; an explicit ID selects both and bypasses both git protections. Use stable path digests for colliding slugs and reject ambiguous legacy IDs.

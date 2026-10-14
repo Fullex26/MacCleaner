@@ -53,3 +53,14 @@ class TestExclusionOverlap(unittest.TestCase):
             (cache / 'keep').symlink_to(destination, target_is_directory=True)
             target = {'path': cache, 'skip': [str(cache / 'keep')]}
             self.assertEqual(cleaner._target_paths(target), [])
+
+    def test_dynamic_log_target_respects_excluded_descendant(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            log = home / 'Library/Logs/Protected'
+            log.mkdir(parents=True)
+            (log / 'keep').write_bytes(b'x' * 4096)
+            config = {**cleaner.DEFAULT_CONFIG, 'enabled_categories': ['logs'],
+                      'log_threshold_mb': 0, 'skip_paths': [str(log / 'keep')]}
+            with mock.patch.object(cleaner, 'HOME', home):
+                self.assertEqual(cleaner.get_targets(config), [])

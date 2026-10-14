@@ -10,7 +10,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ## [Unreleased]
 
 ### Fixed
-- Path exclusions now also withhold parent cleanup targets that could remove an excluded descendant, including broad cache sweeps, glob matches, temporary builds, and app leftovers. Python and read-only Swift scans preserve both symlink entry and destination exclusions.
+- Path exclusions now also withhold parent cleanup targets that could remove an excluded descendant, including broad cache sweeps, glob matches, temporary builds, app leftovers, and dynamic log folders. Python and read-only Swift scans preserve both symlink entry and destination exclusions.
 - Project discovery now honors `skip_paths`, including roots reached through symlink aliases. Artifacts containing an excluded descendant are omitted entirely, so cleanup cannot remove that descendant through its parent.
 - Swift process-list, parent-process, simulator, and Spotlight probes now use bounded process-group execution with file-backed output and Python-equivalent deadlines. The shared runner remains internal and read-only.
 - Project directory discovery now has a 120-second daemon deadline, including root validation. A blocked filesystem read returns candidates already discovered with a partial-results warning instead of hanging the CLI; sizing and git checks retain their existing subprocess bounds.

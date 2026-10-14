@@ -907,6 +907,8 @@ def get_targets(config, all_categories=False):
     log_dir = HOME / "Library/Logs"
     if "logs" in enabled and log_dir.exists():
         for item in sorted(log_dir.iterdir()):
+            if _path_overlaps_exclusion(item, skip):
+                continue
             size = get_size(item)
             if size > threshold:
                 targets.append({
@@ -915,6 +917,7 @@ def get_targets(config, all_categories=False):
                     "label": f"Log: {item.name}",
                     "description": f"Oversized log folder (>{config.get('log_threshold_mb', 100)} MB)",
                     "path": item,
+                    "skip": [str(s) for s in sorted(skip)],
                     "glob": None,
                     "safe": True,
                     "cmd": None,
