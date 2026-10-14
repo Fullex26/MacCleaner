@@ -43,7 +43,7 @@ import datetime
 import plistlib
 import threading
 import fcntl
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -281,7 +281,33 @@ def _icloud_config_dir():
     return HOME / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "MacCleaner"
 
 
+@contextmanager
+def _config_transaction(extra_paths=()):
+    # Lock the local binding before resolving it: sync on/off can replace the
+    # leaf while setting writers wait. Shared destinations also serialize
+    # callers using different local symlinks to the same configuration.
+    local = CONFIG_PATH.parent.resolve() / CONFIG_PATH.name
+    with _state_transaction(local):
+        destinations = {CONFIG_PATH.resolve(), *(p.resolve() for p in extra_paths)} - {local}
+        with ExitStack() as locks:
+            for destination in sorted(destinations):
+                locks.enter_context(_state_transaction(destination))
+            yield
+
+
 def run_config_sync(action, json_mode=False):
+    if action not in ("on", "off"):
+        return _run_config_sync(action, json_mode)
+    extra = ()
+    if action == "on":
+        directory = _icloud_config_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        extra = (directory / "config.json",)
+    with _config_transaction(extra):
+        return _run_config_sync(action, json_mode)
+
+
+def _run_config_sync(action, json_mode=False):
     """`config sync on|off|status` — keep config.json in iCloud Drive with a
     symlink at CONFIG_PATH, so the CLI, the app, and the launchd agents all
     read and write the shared copy unchanged.
@@ -1176,7 +1202,7 @@ def cmd_config_set_category(cfg, action, category):
     if category not in ALL_CATEGORIES:
         print(f"Unknown category '{category}'. Valid: {', '.join(ALL_CATEGORIES)}", file=sys.stderr)
         sys.exit(1)
-    with _state_transaction(CONFIG_PATH.resolve()):
+    with _config_transaction():
         cfg.clear()
         cfg.update(load_config())
         cats = cfg["enabled_categories"]
@@ -1200,7 +1226,7 @@ def cmd_config_set_key(cfg, key, value):
         parsed = json.loads(value)
     except json.JSONDecodeError:
         parsed = value
-    with _state_transaction(CONFIG_PATH.resolve()):
+    with _config_transaction():
         cfg.clear()
         cfg.update(load_config())
         cfg[key] = parsed

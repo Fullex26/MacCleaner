@@ -38,6 +38,7 @@ This document tracks planned features and long-term direction. Community input w
 ## Next — v2.x Ideas
 
 - [x] **Bound remaining read-only directory walks (pending release)** — Injected blocked enumeration reproduces indefinite waits in tmp discovery, installed-app inventory, leftovers, dynamic logs, Storage map, and the System temp advisory. Four further probes reproduced blocked glob expansion and empty-only pre-enumeration in measurement, preview, and cleanup. Bound filesystem discovery itself while supervising subprocesses and deletion on the caller; an incomplete installed-app inventory must suppress leftover candidates.
+- [x] **Serialize config sync transitions with setting writes (pending release)** — A deterministic temporary-file reproduction showed sync-off restoring `delete_mode: rm` after a concurrent setter successfully selected Trash mode. Lock the local binding as well as shared destinations so sync-on/off cannot race preference writes.
 
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
