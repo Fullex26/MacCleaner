@@ -45,6 +45,16 @@ struct CleanResult: Codable {
     let freed_human: String
     let disk_after: String?
     let items: [CleanItem]
+
+    var notificationBody: String {
+        let cleaned = items.filter { $0.status == "deleted" || $0.status == "trashed" }.count
+        let failed = items.filter { $0.status == "error" }.count
+        let skipped = items.filter { $0.status == "skipped" }.count
+        var parts = ["\(cleaned) \(cleaned == 1 ? "item" : "items") cleaned"]
+        if failed > 0 { parts.append("\(failed) failed") }
+        if skipped > 0 { parts.append("\(skipped) skipped") }
+        return parts.joined(separator: " · ")
+    }
 }
 
 /// `null` when git status couldn't be determined (not a repo, `git` missing,
@@ -694,7 +704,7 @@ final class CleanerBridge: ObservableObject {
             if notificationsEnabled, let result = lastClean {
                 NotificationManager.shared.post(
                     title: "MacCleaner freed \(result.freed_human)",
-                    body: "\(result.items.filter { $0.status != "skipped" }.count) items cleaned")
+                    body: result.notificationBody)
             }
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
@@ -732,7 +742,7 @@ final class CleanerBridge: ObservableObject {
             if notificationsEnabled, let result = lastClean {
                 NotificationManager.shared.post(
                     title: "MacCleaner freed \(result.freed_human)",
-                    body: "\(result.items.filter { $0.status != "skipped" }.count) items cleaned")
+                    body: result.notificationBody)
             }
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
