@@ -179,3 +179,5 @@ Swift read-only subprocess probes use `ReadOnlyProcess` for process-group deadli
 
 Configuration setting/category commands must lock `CONFIG_PATH.resolve()`, reload inside that lock, then mutate and save. Locking only the atomic write still loses other callers’ changes; locking the resolved destination keeps synced-config aliases on one transaction lock.
 Minimum-free dry runs share safe-only candidate filtering with execution, including explicit selections. Their candidate list is an upper bound, not a predicted stopping point: trash, command targets, overlaps, and filesystem allocation prevent predicting free-space changes. `target_met` and `free_bytes` describe the initial reading; ordinary dry-run behavior stays unchanged.
+
+Empty-only targets must refuse a symlink leaf before enumerating children. `_safe_to_delete` deliberately permits an in-home symlink leaf because unlinking it is safe, but `iterdir()` follows it; a `Library/Caches -> ~` link can otherwise offer personal files for removal. Refuse without removing the link, and mirror that behavior in dry-run. `TestEmptyOnlySymlinks` covers both general caches and Trash in both deletion modes.

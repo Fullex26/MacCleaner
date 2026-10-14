@@ -10,6 +10,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ## [Unreleased]
 
 ### Fixed
+- Empty-only cleanup refuses symlink roots instead of following them into unrelated personal files. Both the link and its destination remain untouched; dry-run likewise omits destination children. This covers general caches and Trash.
 - Concurrent setting and category changes now reload and update the configuration under a transaction lock, so a stale caller cannot undo another preference such as Trash mode. Synced configuration symlinks remain intact and share the destination lock.
 - Minimum-free dry runs now apply the execution path’s safe-only selection and return no candidates when the floor is already met. Additive JSON metadata and preview wording identify eligible candidates as an upper bound; execution may stop earlier. Invalid minimum-free thresholds fail before scanning.
 - Colliding project artifact slugs now receive stable path-digest suffixes, so selecting one artifact cannot select a different project with the same normalized name. Ambiguous old IDs are rejected; non-colliding IDs stay unchanged.

@@ -37,7 +37,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
-- [ ] **Refuse symlink roots for empty-only cleanup** — An isolated fixture with `Library/Caches` linked to home made cleanup attempt personal-file removals and made dry-run list those files. Reject symlink roots before enumeration for general caches and Trash; preserve both link and destination.
+- [x] **Refuse symlink roots for empty-only cleanup (pending release)** — An isolated fixture with `Library/Caches` linked to home made cleanup attempt personal-file removals and made dry-run list those files. Reject symlink roots before enumeration for general caches and Trash; preserve both link and destination.
 
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
