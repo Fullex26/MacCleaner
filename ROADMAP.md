@@ -39,6 +39,8 @@ This document tracks planned features and long-term direction. Community input w
 
 > Incremental improvements on the v2.0 foundation. A few of these pull forward items from the phases below.
 
+- [ ] **Serialize state transactions** — isolated competing processes lost one of two report entries and snapshot days, and both claimed the same low-disk notification. Protect each read/modify/write transaction with a bounded interprocess lock while retaining atomic JSON replacement.
+
 - [ ] **Readable Storage bars** — Jordan's screenshot shows tiny bars when `~/Library` dominates the home map; `StorageView` divides each row by the entire root total. Implemented for the next release: scale against the largest sibling, retain clamping, and pin the behavior in the app probe.
 
 - [ ] **V3 command-target estimates** — implemented for the next release: strict stub-tool parity reproduced 15 field divergences, including four zero estimates and discarded simulator sizes. The read-only kit now carries generated estimate metadata, bounded execution, and full command-target size/existence parity.
