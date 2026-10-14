@@ -2273,8 +2273,12 @@ def scan_projects(config, roots=None, min_age_days=None):
 
     def discover():
         try:
-            skip.extend(Path(os.path.expanduser(p)).resolve()
-                        for p in config.get("skip_paths", []))
+            for raw in config.get("skip_paths", []):
+                prefix = Path(os.path.abspath(os.path.expanduser(raw)))
+                # Protect both the named entry and its destination when the
+                # exclusion itself is a symlink.
+                skip.extend((prefix, prefix.parent.resolve() / prefix.name,
+                             prefix.resolve()))
             for r in root_strs:
                 if stopped.is_set():
                     return

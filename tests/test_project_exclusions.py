@@ -21,6 +21,11 @@ class TestProjectExclusions(unittest.TestCase):
                 (project / 'package.json').write_text('{}')
                 (project / 'node_modules' / 'data').write_bytes(b'x' * 4096)
             excluded = protected if exclusion == 'project' else protected / 'node_modules' / 'data'
+            if exclusion == 'symlink':
+                shared = home / 'shared'
+                shared.mkdir()
+                excluded = protected / 'node_modules' / 'keep'
+                excluded.symlink_to(shared, target_is_directory=True)
             config = root / 'config.json'
             config.write_text(json.dumps({'skip_paths': [str(excluded)], 'project_git_check': False}))
             scan_root = home / 'projects'
@@ -41,6 +46,8 @@ class TestProjectExclusions(unittest.TestCase):
                 self.assertTrue((protected / 'node_modules' / 'data').exists())
                 self.assertFalse((allowed / 'node_modules').exists())
                 self.assertEqual(len(data['items']), 1)
+                if exclusion == 'symlink':
+                    self.assertTrue(excluded.is_symlink())
             else:
                 self.assertEqual(len(data['artifacts']), 1)
                 self.assertEqual(Path(data['artifacts'][0]['project']).name, 'allowed')
@@ -53,3 +60,6 @@ class TestProjectExclusions(unittest.TestCase):
 
     def test_root_alias_cannot_bypass_project_exclusion(self):
         self.run_case('project', alias=True)
+
+    def test_excluded_symlink_entry_protects_its_artifact_parent(self):
+        self.run_case('symlink', clean=True)
