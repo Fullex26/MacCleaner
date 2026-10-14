@@ -1,6 +1,6 @@
 # AGENTS.md — MacCleaner machine interface
 
-MacCleaner is a macOS developer storage cleanup tool: it scans 94 known cache/artifact locations across 23 categories (Xcode, Docker, npm, pip, Homebrew, AI model caches, Flutter, PHP, VMs, ...) plus stale per-project build artifacts, stale build litter left under `/private/tmp`, unused iOS simulator devices/runtimes, and orphaned per-app leftovers under `~/Library` from apps you've already uninstalled, reports sizes, and deletes what you select. The engine is a single stdlib-only Python 3 script. Entry point: `python3 cleaner.py` from a repo checkout, or `maccleaner` (shell alias) / `python3 ~/mac-cleaner/cleaner.py` after `install.sh`. Every data command takes `--json`; that JSON interface is the contract this document specifies (the bundled macOS app is just another client of it). Current version: 2.17.3. As of 2.4.0, `install.sh` also wires up zsh/bash shell completions (`completions/_maccleaner`, `completions/maccleaner.bash`) and the CLI tarball ships them too — a human-facing convenience only, it doesn't change any of the JSON below.
+MacCleaner is a macOS developer storage cleanup tool: it scans 94 known cache/artifact locations across 23 categories (Xcode, Docker, npm, pip, Homebrew, AI model caches, Flutter, PHP, VMs, ...) plus stale per-project build artifacts, stale build litter left under `/private/tmp`, unused iOS simulator devices/runtimes, and orphaned per-app leftovers under `~/Library` from apps you've already uninstalled, reports sizes, and deletes what you select. The engine is a single stdlib-only Python 3 script. Entry point: `python3 cleaner.py` from a repo checkout, or `maccleaner` (shell alias) / `python3 ~/mac-cleaner/cleaner.py` after `install.sh`. Every data command takes `--json`; that JSON interface is the contract this document specifies (the bundled macOS app is just another client of it). Current version: 2.18.0. As of 2.4.0, `install.sh` also wires up zsh/bash shell completions (`completions/_maccleaner`, `completions/maccleaner.bash`) and the CLI tarball ships them too — a human-facing convenience only, it doesn't change any of the JSON below.
 
 ## 1. Quick recipes
 
@@ -80,7 +80,7 @@ Flag details:
 - `config show` always prints JSON (no `--json` flag needed). `config path` prints the config file path.
 - `schedule` (new in 2.3.0) takes exactly one positional `action` — `status`, `weekly`, `monthly`, or `off`; anything else is an argparse usage error, exit 2. `status` is read-only. `weekly`/`monthly` (re)install both launchd agents, replacing any existing schedule, and migrate a legacy cron entry the first time either runs. `off` unloads both agents (and strips a legacy cron entry) whether or not anything was installed. `scheduler.sh weekly|monthly|remove|status` is now a thin `exec`-based wrapper over `schedule weekly|monthly|off|status` — same behavior, same exit codes.
 
-- `clean --min-free GB` (2.16.0) cleans **safe targets only, largest first, and stops the moment free space reaches the threshold** — built for agents under a fail-closed disk floor: free just enough to clear the floor instead of sweeping every cache. Requires `--yes` (an until-threshold clean is unattended by nature; exit 1 without it). Review targets are never touched, `--targets` is ignored in this mode's selection (safe tier only), and the JSON adds `min_free_gb`, `target_met` (honest: exhausting every safe target without reaching the floor is `false`), and `free_bytes`. Threshold unit is GiB (1024³), matching `low_disk_threshold_gb`.
+- `clean --min-free GB` (2.16.0) cleans **safe targets only, largest first, and stops the moment free space reaches the threshold** — built for agents under a fail-closed disk floor: free just enough to clear the floor instead of sweeping every cache. Requires `--yes` (an until-threshold clean is unattended by nature; exit 1 without it). Review targets are never touched, `--targets` still narrows the candidates before the safe-only filter, and the JSON adds `min_free_gb`, `target_met` (honest: exhausting every safe target without reaching the floor is `false`), and `free_bytes`. Threshold unit is GiB (1024³), matching `low_disk_threshold_gb`. Values must be finite, non-negative, and convertible to a finite byte threshold; invalid values fail with exit 2 before discovery. Zero is accepted. With `--dry-run`, no `--yes` is needed: an already-met floor yields no items; otherwise the preview lists eligible safe candidates, an upper bound on selection because execution rechecks actual free space after each cleanup. JSON adds `min_free_gb`, current `free_bytes`, current `target_met`, and `selection_is_upper_bound: true`. The existing `would-delete`/`would-run` statuses are conditional candidates in this mode, and `freed_bytes` remains a candidate-size estimate (possibly overlapping), not a predicted disk-space gain. Ordinary dry runs are unchanged.
 - `storage-map --depth N` (2.16.0, N=1–3, default 1): directory entries gain a nested `"children"` array at depth ≥ 2 — one call for a whole subtree audit instead of N drill-downs. Depth-1 output is byte-identical to the pre-2.15 contract (no `children` key). Bounded at 3 on purpose; 0 or 4 is an argparse usage error (exit 2). Files never carry `children`.
 - `schedule run` (2.16.0) kickstarts the **real** launchd clean agent (`launchctl kickstart`), exiting 1 with `{"started": false, "error": ...}` if launchctl refuses (e.g. no schedule installed). This exists because the schedule was reported broken while working perfectly — it was simply unobservable. Success here exercises the exact plumbing the scheduled run uses. `schedule status --json` additionally gains `"next_run"` (ISO timestamp of the next scheduled clean, `null` when off).
 
@@ -94,7 +94,7 @@ Abbreviated but field-accurate examples. All JSON is pretty-printed to stdout.
 
 ```json
 {
-  "version": "2.17.3",
+  "version": "2.18.0",
   "timestamp": "2026-07-14T09:12:03.481920",
   "disk": "Used: 380Gi / 460Gi (85%)",
   "disk_stats": {
@@ -136,7 +136,7 @@ Targets are sorted by `size_bytes` descending. Command-based targets (docker/bre
 
 ```json
 {
-  "version": "2.17.3",
+  "version": "2.18.0",
   "timestamp": "2026-07-14T09:14:55.102331",
   "delete_mode": "rm",
   "freed_bytes": 14495514624,
@@ -156,7 +156,7 @@ Targets are sorted by `size_bytes` descending. Command-based targets (docker/bre
 
 ```json
 {
-  "version": "2.17.3",
+  "version": "2.18.0",
   "timestamp": "2026-07-14T09:14:55.102331",
   "dry_run": true,
   "delete_mode": "rm",
@@ -191,7 +191,7 @@ Same envelope shape as `clean --json` (`delete_mode`, `freed_bytes`, `disk_after
 
 ```json
 {
-  "version": "2.17.3",
+  "version": "2.18.0",
   "timestamp": "2026-07-14T09:16:12.000000",
   "roots": ["/Users/you/Documents", "/Users/you/Code"],
   "min_age_days": 30,
@@ -210,13 +210,13 @@ Same envelope shape as `clean --json` (`delete_mode`, `freed_bytes`, `disk_after
 }
 ```
 
-Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets` accepts. `git` is `null` when git status couldn't be determined (not a repo, `git` missing, or any git failure — including a 2-second timeout); otherwise `{"dirty": bool, "unpushed": bool}`. `dirty` means `git status --porcelain` reported changes; `unpushed` means there are commits on local branches that no remote has (a repo with no remotes at all counts as unpushed). Controlled by config `project_git_check` (default `true`); when disabled, `git` is always `null` and no git subprocess is run.
+Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets` accepts. When different paths normalize to the same slug, every colliding ID includes a stable path-digest suffix; the ambiguous unsuffixed ID is rejected. Non-colliding IDs are unchanged. `git` is `null` when git status couldn't be determined (not a repo, `git` missing, or any git failure — including a 2-second timeout); otherwise `{"dirty": bool, "unpushed": bool}`. `dirty` means `git status --porcelain` reported changes; `unpushed` means there are commits on local branches that no remote has (a repo with no remotes at all counts as unpushed). Controlled by config `project_git_check` (default `true`); when disabled, `git` is always `null` and no git subprocess is run.
 
 ### `doctor --json`
 
 ```json
 {
-  "version": "2.17.3",
+  "version": "2.18.0",
   "ok": true,
   "checks": [
     { "name": "Python",       "status": "3.12.4", "ok": true },
@@ -286,7 +286,7 @@ Both 2.8.0 checks use hardcoded thresholds (8 GiB of swapfiles on disk; 500 MB h
 
 ```json
 {
-  "version": "2.17.3",
+  "version": "2.18.0",
   "free_bytes": 8321499136,
   "free_human": "7.8 GB",
   "threshold_bytes": 10737418240,
@@ -300,7 +300,7 @@ Both 2.8.0 checks use hardcoded thresholds (8 GiB of swapfiles on disk; 500 MB h
 
 New in 2.2.0. Deliberately cheap: one `shutil.disk_usage` call — no `du` measurement pass over targets, and it neither records a `snapshots.log` entry nor a `report.log` run (this is a monitor, not a scan or a clean). `below_threshold` compares `free_bytes` against config `low_disk_threshold_gb` (default 10 GB) converted to bytes. `notified` is `true` only if a notification was actually posted **by this invocation** — posting is throttled to at most once per 24 hours while free space stays below the threshold (state lives in `alerts.json`, see §5), and skipped entirely (with `notified: false`, but `below_threshold` still accurate) when config `low_disk_alerts` is `false`. A malformed `low_disk_threshold_gb` (non-numeric, `NaN`, or infinite) falls back to the 10 GB default and prints a warning to stderr; the command still succeeds. **`disk-check` always exits 0** — it's a monitor meant to run unattended every hour via the `com.fullex.maccleaner.diskwatch` launchd agent, not a check that should ever fail a script.
 
-`should_notify` (new in 2.9.1) is the same true/false decision `notified` is derived from, but reported independently of whether posting was attempted — it's `true` exactly when a notification is due (below threshold, `low_disk_alerts` enabled, and not currently throttled). `--no-post` (new in 2.9.1) skips the actual `osascript` post — which always shows a generic icon, since `display notification` has no attribution option — while still making and persisting the throttle decision. This is what the SwiftUI app uses to deliver the alert itself, in-process, via a real, correctly-attributed notification (the same mechanism already used for the "cleanup finished" banner) whenever the app happens to be running; the standalone launchd `diskwatch` agent keeps calling plain `disk-check` (no flag) and is unaffected. Because both share the same `alerts.json` throttle, whichever one runs first within a 24h window claims it and the other stays quiet — no duplicate notification. `--no-post` always reports `notified: false` regardless of `should_notify`, since nothing was posted by that invocation.
+`should_notify` (new in 2.9.1) is the same true/false decision `notified` is derived from, but reported independently of whether posting was attempted — it's `true` exactly when a notification is due (below threshold, `low_disk_alerts` enabled, and not currently throttled). `--no-post` (new in 2.9.1) skips the actual `osascript` post — which always shows a generic icon, since `display notification` has no attribution option — while still making and persisting the throttle decision. This is what the SwiftUI app uses to deliver the alert itself, in-process, via a real, correctly-attributed notification (the same mechanism already used for the "cleanup finished" banner) whenever the app happens to be running; the standalone launchd `diskwatch` agent keeps calling plain `disk-check` (no flag) and is unaffected. Because both share the same `alerts.json` throttle, whichever one runs first within a 24h window claims it and the other stays quiet — no duplicate notification. `--no-post` always reports `notified: false` regardless of `should_notify`, since nothing was posted by that invocation. If its shared throttle claim cannot be saved, it warns on stderr and reports `should_notify: false` so the app does not deliver an unclaimed notification; disk measurements remain accurate.
 
 **Liveness guard (2.14.2).** Before offering any `tmp` target — top-level or nested — the scanner checks whether a **running process names the candidate path on its command line** (one `ps -axo command=` per scan), and silently skips it if so. Age alone is not proof of idleness: a nested write does not update the parent directory's mtime, so a workspace can read as weeks-stale at its top level while a build writes inside it — observed live, with a DerivedData root whose mtime receded across samples while `xcodebuild` held seven open handles beneath it. Matching is boundary-aware (`/tmp/ws` in a command line does not shield `/tmp/ws2`) and excludes MacCleaner's own process tree (asking about a path puts that path into the asking shell's command line — the check must not see its own reflection). If the process list cannot be read, the guard degrades open and the age gate remains the protection, since these targets are review-only and never auto-cleaned.
 
@@ -308,7 +308,7 @@ New in 2.2.0. Deliberately cheap: one `shutil.disk_usage` call — no `du` measu
 
 ```json
 {
-  "version": "2.17.3",
+  "version": "2.18.0",
   "root": "/Users/you",
   "total_bytes": 170728030208,
   "total_human": "159.0 GB",
@@ -328,13 +328,14 @@ Differences from every other command here, all deliberate:
 - **It never deletes, and has no delete flag.** Entries carry no `id` and no `safe` field, are never accepted by `clean --targets`, and are never passed to the delete pipeline. The only removal path offered anywhere for these paths is the macOS Trash, from the app's Storage tab.
 - **`kind`** is `"dir"`, `"file"` or `"link"`. **`category`** is one of `applications`, `documents`, `media`, `developer`, `caches`, `appdata`, `system`, `other` — a display bucket only; nothing downstream branches on it.
 - **Measurement never crosses mount points** (`du -xkd 1`). This matters more than it sounds: without `-x`, `du` descends into any mounted disk image beneath the path and counts that image's contents on top of the image file itself. Measured that way, `/Library/Developer/CoreSimulator` on a real machine reported **106 GB** when it actually held **11 GB**. Any agent reimplementing this measurement must pass `-x`.
+- **`incomplete`** is an optional boolean, emitted only as `true` when disk measurement failed or was partial (including a nested level). Sizes and rows may be partial; a zero total then means unavailable, not an empty folder. Complete measurements omit the key. The app displays unavailable totals explicitly.
 - `--min-size MB` hides entries below the threshold. Exit code is 0 whether or not anything was found.
 
 ### `storage-insights --json`
 
 ```json
 {
-  "version": "2.17.3",
+  "version": "2.18.0",
   "roots": [
     "/Users/you/Documents", "/Users/you/Downloads", "/Users/you/Desktop",
     "/Users/you/Library", "/Users/you/Applications", "/Applications"
@@ -380,7 +381,7 @@ New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`month
 
 ```json
 {
-  "version": "2.17.3",
+  "version": "2.18.0",
   "schedule": "weekly",
   "agents": [
     { "label": "com.fullex.maccleaner.clean",     "plist_present": true, "loaded": true, "load_state": "loaded" },
@@ -399,7 +400,7 @@ New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`month
 
 **Exit codes**: `status` and `off` always exit `0`, even when nothing is scheduled. `weekly`/`monthly` exit `1` if either agent failed to load with `launchctl` (the plist is still written to disk either way, and the stderr output includes the manual `launchctl bootstrap` command to load it); they exit `0` when both agents loaded. An unrecognized `action` is an argparse usage error, exit `2`, before any of this runs.
 
-`weekly`/`monthly --json` have one more exit path that does **not** follow the common envelope above: if no usable, non-virtualenv `python3` interpreter can be resolved for `ProgramArguments[0]` (see `_agent_python()`), nothing is written — no plist, no `launchctl` call — and the command exits `1` printing only `{"version": "2.17.3", "error": "<message>"}`. This response has no `schedule`, `agents`, or `legacy_cron` keys at all; a strict external decoder expecting the common shape on every `weekly`/`monthly` call should check for `"error"` first.
+`weekly`/`monthly --json` have one more exit path that does **not** follow the common envelope above: if no usable, non-virtualenv `python3` interpreter can be resolved for `ProgramArguments[0]` (see `_agent_python()`), nothing is written — no plist, no `launchctl` call — and the command exits `1` printing only `{"version": "2.18.0", "error": "<message>"}`. This response has no `schedule`, `agents`, or `legacy_cron` keys at all; a strict external decoder expecting the common shape on every `weekly`/`monthly` call should check for `"error"` first.
 
 Honors `MACCLEANER_LAUNCH_AGENTS_DIR` (default `~/Library/LaunchAgents`) for both reading and writing agent plists — see §5.
 
@@ -407,7 +408,7 @@ Honors `MACCLEANER_LAUNCH_AGENTS_DIR` (default `~/Library/LaunchAgents`) for bot
 
 ```json
 {
-  "version": "2.17.3",
+  "version": "2.18.0",
   "categories": [
     {
       "name": "xcode",
@@ -428,7 +429,7 @@ Lists **all** categories and targets regardless of the enabled_categories config
 
 ```json
 {
-  "version": "2.17.3",
+  "version": "2.18.0",
   "runs": [
     {
       "timestamp": "2026-07-13T09:00:04.120394",
@@ -460,7 +461,7 @@ Lists **all** categories and targets regardless of the enabled_categories config
 }
 ```
 
-Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 50 runs. With no history: `{"version": "2.17.3", "runs": [], "disk_history": {...}}` (`disk_history` is present either way).
+Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 50 runs. With no history: `{"version": "2.18.0", "runs": [], "disk_history": {...}}` (`disk_history` is present either way).
 
 `disk_history` is **additive** (new in 2.1.0) and always present, even with no cleanup history. `current` is today's `disk_stats()` snapshot. `snapshots` is the full contents of `snapshots.log` (append-only, capped at the most recent 365 entries; a snapshot recorded on the same calendar day as the previous one replaces it instead of adding a new entry — so a machine scanned any number of times a day, including every few minutes by the menu bar app's auto-refresh, accumulates at most one entry per day, giving 365 entries roughly a year of history). Every `scan` and every real `clean`/`projects --clean` run (not `--dry-run`) records one snapshot. `reclaimable_bytes` and `categories` (a map of category → bytes) are `null` unless the run covers the **full, unscoped target list** — a plain `scan`, or a plain `clean` with no `--category`/`--min-size`/`--targets` (this doesn't depend on `--yes`: an unscoped interactive `clean` counts too). The sums span every measured target regardless of `safe` — review targets (e.g. all of `ai`, and `system`'s `trash`/`ios-backups`) are folded into `categories` too, not excluded; for `clean` the sum is taken after the run, over whatever remains uncleaned (targets not deleted/trashed this pass, including any review target skipped or declined). They're `null` for `scan --category …`, `scan --min-size …`, any `clean` scoped by `--targets`/`--category`/`--min-size`, and *every* `projects --clean` run (project artifacts aren't part of the regular category sweep, and it never records full scope) — in all of those cases only `disk_total_bytes`/`disk_free_bytes` are trustworthy. Use `MACCLEANER_SNAPSHOTS` to point the engine at a different snapshots file (see §5).
 

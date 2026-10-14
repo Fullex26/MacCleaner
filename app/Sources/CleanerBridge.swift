@@ -45,6 +45,16 @@ struct CleanResult: Codable {
     let freed_human: String
     let disk_after: String?
     let items: [CleanItem]
+
+    var notificationBody: String {
+        let cleaned = items.filter { $0.status == "deleted" || $0.status == "trashed" }.count
+        let failed = items.filter { $0.status == "error" }.count
+        let skipped = items.filter { $0.status == "skipped" }.count
+        var parts = ["\(cleaned) \(cleaned == 1 ? "item" : "items") cleaned"]
+        if failed > 0 { parts.append("\(failed) failed") }
+        if skipped > 0 { parts.append("\(skipped) skipped") }
+        return parts.joined(separator: " · ")
+    }
 }
 
 /// `null` when git status couldn't be determined (not a repo, `git` missing,
@@ -194,6 +204,14 @@ struct StorageMapReport: Codable {
     let total_human: String
     let category: String
     let children: [StorageMapEntry]
+    var incomplete: Bool? = nil
+
+    var totalLabel: String { incomplete == true ? "Total unavailable" : total_human }
+    var measurementWarning: String? {
+        incomplete == true
+            ? "Measurement incomplete. Some items could not be measured. Try refreshing."
+            : nil
+    }
 }
 
 struct DiskCheckReport: Codable {
@@ -388,6 +406,7 @@ final class CleanerBridge: ObservableObject {
     /// a notification-gated action) — awaiting it elsewhere just joins the
     /// in-flight (or already-finished) load instead of starting a new one.
     private var settingsLoadTask: Task<Void, Never>?
+    private var storageMapRequestID: UUID?
 
     /// Engine resolution: MACCLEANER_ENGINE env override (development) →
     /// user-installed copy (shares config with the CLI) → bundled fallback.
@@ -685,7 +704,7 @@ final class CleanerBridge: ObservableObject {
             if notificationsEnabled, let result = lastClean {
                 NotificationManager.shared.post(
                     title: "MacCleaner freed \(result.freed_human)",
-                    body: "\(result.items.filter { $0.status != "skipped" }.count) items cleaned")
+                    body: result.notificationBody)
             }
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
@@ -723,7 +742,7 @@ final class CleanerBridge: ObservableObject {
             if notificationsEnabled, let result = lastClean {
                 NotificationManager.shared.post(
                     title: "MacCleaner freed \(result.freed_human)",
-                    body: "\(result.items.filter { $0.status != "skipped" }.count) items cleaned")
+                    body: result.notificationBody)
             }
         } catch {
             statusMessage = "Clean failed: \(error.localizedDescription)"
@@ -758,19 +777,30 @@ final class CleanerBridge: ObservableObject {
     /// Never touches `statusMessage`: this runs concurrently with the Dashboard's
     /// own scan, and a shared banner can't represent two failures at once.
     func scanStorageMap(_ path: String? = nil) async {
+        let requestID = UUID()
+        storageMapRequestID = requestID
         isScanningStorageMap = true
-        defer { isScanningStorageMap = false }
+        defer {
+            if storageMapRequestID == requestID { isScanningStorageMap = false }
+        }
         var args = ["storage-map"]
         if let path { args.append(path) }
         args.append("--json")
         do {
-            storageMap = try await run(StorageMapReport.self, args)
-            storageMapError = nil
+            let report = try await run(StorageMapReport.self, args)
+            guard storageMapRequestID == requestID else { return }
+            acceptStorageMap(report)
         } catch {
+            guard storageMapRequestID == requestID else { return }
             // Leave any previously loaded level on screen rather than blanking
             // the browser out from under the user.
             storageMapError = error.localizedDescription
         }
+    }
+
+    func acceptStorageMap(_ report: StorageMapReport) {
+        storageMap = report
+        storageMapError = report.measurementWarning
     }
 
     /// Moves one item to the Trash. Deliberately NOT the cleanup engine's

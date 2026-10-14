@@ -64,7 +64,7 @@ struct StorageView: View {
                     .font(.title2.weight(.semibold))
                 Spacer()
                 if let map = bridge.storageMap {
-                    Text(map.total_human)
+                    Text(map.totalLabel)
                         .font(.title3.monospacedDigit().weight(.medium))
                         .foregroundStyle(.secondary)
                 }

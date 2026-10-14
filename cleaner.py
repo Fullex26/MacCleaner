@@ -32,16 +32,19 @@ import stat as statmod
 import json
 import math
 import glob as globmod
+import hashlib
+from collections import Counter
 import time
 import shutil
 import tempfile
 import argparse
 import subprocess
+import signal
 import datetime
 import plistlib
 import threading
 import fcntl
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -141,7 +144,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.17.3"
+VERSION = "2.18.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -279,7 +282,33 @@ def _icloud_config_dir():
     return HOME / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "MacCleaner"
 
 
+@contextmanager
+def _config_transaction(extra_paths=()):
+    # Lock the local binding before resolving it: sync on/off can replace the
+    # leaf while setting writers wait. Shared destinations also serialize
+    # callers using different local symlinks to the same configuration.
+    local = CONFIG_PATH.parent.resolve() / CONFIG_PATH.name
+    with _state_transaction(local):
+        destinations = {CONFIG_PATH.resolve(), *(p.resolve() for p in extra_paths)} - {local}
+        with ExitStack() as locks:
+            for destination in sorted(destinations):
+                locks.enter_context(_state_transaction(destination))
+            yield
+
+
 def run_config_sync(action, json_mode=False):
+    if action not in ("on", "off"):
+        return _run_config_sync(action, json_mode)
+    extra = ()
+    if action == "on":
+        directory = _icloud_config_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        extra = (directory / "config.json",)
+    with _config_transaction(extra):
+        return _run_config_sync(action, json_mode)
+
+
+def _run_config_sync(action, json_mode=False):
     """`config sync on|off|status` — keep config.json in iCloud Drive with a
     symlink at CONFIG_PATH, so the CLI, the app, and the launchd agents all
     read and write the shared copy unchanged.
@@ -324,14 +353,13 @@ def run_config_sync(action, json_mode=False):
             # iCloud copy wins; keep the local settings recoverable beside it.
             if local_is_file:
                 shutil.copy2(CONFIG_PATH, CONFIG_PATH.parent / (CONFIG_PATH.name + ".pre-sync.bak"))
-                CONFIG_PATH.unlink()
-        elif local_is_file:
-            shutil.move(str(CONFIG_PATH), str(icloud_cfg))
         else:
             _atomic_write_json(icloud_cfg, load_config())
-        if CONFIG_PATH.is_symlink():
-            CONFIG_PATH.unlink()
-        os.symlink(str(icloud_cfg), str(CONFIG_PATH))
+        # Keep the active binding until its complete replacement is ready.
+        with tempfile.TemporaryDirectory(dir=CONFIG_PATH.parent, prefix=".config-sync-") as td:
+            link = Path(td) / "config.json"
+            os.symlink(str(icloud_cfg), str(link))
+            os.replace(link, CONFIG_PATH)
         print(f"Config sync on — settings now live in iCloud Drive:\n  {icloud_cfg}")
         return state()
 
@@ -340,7 +368,6 @@ def run_config_sync(action, json_mode=False):
             print("Config sync is not on — nothing to do.")
             return state()
         current = load_config()
-        CONFIG_PATH.unlink()
         _atomic_write_json(CONFIG_PATH, current)
         print("Config sync off — settings are local again "
               "(the iCloud copy remains for other Macs).")
@@ -515,17 +542,34 @@ def _parse_conda_estimate(output):
     return total
 
 
+ESTIMATE_TIMEOUT_S = 15
+
+
 def _run_estimate(estimate_cmd, parser):
     try:
-        r = subprocess.run(estimate_cmd, shell=True, capture_output=True, text=True, timeout=15)
-        if r.returncode != 0:
-            return 0
+        # A pipe can outlive its shell; supervise the group and read a file
+        # only after completion so descendants cannot hold an EOF wait open.
+        with tempfile.TemporaryFile(mode="w+t") as output:
+            process = subprocess.Popen(estimate_cmd, shell=True, stdout=output,
+                                       stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                process.wait(timeout=ESTIMATE_TIMEOUT_S)
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            if process.returncode != 0:
+                return 0
+            output.seek(0)
+            stdout = output.read()
         return {
             "brew_dry_run": _parse_brew_estimate,
             "docker_df":    _parse_docker_estimate,
             "du_path":      _parse_du_estimate,
             "conda_dry_run": _parse_conda_estimate,
-        }.get(parser, lambda _: 0)(r.stdout)
+        }.get(parser, lambda _: 0)(stdout)
     except Exception:
         return 0
 
@@ -1130,17 +1174,20 @@ def cmd_config_set_category(cfg, action, category):
     if category not in ALL_CATEGORIES:
         print(f"Unknown category '{category}'. Valid: {', '.join(ALL_CATEGORIES)}", file=sys.stderr)
         sys.exit(1)
-    cats = cfg["enabled_categories"]
-    if action == "enable" and category not in cats:
-        cats.append(category)
-        save_config(cfg)
-        print(f"Enabled '{category}'.")
-    elif action == "disable" and category in cats:
-        cats.remove(category)
-        save_config(cfg)
-        print(f"Disabled '{category}'.")
-    else:
-        print(f"Category '{category}' already {'enabled' if action == 'enable' else 'disabled'}.")
+    with _config_transaction():
+        cfg.clear()
+        cfg.update(load_config())
+        cats = cfg["enabled_categories"]
+        if action == "enable" and category not in cats:
+            cats.append(category)
+            save_config(cfg)
+            print(f"Enabled '{category}'.")
+        elif action == "disable" and category in cats:
+            cats.remove(category)
+            save_config(cfg)
+            print(f"Disabled '{category}'.")
+        else:
+            print(f"Category '{category}' already {'enabled' if action == 'enable' else 'disabled'}.")
 
 
 def cmd_config_set_key(cfg, key, value):
@@ -1151,8 +1198,11 @@ def cmd_config_set_key(cfg, key, value):
         parsed = json.loads(value)
     except json.JSONDecodeError:
         parsed = value
-    cfg[key] = parsed
-    save_config(cfg)
+    with _config_transaction():
+        cfg.clear()
+        cfg.update(load_config())
+        cfg[key] = parsed
+        save_config(cfg)
     print(f"Set {key} = {json.dumps(parsed)}")
 
 
@@ -1511,6 +1561,12 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
     return total_freed, results
 
 
+def _safe_cleanup_candidates(targets):
+    return sorted([t for t in measure_targets(targets)
+                   if t["safe"] and (t.get("exists") or t.get("cmd"))],
+                  key=lambda t: t.get("size") or 0, reverse=True)
+
+
 def run_clean_min_free(targets, min_free_gb, mode="rm", json_mode=False, notify=False):
     """Clean SAFE targets, largest first, only until `min_free_gb` is free.
 
@@ -1522,9 +1578,7 @@ def run_clean_min_free(targets, min_free_gb, mode="rm", json_mode=False, notify=
     reaching the floor is `false`, never a quiet success."""
     threshold = int(min_free_gb * 1024 ** 3)
     say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
-    targets = measure_targets(targets)
-    safe = sorted([t for t in targets if t["safe"] and (t.get("exists") or t.get("cmd"))],
-                  key=lambda x: x["size"] or 0, reverse=True)
+    safe = _safe_cleanup_candidates(targets)
     total_freed, results = 0, []
     say(f"\n🧹 MacCleaner — {disk_free()} · target: {fmt_size(threshold)} free\n")
     for t in safe:
@@ -1565,12 +1619,22 @@ def run_clean_min_free(targets, min_free_gb, mode="rm", json_mode=False, notify=
     return total_freed, results
 
 
-def run_dry_run(targets, mode="rm", json_mode=False):
-    """Resolve exactly what a real clean of `targets` would delete. Deletes
-    nothing, writes no report.log entry, records no snapshot."""
+def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
+    """Resolve cleanup paths without deletion or state writes. Minimum-free
+    previews list eligible candidates: execution may stop before the end."""
     say = (lambda *a: print(*a, file=sys.stderr)) if json_mode else print
-    targets = measure_targets(targets)
-    targets = [t for t in targets if t.get("exists") or t.get("cmd")]
+    extra = {}
+    if min_free_gb is not None:
+        free = disk_stats()["free_bytes"]
+        met = free >= int(min_free_gb * 1024 ** 3)
+        targets = [] if met else _safe_cleanup_candidates(targets)
+        extra = {"min_free_gb": min_free_gb, "free_bytes": free,
+                 "target_met": met, "selection_is_upper_bound": True}
+        say("Minimum-free preview: eligible safe candidates only; execution may stop earlier. "
+            "Candidate sizes do not predict the change in free space.")
+    else:
+        targets = measure_targets(targets)
+        targets = [t for t in targets if t.get("exists") or t.get("cmd")]
     items, total = [], 0
 
     for t in sorted(targets, key=lambda x: x.get("size") or 0, reverse=True):
@@ -1614,16 +1678,17 @@ def run_dry_run(targets, mode="rm", json_mode=False):
             "freed_human": fmt_size(total),
             "disk_after": disk_free(),
             "items": items,
+            **extra,
         }, indent=2))
     else:
         say("\n🧪 Dry run — nothing will be deleted\n")
         for it in items:
             say(f"  {it['label']} ({fmt_size(it['freed'])})")
             if it.get("cmd"):
-                say(f"      would run: {it['cmd']}")
+                say(f"      {'candidate command' if extra else 'would run'}: {it['cmd']}")
             for e in it["paths"]:
-                say(f"      would delete: {e['path']} ({fmt_size(e['size_bytes'])})")
-        say(f"\n  Would free: {fmt_size(total)}\n")
+                say(f"      {'candidate path' if extra else 'would delete'}: {e['path']} ({fmt_size(e['size_bytes'])})")
+        say(f"\n  {'Candidate size estimate' if extra else 'Would free'}: {fmt_size(total)}\n")
     return total, items
 
 
@@ -1735,6 +1800,7 @@ def _bundle_size(root, stats=None):
     than aborting: a partial size for one app beats losing the whole scan.
     `stats`, if given, accumulates `dataless_dirs_skipped` (see _is_dataless)."""
     total, stack = 0, [root]
+    seen_files = set()
     if stats is None:
         stats = {}
     while stack:
@@ -1755,6 +1821,10 @@ def _bundle_size(root, stats=None):
                         continue
                     stack.append(e.path)
                 else:
+                    identity = (st.st_dev, st.st_ino)
+                    if identity in seen_files:
+                        continue
+                    seen_files.add(identity)
                     total += _disk_bytes(st)
             except OSError:
                 continue
@@ -1810,7 +1880,7 @@ def _storage_category(path):
     return best[0]
 
 
-def _du_children(root):
+def _du_children(root, stats=None):
     """`du -xkd 1` -- immediate children plus the root's own total, in bytes.
 
     The `-x` is the whole point and must never be dropped: without it du
@@ -1820,15 +1890,20 @@ def _du_children(root):
     on a real machine read 106 GB when it actually held 11 GB -- a threefold
     overstatement that sent a whole storage investigation down the wrong path.
     """
+    if stats is None:
+        stats = {}
+    stats["incomplete"] = False
     try:
         r = subprocess.run(["du", "-xkd", "1", str(root)],
                            capture_output=True, text=True, timeout=600)
     except Exception as e:
         print("Warning: could not measure %s: %s" % (root, e), file=sys.stderr)
+        stats["incomplete"] = True
         return {}, 0
     # du reports partial results plus stderr noise for unreadable subtrees;
     # a non-zero exit is normal there and the readable numbers are still good.
     sizes, total = {}, 0
+    root_seen = False
     root_s = str(root)
     for line in r.stdout.splitlines():
         parts = line.split("\t", 1)
@@ -1841,8 +1916,12 @@ def _du_children(root):
         path = parts[1]
         if path == root_s:
             total = kb * 1024
+            root_seen = True
         else:
             sizes[path] = kb * 1024
+    stats["incomplete"] = r.returncode != 0 or not root_seen
+    if stats["incomplete"]:
+        print(f"Warning: storage map measurement is incomplete: {root}", file=sys.stderr)
     return sizes, total
 
 
@@ -1858,7 +1937,9 @@ def scan_storage_map(root=None, min_bytes=0, depth=1):
     if not root.exists() or not root.is_dir():
         return empty
 
-    sizes, total = _du_children(root)
+    measurement = {}
+    sizes, total = _du_children(root, measurement)
+    incomplete = measurement["incomplete"]
     children = []
     for path, size in sizes.items():
         if size < min_bytes:
@@ -1887,7 +1968,7 @@ def scan_storage_map(root=None, min_bytes=0, depth=1):
             try:
                 if entry.is_dir(follow_symlinks=False):
                     continue
-                size = entry.stat(follow_symlinks=False).st_size
+                size = _disk_bytes(entry.stat(follow_symlinks=False))
             except OSError:
                 continue
             if size < min_bytes:
@@ -1912,8 +1993,12 @@ def scan_storage_map(root=None, min_bytes=0, depth=1):
             if c["kind"] == "dir":
                 sub = scan_storage_map(c["path"], min_bytes=min_bytes, depth=depth - 1)
                 c["children"] = sub["children"]
-    return {"root": str(root), "total_bytes": total, "total_human": fmt_size(total),
-            "category": _storage_category(root), "children": children}
+                incomplete |= sub.get("incomplete", False)
+    result = {"root": str(root), "total_bytes": total, "total_human": fmt_size(total),
+              "category": _storage_category(root), "children": children}
+    if incomplete:
+        result["incomplete"] = True
+    return result
 
 
 def scan_storage_insights(config, stats=None, time_budget_s=None):
@@ -2347,14 +2432,20 @@ def scan_projects(config, roots=None, min_age_days=None):
 
 def projects_to_targets(hits):
     targets = []
-    for h in hits:
+    base_ids = [f"project-{slugify(os.path.relpath(h['path'], str(HOME)))}" for h in hits]
+    counts = Counter(base_ids)
+    for h, base_id in zip(hits, base_ids):
         git = h.get("git")
         flags = [name for name, on in (("dirty", git and git.get("dirty")),
                                        ("unpushed", git and git.get("unpushed"))) if on]
         badge = "".join(f" [{f}]" for f in flags)
         rel = os.path.relpath(h["path"], str(HOME))
+        # Size/order-dependent suffixes could silently select another project
+        # on a later scan. Disambiguate every colliding slug by path instead.
+        tid = base_id if counts[base_id] == 1 else (
+            base_id + "-" + hashlib.sha256(os.fsencode(rel)).hexdigest())
         targets.append({
-            "id": f"project-{slugify(rel)}",
+            "id": tid,
             "category": "projects",
             "label": f"{h['kind']} — {os.path.relpath(h['project'], str(HOME))}{badge}",
             "description": f"Stale {h['kind']} ({h['age_days']} days old)"
@@ -3986,8 +4077,10 @@ def load_alerts():
 def save_alerts(alerts):
     try:
         _atomic_write_json(ALERTS_PATH, alerts)
+        return True
     except Exception as e:
         print(f"Warning: could not write alert state: {e}", file=sys.stderr)
+        return False
 
 
 def _low_disk_decision(alerts, now, free_bytes, threshold_bytes):
@@ -4070,7 +4163,10 @@ def run_disk_check(config, json_mode=False, post=True):
                 # Skip the write entirely when nothing changed, so an hourly agent
                 # isn't rewriting alerts.json every run for no reason (finding M3).
                 alerts["low_disk"] = state
-                save_alerts(alerts)
+                if not save_alerts(alerts) and not post:
+                    # The app has not delivered yet. Do not authorize a banner
+                    # unless its throttle claim is durable enough to share.
+                    should_notify = False
     except (OSError, TimeoutError) as e:
         # A contending caller must not claim a notification without the lock.
         should_notify = False
@@ -4610,6 +4706,8 @@ def translate_legacy(argv):
         return ["scan"] + strip("--preview")
     if "--report" in flags:
         return ["report"] + strip("--report")
+    if any(a == "--category" or a.startswith("--category=") for a in rest):
+        return ["scan"] + rest
     if "--json" in flags and all(a in ("--json", "--category") or rest[i-1] == "--category"
                                  for i, a in enumerate(rest)):
         return ["scan"] + rest  # bare --json [--category X] = menu bar app contract
@@ -4733,6 +4831,9 @@ def main():
     argv = translate_legacy(sys.argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "clean" and args.min_free is not None:
+        if args.min_free < 0 or not math.isfinite(args.min_free * 1024 ** 3):
+            parser.error("--min-free must be a finite, non-negative GiB value within range")
 
     if args.command is None:
         show_welcome()
@@ -4916,8 +5017,11 @@ def main():
         auto = args.yes or config.get("auto_approve", False)
         mode = "trash" if args.trash else config.get("delete_mode", "rm")
         if args.dry_run:
-            selected = [t for t in targets if t["safe"] or explicit]
-            run_dry_run(selected, mode=mode, json_mode=args.json)
+            if args.min_free is not None:
+                run_dry_run(targets, mode=mode, json_mode=args.json, min_free_gb=args.min_free)
+            else:
+                selected = [t for t in targets if t["safe"] or explicit]
+                run_dry_run(selected, mode=mode, json_mode=args.json)
             return
         if args.min_free is not None:
             if not auto:
