@@ -422,7 +422,7 @@ final class CleanerBridge: ObservableObject {
     /// targets with parallel `du`; `clean` can run `docker system prune`).
     nonisolated static let defaultEngineTimeout: TimeInterval = 600
 
-    nonisolated private static func runEngine(_ args: [String],
+    nonisolated static func runEngine(_ args: [String],
                                               timeout: TimeInterval = defaultEngineTimeout) throws -> Data {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")

@@ -37,6 +37,11 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
+- [ ] **Coordinate app timeout with cleanup shutdown** — an isolated probe matching the bridge’s immediate TERM/KILL sequence left a cleanup descendant writing after the engine exited. Give engine-owned cleanup a bounded graceful termination path before the app hard-kills a stuck engine.
+- [ ] **Bound doctor’s Homebrew bundle lookup** — a blocked `Path.glob` fixture in `_homebrew_cask_app` required external termination. Bound the entire read-only lookup and treat timeout as unknown ownership.
+- [ ] **Honor JSON for config sync mutations** — real CLI probes using temporary config/iCloud directories returned prose for all four on/off transition and no-op cases despite `--json`. Emit the existing sync status envelope for every requested JSON result.
+- [ ] **Count cleanup outcomes accurately in app notifications** — an exact-bridge probe with an error-only response produced “1 items cleaned”. Count deleted/trashed items as successes and report failures separately.
+
 - [ ] **Stop cleanup descendants at timeout** — an isolated harmless command wrote a marker after `delete_target` returned a timeout error. Supervise command cleanup in its own process group and stop the group before reporting failure; deletion-path changes require owner review. Implemented, pending owner review.
 - [ ] **Honor standalone legacy category selection** — a parser-only probe shows documented `--category node` exits 2 while `--preview --category node` works. Translate the standalone spelling into a scan and pin repeatable/category-value variants.
 
