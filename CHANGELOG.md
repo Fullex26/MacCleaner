@@ -11,6 +11,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 - The Storage tab now displays incomplete measurements as unavailable, retaining partial rows with a warning rather than presenting a timed-out folder as empty. Complete refreshes clear the warning; older engine payloads remain compatible.
+- Storage insights counts each hard-linked file once within a bundle, avoiding inflated app sizes while preserving independent bundle totals.
 - Storage map now sizes loose files by allocated blocks, matching directory totals and storage insights. Sparse files no longer overstate their disk use or incorrectly pass minimum-size filters.
 - Config sync-on/off now shares transaction locks with preference writes. A concurrent change to Trash mode can no longer be replaced by sync-off’s stale copy, and a delayed writer cannot break a newly enabled sync symlink.
 - App-owned low-disk checks no longer authorize notification delivery when saving the shared throttle claim fails. Disk measurements remain available, and a notification already posted by the CLI is still reported honestly.

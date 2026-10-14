@@ -1762,6 +1762,7 @@ def _bundle_size(root, stats=None):
     than aborting: a partial size for one app beats losing the whole scan.
     `stats`, if given, accumulates `dataless_dirs_skipped` (see _is_dataless)."""
     total, stack = 0, [root]
+    seen_files = set()
     if stats is None:
         stats = {}
     while stack:
@@ -1782,6 +1783,10 @@ def _bundle_size(root, stats=None):
                         continue
                     stack.append(e.path)
                 else:
+                    identity = (st.st_dev, st.st_ino)
+                    if identity in seen_files:
+                        continue
+                    seen_files.add(identity)
                     total += _disk_bytes(st)
             except OSError:
                 continue
