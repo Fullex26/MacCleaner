@@ -167,3 +167,5 @@ Then bump the hardcoded target counts in `run_tests.sh` (the `--targets` 1st/2nd
 
 ## Optional Dependency
 `rich` is optional — detected at import, falls back to plain text (`RICH = False`). All output paths have both rich and plain variants.
+
+`projects --targets` must distinguish absence (`None`) from an explicitly empty string. The latter selects nothing in both cleanup and dry-run paths; never use truthiness to decide whether to apply the selection filter.

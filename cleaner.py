@@ -4709,7 +4709,8 @@ def main():
         hits, roots, min_age = scan_projects(config, roots=args.roots, min_age_days=args.min_age_days)
         if args.clean or args.dry_run:
             targets = projects_to_targets(hits)
-            if args.targets:
+            targets_given = args.targets is not None
+            if targets_given:
                 wanted = {t.strip() for t in args.targets.split(",") if t.strip()}
                 targets = [t for t in targets if t["id"] in wanted]
                 missing = wanted - {t["id"] for t in targets}
@@ -4718,13 +4719,13 @@ def main():
                     sys.exit(1)
             mode = "trash" if args.trash else config.get("delete_mode", "rm")
             if args.dry_run:
-                selected = _filter_git_flagged(targets, bypass=bool(args.targets))
+                selected = _filter_git_flagged(targets, bypass=targets_given)
                 run_dry_run(selected, mode=mode, json_mode=args.json)
                 return
             if args.yes:
-                targets = _filter_git_flagged(targets, bypass=bool(args.targets))
+                targets = _filter_git_flagged(targets, bypass=targets_given)
             run_clean(targets, auto_approve=args.yes, mode=mode,
-                      json_mode=args.json, explicit=bool(args.targets) or args.yes)
+                      json_mode=args.json, explicit=targets_given or args.yes)
         elif args.json:
             print(json.dumps({
                 "version": VERSION,
