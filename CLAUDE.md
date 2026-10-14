@@ -179,3 +179,5 @@ Swift read-only subprocess probes use `ReadOnlyProcess` for process-group deadli
 
 Configuration setting/category commands must lock `CONFIG_PATH.resolve()`, reload inside that lock, then mutate and save. Locking only the atomic write still loses other callers’ changes; locking the resolved destination keeps synced-config aliases on one transaction lock.
 Minimum-free dry runs share safe-only candidate filtering with execution, including explicit selections. Their candidate list is an upper bound, not a predicted stopping point: trash, command targets, overlaps, and filesystem allocation prevent predicting free-space changes. `target_met` and `free_bytes` describe the initial reading; ordinary dry-run behavior stays unchanged.
+
+For `disk-check --no-post`, authorizing app delivery requires a successful throttle-state save. A failed save must return `should_notify: false`, as a failed transaction lock does. Never rewrite `notified: true` to false after the CLI already posted a banner, even if the subsequent state save failed.
