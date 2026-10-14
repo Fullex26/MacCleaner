@@ -168,6 +168,7 @@ Then bump the hardcoded target counts in `run_tests.sh` (the `--targets` 1st/2nd
 ## Optional Dependency
 `rich` is optional — detected at import, falls back to plain text (`RICH = False`). All output paths have both rich and plain variants.
 
+Persistent state updates require `_state_transaction(path)` around the entire read/modify/write, not just `_atomic_write_json`. Stable sibling `.lock` files must never be unlinked: replacing the lock inode lets two processes hold different locks for the same state. Lock waits are bounded; alert checks that cannot acquire the lock warn and do not claim notification delivery.
 `projects --targets` must distinguish absence (`None`) from an explicitly empty string. The latter selects nothing in both cleanup and dry-run paths; never use truthiness to decide whether to apply the selection filter.
 
 Project discovery runs in a daemon with a 120-second deadline, including root validation. A stop event and result lock freeze candidates before sizing/git checks; a resumed filesystem operation must not publish more candidates after the timeout. The daemon only discovers paths and never deletes or writes state.
