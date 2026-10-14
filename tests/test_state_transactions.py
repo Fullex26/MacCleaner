@@ -15,6 +15,8 @@ root, kind, index = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 cleaner.LOG_PATH = root / 'report.log'
 cleaner.SNAPSHOTS_PATH = root / 'snapshots.log'
 cleaner.ALERTS_PATH = root / 'alerts.json'
+cleaner.CONFIG_PATH = root / 'config.json'
+cfg = cleaner.load_config()
 cleaner.disk_free = lambda: 'test disk'
 cleaner.disk_stats = lambda: {'free_bytes': 1, 'total_bytes': 100}
 cleaner._trim_cron_log = lambda: None
@@ -36,6 +38,9 @@ elif kind == 'snapshot':
         def now(cls): return cls(2026, 1, index + 1)
     cleaner.datetime.datetime = Clock
     cleaner.record_snapshot(index, {})
+elif kind == 'config':
+    cleaner.cmd_config_set_key(cfg, 'delete_mode' if index == 0 else 'project_min_age_days',
+                               '"trash"' if index == 0 else '60')
 else:
     result = cleaner.run_disk_check({'low_disk_alerts': True}, json_mode=True, post=False)
     (root / ('result-' + str(index))).write_text(json.dumps(result))
@@ -70,6 +75,10 @@ class TestStateTransactions(unittest.TestCase):
                     self.assertEqual({r['total_freed_bytes'] for r in json.loads((root / 'report.log').read_text())}, {0, 1})
                 elif kind == 'snapshot':
                     self.assertEqual({r['reclaimable_bytes'] for r in json.loads((root / 'snapshots.log').read_text())}, {0, 1})
+                elif kind == 'config':
+                    cfg = json.loads((root / 'config.json').read_text())
+                    self.assertEqual(cfg['delete_mode'], 'trash')
+                    self.assertEqual(cfg['project_min_age_days'], 60)
                 else:
                     claims = [json.loads((root / ('result-' + str(i))).read_text())['should_notify'] for i in range(2)]
                     self.assertEqual(sum(claims), 1)
@@ -84,6 +93,9 @@ class TestStateTransactions(unittest.TestCase):
 
     def test_concurrent_snapshot_days_are_preserved(self):
         self.run_competing('snapshot')
+
+    def test_concurrent_config_changes_are_preserved(self):
+        self.run_competing('config')
 
     def test_concurrent_alert_checks_claim_only_once(self):
         self.run_competing('alert')
