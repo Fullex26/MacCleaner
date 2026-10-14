@@ -1108,17 +1108,20 @@ def cmd_config_set_category(cfg, action, category):
     if category not in ALL_CATEGORIES:
         print(f"Unknown category '{category}'. Valid: {', '.join(ALL_CATEGORIES)}", file=sys.stderr)
         sys.exit(1)
-    cats = cfg["enabled_categories"]
-    if action == "enable" and category not in cats:
-        cats.append(category)
-        save_config(cfg)
-        print(f"Enabled '{category}'.")
-    elif action == "disable" and category in cats:
-        cats.remove(category)
-        save_config(cfg)
-        print(f"Disabled '{category}'.")
-    else:
-        print(f"Category '{category}' already {'enabled' if action == 'enable' else 'disabled'}.")
+    with _state_transaction(CONFIG_PATH.resolve()):
+        cfg.clear()
+        cfg.update(load_config())
+        cats = cfg["enabled_categories"]
+        if action == "enable" and category not in cats:
+            cats.append(category)
+            save_config(cfg)
+            print(f"Enabled '{category}'.")
+        elif action == "disable" and category in cats:
+            cats.remove(category)
+            save_config(cfg)
+            print(f"Disabled '{category}'.")
+        else:
+            print(f"Category '{category}' already {'enabled' if action == 'enable' else 'disabled'}.")
 
 
 def cmd_config_set_key(cfg, key, value):
@@ -1129,8 +1132,11 @@ def cmd_config_set_key(cfg, key, value):
         parsed = json.loads(value)
     except json.JSONDecodeError:
         parsed = value
-    cfg[key] = parsed
-    save_config(cfg)
+    with _state_transaction(CONFIG_PATH.resolve()):
+        cfg.clear()
+        cfg.update(load_config())
+        cfg[key] = parsed
+        save_config(cfg)
     print(f"Set {key} = {json.dumps(parsed)}")
 
 

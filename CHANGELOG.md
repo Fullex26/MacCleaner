@@ -10,6 +10,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ## [Unreleased]
 
 ### Fixed
+- Concurrent setting and category changes now reload and update the configuration under a transaction lock, so a stale caller cannot undo another preference such as Trash mode. Synced configuration symlinks remain intact and share the destination lock.
 - Project discovery now honors `skip_paths`, including roots reached through symlink aliases. Artifacts containing an excluded descendant are omitted entirely, so cleanup cannot remove that descendant through its parent.
 - Swift process-list, parent-process, simulator, and Spotlight probes now use bounded process-group execution with file-backed output and Python-equivalent deadlines. The shared runner remains internal and read-only.
 - Project directory discovery now has a 120-second daemon deadline, including root validation. A blocked filesystem read returns candidates already discovered with a partial-results warning instead of hanging the CLI; sizing and git checks retain their existing subprocess bounds.
