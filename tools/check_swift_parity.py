@@ -92,6 +92,25 @@ def main():
                 if rows.get(tid, {}).get("size_bytes") != size:
                     failures.append(f"{engine}/{tid}: expected {size} bytes")
 
+        # Real scanner collisions must retain identical IDs in both engines.
+        import os, time
+        for name in ("foo-bar", "foo_bar"):
+            shutil.copytree(root / "tmp-root/ws-derived-top", root / "tmp-root" / name)
+        orphan = root / "leftover-lib/Caches/com.gone-app"
+        orphan.mkdir()
+        (orphan / "blob").write_bytes(b"x" * 4096)
+        old = time.time() - gen.LEFTOVER_AGE
+        os.utime(orphan, (old, old))
+        collision_py = by_id(run_json([sys.executable, str(gen.ENGINE), "scan", "--json", "--all"], env))
+        collision_sw = by_id(run_json([str(MCK), "scan", "--json", "--all"], env))
+        for tid in sorted(set(collision_py) | set(collision_sw)):
+            p, s = collision_py.get(tid), collision_sw.get(tid)
+            if p is None or s is None or p.get("size_bytes") != s.get("size_bytes"):
+                failures.append(f"collision/{tid}: presence or size differs")
+        for prefix in ("tmp-foo-bar--", "leftover-com-gone-app--"):
+            if sum(tid.startswith(prefix) for tid in collision_py) != 2:
+                failures.append(f"collision/{prefix}: expected two distinct digest IDs")
+
         cfg["enabled_categories"] = ["docker", "homebrew", "node", "python"]
         cfg_path.write_text(json.dumps(cfg))
         for scenario, body in (("failed", "printf 'free approximately 5GB'; exit 1"),

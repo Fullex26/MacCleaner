@@ -81,10 +81,13 @@ final class TmpScannerTests: XCTestCase {
         XCTAssertEqual(TmpScanner.slugify("release-v0.9.0"), "release-v0-9-0")
     }
 
-    func testDuplicateIdsGetNumericSuffixLikePython() {
+    func testDuplicateIdsStayDistinctAndNeverRedirect() {
         let hits = [TmpHit(path: "/t/foo-bar", kind: .derivedData),
                     TmpHit(path: "/t/foo_bar", kind: .repoClone)]
         let ids = TmpScanner.targets(for: hits).map(\.id)
-        XCTAssertEqual(ids, ["tmp-foo-bar", "tmp-foo-bar-2"])
+        XCTAssertEqual(Set(ids).count, 2)
+        XCTAssertTrue(ids.allSatisfy { $0.hasPrefix("tmp-foo-bar--") })
+        XCTAssertEqual(ids, Array(TmpScanner.targets(for: Array(hits.reversed())).map(\.id).reversed()))
+        XCTAssertNotEqual(ids[0], TmpScanner.targets(for: [hits[1]])[0].id)
     }
 }

@@ -194,13 +194,10 @@ public enum TmpScanner {
 
     /// Mirrors tmp_to_targets' id/label/description derivation.
     public static func targets(for hits: [TmpHit]) -> [(id: String, label: String, desc: String, path: String)] {
-        var seen = Set<String>()
-        return hits.map { h in
+        let bases = hits.map { "tmp-" + slugify(($0.path as NSString).lastPathComponent) }
+        let ids = TargetIDs.disambiguate(bases, identities: hits.map(\.path))
+        return zip(hits, ids).map { h, tid in
             let name = (h.path as NSString).lastPathComponent
-            let base = "tmp-" + slugify(name)
-            var tid = base, n = 2
-            while seen.contains(tid) { tid = "\(base)-\(n)"; n += 1 }
-            seen.insert(tid)
             let kindDesc = h.kind == .derivedData
                 ? "Xcode-style derived build products"
                 : "Stale repo clone containing build artifacts"
