@@ -37,6 +37,9 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
+- [ ] **Deduplicate hard links inside bundle sizes** — a temporary app containing an 8 KiB file and a second hard link reports 16 KiB in storage insights while allocated blocks and `du` report 8 KiB. Count each device/inode once within a bundle traversal.
+- [ ] **Show incomplete Storage maps as unavailable** — the bounded enumeration fallback in #78 returns `incomplete: true`, but the Swift bridge discards it and displays a nonempty folder as zero bytes. Decode the additive flag and show a partial/unavailable state instead of the empty-folder message.
+
 - [x] **Measure sparse Storage-map files by allocated blocks (pending release)** — A temporary 1 GiB sparse file on this Mac occupied zero allocated bytes but appeared as a 1 GiB child under a zero-byte map total. Use allocated blocks for loose-file rows and size filtering, matching directory measurements and storage insights.
 - [x] **Serialize config sync transitions with setting writes (pending release)** — A deterministic temporary-file reproduction showed sync-off restoring `delete_mode: rm` after a concurrent setter successfully selected Trash mode. Lock the local binding as well as shared destinations so sync-on/off cannot race preference writes.
 
