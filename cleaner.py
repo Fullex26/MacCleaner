@@ -39,6 +39,7 @@ import shutil
 import tempfile
 import argparse
 import subprocess
+import signal
 import datetime
 import plistlib
 import threading
@@ -548,15 +549,29 @@ ESTIMATE_TIMEOUT_S = 15
 
 def _run_estimate(estimate_cmd, parser):
     try:
-        r = subprocess.run(estimate_cmd, shell=True, capture_output=True, text=True, timeout=ESTIMATE_TIMEOUT_S)
-        if r.returncode != 0:
-            return 0
+        # A pipe can outlive its shell; supervise the group and read a file
+        # only after completion so descendants cannot hold an EOF wait open.
+        with tempfile.TemporaryFile(mode="w+t") as output:
+            process = subprocess.Popen(estimate_cmd, shell=True, stdout=output,
+                                       stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                process.wait(timeout=ESTIMATE_TIMEOUT_S)
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            if process.returncode != 0:
+                return 0
+            output.seek(0)
+            stdout = output.read()
         return {
             "brew_dry_run": _parse_brew_estimate,
             "docker_df":    _parse_docker_estimate,
             "du_path":      _parse_du_estimate,
             "conda_dry_run": _parse_conda_estimate,
-        }.get(parser, lambda _: 0)(r.stdout)
+        }.get(parser, lambda _: 0)(stdout)
     except Exception:
         return 0
 
