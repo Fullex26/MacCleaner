@@ -166,9 +166,7 @@ public enum LeftoversScanner {
         let lib = libraryRoot()
         let cutoff = now - minAgeDays * 86400
         let fm = FileManager.default
-        let skip = skipPaths.map {
-            (Scanner.expand($0) as NSString).resolvingSymlinksInPath
-        }
+        let skip = Scanner.exclusionPaths(skipPaths)
 
         struct Acc { var paths: [String] = []; var locations: [String] = []; var mtime: TimeInterval = 0 }
         var byId: [String: Acc] = [:]
@@ -185,8 +183,7 @@ public enum LeftoversScanner {
                       !ownedByInstalled(cand, installed) else { continue }
                 var st = stat()
                 guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) != S_IFLNK else { continue }
-                let resolved = (path as NSString).resolvingSymlinksInPath
-                if skip.contains(where: { resolved == $0 || resolved.hasPrefix($0 + "/") }) {
+                if Scanner.overlapsExclusion(path, skip: skip) {
                     continue
                 }
                 var acc = byId[cand] ?? Acc()
