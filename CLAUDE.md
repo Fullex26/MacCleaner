@@ -218,3 +218,5 @@ Lossy dynamic IDs use `--` before the full identity digest: slugify collapses da
 The same read-only deadline also covers `_target_paths` glob expansion and `_cleanup_children` pre-enumeration. Timeout is distinct from an empty directory: cleanup returns an error before accounting or mutation, scans expose `measurement_error`, and previews offer no unresolved paths. Never put `_remove`, Trash moves, or recursive deletion inside an abandoned daemon.
 
 Doctor’s Homebrew cask ownership lookup also runs inside the read-only discovery deadline: globbing version directories or resolving a bundle link may stall. Timeout means unknown ownership (`None`), never a reason to remove or rewrite an installation.
+
+Empty-only targets must refuse a symlink leaf before enumerating children. `_safe_to_delete` deliberately permits an in-home symlink leaf because unlinking it is safe, but `iterdir()` follows it; a `Library/Caches -> ~` link can otherwise offer personal files for removal. Refuse without removing the link, and mirror that behavior in dry-run. `TestEmptyOnlySymlinks` covers both general caches and Trash in both deletion modes.

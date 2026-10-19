@@ -1220,6 +1220,9 @@ def delete_target(t, mode="rm"):
             if not (t.get("tmp_scan") and _tmp_scan_path_allowed(path)):
                 errors.append(f"refused (outside home): {path}")
                 continue
+        if t.get("empty_only") and path.is_symlink():
+            errors.append(f"refused (empty-only symlink): {path}")
+            continue
         children = None
         if t.get("empty_only"):
             try:
@@ -1738,6 +1741,9 @@ def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
             if not p.exists() and not p.is_symlink():
                 continue
             if t.get("empty_only"):
+                if p.is_symlink():
+                    say(f"Skipped empty-only symlink: {p}")
+                    continue
                 # Guarded the same way delete_target guards the equivalent loop:
                 # a PermissionError previewing one target's children must not
                 # abort the whole preview when the real delete would tolerate it.

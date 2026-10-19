@@ -10,6 +10,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ## [Unreleased]
 
 ### Fixed
+- Empty-only cleanup refuses symlink roots before sizing or enumeration, preserving the symlink and its destination in both deletion and Trash modes; dry-run omits those paths.
 - Read-only directory discovery, glob expansion, empty-only pre-enumeration, and Homebrew ownership lookup have deadlines. Incomplete installed-app inventory suppresses leftovers; measurement failures remain visible and cleanup refuses them before mutation.
 - Lossy project, log, temporary-build, and leftover identifiers use stable identity digests independent of candidate membership. This intentionally rejects old ambiguous lossy IDs rather than allowing them to select a different path.
 - Cleanup target selection honors excluded descendants as well as excluded parents, including lexical and resolved aliases across static and dynamic targets. Swift read-only selection follows the same exclusion policy.
