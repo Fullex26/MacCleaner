@@ -33,7 +33,6 @@ import json
 import math
 import glob as globmod
 import hashlib
-from collections import Counter
 import time
 import shutil
 import tempfile
@@ -574,6 +573,23 @@ def _run_estimate(estimate_cmd, parser):
         return 0
 
 
+def _exclusion_paths(paths):
+    """Keep the named entry and destination, including symlinked ancestors."""
+    out = set()
+    for raw in paths:
+        path = Path(os.path.abspath(os.path.expanduser(str(raw))))
+        out.update((path, path.parent.resolve() / path.name, path.resolve()))
+    return out
+
+
+def _path_overlaps_exclusion(path, skip):
+    if not skip:
+        return False
+    candidates = _exclusion_paths([path])
+    return any(str(candidate).startswith(str(prefix)) or candidate in prefix.parents
+               for candidate in candidates for prefix in skip)
+
+
 # ── Target definitions ─────────────────────────────────────────────────────────
 READ_ONLY_SCAN_BUDGET_S = 120
 STORAGE_MAP_SCAN_BUDGET_S = 600
@@ -607,8 +623,15 @@ def _read_only_scan(read, fallback, label, budget=None):
     return result[0]
 
 
+def _target_ids(bases, identities):
+    """Bind lossy slugs to identity, independent of other scan candidates."""
+    return [base if identity == slugify(identity) else
+            base + "--" + hashlib.sha256(os.fsencode(identity)).hexdigest()
+            for base, identity in zip(bases, identities)]
+
+
 def get_targets(config, all_categories=False):
-    skip = [Path(os.path.expanduser(p)) for p in config.get("skip_paths", [])]
+    skip = _exclusion_paths(config.get("skip_paths", []))
     enabled = set(ALL_CATEGORIES) if all_categories else set(config["enabled_categories"])
     targets = []
 
@@ -629,7 +652,7 @@ def get_targets(config, all_categories=False):
             # a skip_paths entry can retire part of a multi-path target
             # without silently taking the whole thing with it.
             multi = [x for x in multi
-                     if not any(str(x).startswith(str(s)) for s in skip)]
+                     if not _path_overlaps_exclusion(x, skip)]
             if not multi:
                 return
         elif path is not None:
@@ -637,7 +660,7 @@ def get_targets(config, all_categories=False):
                 pattern = os.path.expanduser(str(path))
             else:
                 p = Path(os.path.expanduser(str(path)))
-                if any(str(p).startswith(str(s)) for s in skip):
+                if _path_overlaps_exclusion(p, skip):
                     return
         targets.append({
             "id": tid,
@@ -647,7 +670,7 @@ def get_targets(config, all_categories=False):
             "path": p,
             "paths": multi,
             "glob": pattern,
-            "skip": [str(s) for s in skip] if pattern else [],
+            "skip": [str(s) for s in sorted(skip)],
             "safe": safe,
             "cmd": cmd,
             "estimate_cmd": estimate_cmd,
@@ -970,9 +993,12 @@ def _log_targets(config):
     targets = []
     threshold = config.get("log_threshold_mb", 100) * 1024 * 1024
     log_dir = HOME / "Library/Logs"
+    skip = _exclusion_paths(config.get("skip_paths", []))
     entries = _read_only_scan(lambda: sorted(log_dir.iterdir()) if log_dir.exists() else [],
                               [], "log discovery")
     for item in entries:
+        if _path_overlaps_exclusion(item, skip):
+            continue
         size = get_size(item)
         if size > threshold:
             targets.append({
@@ -981,6 +1007,7 @@ def _log_targets(config):
                 "label": f"Log: {item.name}",
                 "description": f"Oversized log folder (>{config.get('log_threshold_mb', 100)} MB)",
                 "path": item,
+                "skip": [str(s) for s in sorted(skip)],
                 "glob": None,
                 "safe": True,
                 "cmd": None,
@@ -989,8 +1016,10 @@ def _log_targets(config):
                 "empty_only": False,
                 "size": size,
             })
+    for target, tid in zip(targets, _target_ids(
+            [t["id"] for t in targets], [t["path"].name for t in targets])):
+        target["id"] = tid
     return targets
-
 
 def collect_targets(config, all_categories=False, categories=None, target_ids=None):
     """Static targets plus dynamic scanner targets (tmp, simulators).
@@ -1034,24 +1063,24 @@ def _cleanup_children(path):
 
 
 def _target_paths(t):
-    """Concrete filesystem paths for a target (glob patterns expanded).
+    """Concrete paths, withholding whole candidates that overlap exclusions.
 
-    Glob matches are filtered against skip_paths here because the prefix
-    check in add() can only see the pattern, not its expansions."""
+    This deliberately withholds a broad parent (including empty-only sweeps)
+    rather than risk deleting a protected descendant through that parent.
+    """
     if t.get("glob"):
-        skip = t.get("skip", [])
-        paths = _read_only_scan(lambda: [Path(p) for p in sorted(globmod.glob(t["glob"]))
-                                        if not any(p.startswith(s) for s in skip)],
+        paths = _read_only_scan(lambda: [Path(p) for p in sorted(globmod.glob(t["glob"]))],
                                 None, "target glob expansion")
         if paths is None:
             raise TimeoutError(f"could not enumerate target glob: {t['glob']}")
-        return paths
-    if t.get("paths"):
-        return t["paths"]
-    if t.get("path"):
-        return [t["path"]]
-    return []
-
+    elif t.get("paths"):
+        paths = t["paths"]
+    elif t.get("path"):
+        paths = [t["path"]]
+    else:
+        return []
+    skip = _exclusion_paths(t.get("skip", []))
+    return [p for p in paths if not _path_overlaps_exclusion(p, skip)]
 
 # ── Core actions ───────────────────────────────────────────────────────────────
 def measure_targets(targets):
@@ -1140,7 +1169,7 @@ def _remove(path: Path):
     if path.is_symlink():
         path.unlink(missing_ok=True)
     elif path.is_dir():
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(path)
     else:
         path.unlink(missing_ok=True)
 
@@ -1198,16 +1227,21 @@ def delete_target(t, mode="rm"):
             except OSError as exc:
                 errors.append(f"{path}: {exc}")
                 continue
-        freed += get_size(path)
         try:
             if t.get("empty_only"):
-                for child in children:
-                    if _safe_to_delete(child):
-                        _move_to_trash(child) if mode == "trash" else _remove(child)
-            elif mode == "trash":
-                _move_to_trash(path)
+                # Measure the parent as a unit so du deduplicates hard links
+                # shared by siblings. The remainder also captures partial failure.
+                before = get_size(path)
+                try:
+                    for child in children:
+                        if _safe_to_delete(child):
+                            _move_to_trash(child) if mode == "trash" else _remove(child)
+                finally:
+                    freed += max(0, before - get_size(path))
             else:
-                _remove(path)
+                size = get_size(path)
+                _move_to_trash(path) if mode == "trash" else _remove(path)
+                freed += size
         except Exception as e:
             errors.append(f"{path}: {e}")
     return freed, ("; ".join(errors) if errors else None)
@@ -2492,17 +2526,12 @@ def scan_projects(config, roots=None, min_age_days=None):
 def projects_to_targets(hits):
     targets = []
     base_ids = [f"project-{slugify(os.path.relpath(h['path'], str(HOME)))}" for h in hits]
-    counts = Counter(base_ids)
-    for h, base_id in zip(hits, base_ids):
+    ids = _target_ids(base_ids, [os.path.relpath(h["path"], str(HOME)) for h in hits])
+    for h, tid in zip(hits, ids):
         git = h.get("git")
         flags = [name for name, on in (("dirty", git and git.get("dirty")),
                                        ("unpushed", git and git.get("unpushed"))) if on]
         badge = "".join(f" [{f}]" for f in flags)
-        rel = os.path.relpath(h["path"], str(HOME))
-        # Size/order-dependent suffixes could silently select another project
-        # on a later scan. Disambiguate every colliding slug by path instead.
-        tid = base_id if counts[base_id] == 1 else (
-            base_id + "-" + hashlib.sha256(os.fsencode(rel)).hexdigest())
         targets.append({
             "id": tid,
             "category": "projects",
@@ -2692,7 +2721,7 @@ def _scan_tmp_artifacts(config, commands, own_cmds):
     skip prefix, and this scanner must match that, finding F1)."""
     min_age = config.get("tmp_min_age_days", 1)
     cutoff = time.time() - min_age * 86400
-    skip = [Path(os.path.expanduser(p)) for p in config.get("skip_paths", [])]
+    skip = _exclusion_paths(config.get("skip_paths", []))
     hits = []
     try:
         entries = list(os.scandir(TMP_SCAN_ROOT))
@@ -2709,8 +2738,7 @@ def _scan_tmp_artifacts(config, commands, own_cmds):
             if st.st_uid != uid or st.st_mtime > cutoff:
                 continue
             resolved = Path(e.path).resolve()
-            if any(resolved == s.resolve() or str(resolved).startswith(str(s.resolve()) + os.sep)
-                   for s in skip):
+            if _path_overlaps_exclusion(Path(e.path), skip):
                 continue
             if _path_is_in_use(Path(e.path), commands, own_cmds):
                 continue
@@ -2733,13 +2761,12 @@ def _scan_tmp_artifacts(config, commands, own_cmds):
 
 
 def tmp_to_targets(hits):
-    targets, seen = [], set()
-    for h in hits:
-        base = "tmp-" + slugify(h["path"].name)
-        tid, n = base, 2
-        while tid in seen:
-            tid, n = "%s-%d" % (base, n), n + 1
-        seen.add(tid)
+    targets = []
+    ids = _target_ids(["tmp-" + slugify(h["path"].name) for h in hits],
+                      [str(h["path"].relative_to(TMP_SCAN_ROOT))
+                       if TMP_SCAN_ROOT in h["path"].parents else str(h["path"])
+                       for h in hits])
+    for h, tid in zip(hits, ids):
         kind_desc = ("Xcode-style derived build products"
                      if h["kind"] == "derived-data"
                      else "Stale repo clone containing build artifacts")
@@ -3258,7 +3285,7 @@ def _scan_app_leftovers(config, installed):
     # Resolved once up front (not per-candidate, finding M2): this scanner
     # walks ~2900 entries across 5 roots, vs. scan_tmp_artifacts' single
     # shallow root, so re-resolving on every iteration is a real cost here.
-    skip = [Path(os.path.expanduser(p)).resolve() for p in config.get("skip_paths", [])]
+    skip = _exclusion_paths(config.get("skip_paths", []))
 
     by_id = {}
     for root_name in LEFTOVER_ROOTS:
@@ -3286,8 +3313,7 @@ def _scan_app_leftovers(config, installed):
                 resolved = Path(e.path).resolve()
             except OSError:
                 continue
-            if any(resolved == s or str(resolved).startswith(str(s) + os.sep)
-                   for s in skip):
+            if _path_overlaps_exclusion(Path(e.path), skip):
                 continue
             entry = by_id.setdefault(candidate, {"bundle_id": candidate, "paths": [],
                                                   "locations": [], "mtime": 0.0})
@@ -3299,13 +3325,10 @@ def _scan_app_leftovers(config, installed):
 
 
 def app_leftovers_to_targets(hits):
-    targets, seen = [], set()
-    for h in hits:
-        base = "leftover-" + slugify(h["bundle_id"])
-        tid, n = base, 2
-        while tid in seen:
-            tid, n = "%s-%d" % (base, n), n + 1
-        seen.add(tid)
+    targets = []
+    ids = _target_ids(["leftover-" + slugify(h["bundle_id"]) for h in hits],
+                      [h["bundle_id"] for h in hits])
+    for h, tid in zip(hits, ids):
         targets.append({
             "id": tid,
             "category": "leftovers",
