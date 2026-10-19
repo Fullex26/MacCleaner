@@ -92,6 +92,24 @@ def main():
                 if rows.get(tid, {}).get("size_bytes") != size:
                     failures.append(f"{engine}/{tid}: expected {size} bytes")
 
+        cfg["skip_paths"] = [str(root / "home/.npm/_cacache/content-v2/aa"),
+                             str(root / "home/Library/Caches/pip"),
+                             str(root / "tmp-root/ws-derived-top/Build"),
+                             str(root / "leftover-lib/Caches/com.gone.app/blob")]
+        cfg_path.write_text(json.dumps(cfg))
+        excluded_py = by_id(run_json([sys.executable, str(gen.ENGINE), "scan", "--json", "--all"], env))
+        excluded_sw = by_id(run_json([str(MCK), "scan", "--json", "--all"], env))
+        for tid in sorted(set(excluded_py) | set(excluded_sw)):
+            p, s = excluded_py.get(tid), excluded_sw.get(tid)
+            if p is None or s is None:
+                failures.append(f"excluded/{tid}: presence differs")
+            elif any(p.get(k) != s.get(k) for k in ("exists", "size_bytes")):
+                failures.append(f"excluded/{tid}: size or existence differs")
+        for tid in ("npm-cache", "pip-cache", "general-caches", "tmp-ws-derived-top"):
+            if tid in excluded_py or tid in excluded_sw:
+                failures.append(f"excluded/{tid}: protected parent still offered")
+        cfg["skip_paths"] = []
+
         cfg["enabled_categories"] = ["docker", "homebrew", "node", "python"]
         cfg_path.write_text(json.dumps(cfg))
         for scenario, body in (("failed", "printf 'free approximately 5GB'; exit 1"),

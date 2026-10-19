@@ -158,14 +158,13 @@ public enum TmpScanner {
         let commands = runningCommandLines()
         let own = ownProcessTree()
         var hits: [TmpHit] = []
-        let resolvedSkips = skipPaths.map { (($0 as NSString).expandingTildeInPath as NSString).resolvingSymlinksInPath }
+        let resolvedSkips = Scanner.exclusionPaths(skipPaths)
         for name in entries {
             let p = root + "/" + name
             guard let st = lstatEntry(p), st.isDir, !st.isSymlink else { continue }
             if tmpActivePrefixes.contains(where: { name.hasPrefix($0) }) { continue }
             guard st.uid == uid, st.mtime <= cutoff else { continue }
-            let resolved = (p as NSString).resolvingSymlinksInPath
-            if resolvedSkips.contains(where: { resolved == $0 || resolved.hasPrefix($0 + "/") }) { continue }
+            if Scanner.overlapsExclusion(p, skip: resolvedSkips) { continue }
             if pathIsInUse(p, commands: commands, own: own) { continue }
             if let kind = classify(p) {
                 hits.append(TmpHit(path: p, kind: kind))
