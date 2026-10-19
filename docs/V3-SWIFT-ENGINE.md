@@ -61,7 +61,7 @@ clean evidence over real use (in progress).
    plus fixture-sandbox parity: 4 offered and 5 refused tmp scenarios are
    seeded by `tools/gen_contract_fixtures.py` and pinned in the committed
    fixtures. The **simulators and leftovers ports landed too** (`SimulatorScanner.swift`,
-   `LeftoversScanner.swift`, #45), and **cmd-target estimates are now implemented for the next release**:
+   `LeftoversScanner.swift`, #45), and **cmd-target estimates shipped in v2.18.0**:
    generated estimate metadata drives the four Python-equivalent parsers,
    with a 15-second process-group timeout. Simulator precomputed sizes are
    preserved too. `tools/check_swift_parity.py` compares all target fields,
