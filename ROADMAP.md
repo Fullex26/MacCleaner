@@ -43,7 +43,7 @@ This document tracks planned features and long-term direction. Community input w
 
 - [x] **Resolve Swift build output through SwiftPM** — the real macOS build succeeded under `.build/out/Products/Release` but the app script looked under `.build/apple/Products/Release` and omitted the soak engine. Query `--show-bin-path` for the successful build configuration instead of assuming a layout. Shipped in v2.18.0.
 
-- [ ] **Report deletion failures accurately (#66)** — a mocked removal failure was silently credited as reclaimed space. Preserve errors and account only successful removal; implemented, awaiting Jordan’s deletion-path review.
+- [ ] **Report deletion failures accurately (#66)** — a mocked removal failure was silently credited as reclaimed space. Preserve errors and account only successful removal; implemented and approved for the follow-up safety release.
 - [ ] **Protect excluded descendants (#73)** — isolated fixtures showed a parent cleanup target could include a configured excluded child. Apply overlap checks across static and dynamic targets; implemented, awaiting Jordan’s protected-scanner review.
 - [ ] **Keep lossy dynamic IDs stable (#76)** — singleton-to-different-singleton fixtures reused old normalized IDs even without a simultaneous collision. Bind lossy project/log/tmp/leftover names to stable identity digests; implemented, awaiting Jordan’s contract-migration approval.
 - [ ] **Bound remaining read-only walks (#78)** — blocked enumeration, globbing, empty-only pre-enumeration, and Caskroom lookup fixtures exceeded deadlines. Bound discovery itself and fail closed on incomplete inventory or measurement; implemented, awaiting Jordan’s deletion/tmp review.

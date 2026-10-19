@@ -9,6 +9,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+- Deletion failures now remain visible and only successful removals contribute reclaimed bytes; empty-only cleanup measures before/after allocation to avoid hardlink overcounting.
+
 ---
 
 ## [2.18.0] — 2026-10-15
