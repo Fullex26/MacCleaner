@@ -591,6 +591,38 @@ def _path_overlaps_exclusion(path, skip):
 
 
 # ── Target definitions ─────────────────────────────────────────────────────────
+READ_ONLY_SCAN_BUDGET_S = 120
+STORAGE_MAP_SCAN_BUDGET_S = 600
+
+
+def _read_only_scan(read, fallback, label, budget=None):
+    """Bound the filesystem read itself; a blocked daemon cannot delay exit.
+
+    Workers only read and keep their result private. A late result is never
+    published after the caller has returned its conservative fallback.
+    """
+    if budget is None:
+        budget = READ_ONLY_SCAN_BUDGET_S
+    result, errors = [], []
+
+    def run():
+        try:
+            result.append(read())
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run, name=label, daemon=True)
+    worker.start()
+    worker.join(budget)
+    if worker.is_alive():
+        print(f"Warning: {label} stopped after {budget}s; results unavailable",
+              file=sys.stderr)
+        return fallback
+    if errors:
+        raise errors[0]
+    return result[0]
+
+
 def _target_ids(bases, identities):
     """Bind lossy slugs to identity, independent of other scan candidates."""
     return [base if identity == slugify(identity) else
@@ -952,37 +984,42 @@ def get_targets(config, all_categories=False):
     add("vms", "minikube-cache", "minikube cache", "~/.minikube/cache",
         desc="Cached minikube images and binaries; re-fetched on demand")
 
-    # Logs (dynamic)
-    threshold = config.get("log_threshold_mb", 100) * 1024 * 1024
-    log_dir = HOME / "Library/Logs"
-    if "logs" in enabled and log_dir.exists():
-        for item in sorted(log_dir.iterdir()):
-            if _path_overlaps_exclusion(item, skip):
-                continue
-            size = get_size(item)
-            if size > threshold:
-                targets.append({
-                    "id": f"log-{slugify(item.name)}",
-                    "category": "logs",
-                    "label": f"Log: {item.name}",
-                    "description": f"Oversized log folder (>{config.get('log_threshold_mb', 100)} MB)",
-                    "path": item,
-                    "skip": [str(s) for s in sorted(skip)],
-                    "glob": None,
-                    "safe": True,
-                    "cmd": None,
-                    "estimate_cmd": None,
-                    "estimate_parser": None,
-                    "empty_only": False,
-                    "size": size,
-                })
-
-    logs = [t for t in targets if t["category"] == "logs"]
-    for target, tid in zip(logs, _target_ids(
-            [t["id"] for t in logs], [t["path"].name for t in logs])):
-        target["id"] = tid
+    if "logs" in enabled:
+        targets.extend(_log_targets(config))
     return targets
 
+
+def _log_targets(config):
+    targets = []
+    threshold = config.get("log_threshold_mb", 100) * 1024 * 1024
+    log_dir = HOME / "Library/Logs"
+    skip = _exclusion_paths(config.get("skip_paths", []))
+    entries = _read_only_scan(lambda: sorted(log_dir.iterdir()) if log_dir.exists() else [],
+                              [], "log discovery")
+    for item in entries:
+        if _path_overlaps_exclusion(item, skip):
+            continue
+        size = get_size(item)
+        if size > threshold:
+            targets.append({
+                "id": f"log-{slugify(item.name)}",
+                "category": "logs",
+                "label": f"Log: {item.name}",
+                "description": f"Oversized log folder (>{config.get('log_threshold_mb', 100)} MB)",
+                "path": item,
+                "skip": [str(s) for s in sorted(skip)],
+                "glob": None,
+                "safe": True,
+                "cmd": None,
+                "estimate_cmd": None,
+                "estimate_parser": None,
+                "empty_only": False,
+                "size": size,
+            })
+    for target, tid in zip(targets, _target_ids(
+            [t["id"] for t in targets], [t["path"].name for t in targets])):
+        target["id"] = tid
+    return targets
 
 def collect_targets(config, all_categories=False, categories=None, target_ids=None):
     """Static targets plus dynamic scanner targets (tmp, simulators).
@@ -1018,6 +1055,13 @@ def collect_targets(config, all_categories=False, categories=None, target_ids=No
     return targets
 
 
+def _cleanup_children(path):
+    children = _read_only_scan(lambda: list(path.iterdir()), None, "cleanup enumeration")
+    if children is None:
+        raise TimeoutError(f"could not enumerate cleanup directory: {path}")
+    return children
+
+
 def _target_paths(t):
     """Concrete paths, withholding whole candidates that overlap exclusions.
 
@@ -1025,7 +1069,10 @@ def _target_paths(t):
     rather than risk deleting a protected descendant through that parent.
     """
     if t.get("glob"):
-        paths = [Path(p) for p in sorted(globmod.glob(t["glob"]))]
+        paths = _read_only_scan(lambda: [Path(p) for p in sorted(globmod.glob(t["glob"]))],
+                                None, "target glob expansion")
+        if paths is None:
+            raise TimeoutError(f"could not enumerate target glob: {t['glob']}")
     elif t.get("paths"):
         paths = t["paths"]
     elif t.get("path"):
@@ -1035,7 +1082,6 @@ def _target_paths(t):
     skip = _exclusion_paths(t.get("skip", []))
     return [p for p in paths if not _path_overlaps_exclusion(p, skip)]
 
-
 # ── Core actions ───────────────────────────────────────────────────────────────
 def measure_targets(targets):
     """Attach size and existence info to each target (parallel du)."""
@@ -1043,7 +1089,11 @@ def measure_targets(targets):
         if "size" in t and t["size"] is not None:
             t.setdefault("exists", True)
             return
-        paths = _target_paths(t)
+        try:
+            paths = _target_paths(t)
+        except TimeoutError as exc:
+            t.update(size=0, exists=False, measurement_error=str(exc))
+            return
         existing = [p for p in paths if p.exists()]
         if existing:
             t["size"] = sum(get_size(p) for p in existing)
@@ -1157,12 +1207,25 @@ def delete_target(t, mode="rm"):
 
     freed = 0
     errors = []
-    for path in _target_paths(t):
+    if t.get("measurement_error"):
+        return 0, t["measurement_error"]
+    try:
+        paths = _target_paths(t)
+    except TimeoutError as exc:
+        return 0, str(exc)
+    for path in paths:
         if not path.exists() and not path.is_symlink():
             continue
         if not _safe_to_delete(path):
             if not (t.get("tmp_scan") and _tmp_scan_path_allowed(path)):
                 errors.append(f"refused (outside home): {path}")
+                continue
+        children = None
+        if t.get("empty_only"):
+            try:
+                children = _cleanup_children(path)
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
                 continue
         try:
             if t.get("empty_only"):
@@ -1170,7 +1233,7 @@ def delete_target(t, mode="rm"):
                 # shared by siblings. The remainder also captures partial failure.
                 before = get_size(path)
                 try:
-                    for child in list(path.iterdir()):
+                    for child in children:
                         if _safe_to_delete(child):
                             _move_to_trash(child) if mode == "trash" else _remove(child)
                 finally:
@@ -1419,12 +1482,18 @@ def reclaimable_total(targets):
 
     cmd-based targets (brew cleanup, docker prune) have no path and always
     count -- there is nothing to nest them inside."""
-    owned = []
+    resolved = []
     for t in targets:
-        owned.extend(str(p) for p in _target_paths(t))
+        if t.get("measurement_error"):
+            continue
+        try:
+            paths = [str(p) for p in _target_paths(t)]
+        except TimeoutError:
+            continue
+        resolved.append((t, paths))
+    owned = [p for _, paths in resolved for p in paths]
     total = 0
-    for t in targets:
-        paths = [str(p) for p in _target_paths(t)]
+    for t, paths in resolved:
         if paths and all(
             any(p != q and p.startswith(q.rstrip(os.sep) + os.sep) for q in owned)
             for p in paths
@@ -1454,6 +1523,7 @@ def scan_json(targets, extra=None):
                 "size_human": fmt_size(t["size"]),
                 "safe": t["safe"],
                 "exists": t.get("exists", False),
+                **({"measurement_error": t["measurement_error"]} if t.get("measurement_error") else {}),
             }
             for t in sorted(targets, key=lambda x: x["size"], reverse=True)
         ]
@@ -1470,7 +1540,7 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
 
     targets = measure_targets(targets)
     # Drop targets with nothing to clean (keep cmd-based, which are always runnable)
-    targets = [t for t in targets if t.get("exists") or t.get("cmd")]
+    targets = [t for t in targets if t.get("exists") or t.get("cmd") or t.get("measurement_error")]
     total_freed = 0
     results = []
 
@@ -1578,7 +1648,7 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
 
 def _safe_cleanup_candidates(targets):
     return sorted([t for t in measure_targets(targets)
-                   if t["safe"] and (t.get("exists") or t.get("cmd"))],
+                   if t["safe"] and (t.get("exists") or t.get("cmd") or t.get("measurement_error"))],
                   key=lambda t: t.get("size") or 0, reverse=True)
 
 
@@ -1649,7 +1719,7 @@ def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
             "Candidate sizes do not predict the change in free space.")
     else:
         targets = measure_targets(targets)
-        targets = [t for t in targets if t.get("exists") or t.get("cmd")]
+        targets = [t for t in targets if t.get("exists") or t.get("cmd") or t.get("measurement_error")]
     items, total = [], 0
 
     for t in sorted(targets, key=lambda x: x.get("size") or 0, reverse=True):
@@ -1660,7 +1730,11 @@ def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
             total += size
             continue
         paths = []
-        for p in _target_paths(t):
+        try:
+            target_paths = [] if t.get("measurement_error") else _target_paths(t)
+        except TimeoutError:
+            target_paths = []
+        for p in target_paths:
             if not p.exists() and not p.is_symlink():
                 continue
             if t.get("empty_only"):
@@ -1668,7 +1742,7 @@ def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
                 # a PermissionError previewing one target's children must not
                 # abort the whole preview when the real delete would tolerate it.
                 try:
-                    children = list(p.iterdir())
+                    children = _cleanup_children(p)
                 except (PermissionError, FileNotFoundError, OSError):
                     continue
                 paths.extend(c for c in sorted(children) if _safe_to_delete(c))
@@ -1941,20 +2015,37 @@ def _du_children(root, stats=None):
 
 
 def scan_storage_map(root=None, min_bytes=0, depth=1):
-    """One level of children beneath `root`, largest first, with real sizes.
-
-    Read-only: it stats and measures, and never deletes, moves or opens file
-    contents. Unreadable subtrees are reported at whatever size du managed
-    rather than failing the whole scan."""
+    """Read-only map; filesystem enumeration and du each have a deadline."""
     root = Path(os.path.expanduser(str(root))) if root else Path.home()
     empty = {"root": str(root), "total_bytes": 0, "total_human": fmt_size(0),
              "category": _storage_category(root), "children": []}
-    if not root.exists() or not root.is_dir():
+    valid = _read_only_scan(lambda: root.exists() and root.is_dir(), None,
+                            "storage map root", STORAGE_MAP_SCAN_BUDGET_S)
+    if valid is None:
+        return dict(empty, incomplete=True)
+    if not valid:
         return empty
-
     measurement = {}
     sizes, total = _du_children(root, measurement)
+    children = _read_only_scan(lambda: _storage_map_children(root, sizes, min_bytes),
+                               None, "storage map enumeration", STORAGE_MAP_SCAN_BUDGET_S)
+    if children is None:
+        return dict(empty, incomplete=True)
     incomplete = measurement["incomplete"]
+    if depth > 1:
+        for child in children:
+            if child["kind"] == "dir":
+                sub = scan_storage_map(child["path"], min_bytes=min_bytes, depth=depth - 1)
+                child["children"] = sub["children"]
+                incomplete |= sub.get("incomplete", False)
+    result = {"root": str(root), "total_bytes": total, "total_human": fmt_size(total),
+              "category": _storage_category(root), "children": children}
+    if incomplete:
+        result["incomplete"] = True
+    return result
+
+
+def _storage_map_children(root, sizes, min_bytes):
     children = []
     for path, size in sizes.items():
         if size < min_bytes:
@@ -2000,20 +2091,7 @@ def scan_storage_map(root=None, min_bytes=0, depth=1):
         pass
 
     children.sort(key=lambda c: -c["size_bytes"])
-    if depth > 1:
-        # One JSON tree instead of N drill-down calls -- for agents auditing
-        # a whole subtree. The key is attached only when depth > 1 so depth-1
-        # output stays byte-identical to the pre-2.15 contract.
-        for c in children:
-            if c["kind"] == "dir":
-                sub = scan_storage_map(c["path"], min_bytes=min_bytes, depth=depth - 1)
-                c["children"] = sub["children"]
-                incomplete |= sub.get("incomplete", False)
-    result = {"root": str(root), "total_bytes": total, "total_human": fmt_size(total),
-              "category": _storage_category(root), "children": children}
-    if incomplete:
-        result["incomplete"] = True
-    return result
+    return children
 
 
 def scan_storage_insights(config, stats=None, time_budget_s=None):
@@ -2627,6 +2705,12 @@ def _nested_build_dirs(parent, cutoff, commands=None, own=None):
 
 
 def scan_tmp_artifacts(config):
+    commands, own_cmds = _running_command_lines(), _own_process_tree()
+    return _read_only_scan(lambda: _scan_tmp_artifacts(config, commands, own_cmds),
+                           [], "tmp discovery")
+
+
+def _scan_tmp_artifacts(config, commands, own_cmds):
     """Top-level-only scan of TMP_SCAN_ROOT for stale build junk.
 
     Guards (all mandatory, see the v2.5 design doc): min-age via
@@ -2644,9 +2728,6 @@ def scan_tmp_artifacts(config):
     except OSError:
         return hits
     uid = os.getuid()
-    # Read once for the whole scan, not per candidate.
-    commands = _running_command_lines()
-    own_cmds = _own_process_tree()
     for e in entries:
         try:
             if not e.is_dir(follow_symlinks=False):
@@ -2920,6 +3001,10 @@ def _installed_app_bundles():
 
 
 def _homebrew_cask_app():
+    return _read_only_scan(_find_homebrew_cask_app, None, "Homebrew cask lookup")
+
+
+def _find_homebrew_cask_app():
     """The MacCleaner.app the Homebrew cask manages, or None.
 
     Homebrew leaves a `<Caskroom>/maccleaner/<version>/MacCleaner.app`
@@ -2990,6 +3075,11 @@ def _collect_app_bundle_id(entry, ids):
 
 
 def installed_bundle_ids():
+    # None means unknown, never an inventory proving every app absent.
+    return _read_only_scan(_installed_bundle_ids, None, "installed-app inventory")
+
+
+def _installed_bundle_ids():
     """Bundle IDs of every top-level .app in the configured app-root
     directories (MACCLEANER_INSTALLED_APPS_DIRS), PLUS .app bundles nested
     exactly one level inside a non-.app wrapper folder -- some vendors
@@ -3169,6 +3259,19 @@ def _leftover_candidate(root_name, entry):
 
 
 def scan_app_leftovers(config):
+    installed = installed_bundle_ids()
+    if installed is None:
+        return []
+    by_id = _read_only_scan(lambda: _scan_app_leftovers(config, installed),
+                            {}, "app leftovers")
+    confirmed = _mdfind_confirms_installed(by_id.keys())
+    cutoff = time.time() - config.get("app_leftover_min_age_days", 7) * 86400
+    return sorted((h for h in by_id.values()
+                   if h["mtime"] <= cutoff and h["bundle_id"] not in confirmed),
+                  key=lambda h: h["bundle_id"])
+
+
+def _scan_app_leftovers(config, installed):
     """Top-level scan of five bundle-ID-keyed ~/Library subdirectories for
     entries whose bundle ID has no matching installed app. Never fuzzy --
     only names shaped like a reverse-DNS bundle ID are considered, and only
@@ -3178,10 +3281,7 @@ def scan_app_leftovers(config):
     root here is already strictly inside $HOME. skip_paths is honored the
     same way scan_tmp_artifacts honors it (finding F4) -- AGENTS.md already
     promises "Cleaning respects enabled_categories and skip_paths"."""
-    installed = installed_bundle_ids()
     library_root = _leftover_library_root()
-    min_age = config.get("app_leftover_min_age_days", 7)
-    cutoff = time.time() - min_age * 86400
     # Resolved once up front (not per-candidate, finding M2): this scanner
     # walks ~2900 entries across 5 roots, vs. scan_tmp_artifacts' single
     # shallow root, so re-resolving on every iteration is a real cost here.
@@ -3221,17 +3321,7 @@ def scan_app_leftovers(config):
             entry["locations"].append(root_name)
             entry["mtime"] = max(entry["mtime"], st.st_mtime)
 
-    # Spotlight second-opinion pass (3rd whole-branch review): the
-    # directory walk above is the fast primary signal and is left
-    # completely untouched; this only ever narrows the candidate set
-    # further, for bundle IDs the walk couldn't place but Spotlight's index
-    # (unbounded by location/depth/nesting) can still confirm are installed.
-    mdfind_confirmed = _mdfind_confirms_installed(by_id.keys())
-
-    hits = [h for h in by_id.values()
-            if h["mtime"] <= cutoff and h["bundle_id"] not in mdfind_confirmed]
-    hits.sort(key=lambda h: h["bundle_id"])
-    return hits
+    return by_id
 
 
 def app_leftovers_to_targets(hits):
@@ -3435,7 +3525,7 @@ def _system_temp_usage():
     if "/var/folders/" not in tmpdir:
         return None
     root = Path(tmpdir)
-    if not root.is_dir():
+    if not _read_only_scan(root.is_dir, False, "system temp root"):
         return None
     try:
         r = subprocess.run(["du", "-skx", str(root)],
@@ -3443,10 +3533,15 @@ def _system_temp_usage():
         kb = int(r.stdout.split()[0])
     except Exception:
         return None
-    try:
-        entries = sum(1 for _ in os.scandir(root))
-    except OSError:
-        entries = 0
+    def count_entries():
+        try:
+            return sum(1 for _ in os.scandir(root))
+        except OSError:
+            return 0
+
+    entries = _read_only_scan(count_entries, None, "system temp enumeration")
+    if entries is None:
+        return None
     return {"path": str(root), "bytes": kb * 1024, "entries": entries}
 
 
