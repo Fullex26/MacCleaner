@@ -21,7 +21,7 @@ maccleaner clean --category xcode --min-size 500 --yes --json
 maccleaner projects --json
 
 # Delete specific stale artifacts (IDs from projects --json)
-maccleaner projects --clean --targets project-documents-foo-node-modules --yes --json
+maccleaner projects --clean --targets project-documents-foo-node-modules--d34f55561bacdf99792a3ee4317812fc03626af33e649fbf85d9c8bd53cb6da3 --yes --json
 
 # Recoverable clean: move to ~/.Trash instead of deleting
 maccleaner clean --yes --trash --json
@@ -204,13 +204,13 @@ Same envelope shape as `clean --json` (`delete_mode`, `freed_bytes`, `disk_after
       "age_days": 142,
       "size_bytes": 3221225472,
       "git": { "dirty": false, "unpushed": true },
-      "id": "project-documents-old-app-node-modules"
+      "id": "project-documents-old-app-node-modules--a5b957a9eae5ead4e98a12ff4e4a8996593e61f84c9796cbb868b7d00cc6d311"
     }
   ]
 }
 ```
 
-Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets` accepts. When different paths normalize to the same slug, every colliding ID includes a stable path-digest suffix; the ambiguous unsuffixed ID is rejected. Non-colliding IDs are unchanged. `git` is `null` when git status couldn't be determined (not a repo, `git` missing, or any git failure — including a 2-second timeout); otherwise `{"dirty": bool, "unpushed": bool}`. `dirty` means `git status --porcelain` reported changes; `unpushed` means there are commits on local branches that no remote has (a repo with no remotes at all counts as unpushed). Controlled by config `project_git_check` (default `true`); when disabled, `git` is always `null` and no git subprocess is run.
+Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets` accepts. Dynamic IDs whose identity loses information during slug conversion always carry a full SHA-256 digest after a reserved `--` separator, even when no current candidate collides. This includes project relative paths, bundle IDs, nested tmp paths, and non-canonical log/tmp names. IDs are independent of the other candidates present. Rescan after upgrading; old lossy IDs are rejected rather than aliased to a potentially different path. Simple canonical identities retain their existing IDs. `git` is `null` when git status couldn't be determined (not a repo, `git` missing, or any git failure — including a 2-second timeout); otherwise `{"dirty": bool, "unpushed": bool}`. `dirty` means `git status --porcelain` reported changes; `unpushed` means there are commits on local branches that no remote has (a repo with no remotes at all counts as unpushed). Controlled by config `project_git_check` (default `true`); when disabled, `git` is always `null` and no git subprocess is run.
 
 ### `doctor --json`
 
@@ -305,6 +305,9 @@ New in 2.2.0. Deliberately cheap: one `shutil.disk_usage` call — no `du` measu
 **Liveness guard (2.14.2).** Before offering any `tmp` target — top-level or nested — the scanner checks whether a **running process names the candidate path on its command line** (one `ps -axo command=` per scan), and silently skips it if so. Age alone is not proof of idleness: a nested write does not update the parent directory's mtime, so a workspace can read as weeks-stale at its top level while a build writes inside it — observed live, with a DerivedData root whose mtime receded across samples while `xcodebuild` held seven open handles beneath it. Matching is boundary-aware (`/tmp/ws` in a command line does not shield `/tmp/ws2`) and excludes MacCleaner's own process tree (asking about a path puts that path into the asking shell's command line — the check must not see its own reflection). If the process list cannot be read, the guard degrades open and the age gate remains the protection, since these targets are review-only and never auto-cleaned.
 
 ### `storage-map --json`
+
+Each map level’s root validation and child enumeration have a 600-second deadline; `du` retains its own supervised 600-second timeout. An enumeration timeout returns the usual envelope with empty `children`, zero reported totals, and additive `"incomplete": true`, plus a warning on stderr. Those zeros mean unavailable measurement, not an empty disk. Nested timeouts propagate `incomplete: true` to the top-level result. Normal completed output is unchanged.
+
 
 ```json
 {
@@ -541,3 +544,7 @@ Matching is bundle-ID-precise rather than fuzzy, but it still isn't an absolute 
 - `scan`, `projects` (without `--clean`), `doctor`, `report`, `categories`, `config show|path`, and `storage-insights` never delete anything. `scan` and every real `clean`/`projects --clean` run (not `--dry-run`) also record a disk-usage entry to `snapshots.log`; `clean` and `projects --clean` (but not `--dry-run`) additionally append a run entry to `report.log`. `--dry-run` writes to neither log. `storage-insights` writes to no log at all — no `report.log`, `snapshots.log`, or `alerts.json` entry, ever.
 
 Empty-only targets (`general-caches` and `trash`) refuse symlink roots: cleanup reports an error with zero freed bytes and preserves the link and destination. Dry-run lists no destination children and prints a skip note to stderr in JSON mode. Ordinary non-empty-only symlink targets retain their existing unlink/move behavior.
+
+Read-only directory discovery for tmp, installed apps, app leftovers, oversized logs, and the System temp advisory has a 120-second discovery deadline, with subprocess probes and sizing retaining their separately supervised timeouts. On timeout the affected candidates/advisory are omitted with a stderr warning. An incomplete installed-app inventory suppresses all app leftovers; it is never treated as proof that apps are uninstalled.
+
+Glob expansion and empty-only child enumeration have a 120-second read-only deadline. Cleanup reports an enumeration failure as `status: "error"` with zero freed bytes; it never starts removal after that failure. A scan target whose glob could not be enumerated has additive `measurement_error`, `size_bytes: 0`, and `exists: false` (presence could not be established, not proof of absence). Its unknown size is excluded from the total. Dry-run offers no paths from failed enumeration and warns on stderr; mutation always remains caller-owned.

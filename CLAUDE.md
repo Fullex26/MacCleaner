@@ -203,4 +203,20 @@ Resolve SwiftPM executables with `swift build --show-bin-path` using the same co
 
 Only query/copy a Swift build output after that build succeeds. A failed compiler can leave an old executable at the expected path; existence alone does not prove it belongs to the current sources. Optional soak-engine failure must omit it and let app packaging continue.
 
+- **Removal accounting:** `_remove` must propagate filesystem errors. `delete_target` credits a path only after its remove/trash succeeds; empty-only targets measure the parent before and after, including on failure, so hard links across siblings are deduplicated. A failed whole-directory removal can be partial, but its unknown reclaim is conservatively reported as zero, never its original size.
+
+Path exclusions protect both named symlink entries and destinations (including resolved ancestors). Withhold a whole parent cleanup candidate when it contains an excluded descendant, even for empty-only sweeps. Do not let broad cache targets bypass narrower exclusions; Python and Swift must agree on filtered target presence as well as size.
+
+Project artifact IDs must be unique across the discovered hit set. Every lossy identity gets a SHA-256 digest independent of the other candidates; never assign suffixes by scan order or size, which could redirect a later explicit cleanup. The unsuffixed ambiguous ID is deliberately unknown, not an alias for the colliding group.
+
+Lossy dynamic IDs use `--` before the full identity digest: slugify collapses dash runs, so a literal slug cannot steal a generated ID. Never use encounter-order numeric suffixes for cleanup IDs; removing a candidate must not redirect an old ID to a different path. Hashing only currently colliding groups is insufficient: one singleton can replace another between scan and clean. Tmp identities are relative to the configured tmp root; log identities are names within Library/Logs; project identities are home-relative paths; leftovers use bundle IDs. Python/Swift parity includes real tmp and leftover collisions.
+
+### Remaining read-only walk deadlines
+
+`_read_only_scan` bounds filesystem discovery, including blocked directory reads, using a daemon worker whose result stays private until completion. Tmp, app inventory, leftovers, logs, and System temp enumeration use 120 seconds; each Storage map root/child enumeration uses 600 seconds. Subprocess probes and sizing must stay on the caller thread with their existing timeouts: abandoning a daemon supervising `subprocess.run` can orphan its child when the CLI exits. Nested map levels also run on the caller. Timeout returns an unavailable result and a stderr warning. Installed-app inventory returns `None` on timeout: leftovers must treat that as unknown and offer nothing, never as an empty set proving all apps absent. These workers must remain read-only and must not start subprocesses.
+
+The same read-only deadline also covers `_target_paths` glob expansion and `_cleanup_children` pre-enumeration. Timeout is distinct from an empty directory: cleanup returns an error before accounting or mutation, scans expose `measurement_error`, and previews offer no unresolved paths. Never put `_remove`, Trash moves, or recursive deletion inside an abandoned daemon.
+
+Doctor’s Homebrew cask ownership lookup also runs inside the read-only discovery deadline: globbing version directories or resolving a bundle link may stall. Timeout means unknown ownership (`None`), never a reason to remove or rewrite an installation.
+
 Empty-only targets must refuse a symlink leaf before enumerating children. `_safe_to_delete` deliberately permits an in-home symlink leaf because unlinking it is safe, but `iterdir()` follows it; a `Library/Caches -> ~` link can otherwise offer personal files for removal. Refuse without removing the link, and mirror that behavior in dry-run. `TestEmptyOnlySymlinks` covers both general caches and Trash in both deletion modes.
