@@ -5033,7 +5033,7 @@ class TestAppLeftoverScanner(unittest.TestCase):
         t = targets[0]
         self.assertFalse(t["safe"])
         self.assertEqual(t["category"], "leftovers")
-        self.assertEqual(t["id"], "leftover-com-example-gonezo")
+        self.assertEqual(t["id"], "leftover-com-example-gonezo--8da87e4f58c548eec105cf08dc2272791e63e91a0a092f1120841a7066b7646a")
         self.assertNotIn("tmp_scan", t)
 
     def test_target_id_dedup_suffix_on_collision(self):
