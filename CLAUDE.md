@@ -203,4 +203,6 @@ Resolve SwiftPM executables with `swift build --show-bin-path` using the same co
 
 Only query/copy a Swift build output after that build succeeds. A failed compiler can leave an old executable at the expected path; existence alone does not prove it belongs to the current sources. Optional soak-engine failure must omit it and let app packaging continue.
 
+- **Removal accounting:** `_remove` must propagate filesystem errors. `delete_target` credits a path only after its remove/trash succeeds; empty-only targets measure the parent before and after, including on failure, so hard links across siblings are deduplicated. A failed whole-directory removal can be partial, but its unknown reclaim is conservatively reported as zero, never its original size.
+
 Path exclusions protect both named symlink entries and destinations (including resolved ancestors). Withhold a whole parent cleanup candidate when it contains an excluded descendant, even for empty-only sweeps. Do not let broad cache targets bypass narrower exclusions; Python and Swift must agree on filtered target presence as well as size.
