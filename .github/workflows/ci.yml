@@ -97,6 +97,8 @@ jobs:
       - name: Storage request ordering regression
         run: python3 tools/check_storage_request_order.py
 
+      - name: Cleanup bridge timeout regression
+        run: python3 tools/check_cleanup_bridge_timeout.py
       - name: Cleanup notification outcome regression
         run: python3 tools/check_cleanup_notifications.py
 

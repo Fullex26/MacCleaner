@@ -48,7 +48,7 @@ This document tracks planned features and long-term direction. Community input w
 - [ ] **Keep lossy dynamic IDs stable (#76)** — singleton-to-different-singleton fixtures reused old normalized IDs even without a simultaneous collision. Bind lossy project/log/tmp/leftover names to stable identity digests; implemented and approved for the follow-up safety release.
 - [ ] **Bound remaining read-only walks (#78)** — blocked enumeration, globbing, empty-only pre-enumeration, and Caskroom lookup fixtures exceeded deadlines. Bound discovery itself and fail closed on incomplete inventory or measurement; implemented and approved for the follow-up safety release.
 - [ ] **Reject empty-only symlink roots (#80)** — a cache-root symlink to home exposed personal-file children to cleanup and preview. Refuse the symlink before enumeration; implemented and approved for the follow-up safety release.
-- [ ] **Stop cleanup groups on interruption (#88)** — timeout, immediate app shutdown, and interruption during process launch each left harmless fixture descendants writing after failure. Coordinate engine/app shutdown and defer launch-time signals until supervision exists; implemented, awaiting Jordan’s deletion-path review.
+- [ ] **Stop cleanup groups on interruption (#88)** — timeout, immediate app shutdown, and interruption during process launch each left harmless fixture descendants writing after failure. Coordinate engine/app shutdown and defer launch-time signals until supervision exists; implemented and approved for the follow-up safety release.
 - [x] **Rebuild the committed fallback app (v2.18.0)** — its tracked engine and metadata remained at 2.17.2 despite newer releases. Rebuilt on macOS from the release sources.
 
 

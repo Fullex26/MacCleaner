@@ -1187,6 +1187,46 @@ def _move_to_trash(path: Path):
     shutil.move(str(path), str(dest))
 
 
+CLEANUP_TIMEOUT_S = 600
+
+
+@contextmanager
+def _cleanup_termination_signals():
+    # Record launch-time interruptions until the child handle is inside the
+    # cleanup-protected block. Signal masks would also affect the child.
+    previous = {}
+    pending = []
+    launching = True
+
+    def interrupt(signum, frame):
+        if launching:
+            pending.append((signum, frame))
+        elif signum == signal.SIGTERM:
+            raise SystemExit(128 + signum)
+        else:
+            handler = previous[signum]
+            if callable(handler):
+                handler(signum, frame)
+            elif handler != signal.SIG_IGN:
+                raise SystemExit(128 + signum)
+
+    def launched():
+        nonlocal launching
+        launching = False
+        for signum, frame in pending:
+            interrupt(signum, frame)
+
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, interrupt)
+    try:
+        yield launched
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
 def delete_target(t, mode="rm"):
     """Delete a target. Returns (bytes_freed, error_message_or_None)."""
     if t.get("cmd"):
@@ -1196,7 +1236,21 @@ def delete_target(t, mode="rm"):
             # targets) exclusively from simctl identifiers that passed
             # _SIMCTL_UDID_RE/_SIMCTL_RUNTIME_ID_RE — never raw user input,
             # so shell=True is safe here
-            subprocess.run(t["cmd"], shell=True, capture_output=True, timeout=600)
+            with _cleanup_termination_signals() as launched:
+                process = subprocess.Popen(t["cmd"], shell=True, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL, start_new_session=True)
+                try:
+                    launched()
+                    process.wait(timeout=CLEANUP_TIMEOUT_S)
+                except BaseException:
+                    # A new session does not receive the caller's Ctrl-C. Stop its
+                    # entire group on timeout or interruption before propagating it.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                    raise
             return 0, None  # Can't easily measure cmd-based targets
         except Exception as e:
             return 0, str(e)
