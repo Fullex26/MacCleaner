@@ -41,6 +41,87 @@ This document tracks planned features and long-term direction. Community input w
 
 ## Next — v2.x Ideas
 
+### Direction after 2.18.1 — reviewed 2026-10-19
+
+The previous buildable backlog shipped in 2.18.0–2.18.1 ([run report #98](https://github.com/Fullex26/MacCleaner/issues/98)); the remaining old checkboxes were Swift deletion/cutover and two entries for the same App Store initiative. The next cycle should make the existing developer cleaner easier to trust, inspect, and operate while collecting real evidence for V3.
+
+Three directions were considered: expanding cleanup coverage, finishing the Swift migration, and improving the current cleanup workflow. **Prioritize the current workflow and soak evidence:** coverage needs measured developer-machine examples, and deletion migration cannot bypass calendar-time soak. Avoid adding features solely to lengthen this document.
+
+**Status rules:** “Ready to specify” means there is a concrete incident or inspected capability gap, not that a design or implementation is approved. Start each item with its stated fixture/probe and keep one item per PR; a source observation is not a claimed reproduced runtime bug. Discovery items below are hypotheses, outside the implementation queue until their validation produces evidence. Sizes are relative: **S** one focused change, **M** a feature across engine/bridge/UI, **L** several separately reviewed changes; they are not delivery promises. Version assignments follow validation rather than dates.
+
+**Recommended first batch:** R01 → R02 → R03, then R04/R05 and R09/R10. These improve safety communication and produce the evidence needed to choose the next larger investment. All JSON additions remain optional/additive; Python stays stdlib-only and the app remains a thin engine client.
+
+#### Priority 1 — Make cleanup decisions and outcomes explicit
+
+- [ ] **R01 · Show unavailable scan measurements — Ready to specify · S.** Evidence: #78 added `measurement_error` with `exists: false`, but `ScanTarget` in [CleanerBridge.swift](app/Sources/CleanerBridge.swift) does not decode it and [DashboardView.swift](app/Sources/DashboardView.swift) filters absent targets out; users can miss why an expected cache disappeared. Add an unavailable state and bounded retry, first proving the current behavior with the real bridge; done when a failed measurement stays visible, cannot be selected as a known-size candidate, and a successful retry clears the warning without breaking older JSON.
+
+- [ ] **R02 · Inspect exact cleanup scope before confirming — Ready to specify · M.** Evidence: `clean --dry-run --json` already exposes resolved paths/commands ([AGENTS.md](AGENTS.md)), while the Dashboard confirmation operates on selected IDs; #73 and #80 demonstrate why parent scope and symlinks matter. Add an on-demand preview for the frozen selection using the existing engine contract; done when path and command targets are clearly distinguished, preview errors are visible, preview has zero writes, and execution revalidates current safety rules rather than trusting stale preview paths.
+
+- [ ] **R03 · Explain per-item cleanup outcomes in History — Ready to specify · M.** Evidence: #66 preserves deletion errors and #90 separates notification successes/failures, but [HistoryView.swift](app/Sources/HistoryView.swift) renders date, bytes, and a non-skipped count without item details. Add expandable outcome rows and separate deleted/trashed/skipped/failed counts; done when an error-only and a partial-success fixture remain understandable after relaunch and historical records without optional details still decode.
+
+- [ ] **R04 · Manage protected paths in Settings — Ready to specify · M.** Evidence: #71/#73 implemented exclusion safety, and `skip_paths` exists in engine config, but [SettingsView.swift](app/Sources/SettingsView.swift) offers no editor. Add folder selection, a readable protected-path list, and explicit removal through existing config transactions; done when exclusions survive concurrent setting updates and sync, and the UI explains that protecting a descendant can withhold a whole parent target.
+
+- [ ] **R05 · Configure project scan scope in the app — Ready to specify · M.** Evidence: `project_roots` and `project_min_age_days` exist in [cleaner.py](cleaner.py) and CLI flags, while Settings does not expose them. Add root and age controls backed by config commands; done when invalid/unavailable roots are explained, saved settings affect both CLI and app scans, and dirty/unpushed project protection stays enabled and visible.
+
+- [ ] **R06 · Preserve successful-command warnings for app users — Ready to specify · M.** Evidence: #69/#78 emit partial-discovery warnings on stderr, while `runEngine` returns only stdout on exit zero; the CLI user can see information the app client cannot. Specify a bounded diagnostics result at the bridge or an additive engine warning envelope, keeping stdout valid JSON; done when a successful but incomplete fixture shows a warning, ordinary success remains quiet, and warning text is never interpreted as permission to clean.
+
+#### Priority 2 — Explain storage and support problems
+
+- [ ] **R07 · Surface doctor results in the app — Ready to specify · M.** Evidence: `doctor --json` already distinguishes actionable installation/config faults from advisory swap, held-open files, and Docker image observations ([AGENTS.md](AGENTS.md)); the current sidebar has no health view. Add an on-demand diagnostic view keyed by check name with optional advisory decoding; done when advisories never become cleanup actions or a failed overall health gate, and unknown future checks render safely.
+
+- [ ] **R08 · Create a local, reviewable support export — Ready to specify · M.** Evidence: #61 required layout evidence, and reports #94/#98 assembled versions, probes, and release facts manually. Export a user-selected local bundle of versions, doctor results, diagnostic summaries, and optional logs with a preview/redaction step; done when usernames, home paths, project names, and user-supplied config values are excluded or explicitly approved, output is size-bounded, and nothing is uploaded automatically.
+
+- [ ] **R09 · Report soak eligibility and failure reasons — Ready to specify · S.** Evidence: `runSoakIfEnabled` silently skips missing `mck` or a missing `~/mac-cleaner/config.json`, while Settings shows only the last divergence count. Expose disabled, unavailable, running, failed, and compared states with the actual config source; done when missing-helper and bundled-engine fixtures cannot be mistaken for “engines agree,” and resolving alternate layouts never compares different configurations.
+
+- [ ] **R10 · Build an auditable soak summary — Ready to specify · M.** Evidence: [V3's gate](docs/V3-SWIFT-ENGINE.md) requires clean real-use evidence across a release cycle, but the UI reports only the last comparison and `soak.log` is a line log. Add local records of attempted/completed/skipped comparisons, engine versions, timestamps, coverage and divergence classes plus a summary/export; done when zero comparisons cannot pass readiness, incomplete/malformed logs are reported, and fixtures are explicitly excluded from real-machine evidence.
+
+- [ ] **R11 · Measure command-target parity during real soak — Ready to specify · M.** Evidence: #64 added full command-estimate parity in fixture CI, but `soakCompare` still bypasses existence/size comparison for `sw.cmd`. Design a read-only, timing-aware comparison using the new estimates; done when deliberate command divergence is recorded, unavailable tools are distinguished from agreement, and documented tolerance handles timing drift without hiding safety or target-presence mismatches.
+
+- [ ] **R12 · Automate published-release verification — Ready to specify · M.** Evidence: #98 required separate manual checks for ZIP/CLI contents, Ed25519, stapling, Gatekeeper, stable appcast, and two casks; [RELEASING.md](docs/RELEASING.md) also contains historical setup prose that no longer describes current publication. Turn those checks into a repeatable read-only verifier and refresh the current procedure; done when a wrong hash, missing appcast, stale engine, or channel-version mismatch fails clearly, and the verifier never publishes or rewrites a release.
+
+#### Priority 3 — Make quality evidence repeatable
+
+- [ ] **R13 · Validate the rendered app on real Macs — Ready to specify · M.** Evidence: #61 measured a 1513 pt layout minimum against a 480 pt window, and #98 explicitly stops short of visual acceptance. Create a repeatable fixture-backed visual/interaction checklist for every section, narrow/default windows, long labels, empty/loading/error/partial states, and light/dark appearance; done when dated actual renders and keyboard navigation results accompany the existing minimum-size probe, with real data hidden and visual failures reproduced before fixes.
+
+- [ ] **R14 · Extend real-bridge contract coverage — Ready to specify · M.** Evidence: #83/#86 addressed incomplete map results, #87 stale navigation results, and #90 outcome notifications through focused probes; optional fields can still be dropped by individual models as R01 illustrates. Inventory every Codable envelope against current, legacy, empty, partial, and error fixtures; done when omissions with user impact have named regression cases, unknown additive keys decode, and the test exercises production bridge types rather than copies.
+
+### Discovery backlog — validate before implementation
+
+These ten investigations deliberately expand the choices without claiming ten new bugs or committing to ten features. Each must yield a measurement, reproducible fixture, or observed user need before promotion into the queue above. A negative result closes the investigation; it does not justify speculative product code.
+
+- [ ] **D01 · Accurate selected-space estimates · Hypothesis · S.** Evidence anchor: the engine already unions nested targets, while Dashboard selected/pending totals sum row sizes. Seed a parent plus nested child and compare the displayed promise with the engine's union; promote only if the result misleads, then specify a selection estimate that also labels command estimates and Trash behavior honestly.
+
+- [ ] **D02 · Storage growth attribution · Hypothesis · M.** Evidence anchor: daily disk snapshots and `report --stats` exist, but they answer free-space trend and cleanup value, not which directory grew. Measure whether repeated user-requested maps explain real low-disk incidents; a prototype must preserve scan scope/completeness, avoid counting changing coverage as growth, and establish retention/IO costs before proposing stored per-path history.
+
+- [ ] **D03 · Search and filter large result sets · Hypothesis · S.** Evidence anchor: 94 static targets plus dynamic projects/leftovers can produce long lists, and the recorded first soak had 763 targets. Exercise representative fixture sizes and keyboard tasks; add search, category, risk, or age filters only where measured navigation is poor, with hidden selections explicitly accounted for in confirmation.
+
+- [ ] **D04 · User cancellation for read-only scans · Hypothesis · M.** Evidence anchor: #69/#78 bound walks at 120 seconds and the app has a 600-second backstop. Measure abandoned navigation and slow-scan wait times; first prove a cancel operation can reap owned subprocesses, suppress stale results, and leave state consistent, without extending the design to abandoned background deletion.
+
+- [ ] **D05 · Scan latency and resource budget · Measurement study · M.** Evidence anchor: the former 12-minute hang and subsequent hard bounds prove liveness, not acceptable normal latency. Record phase durations, subprocess counts, CPU and memory on real small/large developer machines; propose optimizations only for measured bottlenecks, with cold/warm runs and incomplete results reported separately.
+
+- [ ] **D06 · Target expansion from measured developer storage · On-device verification required · M.** Evidence anchor: prior targets reclaimed measured developer space, but the Spotify profile incident showed cache-looking roots can contain credentials and live state. Collect opt-in path, allocated-size, owning-tool, rebuild-cost and liveness evidence for uncovered storage, check overlaps with all current targets, and add no target or safe flag until its exact regenerable boundary is verified on a real Mac.
+
+- [ ] **D07 · Explain why a candidate is withheld · Hypothesis · M.** Evidence anchor: exclusions, tmp liveness, age gates, incomplete app inventory, and project git guards intentionally suppress candidates. Collect support cases where that absence is confusing; prototype a bounded, on-demand explanation that identifies the applicable guard without bypassing it, exposing private path inventories by default, or making normal scans noisier.
+
+- [ ] **D08 · Accessibility and reduced-motion audit · Verification study · M.** Evidence anchor: the app uses custom glass panels, proportional bars, icon actions, and category colors, while the existing layout probe measures geometry. Inspect VoiceOver labels/order, keyboard-only use, increased contrast and reduced motion on actual macOS; promote only observed failures into focused fixes, preserving explicit text for safety and outcome states.
+
+- [ ] **D09 · Recovery expectations for Trash cleanup · Product investigation · M.** Evidence anchor: recoverable mode exists, but command-based targets are still external cleanup commands and Trash does not immediately free disk space. Test users' interpretation of preview, confirmation and minimum-free results; prefer accurate scope/help first, and consider an undo ledger only after separately designing destination collisions, restart persistence, and explicit ownership without promising command rollback.
+
+- [ ] **D10 · Scheduled-clean observability after Run Now · Verification study · S.** Evidence anchor: Settings' existing comment records a functioning schedule being reported broken because it was invisible; `schedule run` proves launchctl accepted a start, not that cleanup completed. Trace controlled accepted-start, delayed, failed and completed runs; if the current UI conflates those states, specify persisted last-attempt/outcome reporting without adding a second scheduler or changing doctor exit semantics.
+
+### Gated milestones — evidence and decisions still required
+
+- **V3 gate A: evidence collection.** R09–R11 make evidence understandable; they do not satisfy the gate themselves. Run the released read-only dual-engine comparison on real developer machines for at least one release cycle, record versions/coverage, and investigate divergences. Missing runs, synthetic fixtures, or repeated CI runs do not count as soak.
+- **V3 gate B: deletion design and review.** Only after gate A and existing guard parity pass, specify the caller port with the Python safety corpus, failure accounting, exclusions, symlink behavior and process shutdown preserved. Deletion code and safe-flag changes still require explicit owner review; no Swift deletion API is authorized by this roadmap expansion.
+- **V3 gate C: controlled cutover.** After reviewed deletion parity, plan the documented Python fallback release and observable engine selection; retain compatibility tests and define rollback evidence before changing the default.
+- **App Store decision.** Treat the two old MAS checkboxes below as one initiative: decide whether a separate read-only storage product is worth maintaining, then validate actual Swift API coverage and sandbox folder-access behavior before scoping packaging. App Store Connect setup/submission remains owner-authorized work; it is not assumed to be “just packaging.”
+
+### Deliberate exclusions
+
+No guessed cache paths, automatic cleanup of swap/system temp/held-open files/Docker VM images, cloud telemetry service, account system, or automatic upload of support data. Duplicate-file deletion, broad “optimize my Mac” actions, and a second commercial SKU are not implied by developer storage cleanup. Reconsider only with concrete user need and a separate safety/product design.
+
+### Previously shipped v2.x work
+
 - [x] **Do not embed failed Swift build output** — a hermetic build left an executable but exited unsuccessfully, and the fallback still embedded it. Require successful native compilation before querying or copying its result; part of the build-output fix. Shipped in v2.18.0.
 
 - [x] **Resolve Swift build output through SwiftPM** — the real macOS build succeeded under `.build/out/Products/Release` but the app script looked under `.build/apple/Products/Release` and omitted the soak engine. Query `--show-bin-path` for the successful build configuration instead of assuming a layout. Shipped in v2.18.0.
@@ -161,7 +242,7 @@ This document tracks planned features and long-term direction. Community input w
 
 - [ ] **Full Swift rewrite of cleaner engine** — **stages 1–3 landed, plus Stage 4's first half**: contract fixtures (`tests/fixtures/`, regenerated-and-diffed by the suite) and the read-only `MacCleanerKit` (`swift/`, generated target table, CI-enforced Swift/Python parity via `tools/check_swift_parity.py`). Stage 3's dual-engine soak now runs in the app and has already caught a real bug in each engine, and Stage 4's **guards** are ported — `Guards.safeToDelete` (parent resolved, leaf deliberately unresolved, exact 2.8.1 semantics) and `Guards.tmpScanPathAllowed` (the two-level carve-out) — with `tools/check_guard_parity.py` judging a 20-scenario adversarial corpus against BOTH engines in CI, so no deletion caller can be written without verdict parity existing first. What remains is Stage 4's deletion callers, gated on accumulated soak evidence rather than on engineering effort, then Stage 5 cutover, per `docs/V3-SWIFT-ENGINE.md`. Deliberately not attempted as one rewrite: the Python engine is the tested core, and parity for a deletion tool must be proved, not assumed
 - [x] **SwiftUI preferences window** — Settings tab in the v2.0 app, persisted through the same `config.json` as the CLI
-- [ ] **Sandboxed App Store build** — assessed in `docs/APP-STORE-FEASIBILITY.md`: the sandbox denies exactly what MacCleaner does, so a MAS variant would be the read-only storage X-ray (`storage-map`/`storage-insights`), not the cleaner. The read-only Swift core it would ship now exists (V3 stages 1–3), so what remains is a product decision and packaging, not engineering effort
+- [ ] **Sandboxed App Store build** — assessed in `docs/APP-STORE-FEASIBILITY.md`: the sandbox denies exactly what MacCleaner does, so a MAS variant would be the read-only storage X-ray (`storage-map`/`storage-insights`), not the cleaner. The read-only Swift core it would ship now exists (V3 stages 1–3), but the read-only variant still needs a product decision, an API-coverage audit, and validated sandbox folder access before packaging
 - [x] **Sparkle auto-updater** — shipped in v2.6.0, see Phase 4
 - [x] **Universal binary** — `app/build.sh` compiles arm64 + x86_64 and lipos them together
 
@@ -171,7 +252,7 @@ This document tracks planned features and long-term direction. Community input w
 
 > Long-term, if the project gains traction.
 
-- [ ] **Mac App Store release** — see `docs/APP-STORE-FEASIBILITY.md`; V3 stage 3 has landed, so the Swift read-only core exists and the MAS variant is now a packaging exercise. Still requires owner-level App Store Connect actions
+- [ ] **Mac App Store release** — see `docs/APP-STORE-FEASIBILITY.md`; V3 stage 3 has landed, so the Swift read-only core exists and the MAS variant still needs verified API coverage, sandbox access design, and a product decision before packaging. Still requires owner-level App Store Connect actions
 - [x] **iCloud sync for config** — `config sync on|off|status` (v2.15.0): config.json lives in iCloud Drive behind a symlink, shared by the CLI, the app, and the launchd agents; `off` is local-only and leaves the iCloud copy for other Macs
 - [x] **Usage analytics (opt-in)** — `report --stats` (v2.15.0), implemented local-first: aggregates this machine's own `report.log` by target and category to answer "which categories are most valuable" with nothing ever leaving the machine. A networked telemetry backend was deliberately not built
 - [x] **Scheduled scan reports** — the weekly scheduled clean's completion notification now carries a trailing-7-day digest (v2.15.0) — the weekly run's notification is the weekly report, with no second agent and no plist change. Email was deliberately not built (no send infrastructure; notifications are the native channel)
