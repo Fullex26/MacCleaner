@@ -33,7 +33,6 @@ import json
 import math
 import glob as globmod
 import hashlib
-from collections import Counter
 import time
 import shutil
 import tempfile
@@ -592,6 +591,13 @@ def _path_overlaps_exclusion(path, skip):
 
 
 # ── Target definitions ─────────────────────────────────────────────────────────
+def _target_ids(bases, identities):
+    """Bind lossy slugs to identity, independent of other scan candidates."""
+    return [base if identity == slugify(identity) else
+            base + "--" + hashlib.sha256(os.fsencode(identity)).hexdigest()
+            for base, identity in zip(bases, identities)]
+
+
 def get_targets(config, all_categories=False):
     skip = _exclusion_paths(config.get("skip_paths", []))
     enabled = set(ALL_CATEGORIES) if all_categories else set(config["enabled_categories"])
@@ -971,6 +977,10 @@ def get_targets(config, all_categories=False):
                     "size": size,
                 })
 
+    logs = [t for t in targets if t["category"] == "logs"]
+    for target, tid in zip(logs, _target_ids(
+            [t["id"] for t in logs], [t["path"].name for t in logs])):
+        target["id"] = tid
     return targets
 
 
@@ -2438,17 +2448,12 @@ def scan_projects(config, roots=None, min_age_days=None):
 def projects_to_targets(hits):
     targets = []
     base_ids = [f"project-{slugify(os.path.relpath(h['path'], str(HOME)))}" for h in hits]
-    counts = Counter(base_ids)
-    for h, base_id in zip(hits, base_ids):
+    ids = _target_ids(base_ids, [os.path.relpath(h["path"], str(HOME)) for h in hits])
+    for h, tid in zip(hits, ids):
         git = h.get("git")
         flags = [name for name, on in (("dirty", git and git.get("dirty")),
                                        ("unpushed", git and git.get("unpushed"))) if on]
         badge = "".join(f" [{f}]" for f in flags)
-        rel = os.path.relpath(h["path"], str(HOME))
-        # Size/order-dependent suffixes could silently select another project
-        # on a later scan. Disambiguate every colliding slug by path instead.
-        tid = base_id if counts[base_id] == 1 else (
-            base_id + "-" + hashlib.sha256(os.fsencode(rel)).hexdigest())
         targets.append({
             "id": tid,
             "category": "projects",
@@ -2675,13 +2680,12 @@ def scan_tmp_artifacts(config):
 
 
 def tmp_to_targets(hits):
-    targets, seen = [], set()
-    for h in hits:
-        base = "tmp-" + slugify(h["path"].name)
-        tid, n = base, 2
-        while tid in seen:
-            tid, n = "%s-%d" % (base, n), n + 1
-        seen.add(tid)
+    targets = []
+    ids = _target_ids(["tmp-" + slugify(h["path"].name) for h in hits],
+                      [str(h["path"].relative_to(TMP_SCAN_ROOT))
+                       if TMP_SCAN_ROOT in h["path"].parents else str(h["path"])
+                       for h in hits])
+    for h, tid in zip(hits, ids):
         kind_desc = ("Xcode-style derived build products"
                      if h["kind"] == "derived-data"
                      else "Stale repo clone containing build artifacts")
@@ -3231,13 +3235,10 @@ def scan_app_leftovers(config):
 
 
 def app_leftovers_to_targets(hits):
-    targets, seen = [], set()
-    for h in hits:
-        base = "leftover-" + slugify(h["bundle_id"])
-        tid, n = base, 2
-        while tid in seen:
-            tid, n = "%s-%d" % (base, n), n + 1
-        seen.add(tid)
+    targets = []
+    ids = _target_ids(["leftover-" + slugify(h["bundle_id"]) for h in hits],
+                      [h["bundle_id"] for h in hits])
+    for h, tid in zip(hits, ids):
         targets.append({
             "id": tid,
             "category": "leftovers",

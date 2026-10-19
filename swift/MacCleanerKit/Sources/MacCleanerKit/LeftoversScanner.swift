@@ -202,12 +202,9 @@ public enum LeftoversScanner {
     }
 
     public static func targets(from hits: [Hit]) -> [Target] {
-        var seen = Set<String>()
-        return hits.map { h in
-            let base = "leftover-" + Slug.slugify(h.bundleId)
-            var tid = base, n = 2
-            while seen.contains(tid) { tid = "\(base)-\(n)"; n += 1 }
-            seen.insert(tid)
+        let bases = hits.map { "leftover-" + Slug.slugify($0.bundleId) }
+        let ids = TargetIDs.disambiguate(bases, identities: hits.map(\.bundleId))
+        return zip(hits, ids).map { h, tid in
             return Target(
                 id: tid, category: "leftovers",
                 label: "App leftovers: \(h.bundleId)",
