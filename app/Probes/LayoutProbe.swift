@@ -133,6 +133,15 @@ struct LayoutProbe {
             print("\(ok ? "ok  " : "FAIL") Dashboard unavailable @ width \(Int(width)): min height \(Int(size.height))pt")
             if !ok { failed = true }
         }
+        let historyJSON = Data(#"{"timestamp":"2026-10-23T12:00:00","total_freed_bytes":4096,"total_freed_human":"4 KB","disk_after":"fixture","items":[{"id":"fixture","label":"Partial failure","freed":4096,"status":"error","error":"Permission denied"}]}"#.utf8)
+        bridge.history = [try! JSONDecoder().decode(HistoryRun.self, from: historyJSON)]
+        let historyHost = NSHostingController(rootView: HistoryView().environmentObject(bridge))
+        for width: CGFloat in [0, 120, 300] {
+            let size = historyHost.sizeThatFits(in: CGSize(width: width, height: 0))
+            let ok = size.height <= windowMinHeight
+            print("\(ok ? "ok  " : "FAIL") History outcomes @ width \(Int(width)): min height \(Int(size.height))pt")
+            if !ok { failed = true }
+        }
         if failed {
             print("App probe failed: inspect the FAIL lines above. Oversized section heights indicate fixedSize(vertical:) or fixed frames outside a ScrollView/List.")
             exit(1)

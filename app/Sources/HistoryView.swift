@@ -28,39 +28,52 @@ struct HistoryView: View {
     }
 }
 
-/// One cleanup run as a glass card: date + relative-time caption on the
-/// leading side, freed amount (scaled-down hero figure) + item count on the
-/// trailing side.
+/// Preserve recorded bytes even when an item partially failed.
 struct HistoryCard: View {
     let run: HistoryRun
-
-    /// Mirrors the Dashboard footer's count: "skipped" review targets that
-    /// were merely offered, not actually removed, don't count as freed items.
-    private var itemCount: Int {
-        run.items.filter { $0.status != "skipped" }.count
-    }
+    @State private var expanded = false
 
     var body: some View {
-        HStack(alignment: .top, spacing: 16) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(formatTimestamp(run.timestamp))
-                    .font(.rowLabel)
-                Text(relativeTimeText)
-                    .font(.metaCaption)
-                    .foregroundStyle(.secondary)
-                Text(run.disk_after)
-                    .font(.metaCaption)
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(formatTimestamp(run.timestamp)).font(.rowLabel)
+                    Text(relativeTimeText).font(.metaCaption).foregroundStyle(.secondary)
+                    Text(run.disk_after).font(.metaCaption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 3) {
+                    Text(run.total_freed_human)
+                        .font(.system(size: 20, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(run.total_freed_bytes > 0 ? .green : .secondary)
+                    Text("Reported freed").font(.metaCaption).foregroundStyle(.secondary)
+                }
             }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 3) {
-                Text(run.total_freed_human)
-                    .font(.system(size: 20, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(run.total_freed_bytes > 0 ? .green : .secondary)
-                Text("\(itemCount) item\(itemCount == 1 ? "" : "s")")
-                    .font(.metaCaption)
-                    .foregroundStyle(.secondary)
+            if run.items.isEmpty {
+                Text(run.outcomeSummary).font(.metaCaption).foregroundStyle(.secondary)
+            } else {
+                DisclosureGroup(isExpanded: $expanded) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        // History may contain repeated IDs; retain every recorded outcome.
+                        ForEach(Array(run.items.enumerated()), id: \.offset) { _, item in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(item.label).font(.rowLabel)
+                                Text(item.outcomeLabel)
+                                    .foregroundStyle(item.status == "error" ? .red : .secondary)
+                                Text("Reported freed: \(ByteCountFormatter.string(fromByteCount: Int64(item.freed), countStyle: .file))")
+                                    .font(.metaCaption).foregroundStyle(.secondary)
+                                if let error = item.error {
+                                    Text(error).font(.metaCaption).foregroundStyle(.red).textSelection(.enabled)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .padding(.top, 8)
+                } label: {
+                    Text(run.outcomeSummary).font(.metaCaption)
+                }
             }
         }
         .padding()
