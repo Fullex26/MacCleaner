@@ -4,7 +4,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ---
 
-## Current State — v2.18.1 ✅
+## Current State — v2.19.0 ✅
 
 - Subcommand CLI — `scan`, `clean`, `projects`, `report`, `doctor`, `config`, `categories` — with every v1 spelling (`--preview`, `--clean --yes`, `--report`, `--json`, `--config-*`) still working, so existing cron jobs, aliases, and the old menu bar app don't break
 - Agent-ready interface — `--json` on every data command, stable kebab-case target IDs (`clean --targets npm-cache,pip-cache`), JSON on stdout / messages on stderr, documented exit codes, `AGENTS.md` contract
@@ -37,6 +37,8 @@ This document tracks planned features and long-term direction. Community input w
 
 - **v2.18.1 safety fixes** — honest deletion accounting, excluded-descendant protection, stable dynamic IDs, bounded discovery, empty-only symlink refusal, and supervised cleanup process groups. 651 Python tests plus Swift/parity/app probes. Rescan after upgrading to obtain updated lossy dynamic IDs.
 
+- **v2.19.0 cleanup visibility** — unavailable Dashboard measurements, exact cleanup previews with incomplete-result gating, and detailed History outcomes. 654 Python tests plus production-bridge and layout probes; live visual acceptance remains a separate check.
+
 ---
 
 ## Next — v2.x Ideas
@@ -53,11 +55,11 @@ Three directions were considered: expanding cleanup coverage, finishing the Swif
 
 #### Priority 1 — Make cleanup decisions and outcomes explicit
 
-- [ ] **R01 · Show unavailable scan measurements — Implemented, pending release · S.** Evidence: #78 added `measurement_error` with `exists: false`, but `ScanTarget` in [CleanerBridge.swift](app/Sources/CleanerBridge.swift) does not decode it and [DashboardView.swift](app/Sources/DashboardView.swift) filters absent targets out; users can miss why an expected cache disappeared. Add an unavailable state and bounded retry, first proving the current behavior with the real bridge; done when a failed measurement stays visible, cannot be selected as a known-size candidate, and a successful retry clears the warning without breaking older JSON.
+- [x] **R01 · Show unavailable scan measurements — Shipped in v2.19.0 · S.** Evidence: #78 added `measurement_error` with `exists: false`, but `ScanTarget` in [CleanerBridge.swift](app/Sources/CleanerBridge.swift) does not decode it and [DashboardView.swift](app/Sources/DashboardView.swift) filters absent targets out; users can miss why an expected cache disappeared. Add an unavailable state and bounded retry, first proving the current behavior with the real bridge; done when a failed measurement stays visible, cannot be selected as a known-size candidate, and a successful retry clears the warning without breaking older JSON.
 
-- [ ] **R02 · Inspect exact cleanup scope before confirming — Implemented, pending release · M.** Evidence: `clean --dry-run --json` already exposes resolved paths/commands ([AGENTS.md](AGENTS.md)), while the Dashboard confirmation operates on selected IDs; #73 and #80 demonstrate why parent scope and symlinks matter. Add an on-demand preview for the frozen selection using the existing engine contract; done when path and command targets are clearly distinguished, preview errors are visible, preview has zero writes, and execution revalidates current safety rules rather than trusting stale preview paths.
+- [x] **R02 · Inspect exact cleanup scope before confirming — Shipped in v2.19.0 · M.** Evidence: `clean --dry-run --json` already exposes resolved paths/commands ([AGENTS.md](AGENTS.md)), while the Dashboard confirmation operates on selected IDs; #73 and #80 demonstrate why parent scope and symlinks matter. Add an on-demand preview for the frozen selection using the existing engine contract; done when path and command targets are clearly distinguished, preview errors are visible, preview has zero writes, and execution revalidates current safety rules rather than trusting stale preview paths.
 
-- [ ] **R03 · Explain per-item cleanup outcomes in History — Implemented, pending release · M.** Evidence: #66 preserves deletion errors and #90 separates notification successes/failures, but [HistoryView.swift](app/Sources/HistoryView.swift) renders date, bytes, and a non-skipped count without item details. Add expandable outcome rows and separate deleted/trashed/skipped/failed counts; done when an error-only and a partial-success fixture remain understandable after relaunch and historical records without optional details still decode.
+- [x] **R03 · Explain per-item cleanup outcomes in History — Shipped in v2.19.0 · M.** Evidence: #66 preserves deletion errors and #90 separates notification successes/failures, but [HistoryView.swift](app/Sources/HistoryView.swift) renders date, bytes, and a non-skipped count without item details. Add expandable outcome rows and separate deleted/trashed/skipped/failed counts; done when an error-only and a partial-success fixture remain understandable after relaunch and historical records without optional details still decode.
 
 - [ ] **R04 · Manage protected paths in Settings — Ready to specify · M.** Evidence: #71/#73 implemented exclusion safety, and `skip_paths` exists in engine config, but [SettingsView.swift](app/Sources/SettingsView.swift) offers no editor. Add folder selection, a readable protected-path list, and explicit removal through existing config transactions; done when exclusions survive concurrent setting updates and sync, and the UI explains that protecting a descendant can withhold a whole parent target.
 
