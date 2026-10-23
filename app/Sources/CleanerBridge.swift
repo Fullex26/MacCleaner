@@ -50,6 +50,58 @@ struct CleanItem: Codable, Identifiable {
     let error: String?
 }
 
+struct CleanupPreview: Decodable {
+    struct Item: Decodable, Identifiable {
+        struct PathEntry: Decodable {
+            let path: String
+            let size_bytes: Int
+        }
+        let id: String
+        let label: String
+        let status: String
+        let paths: [PathEntry]
+        let cmd: String?
+        let preview_error: String?
+
+        func actionDescription(mode: String) -> String {
+            if status == "would-run" { return "Run command — not recoverable through Trash" }
+            return mode == "trash" && id != "trash" ? "Move to Trash" : "Permanently delete"
+        }
+    }
+    let dry_run: Bool
+    let delete_mode: String
+    let items: [Item]
+}
+
+struct ReviewedCleanup {
+    let ids: [String]
+    let mode: String
+    let preview: CleanupPreview
+    let diagnostics: String
+
+    var problem: String? {
+        guard diagnostics.isEmpty else { return diagnostics }
+        guard preview.dry_run, ["rm", "trash"].contains(mode), preview.delete_mode == mode else {
+            return "Cleanup mode changed. Refresh settings and preview again."
+        }
+        let returned = preview.items.map(\.id)
+        guard !ids.isEmpty, Set(returned) == Set(ids), returned.count == Set(ids).count else {
+            return "The selected targets changed or disappeared. Scan and select again."
+        }
+        for item in preview.items {
+            if let error = item.preview_error { return error }
+            switch item.status {
+            case "would-run":
+                if item.cmd?.isEmpty != false || !item.paths.isEmpty { return "Incomplete command preview." }
+            case "would-delete":
+                if item.paths.isEmpty || item.cmd != nil { return "No resolved paths for \(item.label). Scan and select again." }
+            default: return "Unrecognized preview outcome: \(item.status)."
+            }
+        }
+        return nil
+    }
+}
+
 struct CleanResult: Codable {
     let delete_mode: String?
     let freed_bytes: Int
@@ -445,6 +497,11 @@ final class CleanerBridge: ObservableObject {
 
     nonisolated static func runEngine(_ args: [String],
                                               timeout: TimeInterval = defaultEngineTimeout) throws -> Data {
+        try runEngineOutput(args, timeout: timeout).data
+    }
+
+    nonisolated private static func runEngineOutput(_ args: [String],
+                      timeout: TimeInterval = defaultEngineTimeout) throws -> (data: Data, diagnostics: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         process.arguments = [enginePath()] + args
@@ -459,11 +516,13 @@ final class CleanerBridge: ObservableObject {
         process.standardError = err
 
         let errBuffer = PipeBuffer()
-        err.fileHandleForReading.readabilityHandler = { handle in
-            errBuffer.append(handle.availableData)
-        }
-
         try process.run()
+        let stderrFinished = DispatchGroup()
+        stderrFinished.enter()
+        DispatchQueue.global(qos: .utility).async {
+            errBuffer.append(err.fileHandleForReading.readDataToEndOfFile())
+            stderrFinished.leave()
+        }
         // TERM gives command cleanup a bounded chance to stop its owned group.
         // A hard-kill backstop still handles a kernel read that cannot unwind.
         // Set the flag first so either exit reports the timeout accurately.
@@ -481,18 +540,24 @@ final class CleanerBridge: ObservableObject {
         let data = out.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         killer.cancel()
-        err.fileHandleForReading.readabilityHandler = nil
+        // Diagnostics are part of preview validation: process exit alone does
+        // not prove the concurrent reader has consumed its final warning.
+        let stderrComplete = stderrFinished.wait(timeout: .now() + 1) == .success
 
         if timedOut.value {
             throw BridgeError.engine(
                 "engine `\(args.first ?? "")` gave up after \(Int(timeout))s — killed")
+        }
+        guard stderrComplete else {
+            throw BridgeError.engine("Engine diagnostics did not finish; preview cannot be confirmed.")
         }
         if process.terminationStatus != 0 {
             let msg = String(data: errBuffer.contents, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             throw BridgeError.engine(msg.isEmpty ? "engine exited \(process.terminationStatus)" : msg)
         }
-        return data
+        return (data, String(data: errBuffer.contents, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
     }
 
     /// Minimal thread-safe flag for the timeout path above: the killer runs
@@ -673,6 +738,29 @@ final class CleanerBridge: ObservableObject {
         if let d = fallback.date(from: raw) { return d }
         fallback.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
         return fallback.date(from: raw)
+    }
+
+    func previewCleanup(ids: [String]) async throws -> ReviewedCleanup {
+        guard !ids.isEmpty else { throw BridgeError.engine("Select at least one target to preview.") }
+        let mode = deleteMode
+        var args = ["clean", "--targets", ids.joined(separator: ","), "--yes", "--dry-run"]
+        if mode == "trash" { args.append("--trash") }
+        args.append("--json")
+        let output = try await Task.detached(priority: .userInitiated) {
+            try Self.runEngineOutput(args)
+        }.value
+        return ReviewedCleanup(ids: ids, mode: mode,
+            preview: try JSONDecoder().decode(CleanupPreview.self, from: output.data),
+            diagnostics: output.diagnostics)
+    }
+
+    func clean(reviewed: ReviewedCleanup) async throws {
+        guard reviewed.problem == nil else { throw BridgeError.engine(reviewed.problem!) }
+        guard reviewed.mode == deleteMode else {
+            throw BridgeError.engine("Cleanup mode changed. Preview again before confirming.")
+        }
+        guard !isCleaning else { throw BridgeError.engine("Another cleanup is running.") }
+        await clean(ids: reviewed.ids)
     }
 
     func clean(ids: [String]) async {

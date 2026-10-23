@@ -9,6 +9,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+- Dashboard cleanup previews show the frozen selection’s resolved paths and commands before confirmation. Incomplete previews and changed deletion modes block confirmation; execution still revalidates IDs through the engine. Dry-run items optionally report `preview_error` without changing existing statuses or fields.
+
 ### Fixed
 - Dashboard retains targets whose measurement failed, labels their sizes unavailable, and excludes them from cleanup selection. Retry scan replaces stale warnings only after a successful response; partial totals are labeled explicitly.
 
