@@ -13,8 +13,11 @@ struct DashboardView: View {
     @State private var pendingIDs: [String] = []
 
     private var targets: [ScanTarget] {
-        bridge.report?.targets.filter { ($0.exists ?? true) && ($0.size_bytes > 0 || $0.safe) } ?? []
+        bridge.report?.dashboardTargets ?? []
     }
+
+    private var selectableTargets: [ScanTarget] { targets.filter(\.canSelectForCleanup) }
+    private var unavailableCount: Int { targets.filter { $0.measurement_error != nil }.count }
 
     private var groupedTargets: [(category: String, items: [ScanTarget])] {
         let groups = Dictionary(grouping: targets, by: \.category)
@@ -26,7 +29,7 @@ struct DashboardView: View {
     }
 
     private var selectedBytes: Int {
-        targets.filter { selection.contains($0.id) }.reduce(0) { $0 + $1.size_bytes }
+        selectableTargets.filter { selection.contains($0.id) }.reduce(0) { $0 + $1.size_bytes }
     }
 
     /// Bytes for the frozen `pendingIDs` snapshot (B6), not the live
@@ -34,7 +37,7 @@ struct DashboardView: View {
     /// they always agree with each other and with what the user first saw.
     private var pendingBytes: Int {
         let ids = Set(pendingIDs)
-        return targets.filter { ids.contains($0.id) }.reduce(0) { $0 + $1.size_bytes }
+        return selectableTargets.filter { ids.contains($0.id) }.reduce(0) { $0 + $1.size_bytes }
     }
 
     var body: some View {
@@ -163,7 +166,7 @@ struct DashboardView: View {
                     .font(.heroNumber)
                     .contentTransition(.numericText())
                     .animation(Motion.standard, value: bridge.report?.total_reclaimable_human)
-                Text("reclaimable")
+                Text(unavailableCount > 0 ? "reclaimable (partial)" : "reclaimable")
                     .font(.title3)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -180,9 +183,15 @@ struct DashboardView: View {
                         await bridge.scanStorageInsights()
                     }
                 } label: {
-                    Label(bridge.isScanning ? "Scanning…" : "Scan", systemImage: "arrow.clockwise")
+                    Label(bridge.isScanning ? "Scanning…" : (unavailableCount > 0 ? "Retry scan" : "Scan"), systemImage: "arrow.clockwise")
                 }
                 .disabled(bridge.isScanning || bridge.isCleaning)
+            }
+            if unavailableCount > 0 {
+                Text("\(unavailableCount) measurement(s) unavailable. Retry the scan to measure them again.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
             }
             if let stats = bridge.report?.disk_stats {
                 Text(diskMetaText(stats))
@@ -253,11 +262,11 @@ struct DashboardView: View {
     private var bulkBar: some View {
         HStack(spacing: 12) {
             Text("Select:").font(.metaCaption).foregroundStyle(.secondary)
-            Button("All")  { selection = Set(targets.map(\.id)) }
+            Button("All")  { selection = Set(selectableTargets.map(\.id)) }
             Button("None") { selection.removeAll() }
             Button("Safe only") { seedSelection() }
             Spacer()
-            Text("\(selection.count) of \(targets.count)")
+            Text("\(selection.count) of \(selectableTargets.count)")
                 .font(.metaCaption).monospacedDigit().foregroundStyle(.secondary)
         }
         .buttonStyle(.link)
@@ -275,7 +284,7 @@ struct DashboardView: View {
                 // without this snapshot the eventual delete would silently
                 // act on whatever `selection` had become by the time the
                 // user tapped confirm, not the count/bytes they read.
-                pendingIDs = Array(selection)
+                pendingIDs = selectableTargets.filter { selection.contains($0.id) }.map(\.id)
                 confirmClean = true
             } label: {
                 Label("Clean Selected", systemImage: "trash")
@@ -347,7 +356,7 @@ struct DashboardView: View {
 
     /// Default selection mirrors the CLI TUI: safe items checked, review items not.
     private func seedSelection() {
-        selection = Set(targets.filter { $0.safe && $0.size_bytes > 0 }.map(\.id))
+        selection = Set(selectableTargets.filter { $0.safe && $0.size_bytes > 0 }.map(\.id))
     }
 }
 
@@ -370,14 +379,20 @@ struct TargetRow: View {
         HStack(spacing: 10) {
             Toggle("", isOn: $isSelected)
                 .labelsHidden()
-                .disabled(isCleaning)
+                .disabled(isCleaning || !target.canSelectForCleanup)
             Circle()
                 .fill(categoryColor(target.category))
                 .frame(width: 7, height: 7)
             VStack(alignment: .leading, spacing: 2) {
                 Text(target.label)
                     .font(.rowLabel)
-                if let description = target.description, !description.isEmpty {
+                if let error = target.measurement_error {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                        .help(error)
+                } else if let description = target.description, !description.isEmpty {
                     Text(description)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -397,7 +412,11 @@ struct TargetRow: View {
 
     @ViewBuilder
     private var statusSlot: some View {
-        if isCleaning {
+        if target.measurement_error != nil {
+            Label("Unavailable", systemImage: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        } else if isCleaning {
             ProgressView()
                 .controlSize(.small)
                 .frame(minWidth: 70, alignment: .trailing)

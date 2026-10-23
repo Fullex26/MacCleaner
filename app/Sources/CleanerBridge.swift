@@ -13,6 +13,15 @@ struct ScanTarget: Codable, Identifiable, Hashable {
     let size_human: String
     let safe: Bool
     let exists: Bool?
+    var measurement_error: String? = nil
+
+    var isVisibleOnDashboard: Bool {
+        measurement_error != nil || ((exists ?? true) && (size_bytes > 0 || safe))
+    }
+
+    var canSelectForCleanup: Bool {
+        measurement_error == nil && isVisibleOnDashboard
+    }
 }
 
 struct DiskStats: Codable {
@@ -29,6 +38,8 @@ struct ScanReport: Codable {
     let total_reclaimable_bytes: Int
     let total_reclaimable_human: String
     let targets: [ScanTarget]
+
+    var dashboardTargets: [ScanTarget] { targets.filter(\.isVisibleOnDashboard) }
 }
 
 struct CleanItem: Codable, Identifiable {
@@ -666,6 +677,14 @@ final class CleanerBridge: ObservableObject {
 
     func clean(ids: [String]) async {
         guard !ids.isEmpty else { return }
+        // A background scan may invalidate a selection while confirmation is open.
+        if report?.targets.contains(where: { ids.contains($0.id) && $0.measurement_error != nil }) == true {
+            let message = "A selected measurement is unavailable. Retry the scan and review your selection."
+            statusMessage = message
+            lastCleanFailed = message
+            lastCleanFailedAt = Date()
+            return
+        }
         // Re-entrancy guard (finding B3): a popover clean and a Dashboard
         // clean both drive the same shared `isCleaning`/`cleaningIDs` state,
         // so letting a second one start mid-flight means whichever finishes

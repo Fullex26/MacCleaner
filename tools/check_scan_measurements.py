@@ -13,11 +13,15 @@ import os
 from pathlib import Path
 import sys
 
-assert sys.argv[1:] == ["scan", "--json"], sys.argv
 root = Path(os.environ["MACCLEANER_REQUEST_FIXTURES"])
+with (root / "calls").open("a") as log:
+    log.write(sys.argv[1] + "\n")
+assert sys.argv[1:] == ["scan", "--json"], sys.argv
 counter = root / "count"
 n = int(counter.read_text()) + 1 if counter.exists() else 1
 counter.write_text(str(n))
+if n == 2:
+    raise SystemExit("fixture retry failed")
 target = {"id": "fixture-cache", "category": "caches", "label": "Fixture cache",
           "description": "Fixture", "size_bytes": 4096, "size_human": "4 KB",
           "safe": True, "exists": True}
@@ -37,20 +41,51 @@ struct MeasurementProbe {
         let bridge = CleanerBridge()
         bridge.v3SoakEnabled = false
         await bridge.scan()
+        let unavailableReport = bridge.report
         guard let failed = bridge.report?.targets.first else { fatalError("missing fixture target") }
         let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(failed)) as! [String: Any]
         guard encoded["measurement_error"] as? String == "directory enumeration timed out" else {
             print("FAIL real bridge discarded unavailable measurement diagnostic")
             exit(1)
         }
-        print("ok   real bridge preserves unavailable measurement diagnostic")
+        guard bridge.report?.dashboardTargets.map(\.id) == ["fixture-cache"],
+              !failed.canSelectForCleanup else { fatalError("unavailable target was hidden or selectable") }
+        var inconsistent = encoded
+        inconsistent["exists"] = true
+        inconsistent["size_bytes"] = 4096
+        let unknown = try JSONDecoder().decode(ScanTarget.self, from: JSONSerialization.data(withJSONObject: inconsistent))
+        guard !unknown.canSelectForCleanup else { fatalError("error with stale size became selectable") }
+        print("ok   unavailable measurements stay visible and cannot be selected")
+        await bridge.scan()
+        guard bridge.report?.targets.first?.measurement_error != nil, bridge.statusMessage != nil else {
+            fatalError("failed retry erased the unavailable measurement")
+        }
+        print("ok   failed retry retains diagnostic")
         await bridge.scan()
         guard let retried = bridge.report?.targets.first, retried.exists == true, retried.size_bytes == 4096 else {
             fatalError("successful retry did not replace unavailable result")
         }
         let recovered = try JSONSerialization.jsonObject(with: JSONEncoder().encode(retried)) as! [String: Any]
-        guard recovered["measurement_error"] == nil else { fatalError("retry retained stale diagnostic") }
+        guard retried.canSelectForCleanup, bridge.report?.dashboardTargets.count == 1, recovered["measurement_error"] == nil else { fatalError("retry retained stale diagnostic") }
         print("ok   successful legacy-shaped retry clears warning and restores size")
+        var absent = recovered
+        absent["exists"] = false
+        absent["size_bytes"] = 0
+        let missing = try JSONDecoder().decode(ScanTarget.self, from: JSONSerialization.data(withJSONObject: absent))
+        guard !missing.isVisibleOnDashboard, !missing.canSelectForCleanup else {
+            fatalError("genuinely absent target appeared as unavailable")
+        }
+        print("ok   legacy absent targets remain hidden")
+        let frozenIDs = [retried.id]
+        bridge.report = unavailableReport
+        let calls = URL(fileURLWithPath: ProcessInfo.processInfo.environment["MACCLEANER_REQUEST_FIXTURES"]!).appendingPathComponent("calls")
+        let before = try String(contentsOf: calls, encoding: .utf8)
+        await bridge.clean(ids: frozenIDs)
+        guard try String(contentsOf: calls, encoding: .utf8) == before, bridge.lastCleanFailed != nil else {
+            print("FAIL stale confirmation reached the engine after measurement became unavailable")
+            exit(1)
+        }
+        print("ok   changed eligibility blocks stale confirmation before engine execution")
     }
 }
 '''
