@@ -94,6 +94,9 @@ jobs:
       - name: Layout probe — no section can outgrow the window
         run: bash tools/check_app_layout.sh
 
+      - name: History outcomes regression
+        run: python3 tools/check_history_outcomes.py
+
       - name: Cleanup preview regression
         run: python3 tools/check_cleanup_preview.py
 

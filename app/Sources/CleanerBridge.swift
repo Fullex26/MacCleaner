@@ -48,6 +48,16 @@ struct CleanItem: Codable, Identifiable {
     let freed: Int
     let status: String
     let error: String?
+
+    var outcomeLabel: String {
+        switch status {
+        case "deleted": return "Deleted"
+        case "trashed": return "Trashed"
+        case "skipped": return "Skipped"
+        case "error": return "Failed"
+        default: return "Unknown (\(status))"
+        }
+    }
 }
 
 struct CleanupPreview: Decodable {
@@ -152,6 +162,19 @@ struct HistoryRun: Codable, Identifiable {
     let disk_after: String
     let items: [CleanItem]
     var id: String { timestamp }
+
+    var outcomeSummary: String {
+        guard !items.isEmpty else { return "Item details unavailable" }
+        let names = [("deleted", "deleted"), ("trashed", "trashed"),
+                     ("skipped", "skipped"), ("error", "failed")]
+        var parts = names.compactMap { status, label -> String? in
+            let count = items.filter { $0.status == status }.count
+            return count > 0 ? "\(count) \(label)" : nil
+        }
+        let unknown = items.filter { item in !names.contains { $0.0 == item.status } }.count
+        if unknown > 0 { parts.append("\(unknown) unknown") }
+        return parts.joined(separator: " · ")
+    }
 
     private enum CodingKeys: String, CodingKey {
         case timestamp, total_freed_bytes, total_freed_human, disk_after, items
