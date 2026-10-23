@@ -94,6 +94,9 @@ jobs:
       - name: Layout probe — no section can outgrow the window
         run: bash tools/check_app_layout.sh
 
+      - name: Scan measurement diagnostics regression
+        run: python3 tools/check_scan_measurements.py
+
       - name: Storage request ordering regression
         run: python3 tools/check_storage_request_order.py
 

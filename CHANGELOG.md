@@ -9,6 +9,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+- Dashboard retains targets whose measurement failed, labels their sizes unavailable, and excludes them from cleanup selection. Retry scan replaces stale warnings only after a successful response; partial totals are labeled explicitly.
+
 ---
 
 ## [2.18.1] — 2026-10-19

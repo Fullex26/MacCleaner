@@ -119,6 +119,20 @@ struct LayoutProbe {
                 if !ok { failed = true }
             }
         }
+        let failedTargets = (0..<40).map { index in
+            ScanTarget(id: "unavailable-\(index)", category: "caches", label: "Unavailable cache \(index)",
+                       description: nil, size_bytes: 0, size_human: "0 B", safe: true, exists: false,
+                       measurement_error: String(repeating: "Directory enumeration timed out. ", count: 20))
+        }
+        bridge.report = ScanReport(timestamp: "fixture", disk: "fixture", disk_stats: nil,
+                                   total_reclaimable_bytes: 0, total_reclaimable_human: "0 B", targets: failedTargets)
+        let unavailableHost = NSHostingController(rootView: DashboardView().environmentObject(bridge))
+        for width: CGFloat in [0, 120, 300] {
+            let size = unavailableHost.sizeThatFits(in: CGSize(width: width, height: 0))
+            let ok = size.height <= windowMinHeight
+            print("\(ok ? "ok  " : "FAIL") Dashboard unavailable @ width \(Int(width)): min height \(Int(size.height))pt")
+            if !ok { failed = true }
+        }
         if failed {
             print("App probe failed: inspect the FAIL lines above. Oversized section heights indicate fixedSize(vertical:) or fixed frames outside a ScrollView/List.")
             exit(1)
