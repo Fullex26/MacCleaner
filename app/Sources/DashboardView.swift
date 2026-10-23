@@ -32,14 +32,6 @@ struct DashboardView: View {
         selectableTargets.filter { selection.contains($0.id) }.reduce(0) { $0 + $1.size_bytes }
     }
 
-    /// Bytes for the frozen `pendingIDs` snapshot (B6), not the live
-    /// `selection` — used by the confirmation dialog's own title/action so
-    /// they always agree with each other and with what the user first saw.
-    private var pendingBytes: Int {
-        let ids = Set(pendingIDs)
-        return selectableTargets.filter { ids.contains($0.id) }.reduce(0) { $0 + $1.size_bytes }
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -292,18 +284,9 @@ struct DashboardView: View {
             .buttonStyle(.borderedProminent)
             .keyboardShortcut(.defaultAction)
             .disabled(selection.isEmpty || bridge.isCleaning || bridge.isScanning)
-            .confirmationDialog(
-                "Delete \(pendingIDs.count) items (\(ByteCountFormatter.string(fromByteCount: Int64(pendingBytes), countStyle: .file)))?",
-                isPresented: $confirmClean
-            ) {
-                Button(bridge.deleteMode == "trash" ? "Move to Trash" : "Delete", role: .destructive) {
-                    Task { await bridge.clean(ids: pendingIDs) }
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text(bridge.deleteMode == "trash"
-                     ? "Items will be moved to the Trash — you can restore them until you empty it."
-                     : "Items will be deleted immediately. Caches rebuild on demand.")
+            .sheet(isPresented: $confirmClean) {
+                CleanupPreviewSheet(ids: pendingIDs)
+                    .environmentObject(bridge)
             }
         }
         .padding()

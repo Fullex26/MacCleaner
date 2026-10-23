@@ -185,6 +185,8 @@ Targets are sorted by `size_bytes` descending. Command-based targets (docker/bre
 }
 ```
 
+**Preview diagnostics (next release):** a dry-run item may include optional `preview_error` when measurement, path resolution, or child enumeration is incomplete. Successfully resolved paths remain visible; statuses stay `would-delete`/`would-run` and the dry run remains non-mutating. Clients must show the diagnostic and require a fresh complete preview before confirmation. Sizing warnings may also appear on stderr, even with exit 0.
+
 Same envelope shape as `clean --json` (`delete_mode`, `freed_bytes`, `disk_after`, `items`), plus `"dry_run": true`. `status` is `would-delete` (path-based targets) or `would-run` (cmd-based targets) — never `deleted`/`trashed`/`error`, since nothing runs. `paths` is the concrete, already-resolved list of `{path, size_bytes}` this run would touch (glob patterns expanded, `empty_only` targets expanded to their children); cmd-based targets always have an empty `paths` array. `disk_after` reflects the *current* disk state, since nothing was freed. `--dry-run` never deletes anything, never prompts, and never writes to `report.log` or `snapshots.log`; the dry run itself always exits `0` — though argument validation (an unknown `--targets` ID or `--category`) runs first and still exits `1` before reaching it. On `projects --clean --dry-run` / `projects --dry-run`, the item set is filtered the same way `--clean --yes` would filter it (git-flagged projects excluded unless named via `--targets`), with the same stderr skip note.
 
 ### `projects --json` (read-only scan)
