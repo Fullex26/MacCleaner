@@ -143,7 +143,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.18.1"
+VERSION = "2.19.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -1787,23 +1787,27 @@ def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
             total += size
             continue
         paths = []
+        errors = [t["measurement_error"]] if t.get("measurement_error") else []
         try:
             target_paths = [] if t.get("measurement_error") else _target_paths(t)
-        except TimeoutError:
+        except TimeoutError as exc:
+            errors.append(str(exc))
             target_paths = []
         for p in target_paths:
             if not p.exists() and not p.is_symlink():
                 continue
             if t.get("empty_only"):
                 if p.is_symlink():
-                    say(f"Skipped empty-only symlink: {p}")
+                    errors.append(f"Skipped empty-only symlink: {p}")
+                    say(errors[-1])
                     continue
                 # Guarded the same way delete_target guards the equivalent loop:
                 # a PermissionError previewing one target's children must not
                 # abort the whole preview when the real delete would tolerate it.
                 try:
                     children = _cleanup_children(p)
-                except (PermissionError, FileNotFoundError, OSError):
+                except OSError as exc:
+                    errors.append(f"{p}: {exc}")
                     continue
                 paths.extend(c for c in sorted(children) if _safe_to_delete(c))
             # Same carve-out delete_target applies: a tmp_scan-marked target's
@@ -1815,7 +1819,8 @@ def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
         size = sum(e["size_bytes"] for e in entries)
         total += size
         items.append({"id": t["id"], "label": t["label"], "freed": size,
-                      "status": "would-delete", "paths": entries})
+                      "status": "would-delete", "paths": entries,
+                      **({"preview_error": "; ".join(errors)} if errors else {})})
 
     if json_mode:
         print(json.dumps({
@@ -1833,6 +1838,8 @@ def run_dry_run(targets, mode="rm", json_mode=False, min_free_gb=None):
         say("\n🧪 Dry run — nothing will be deleted\n")
         for it in items:
             say(f"  {it['label']} ({fmt_size(it['freed'])})")
+            if it.get("preview_error"):
+                say(f"      Preview incomplete: {it['preview_error']}")
             if it.get("cmd"):
                 say(f"      {'candidate command' if extra else 'would run'}: {it['cmd']}")
             for e in it["paths"]:

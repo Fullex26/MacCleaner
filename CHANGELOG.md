@@ -9,6 +9,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+---
+
+## [2.19.0] — 2026-10-23
+
 ### Added
 - History expands each run into per-item outcomes and errors, separates deleted/trashed/skipped/failed/unknown counts, and preserves reported reclaimed bytes for partial failures. Older records without item details retain their totals.
 - Dashboard cleanup previews show the frozen selection’s resolved paths and commands before confirmation. Incomplete previews and changed deletion modes block confirmation; execution still revalidates IDs through the engine. Dry-run items optionally report `preview_error` without changing existing statuses or fields.
