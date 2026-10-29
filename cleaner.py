@@ -1241,6 +1241,30 @@ def _freed_unknown_field(t):
     return {"freed_unknown": True} if t.get("cmd") else {}
 
 
+def _reclaim_unverified_fields(t):
+    """`reclaim_unverified`/`reclaim_note` for a target whose advertised size
+    is not known to come back, else `{}`.
+
+    `freed_unknown` (issue #106) made the *post-clean* report honest. This is
+    the other half: `scan`'s advertised size. `simulator-unused-runtimes` sized
+    itself from simctl's own `sizeBytes` and offered 20.56 GB that four
+    measured runs in a row freed nothing of. See issue #112.
+
+    Mark a target here only when there is *evidence* its bytes do not come
+    back, not merely because measuring them is hard -- an unmeasured target
+    belongs in the total, since leaving it out understates what a user can
+    free just as dishonestly as counting it overstates it.
+
+    Additive and emitted only when true, like `advisory` and `freed_unknown`,
+    so every existing reader keeps decoding unchanged."""
+    if not t.get("reclaim_unverified"):
+        return {}
+    out = {"reclaim_unverified": True}
+    if t.get("reclaim_note"):
+        out["reclaim_note"] = t["reclaim_note"]
+    return out
+
+
 def delete_target(t, mode="rm"):
     """Delete a target. Returns (bytes_freed, error_message_or_None)."""
     if t.get("cmd"):
@@ -1527,15 +1551,19 @@ def print_scan(targets, show_all=False):
             size_str = (fmt_size(t["size"]) if t["size"]
                         else "~unknown" if t.get("estimate_cmd")
                         else "cmd-based")
+            if t.get("reclaim_unverified"):
+                size_str += " †"
             safe_str = "✅" if t["safe"] else "⚠️"
             table.add_row(t["category"], t["label"], t["id"], size_str, safe_str)
 
         console.print(table)
         hidden = len(targets) - len(visible)
         hidden_note = f"\n[dim]{hidden} empty/not-installed targets hidden — use --all to show[/dim]" if hidden else ""
+        footnotes = "".join(f"\n[dim]† {t['label']}: {t['reclaim_note']}[/dim]"
+                            for t in visible if t.get("reclaim_note"))
         console.print(Panel(
             f"[bold green]Total reclaimable: {fmt_size(total)}[/bold green]\n"
-            f"[dim]Current disk: {disk_free()}[/dim]{hidden_note}\n\n"
+            f"[dim]Current disk: {disk_free()}[/dim]{hidden_note}{footnotes}\n\n"
             f"[bold]→ Run [cyan]maccleaner clean[/cyan] to start cleaning[/bold]",
             title="Summary"
         ))
@@ -1547,11 +1575,16 @@ def print_scan(targets, show_all=False):
             size_str = (fmt_size(t["size"]) if t["size"]
                         else "~unknown" if t.get("estimate_cmd")
                         else "cmd")
+            if t.get("reclaim_unverified"):
+                size_str += " †"
             safe = "safe" if t["safe"] else "REVIEW"
-            print(f"  [{t['category']:9}] {t['label']:<38} {size_str:>10}  {safe}")
+            print(f"  [{t['category']:9}] {t['label']:<38} {size_str:>12}  {safe}")
         hidden = len(targets) - len(visible)
         if hidden:
             print(f"\n  ({hidden} empty/not-installed targets hidden — use --all to show)")
+        for t in visible:
+            if t.get("reclaim_note"):
+                print(f"\n  † {t['label']}: {t['reclaim_note']}")
         print(f"\n  Total reclaimable: {fmt_size(total)}")
         print(f"\n  → Run 'maccleaner clean' to start cleaning")
         print(f"{'='*72}\n")
@@ -1586,6 +1619,11 @@ def reclaimable_total(targets):
             for p in paths
         ):
             continue  # fully contained in another target -- already counted
+        if t.get("reclaim_unverified"):
+            # Measured not to come back -- see _reclaim_unverified_fields and
+            # issue #112. Still resolved above, so it keeps shadowing anything
+            # nested inside it; it just stops inflating the headline figure.
+            continue
         total += t.get("size") or 0
     return total
 
@@ -1611,6 +1649,7 @@ def scan_json(targets, extra=None):
                 "safe": t["safe"],
                 "exists": t.get("exists", False),
                 **({"measurement_error": t["measurement_error"]} if t.get("measurement_error") else {}),
+                **_reclaim_unverified_fields(t),
             }
             for t in sorted(targets, key=lambda x: x["size"], reverse=True)
         ]
@@ -3175,8 +3214,44 @@ def scan_simulator_targets(config):
             targets.append({
                 "id": "simulator-unused-runtimes", "category": "simulators",
                 "label": "Unused simulator runtimes (%d)" % len(ids),
-                "description": "Runtime images with no simulator devices — re-downloadable in Xcode",
+                "description": "Runtime images with no simulator devices — "
+                               "deregistering them is not known to free disk, "
+                               "and can leave the image on disk with no way "
+                               "to remove it.",
                 "path": None, "glob": None, "skip": [], "safe": False,
+                # The size is simctl's own sizeBytes and it is real, but it
+                # is not reclaim. Measured on a real machine: three runtimes
+                # were deregistered -- by this target's own command earlier,
+                # and later by Xcode -> Settings -> Platforms -- and all
+                # 21.26 GiB of their /System/Library/AssetsV2 bundles stayed
+                # on disk both times. report.log has four runs of this target,
+                # freed 0 every one. The runtimes then came back Ready after a
+                # reboot, because the asset was still there to rediscover.
+                #
+                # Worse than not reclaiming: once an asset is unregistered
+                # nothing can remove it. simctl has no identifier for it
+                # (`runtime delete --unusable/--outdated --dry-run` both
+                # answer "No matching images found"), Xcode lists only
+                # registered runtimes, and AssetsV2 is SIP-restricted so rm
+                # fails even as root. So a part-failed delete can put the
+                # space permanently beyond reach.
+                #
+                # The command itself is right -- `runtime delete` removes the
+                # asset by default, `--keep-asset` is the opt-out, and the
+                # .asset dir IS the runtime's storage (`runtime list -v`
+                # Image Path), not a cached copy. Why the removal completes
+                # for some runtimes and not others is NOT established; do not
+                # write a mechanism into this comment without measuring one.
+                # And do not point users at Xcode -> Settings -> Platforms as
+                # the fix: in the same session it freed two runtimes' assets
+                # and left these three. Issue #112.
+                "reclaim_unverified": True,
+                "reclaim_note": "Not verified reclaim. On a real Mac both "
+                                "`simctl runtime delete` and Xcode → Settings "
+                                "→ Platforms deregistered these runtimes and "
+                                "left all 21.26 GiB of their images on disk — "
+                                "and once an image is unregistered, no tool "
+                                "can remove it. Expect to free nothing.",
                 # `cmd` describes what runs (and is what --dry-run shows); the
                 # work is done by cmd_runner, one process per identifier, with
                 # a registry re-read afterwards. The old form silenced every

@@ -8079,3 +8079,138 @@ class TestStorageInsightsBlockingDirectory(unittest.TestCase):
         hits = cleaner.scan_storage_insights({}, stats=stats, time_budget_s=self.BUDGET)
         self.assertFalse(stats["truncated"])
         self.assertEqual([h["path"].name for h in hits], ["local.mov"])
+
+
+class TestReclaimUnverified(unittest.TestCase):
+    """`freed_unknown` (#106) made the post-clean report honest; this is the
+    other half, `scan`'s advertised size.
+
+    `simulator-unused-runtimes` sized itself from simctl's `sizeBytes` and
+    offered 20.56 GB of "reclaimable" space that four recorded runs freed
+    nothing of. simctl lists only the runtime images that are currently
+    MOUNTED -- on a real machine `runtime list` fell from 7 runtimes /
+    43.20 GiB to 2 / 11.1 GiB in ten minutes with nothing deleted and no
+    reboot -- so neither the target's membership nor its size is evidence
+    about disk space, and a post-delete registry re-read cannot supply that
+    evidence either. Issue #112."""
+
+    def _t(self, tid, path, size, **extra):
+        t = {"id": tid, "category": "caches", "label": tid, "description": "",
+             "path": Path(path), "paths": None, "glob": None, "skip": [],
+             "safe": True, "cmd": None, "estimate_cmd": None,
+             "estimate_parser": None, "empty_only": False, "size": size}
+        t.update(extra)
+        return t
+
+    # -- the field helper, which must stay additive ------------------------
+    def test_field_omitted_entirely_for_an_ordinary_target(self):
+        # Emitted only when true, like `advisory` and `freed_unknown`: an
+        # ordinary target gets no key at all, never "reclaim_unverified": false.
+        self.assertEqual(cleaner._reclaim_unverified_fields(self._t("a", "/x", 1)), {})
+
+    def test_field_present_with_note_when_marked(self):
+        t = self._t("a", "/x", 1, reclaim_unverified=True, reclaim_note="why")
+        self.assertEqual(cleaner._reclaim_unverified_fields(t),
+                         {"reclaim_unverified": True, "reclaim_note": "why"})
+
+    def test_note_omitted_when_absent(self):
+        t = self._t("a", "/x", 1, reclaim_unverified=True)
+        self.assertEqual(cleaner._reclaim_unverified_fields(t),
+                         {"reclaim_unverified": True})
+
+    # -- the headline figure ----------------------------------------------
+    def test_unverified_bytes_are_left_out_of_the_total(self):
+        plain = self._t("plain", "/x/A", 300)
+        unver = self._t("unver", "/x/B", 700, reclaim_unverified=True)
+        self.assertEqual(cleaner.reclaimable_total([plain, unver]), 300)
+
+    def test_unverified_target_still_shadows_its_children(self):
+        # It is dropped from the sum but kept in the resolution pass, so a
+        # target nested inside it must not start counting again -- that would
+        # undo 2.12.0's union fix the moment a parent became unverified.
+        outer = self._t("outer", "/x/Caches", 1000, reclaim_unverified=True)
+        inner = self._t("inner", "/x/Caches/Chrome", 400)
+        self.assertEqual(cleaner.reclaimable_total([outer, inner]), 0)
+
+    def test_per_target_size_is_untouched(self):
+        unver = self._t("unver", "/x/B", 700, reclaim_unverified=True)
+        cleaner.reclaimable_total([unver])
+        self.assertEqual(unver["size"], 700)   # measured size stays as measured
+
+    # -- the JSON contract -------------------------------------------------
+    def _scan_json(self, targets):
+        buf = io.StringIO()
+        with mock.patch.object(cleaner, "measure_targets", side_effect=lambda t: t):
+            with contextlib.redirect_stdout(buf):
+                cleaner.scan_json(targets)
+        return json.loads(buf.getvalue())
+
+    def test_scan_json_emits_both_keys_only_when_marked(self):
+        plain = self._t("plain", "/x/A", 300, exists=True)
+        unver = self._t("unver", "/x/B", 700, exists=True,
+                        reclaim_unverified=True, reclaim_note="why")
+        out = self._scan_json([plain, unver])
+        by_id = {t["id"]: t for t in out["targets"]}
+        self.assertNotIn("reclaim_unverified", by_id["plain"])
+        self.assertTrue(by_id["unver"]["reclaim_unverified"])
+        self.assertEqual(by_id["unver"]["reclaim_note"], "why")
+        # size_bytes is still the measurement; only the aggregate drops it
+        self.assertEqual(by_id["unver"]["size_bytes"], 700)
+        self.assertEqual(out["total_reclaimable_bytes"], 300)
+
+
+class TestSimulatorRuntimeTargetIsHonest(unittest.TestCase):
+    """The simulator runtime target must keep enumerating and sizing what is
+    about to go -- that is the whole contract of a review-level target -- but
+    must not present those bytes as reclaimable space. Issue #112."""
+
+    def _targets(self):
+        def fake(args):
+            return (SIMCTL_DEVICES if args[:2] == ["list", "devices"]
+                    else SIMCTL_RUNTIMES)
+        with mock.patch.object(cleaner, "_simctl_json", side_effect=fake):
+            with mock.patch.object(cleaner, "get_size", return_value=123):
+                return cleaner.scan_simulator_targets({"simulator_stale_days": 30})
+
+    def test_runtimes_target_is_marked_unverified(self):
+        rt = [t for t in self._targets() if t["id"] == "simulator-unused-runtimes"]
+        self.assertEqual(len(rt), 1)
+        self.assertTrue(rt[0]["reclaim_unverified"])
+        self.assertTrue(rt[0]["reclaim_note"])
+
+    def test_runtimes_target_still_enumerates_and_sizes(self):
+        rt = [t for t in self._targets() if t["id"] == "simulator-unused-runtimes"][0]
+        self.assertIn("iOS-18-6", rt["cmd"])            # still says what goes
+        self.assertEqual(rt["precomputed_bytes"], 6000000000)   # still sized
+
+    def test_text_warns_that_nothing_is_expected_to_be_freed(self):
+        rt = [t for t in self._targets() if t["id"] == "simulator-unused-runtimes"][0]
+        self.assertIn("not known to free disk", rt["description"])
+        self.assertIn("Expect to free nothing", rt["reclaim_note"])
+
+    def test_text_does_not_promise_an_alternative_removal_path(self):
+        # An earlier draft named Xcode -> Settings -> Platforms as the way to
+        # remove registration and image together. Measured: in one session
+        # that UI released two runtimes' assets and left these three in place
+        # (issue #112). There is no removal path to send a user to once an
+        # asset is orphaned, so the text must not invent one.
+        rt = [t for t in self._targets() if t["id"] == "simulator-unused-runtimes"][0]
+        for text in (rt["description"], rt["reclaim_note"]):
+            self.assertNotRegex(
+                text,
+                r"(?i)(remove|use|go to|open)[^.]*Xcode[^.]*Platforms",
+            )
+
+    def test_reclaim_note_states_the_stranding_risk(self):
+        # Running this target can be worse than useless: an unregistered asset
+        # is removable by nothing, so the space goes permanently out of reach.
+        rt = [t for t in self._targets() if t["id"] == "simulator-unused-runtimes"][0]
+        self.assertIn("no tool can remove it", rt["reclaim_note"])
+        self.assertIn("no way to remove it", rt["description"])
+
+    def test_stale_devices_target_is_not_marked(self):
+        # Device data lives under ~/Library/Developer/CoreSimulator/Devices and
+        # deleting it frees real space -- only the runtime half is unverified.
+        dev = [t for t in self._targets() if t["id"] == "simulator-stale-devices"]
+        self.assertEqual(len(dev), 1)
+        self.assertNotIn("reclaim_unverified", dev[0])
