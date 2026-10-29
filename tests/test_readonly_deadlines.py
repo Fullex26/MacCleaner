@@ -62,6 +62,13 @@ elif case == 'cask_lookup':
     os.environ['MACCLEANER_CASKROOM_DIR'] = str(root)
     c.Path.glob = blocked
     assert c._homebrew_cask_app() is None
+elif case == 'simulator_assets':
+    (root / 'com_apple_MobileAsset_iOSSimulatorRuntime').mkdir(parents=True)
+    os.environ['MACCLEANER_ASSETSV2_ROOT'] = str(root)
+    # simctl must be asked on the caller thread, so it is stubbed rather than
+    # blocked; only the asset-store walk is wedged here.
+    c._simctl_json = lambda args: {'u': {'build': '23F77', 'state': 'Ready'}}
+    assert c._stranded_simulator_assets() is None
 elif case == 'system_temp':
     temp_root = root / 'var/folders/test/T'
     temp_root.mkdir(parents=True)
@@ -139,6 +146,8 @@ class TestReadOnlyDeadlines(unittest.TestCase):
     def test_storage_map_returns_after_blocked_read(self): self.check_probe('storage_map')
     def test_log_timeout_preserves_static_targets(self): self.check_probe('logs')
     def test_system_temp_returns_after_blocked_read(self): self.check_probe('system_temp')
+    def test_stranded_asset_scan_returns_unknown_after_blocked_read(self):
+        self.check_probe('simulator_assets')
     def test_cask_lookup_returns_unknown_after_blocked_glob(self): self.check_probe('cask_lookup')
 
     def test_glob_measurement_returns_after_blocked_read(self): self.check_probe('glob_measure')

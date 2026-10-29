@@ -359,7 +359,9 @@ class TestSystemTempAdvisory(unittest.TestCase):
     never touch it, never fail the aggregate `ok`."""
 
     def test_reports_size_and_entry_count_above_the_floor(self):
-        with mock.patch.object(cleaner, "_system_temp_usage",
+        with mock.patch.object(cleaner, "_stranded_simulator_assets",
+                               return_value=None), \
+             mock.patch.object(cleaner, "_system_temp_usage",
                                return_value={"path": "/var/folders/x/y/T",
                                              "bytes": 20 * 1024 ** 3,
                                              "entries": 14999}):
@@ -373,7 +375,9 @@ class TestSystemTempAdvisory(unittest.TestCase):
                       "the remedy is a restart, not a delete")
 
     def test_quiet_below_both_floors(self):
-        with mock.patch.object(cleaner, "_system_temp_usage",
+        with mock.patch.object(cleaner, "_stranded_simulator_assets",
+                               return_value=None), \
+             mock.patch.object(cleaner, "_system_temp_usage",
                                return_value={"path": "/var/folders/x/y/T",
                                              "bytes": 100 * 1024 ** 2, "entries": 12}):
             r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
@@ -386,7 +390,9 @@ class TestSystemTempAdvisory(unittest.TestCase):
         holding only 3 GB -- but that same directory had been 20 GB hours
         earlier. The entry count is the signal that tools are leaking scratch;
         the size just depends on when you happen to look."""
-        with mock.patch.object(cleaner, "_system_temp_usage",
+        with mock.patch.object(cleaner, "_stranded_simulator_assets",
+                               return_value=None), \
+             mock.patch.object(cleaner, "_system_temp_usage",
                                return_value={"path": "/var/folders/x/y/T",
                                              "bytes": 3 * 1024 ** 3, "entries": 16289}):
             r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
@@ -396,7 +402,9 @@ class TestSystemTempAdvisory(unittest.TestCase):
         self.assertIn("16,289", c["status"])
 
     def test_advisory_never_flips_top_level_ok(self):
-        with mock.patch.object(cleaner, "_system_temp_usage",
+        with mock.patch.object(cleaner, "_stranded_simulator_assets",
+                               return_value=None), \
+             mock.patch.object(cleaner, "_system_temp_usage",
                                return_value={"path": "/var/folders/x/y/T",
                                              "bytes": 50 * 1024 ** 3, "entries": 99999}):
             r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
@@ -404,7 +412,9 @@ class TestSystemTempAdvisory(unittest.TestCase):
         self.assertEqual(r["ok"], all(c["ok"] for c in non_advisory))
 
     def test_degrades_quietly_when_it_cannot_measure(self):
-        with mock.patch.object(cleaner, "_system_temp_usage", return_value=None):
+        with mock.patch.object(cleaner, "_stranded_simulator_assets",
+                               return_value=None), \
+             mock.patch.object(cleaner, "_system_temp_usage", return_value=None):
             r = cleaner.run_doctor(cleaner.DEFAULT_CONFIG, json_mode=False)
         self.assertNotIn("System temp", [c["name"] for c in r["checks"]])
 
@@ -1232,6 +1242,15 @@ class TestDoctorSchedule(unittest.TestCase):
         stub_crontab = self.bindir / "crontab"
         stub_crontab.write_text('#!/bin/sh\nexit 1\n')
         stub_crontab.chmod(0o755)
+        # Same reasoning for simctl: doctor's stranded-runtime-asset advisory
+        # asks `xcrun simctl runtime list`, and a dev machine with real
+        # stranded assets would otherwise add a row (and a real asset-store
+        # walk) to every schedule assertion here. A simctl that cannot be
+        # asked makes the advisory omit itself, which is what this sandbox
+        # wants.
+        stub_xcrun = self.bindir / "xcrun"
+        stub_xcrun.write_text('#!/bin/sh\nexit 1\n')
+        stub_xcrun.chmod(0o755)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -5803,11 +5822,12 @@ class TestDoctorPressureChecks(unittest.TestCase):
     # the developer's own machine -- test_every_advisory_collector_is_mocked
     # below fails if this list falls behind.
     COLLECTORS = ("_swap_usage", "_held_open_deleted", "_system_temp_usage",
-                  "_docker_disk_image")
+                  "_docker_disk_image", "_stranded_simulator_assets")
 
-    def _doctor(self, swap=None, held=None, stmp=None, docker=None):
+    def _doctor(self, swap=None, held=None, stmp=None, docker=None, stranded=None):
         values = {"_swap_usage": swap, "_held_open_deleted": held,
-                  "_system_temp_usage": stmp, "_docker_disk_image": docker}
+                  "_system_temp_usage": stmp, "_docker_disk_image": docker,
+                  "_stranded_simulator_assets": stranded}
         buf = io.StringIO()
         with contextlib.ExitStack() as stack:
             for name in self.COLLECTORS:
@@ -5825,7 +5845,8 @@ class TestDoctorPressureChecks(unittest.TestCase):
         import inspect
         src = inspect.getsource(cleaner.run_doctor)
         called = {n for n in dir(cleaner)
-                  if n.startswith("_") and n.endswith(("_usage", "_deleted", "_image"))
+                  if n.startswith("_")
+                  and n.endswith(("_usage", "_deleted", "_image", "_assets"))
                   and callable(getattr(cleaner, n)) and (n + "()") in src}
         self.assertEqual(called - set(self.COLLECTORS), set(),
                          "new advisory collector must be added to COLLECTORS")
@@ -6241,6 +6262,8 @@ class TestDockerImageAdvisory(unittest.TestCase):
              mock.patch.object(cleaner, "_held_open_deleted", return_value=None), \
              mock.patch.object(cleaner, "_system_temp_usage", return_value=None), \
              mock.patch.object(cleaner, "_docker_disk_image", return_value=docker), \
+             mock.patch.object(cleaner, "_stranded_simulator_assets",
+                               return_value=None), \
              contextlib.redirect_stdout(buf):
             cleaner.run_doctor(json.loads(json.dumps(cleaner.DEFAULT_CONFIG)),
                                json_mode=True)
@@ -6294,6 +6317,279 @@ class TestDockerImageAdvisory(unittest.TestCase):
             self.assertLess(info["bytes"], st.st_size)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestStrandedSimulatorAssets(unittest.TestCase):
+    """A deregistered simulator runtime can leave its backing MobileAsset on
+    disk, and the bytes then become invisible to every tool and removable by
+    none: simctl has lost the handle (no --outdated/--unusable selector
+    matches an image it no longer lists) and the `.asset` directories carry
+    SIP's `restricted` flag, so `rm -rf` fails even as root. 21.26 GB sat
+    unexplained on a real machine this way.
+
+    So this is report-only and advisory, like Swap/System temp/Docker, but
+    for the strongest reason of the four: there is no code path in this tool
+    -- or any tool -- that could delete these. Only Xcode's own Platforms UI
+    can. The check must therefore NEVER produce a target, and must never
+    claim "nothing is stranded" when it simply could not look."""
+
+    PLATFORM_DIR = "com_apple_MobileAsset_iOSSimulatorRuntime"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "AssetsV2"
+        self.patch_root = mock.patch.object(cleaner, "_simulator_asset_root",
+                                            return_value=self.root)
+        self.patch_root.start()
+
+    def tearDown(self):
+        self.patch_root.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _asset(self, build, version="18.1", size=2 * 1024 ** 2,
+               platform_dir=None, props_nested=True, plist=True):
+        """A fake `.asset` bundle shaped like the real thing: Build and
+        SimulatorVersion under MobileAssetProperties, payload beside it."""
+        d = self.root / (platform_dir or self.PLATFORM_DIR) / ("%s.asset" % build.lower())
+        (d / "AssetData").mkdir(parents=True)
+        with open(d / "AssetData" / "payload", "wb") as f:
+            f.write(b"\0" * size)
+        if plist:
+            body = {"Build": build, "SimulatorVersion": version}
+            data = {"MobileAssetProperties": body} if props_nested else body
+            with open(d / "Info.plist", "wb") as f:
+                plistlib.dump(data, f)
+        return d
+
+    def _simctl(self, *entries):
+        """Patch simctl's runtime list to the shape current Xcode emits: a
+        bare dict keyed by runtime UUID."""
+        payload = {"UUID-%d" % i: e for i, e in enumerate(entries)}
+        return mock.patch.object(cleaner, "_simctl_json", return_value=payload)
+
+    # ── the finding itself ────────────────────────────────────────────────
+    def test_reports_an_asset_whose_build_no_runtime_claims(self):
+        self._asset("22B81", version="18.1")
+        with self._simctl({"build": "23F77", "state": "Ready"}):
+            found = cleaner._stranded_simulator_assets()
+        self.assertIsNotNone(found)
+        self.assertEqual([a["build"] for a in found["assets"]], ["22B81"])
+        row = found["assets"][0]
+        self.assertEqual(row["platform"], "iOS")
+        self.assertEqual(row["version"], "18.1")
+        self.assertTrue(row["path"].endswith(".asset"))
+        self.assertGreater(row["bytes"], 0)
+        self.assertEqual(found["total_bytes"], row["bytes"])
+
+    def test_registered_build_is_never_reported(self):
+        self._asset("23F77")
+        with self._simctl({"build": "23F77", "state": "Ready"}):
+            found = cleaner._stranded_simulator_assets()
+        self.assertEqual(found["assets"], [])
+        self.assertEqual(found["total_bytes"], 0)
+
+    def test_asset_a_registered_runtime_points_at_is_never_stranded(self):
+        """simctl's own rows carry the backing asset path. If a registered
+        runtime is mounted out of this bundle it is referenced, whatever its
+        Info.plist build string says -- the path is a second, independent
+        signal that keeps a build-string mismatch from being reported as
+        gigabytes of reclaimable-looking junk."""
+        d = self._asset("22G86")
+        with self._simctl({"build": "DIFFERENT",
+                           "path": str(d / "AssetData" / "Restore" / "x.dmg"),
+                           "state": "Ready"}):
+            found = cleaner._stranded_simulator_assets()
+        self.assertEqual(found["assets"], [])
+
+    def test_reads_build_from_nested_mobileassetproperties(self):
+        self._asset("22T572", version="11.5",
+                    platform_dir="com_apple_MobileAsset_watchOSSimulatorRuntime")
+        with self._simctl({"build": "23T570", "state": "Ready"}):
+            found = cleaner._stranded_simulator_assets()
+        self.assertEqual([(a["platform"], a["build"], a["version"])
+                          for a in found["assets"]],
+                         [("watchOS", "22T572", "11.5")])
+
+    def test_accepts_a_top_level_build_key_too(self):
+        self._asset("22B81", props_nested=False)
+        with self._simctl({"build": "23F77", "state": "Ready"}):
+            found = cleaner._stranded_simulator_assets()
+        self.assertEqual([a["build"] for a in found["assets"]], ["22B81"])
+
+    def test_sizes_by_allocated_blocks_not_apparent_size(self):
+        """Consistent with scan_storage_insights: apparent size lies for
+        sparse files, and a runtime asset holds a sparse .dmg."""
+        d = self._asset("22B81", size=0)
+        with open(d / "AssetData" / "sparse.dmg", "wb") as f:
+            f.seek(8 * 1024 ** 3)
+            f.write(b"x")
+        st = os.stat(d / "AssetData" / "sparse.dmg")
+        if st.st_blocks * 512 >= st.st_size:
+            self.skipTest("filesystem did not store the file sparsely")
+        with self._simctl({"build": "23F77", "state": "Ready"}):
+            found = cleaner._stranded_simulator_assets()
+        self.assertLess(found["total_bytes"], st.st_size)
+
+    def test_largest_first(self):
+        self._asset("22B81", size=1024)
+        self._asset("22G86", size=8 * 1024 ** 2)
+        with self._simctl({"build": "23F77", "state": "Ready"}):
+            found = cleaner._stranded_simulator_assets()
+        self.assertEqual([a["build"] for a in found["assets"]], ["22G86", "22B81"])
+
+    # ── degradation: unavailable is never "nothing stranded" ──────────────
+    def test_missing_simctl_reports_unknown_not_clean(self):
+        self._asset("22B81")
+        with mock.patch.object(cleaner, "_simctl_json", return_value=None):
+            self.assertIsNone(cleaner._stranded_simulator_assets())
+
+    def test_runtime_list_with_no_builds_is_unknown(self):
+        """A machine holding runtime assets while simctl reports no builds at
+        all is far likelier to be a JSON shape this code does not recognise
+        than a genuinely empty registry -- and believing it would report
+        every asset on the disk as stranded."""
+        self._asset("22B81")
+        with mock.patch.object(cleaner, "_simctl_json", return_value={}):
+            self.assertIsNone(cleaner._stranded_simulator_assets())
+        with mock.patch.object(cleaner, "_simctl_json",
+                               return_value={"runtimes": [{"state": "Ready"}]}):
+            self.assertIsNone(cleaner._stranded_simulator_assets())
+
+    def test_missing_assets_root_is_simply_no_assets(self):
+        with self._simctl({"build": "23F77", "state": "Ready"}):
+            found = cleaner._stranded_simulator_assets()
+        self.assertEqual(found, {"assets": [], "total_bytes": 0, "unreadable": 0,
+                                 "root": str(self.root)})
+
+    def test_platform_without_a_download_is_skipped_quietly(self):
+        self._asset("22B81")
+        with self._simctl({"build": "23F77", "state": "Ready"}):
+            found = cleaner._stranded_simulator_assets()
+        self.assertEqual(found["unreadable"], 0,
+                         "tvOS/visionOS dirs never downloaded are not failures")
+
+    def test_unreadable_plist_is_counted_never_called_stranded(self):
+        self._asset("22B81", plist=False)
+        bad = self._asset("22G86")
+        (bad / "Info.plist").write_bytes(b"not a plist at all")
+        with self._simctl({"build": "23F77", "state": "Ready"}):
+            found = cleaner._stranded_simulator_assets()
+        self.assertEqual(found["assets"], [],
+                         "an asset whose build cannot be read is unknown, not stranded")
+        self.assertEqual(found["unreadable"], 2)
+
+    def test_plist_without_a_build_key_does_not_raise(self):
+        d = self._asset("22B81")
+        with open(d / "Info.plist", "wb") as f:
+            plistlib.dump({"MobileAssetProperties": {"SimulatorVersion": "18.1"}}, f)
+        with self._simctl({"build": "23F77", "state": "Ready"}):
+            found = cleaner._stranded_simulator_assets()
+        self.assertEqual(found["assets"], [])
+        self.assertEqual(found["unreadable"], 1)
+
+    def test_simctl_is_asked_once_on_the_caller_thread(self):
+        """Subprocess probes must not run inside the bounded daemon worker:
+        abandoning a daemon supervising subprocess.run can orphan its
+        child."""
+        self._asset("22B81")
+        with mock.patch.object(cleaner, "_simctl_json",
+                               return_value={"u": {"build": "23F77"}}) as sim:
+            cleaner._stranded_simulator_assets()
+        self.assertEqual(sim.call_count, 1)
+        self.assertEqual(sim.call_args[0][0], ["runtime", "list"])
+
+    # ── doctor wiring ─────────────────────────────────────────────────────
+    def _doctor(self, stranded):
+        buf = io.StringIO()
+        with mock.patch.object(cleaner, "_swap_usage", return_value=None), \
+             mock.patch.object(cleaner, "_held_open_deleted", return_value=None), \
+             mock.patch.object(cleaner, "_system_temp_usage", return_value=None), \
+             mock.patch.object(cleaner, "_docker_disk_image", return_value=None), \
+             mock.patch.object(cleaner, "_stranded_simulator_assets",
+                               return_value=stranded), \
+             contextlib.redirect_stdout(buf):
+            cleaner.run_doctor(json.loads(json.dumps(cleaner.DEFAULT_CONFIG)),
+                               json_mode=True)
+        return json.loads(buf.getvalue())
+
+    def _row(self, assets, unreadable=0):
+        finding = {"assets": assets, "unreadable": unreadable,
+                   "total_bytes": sum(a["bytes"] for a in assets),
+                   "root": "/System/Library/AssetsV2"}
+        d = self._doctor(finding)
+        row = next((c for c in d["checks"]
+                    if c["name"] == cleaner.STRANDED_ASSET_CHECK_NAME), None)
+        return d, row
+
+    def _real_case(self):
+        """The three assets measured on the machine in the bug report."""
+        return [{"platform": "iOS", "build": "22G86", "version": "18.6",
+                 "bytes": int(8.50 * 1024 ** 3), "path": "/x/7fd8477b.asset"},
+                {"platform": "iOS", "build": "22B81", "version": "18.1",
+                 "bytes": int(8.24 * 1024 ** 3), "path": "/x/4d6f1d5e.asset"},
+                {"platform": "watchOS", "build": "22T572", "version": "11.5",
+                 "bytes": int(4.52 * 1024 ** 3), "path": "/x/4f193649.asset"}]
+
+    def test_doctor_names_builds_sizes_and_the_total(self):
+        _, row = self._row(self._real_case())
+        self.assertIsNotNone(row)
+        self.assertIn("21.3 GB", row["status"])
+        for build in ("22B81", "22G86", "22T572"):
+            self.assertIn(build, row["status"])
+        self.assertIn("18.1", row["status"])
+
+    def test_doctor_remedy_is_xcode_platforms_and_says_sudo_rm_cannot_work(self):
+        _, row = self._row(self._real_case())
+        self.assertIn("Xcode", row["status"])
+        self.assertIn("Platforms", row["status"])
+        self.assertIn("sudo rm", row["status"])
+        self.assertIn("SIP", row["status"])
+
+    def test_doctor_row_is_advisory_and_never_flips_ok(self):
+        d, row = self._row(self._real_case())
+        self.assertTrue(row["advisory"])
+        self.assertFalse(row["ok"])
+        non_advisory = [c for c in d["checks"] if not c.get("advisory")]
+        self.assertEqual(d["ok"], all(c["ok"] for c in non_advisory))
+
+    def test_doctor_says_so_when_some_assets_could_not_be_read(self):
+        _, row = self._row(self._real_case(), unreadable=2)
+        self.assertIn("incomplete", row["status"].lower())
+
+    def test_doctor_omits_the_row_when_nothing_is_stranded(self):
+        _, row = self._row([])
+        self.assertIsNone(row)
+
+    def test_doctor_omits_the_row_below_the_floor(self):
+        _, row = self._row([{"platform": "iOS", "build": "22B81",
+                             "version": "18.1", "bytes": 10 * 1024 ** 2,
+                             "path": "/x/a.asset"}])
+        self.assertIsNone(row, "a stub download is not worth sending anyone into Xcode")
+
+    def test_doctor_omits_the_row_when_it_could_not_look(self):
+        d = self._doctor(None)
+        self.assertNotIn(cleaner.STRANDED_ASSET_CHECK_NAME,
+                         [c["name"] for c in d["checks"]])
+        self.assertTrue(d["ok"], "an unanswerable advisory is not a MacCleaner fault")
+
+    # ── the hard safety line ──────────────────────────────────────────────
+    def test_no_target_ever_points_into_the_asset_store(self):
+        """These are SIP-restricted: a target here could only ever fail, and
+        pretending otherwise would be the one unforgivable bug in this
+        feature."""
+        for t in cleaner.get_targets(cleaner.DEFAULT_CONFIG, all_categories=True):
+            for p in cleaner._target_paths(t):
+                self.assertNotIn("AssetsV2", str(p), t["id"])
+            self.assertNotIn("AssetsV2", t.get("cmd") or "", t["id"])
+
+    def test_the_scanner_produces_no_target_shaped_output(self):
+        self._asset("22B81")
+        with self._simctl({"build": "23F77", "state": "Ready"}):
+            found = cleaner._stranded_simulator_assets()
+        for row in found["assets"]:
+            for key in ("id", "safe", "cmd", "category", "empty_only"):
+                self.assertNotIn(key, row,
+                                 "a stranded asset must never look like a target")
 
 
 class TestScheduleTransparency(unittest.TestCase):

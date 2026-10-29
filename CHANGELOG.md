@@ -14,6 +14,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 - `clean --json` / `report --json` items carry `freed_unknown: true` on command-based targets (additive, present only when true). Their `freed: 0` was indistinguishable from a measured zero; the engine cannot measure what a command reclaimed, and for the simulator targets the bytes may sit in SIP-protected asset bundles it can never see. The app shows "not measurable" instead of "0 bytes".
+- `doctor` reports simulator runtime images macOS still stores for runtimes Xcode no longer lists, with their build, size and location. These are invisible to every other tool and removable by none — the directories are SIP-protected, so `sudo rm` fails even as root — so the finding names Xcode → Settings → Platforms as the only removal path and says plainly that deleting them by hand cannot work. Report-only: it never becomes a cleanup target, never affects `doctor`'s overall result, and is omitted rather than reported clean whenever the asset store or `simctl` cannot be asked.
 
 ---
 
