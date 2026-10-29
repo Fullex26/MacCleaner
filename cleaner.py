@@ -3658,8 +3658,29 @@ DOCKER_RAW_PATHS = [
     HOME / "Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw",
     HOME / "Library/Containers/com.docker.docker/Data/vms/0/Docker.raw",
 ]
+# Simulator runtime MobileAssets. macOS stores each downloaded runtime as a
+# `<sha>.asset` bundle under /System/Library/AssetsV2; when a runtime is
+# deregistered but its asset survives, the bytes become invisible to every
+# tool and removable by none -- simctl has lost the handle (none of
+# --outdated/--unusable/--notUsedSinceDays matches an image it no longer
+# lists) and the directories carry SIP's `restricted` flag, so `rm -rf`
+# fails even as root. 21.26 GB stranded this way on a real machine with
+# nothing anywhere to explain it. Report-only, and more absolutely so than
+# any other advisory: there is no deletion this tool could even attempt.
+SIMULATOR_ASSET_PLATFORMS = {
+    "com_apple_MobileAsset_iOSSimulatorRuntime": "iOS",
+    "com_apple_MobileAsset_watchOSSimulatorRuntime": "watchOS",
+    "com_apple_MobileAsset_tvOSSimulatorRuntime": "tvOS",
+    "com_apple_MobileAsset_xrOSSimulatorRuntime": "visionOS",
+}
+STRANDED_ASSET_CHECK_NAME = "Stranded simulator runtimes"
+# A real runtime asset is multiple GB (8.24/8.50/4.52 GB in the reported
+# case). Below 1 GiB the finding is a partial or abandoned download, not
+# worth sending anyone into Xcode's Platforms pane for.
+STRANDED_ASSET_WARN_BYTES = 1024 ** 3
+STRANDED_ASSET_MAX_NAMED = 4
 
-_SWAP_UNITS = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+_SWAP_UNITS ={"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
 
 
 def _parse_swap_usage(output):
@@ -3792,6 +3813,169 @@ def _docker_disk_image():
             pass
         return {"path": str(raw), "bytes": _disk_bytes(st), "running": running}
     return None
+
+
+def _simulator_asset_root():
+    """macOS's MobileAsset store. Read from the environment on every call so
+    tests never have to touch the real /System/Library/AssetsV2."""
+    return Path(os.environ.get("MACCLEANER_ASSETSV2_ROOT", "/System/Library/AssetsV2"))
+
+
+def _asset_dir_of(path):
+    """The `<sha>.asset` directory a path sits inside, or None.
+
+    simctl reports a registered runtime's backing store as a path *inside*
+    the bundle (".../<sha>.asset/AssetData/Restore/x.dmg"), so the bundle has
+    to be recovered from it before it can be compared with one found on
+    disk."""
+    if not isinstance(path, str) or ".asset" not in path:
+        return None
+    head = os.path.normpath(path)
+    while head not in ("/", ""):
+        if head.endswith(".asset"):
+            return head
+        parent = os.path.dirname(head)
+        if parent == head:
+            return None
+        head = parent
+    return None
+
+
+def _registered_simulator_runtimes():
+    """(builds, asset directories) of every runtime simctl still lists, or
+    None when the question could not be answered.
+
+    None is load-bearing. Without simctl's half of the cross-reference an
+    asset cannot be shown to be unreferenced, and reporting "nothing is
+    stranded" would be exactly the false negative this check exists to fix.
+    An answer that parses but yields no build string at all is also None: a
+    machine that holds runtime assets while simctl names no builds is far
+    likelier to be a JSON shape this code does not recognise than a
+    genuinely empty registry, and believing it would report every asset on
+    the disk as stranded."""
+    rows = _simctl_runtime_entries(_simctl_json(["runtime", "list"]))
+    builds, assets = set(), set()
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        build = r.get("build") or r.get("buildversion")
+        if isinstance(build, str) and build.strip():
+            builds.add(build.strip())
+        # The path is a second, independent signal: a bundle a registered
+        # runtime is mounted out of is referenced whatever its Info.plist
+        # says, which keeps a build-string mismatch from being reported as
+        # gigabytes of reclaimable-looking junk.
+        for key in ("path", "parentMountPath", "runtimeBundlePath"):
+            found = _asset_dir_of(r.get(key))
+            if found:
+                assets.add(found)
+    if not builds:
+        return None
+    return builds, assets
+
+
+def _asset_build_and_version(info_plist):
+    """(Build, SimulatorVersion) from an `.asset` bundle's Info.plist, or
+    (None, None) when it cannot be read.
+
+    `Build` sits under `MobileAssetProperties` in every asset observed on a
+    real machine; a top-level `Build` is accepted as a fallback because the
+    bug report quoted `plutil -p | grep Build`, which cannot tell the two
+    apart. Never raises -- a missing, truncated or non-plist file is just an
+    asset whose build is unknown, and an unknown build is never reported
+    stranded."""
+    try:
+        with open(info_plist, "rb") as f:
+            data = plistlib.load(f)
+    except Exception:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    props = data.get("MobileAssetProperties")
+    if not isinstance(props, dict):
+        props = {}
+    def text(key):
+        value = props.get(key, data.get(key))
+        return value.strip() if isinstance(value, str) and value.strip() else None
+    return text("Build"), text("SimulatorVersion")
+
+
+def _stranded_simulator_assets():
+    """Simulator runtime assets no registered runtime claims — report-only.
+
+    Returns {"assets": [...], "total_bytes", "unreadable", "root"}, or None
+    when the store could not be enumerated or simctl could not be asked.
+    None means "unknown", never "nothing stranded": these bytes exist
+    precisely because nothing else on the machine admits to them.
+
+    simctl runs on the caller thread (abandoning a daemon that supervises
+    subprocess.run can orphan its child); only the filesystem walk goes
+    inside the bounded read-only worker. Sizing is stat-only
+    (`_bundle_size`/`_disk_bytes`, allocated blocks), matching
+    scan_storage_insights -- a runtime asset holds a sparse .dmg, so
+    apparent size would overstate it badly.
+
+    Nothing here is a target: rows carry no id, no `safe`, no `cmd`, and are
+    never passed to delete_target. They could not be deleted anyway."""
+    registered = _registered_simulator_runtimes()
+    if registered is None:
+        return None
+    builds, referenced = registered
+    root = _simulator_asset_root()
+    exists = _read_only_scan(root.is_dir, None, "simulator asset store")
+    if exists is None:
+        return None
+    if not exists:
+        return {"assets": [], "total_bytes": 0, "unreadable": 0, "root": str(root)}
+
+    def read():
+        found, unreadable = [], 0
+        for dirname, platform in sorted(SIMULATOR_ASSET_PLATFORMS.items()):
+            try:
+                entries = list(os.scandir(root / dirname))
+            except FileNotFoundError:
+                # That platform was simply never downloaded.
+                continue
+            except OSError:
+                unreadable += 1
+                continue
+            for entry in entries:
+                if not entry.name.endswith(".asset"):
+                    continue
+                try:
+                    if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    unreadable += 1
+                    continue
+                if _is_dataless(st):
+                    # Nothing under AssetsV2 should ever be an evicted iCloud
+                    # folder, but listing one blocks in the kernel, so it is
+                    # counted rather than entered (see _is_dataless).
+                    unreadable += 1
+                    continue
+                build, version = _asset_build_and_version(
+                    Path(entry.path) / "Info.plist")
+                if not build:
+                    unreadable += 1
+                    continue
+                if build in builds or os.path.normpath(entry.path) in referenced:
+                    continue
+                found.append({"platform": platform, "build": build,
+                              "version": version, "path": entry.path,
+                              "bytes": _bundle_size(Path(entry.path))})
+        found.sort(key=lambda a: a["bytes"], reverse=True)
+        return {"assets": found, "unreadable": unreadable,
+                "total_bytes": sum(a["bytes"] for a in found), "root": str(root)}
+
+    return _read_only_scan(read, None, "simulator asset scan")
+
+
+def _stranded_asset_label(asset):
+    version = (" " + asset["version"]) if asset.get("version") else ""
+    return "%s%s (%s, %s)" % (asset["platform"], version, asset["build"],
+                              fmt_size(asset["bytes"]))
 
 
 def _system_temp_usage():
@@ -4028,6 +4212,34 @@ def run_doctor(config, json_mode=False):
               f"to reclaim it, {how} — Docker returns the freed space to the "
               f"disk itself. MacCleaner never touches this image: deleting or "
               f"truncating it would destroy every container, image and volume",
+              ok=False, advisory=True)
+
+    # Stranded simulator runtime assets. Report-only and advisory for the
+    # strongest reason of any check here: the `.asset` directories carry
+    # SIP's `restricted` flag, so there is no deletion this tool -- or any
+    # tool, at any privilege level -- could even attempt. Only Xcode's own
+    # Platforms pane has the authority. The row's ABSENCE never asserts that
+    # nothing is stranded: _stranded_simulator_assets() returns None when it
+    # could not look, and an unknown is omitted rather than reported clean.
+    stranded = _stranded_simulator_assets()
+    if stranded and stranded["total_bytes"] >= STRANDED_ASSET_WARN_BYTES:
+        rows = stranded["assets"]
+        shown = rows[:STRANDED_ASSET_MAX_NAMED]
+        named = ", ".join(_stranded_asset_label(a) for a in shown)
+        rest = len(rows) - len(shown)
+        if rest > 0:
+            named += f" +{rest} more"
+        partial = ""
+        if stranded["unreadable"]:
+            partial = (f" {stranded['unreadable']} further asset(s) could not be"
+                       f" read, so this total may be incomplete.")
+        check(STRANDED_ASSET_CHECK_NAME,
+              f"{fmt_size(stranded['total_bytes'])} still stored under "
+              f"{stranded['root']} for simulator runtimes Xcode no longer "
+              f"lists: {named}. Remove them in Xcode → Settings → Platforms, "
+              f"which is the only thing with the authority — these directories "
+              f"are SIP-restricted, so `sudo rm` fails even as root, and "
+              f"MacCleaner only reports them.{partial}",
               ok=False, advisory=True)
 
     # Deleted-but-still-open files (2.8.0). Report-only: the space returns by
