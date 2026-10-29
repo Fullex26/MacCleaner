@@ -9,6 +9,12 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+- `simulator-unused-runtimes` and `simulator-stale-devices` can now report failure. Both previously ran a `; `-joined shell string in which every command was silenced with `2>/dev/null` and the whole thing ended `; true`, so the run always exited 0 and the item was always recorded as `deleted` — on a real machine it reported success while leaving 21.26 GB of runtime assets on disk. Each identifier now runs as its own process (no shell, so simctl's exit code and stderr survive), and simctl's registry is re-read afterwards: anything still registered is a failure, partial results are reported as `"2 of 3 runtimes deleted; still registered: …"`, and a registry that cannot be re-read is reported as unverified rather than as success. One bad identifier still never stops the others from being attempted.
+
+### Added
+- `clean --json` / `report --json` items carry `freed_unknown: true` on command-based targets (additive, present only when true). Their `freed: 0` was indistinguishable from a measured zero; the engine cannot measure what a command reclaimed, and for the simulator targets the bytes may sit in SIP-protected asset bundles it can never see. The app shows "not measurable" instead of "0 bytes".
+
 ---
 
 ## [2.19.0] — 2026-10-23

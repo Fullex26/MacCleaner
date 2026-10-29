@@ -4307,13 +4307,20 @@ class TestSimulatorTargets(unittest.TestCase):
         self.assertIn("iOS-18-6", rt[0]["cmd"])
         self.assertNotIn("iOS-26-5", rt[0]["cmd"])
         self.assertEqual(rt[0]["precomputed_bytes"], 6000000000)
-        # "; "-joined with per-command suppression, not "&&" -- one failing
-        # delete must not short-circuit and skip every later identifier.
+        # The cmd string now DESCRIBES what runs and nothing more: no
+        # 2>/dev/null, no trailing "; true". Those two made the target
+        # structurally incapable of reporting failure (issue #106). The
+        # "one bad identifier must not skip the rest" property they were
+        # chosen for now comes from iterating in Python -- see
+        # TestSimctlDeleteIsVerified.
         self.assertEqual(
             rt[0]["cmd"],
             "xcrun simctl runtime delete "
-            "com.apple.CoreSimulator.SimRuntime.iOS-18-6 2>/dev/null; true")
+            "com.apple.CoreSimulator.SimRuntime.iOS-18-6")
         self.assertNotIn("&&", rt[0]["cmd"])
+        self.assertEqual(rt[0]["cmd_runner"], "simctl-runtime-delete")
+        self.assertEqual(rt[0]["cmd_ids"],
+                         ["com.apple.CoreSimulator.SimRuntime.iOS-18-6"])
 
     def test_malicious_udid_dropped_before_reaching_cmd(self):
         # A udid that doesn't look like a UDID (whatever produced this JSON --
@@ -4429,6 +4436,308 @@ class TestSimulatorTargets(unittest.TestCase):
                                 return_value=[{"id": "simulator-stale-devices"}]):
             targets = cleaner.collect_targets(cfg)
         self.assertFalse(any(t.get("id") == "simulator-stale-devices" for t in targets))
+
+
+class TestSimctlDeleteIsVerified(unittest.TestCase):
+    """Issue #106: `simulator-unused-runtimes` could not report failure.
+
+    Its cmd was "; "-joined with `2>/dev/null` per command and a trailing
+    `; true`, so `delete_target`'s `status = "error" if err else "deleted"`
+    was decided before the first byte ran: stderr was discarded and the exit
+    code was forced to 0. On a real machine it reported `status: "deleted"`,
+    `freed: 0` while leaving 21.26 GB of runtime assets on disk.
+
+    The replacement runs one process per identifier (so one bad identifier
+    still cannot short-circuit the rest -- the only reason `; ` was there)
+    and then re-reads simctl's own registry: anything still registered is a
+    failure whatever simctl's exit code claimed."""
+
+    RUNTIME_A = "com.apple.CoreSimulator.SimRuntime.iOS-18-1"
+    RUNTIME_B = "com.apple.CoreSimulator.SimRuntime.iOS-18-6"
+
+    def _target(self, ids=None):
+        ids = [self.RUNTIME_A, self.RUNTIME_B] if ids is None else ids
+        return {"id": "simulator-unused-runtimes", "category": "simulators",
+                "label": "Unused simulator runtimes (%d)" % len(ids),
+                "path": None, "glob": None, "skip": [], "safe": False,
+                "cmd": "; ".join("xcrun simctl runtime delete %s" % i for i in ids),
+                "cmd_runner": "simctl-runtime-delete", "cmd_ids": list(ids),
+                "estimate_cmd": None, "estimate_parser": None,
+                "empty_only": False, "precomputed_bytes": 20 * 1024 ** 3}
+
+    @contextlib.contextmanager
+    def _simctl(self, results, remaining):
+        """Fake the two halves separately: `results` maps an identifier to the
+        (returncode, stderr) its delete returns, `remaining` is what the
+        verification re-read of `runtime list` reports back (None = simctl
+        could not be asked)."""
+        calls = []
+
+        def run_owned(argv, timeout_s):
+            calls.append(list(argv))
+            return results.get(argv[-1], (0, ""))
+
+        def simctl_json(args):
+            return remaining if args[:2] == ["runtime", "list"] else None
+
+        with mock.patch.object(cleaner, "_simctl_run_owned", side_effect=run_owned):
+            with mock.patch.object(cleaner, "_simctl_json", side_effect=simctl_json):
+                yield calls
+
+    @staticmethod
+    def _registry(ids):
+        return {"runtimes": [{"identifier": i, "runtimeIdentifier": i,
+                              "state": "Ready", "sizeBytes": 1} for i in ids]}
+
+    def test_each_identifier_runs_as_its_own_argv_never_a_shell_string(self):
+        with self._simctl({}, self._registry([])) as calls:
+            result = cleaner.delete_target(self._target())
+        self.assertEqual(result, (0, None))
+        self.assertEqual(calls, [["xcrun", "simctl", "runtime", "delete", self.RUNTIME_A],
+                                 ["xcrun", "simctl", "runtime", "delete", self.RUNTIME_B]])
+        for argv in calls:
+            self.assertNotIn("2>/dev/null", " ".join(argv))
+            self.assertNotIn("; true", " ".join(argv))
+
+    def test_one_failing_identifier_does_not_short_circuit_the_rest(self):
+        # The property the original "; "-join existed to preserve.
+        results = {self.RUNTIME_A: (1, "An error was encountered processing the command")}
+        with self._simctl(results, self._registry([self.RUNTIME_A])) as calls:
+            freed, err = cleaner.delete_target(self._target())
+        self.assertEqual([argv[-1] for argv in calls],
+                         [self.RUNTIME_A, self.RUNTIME_B])
+        self.assertIsNotNone(err)
+        self.assertIn("1 of 2", err)
+        self.assertIn(self.RUNTIME_A, err)
+        self.assertIn("An error was encountered", err)
+        self.assertEqual(freed, 0)
+
+    def test_surviving_runtime_is_an_error_even_when_simctl_exited_zero(self):
+        # The exact #106 shape: every delete "succeeded" and nothing went away.
+        with self._simctl({}, self._registry([self.RUNTIME_A, self.RUNTIME_B])):
+            freed, err = cleaner.delete_target(self._target())
+        self.assertEqual(freed, 0)
+        self.assertIsNotNone(err, "a clean that removed nothing is not a success")
+        self.assertIn("0 of 2", err)
+        self.assertIn("still registered", err)
+
+    def test_fully_verified_deletion_reports_success(self):
+        with self._simctl({}, self._registry([self.RUNTIME_B])):
+            freed, err = cleaner.delete_target(self._target([self.RUNTIME_A]))
+        self.assertIsNone(err)
+        self.assertEqual(freed, 0)
+
+    def test_empty_registry_is_success_not_an_unanswerable_query(self):
+        # Deleting the last runtime leaves `runtime list -j` answering with an
+        # empty collection, which is falsy. Conflating that with "simctl could
+        # not be asked" (the _launchd_is_loaded lesson) would turn the one
+        # completely successful case into a permanent "could not verify".
+        for empty in ({}, [], {"runtimes": []}):
+            with self.subTest(empty=empty):
+                with self._simctl({}, empty):
+                    _, err = cleaner.delete_target(self._target())
+                self.assertIsNone(err)
+
+    def test_unanswerable_verification_is_never_reported_as_success(self):
+        with self._simctl({}, None):
+            freed, err = cleaner.delete_target(self._target())
+        self.assertEqual(freed, 0)
+        self.assertIsNotNone(err)
+        self.assertIn("verif", err.lower())
+
+    def test_timed_out_identifier_is_reported_not_swallowed(self):
+        def run_owned(argv, timeout_s):
+            raise subprocess.TimeoutExpired(argv, timeout_s)
+
+        with mock.patch.object(cleaner, "_simctl_run_owned", side_effect=run_owned):
+            with mock.patch.object(cleaner, "_simctl_json",
+                                   return_value=self._registry([self.RUNTIME_A,
+                                                                self.RUNTIME_B])):
+                _, err = cleaner.delete_target(self._target())
+        self.assertIsNotNone(err)
+        self.assertIn("timed out", err)
+
+    def test_malformed_identifier_is_refused_before_reaching_simctl(self):
+        # Defence in depth: the scanner validates, but a target assembled any
+        # other way must still never hand simctl an unvalidated string --
+        # "all" is a real `runtime delete` argument that wipes every image.
+        # A refusal is itself a failure to report: the engine did less than
+        # the target promised, whether or not the registry mentions the id.
+        with self._simctl({}, self._registry([])) as calls:
+            _, err = cleaner.delete_target(self._target(["all", self.RUNTIME_A]))
+        self.assertEqual([argv[-1] for argv in calls], [self.RUNTIME_A])
+        self.assertIsNotNone(err)
+        self.assertIn("1 of 2", err)
+        self.assertIn("never attempted", err)
+        self.assertIn("malformed identifier", err)
+
+    def test_non_string_identifier_is_reported_not_crashed_on(self):
+        # An unhashable identifier used to be able to blow up the per-identifier
+        # reasons dict, and the runner dispatch sits outside delete_target's
+        # try block -- that would have aborted the whole clean run, not just
+        # this target.
+        with self._simctl({}, self._registry([self.RUNTIME_A])) as calls:
+            freed, err = cleaner.delete_target(
+                self._target([{"nope": 1}, self.RUNTIME_A]))
+        self.assertEqual([argv[-1] for argv in calls], [self.RUNTIME_A])
+        self.assertEqual(freed, 0)
+        self.assertIsNotNone(err)
+        self.assertIn("malformed identifier", err)
+
+    def test_unknown_cmd_runner_never_falls_back_to_the_shell(self):
+        t = self._target()
+        t["cmd_runner"] = "something-new"
+        with mock.patch.object(cleaner.subprocess, "Popen") as popen:
+            freed, err = cleaner.delete_target(t)
+        popen.assert_not_called()
+        self.assertEqual(freed, 0)
+        self.assertIn("unknown command runner", err)
+
+    def test_stale_devices_delete_is_per_udid_and_verified(self):
+        udids = ["AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+                 "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"]
+        t = {"id": "simulator-stale-devices", "category": "simulators",
+             "label": "Stale simulator devices (2)", "path": None, "glob": None,
+             "skip": [], "safe": False,
+             "cmd": "; ".join("xcrun simctl delete %s" % u for u in udids),
+             "cmd_runner": "simctl-device-delete", "cmd_ids": udids,
+             "estimate_cmd": None, "estimate_parser": None,
+             "empty_only": False, "precomputed_bytes": 1}
+        calls = []
+
+        def run_owned(argv, timeout_s):
+            calls.append(list(argv))
+            return 0, ""
+
+        devices = {"devices": {"com.apple.CoreSimulator.SimRuntime.iOS-26-5":
+                               [{"udid": udids[1], "name": "survivor"}]}}
+        with mock.patch.object(cleaner, "_simctl_run_owned", side_effect=run_owned):
+            with mock.patch.object(cleaner, "_simctl_json", return_value=devices):
+                _, err = cleaner.delete_target(t)
+        self.assertEqual(calls, [["xcrun", "simctl", "delete", udids[0]],
+                                 ["xcrun", "simctl", "delete", udids[1]]])
+        self.assertIsNotNone(err)
+        self.assertIn("1 of 2", err)
+        self.assertIn(udids[1], err)
+
+    def test_owned_runner_uses_its_own_process_group_and_no_shell(self):
+        # xcrun is only a launcher: killing it on timeout would leave simctl
+        # mutating storage, so the child gets its own group and the group is
+        # terminated on every exit path, like every other cleanup subprocess.
+        class FakeProc:
+            pid = 4242
+            returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        with mock.patch.object(cleaner.subprocess, "Popen",
+                               return_value=FakeProc()) as popen:
+            with mock.patch.object(cleaner.os, "killpg") as killpg:
+                rc, err = cleaner._simctl_run_owned(["xcrun", "simctl", "x"], 5)
+        self.assertEqual((rc, err), (0, ""))
+        kwargs = popen.call_args[1]
+        self.assertEqual(popen.call_args[0][0], ["xcrun", "simctl", "x"])
+        self.assertNotIn("shell", kwargs)
+        self.assertTrue(kwargs["start_new_session"])
+        killpg.assert_called_once_with(4242, cleaner.signal.SIGKILL)
+
+    def test_scanner_cmd_no_longer_suppresses_output_or_forces_exit_zero(self):
+        devices = {"devices": {"com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+            {"udid": "AAAAAAAA-0000-0000-0000-000000000001", "name": "iPhone",
+             "state": "Shutdown", "lastBootedAt": "2020-01-01T00:00:00Z",
+             "dataPath": "/dev/null"}]}}
+        runtimes = {"runtimes": [
+            {"identifier": self.RUNTIME_B, "runtimeIdentifier": self.RUNTIME_B,
+             "state": "Ready", "sizeBytes": 6000000000}]}
+
+        def fake(args):
+            return devices if args[:2] == ["list", "devices"] else runtimes
+        with mock.patch.object(cleaner, "_simctl_json", side_effect=fake):
+            with mock.patch.object(cleaner, "get_size", return_value=0):
+                targets = cleaner.scan_simulator_targets({"simulator_stale_days": 30})
+        self.assertEqual(len(targets), 2)
+        for t in targets:
+            self.assertNotIn("2>/dev/null", t["cmd"])
+            self.assertNotIn("true", t["cmd"])
+            self.assertNotIn("&&", t["cmd"])
+            self.assertTrue(t["cmd_runner"])
+            self.assertTrue(t["cmd_ids"])
+        rt = [t for t in targets if t["id"] == "simulator-unused-runtimes"][0]
+        self.assertEqual(rt["cmd_ids"], [self.RUNTIME_B])
+        self.assertEqual(rt["cmd"],
+                         "xcrun simctl runtime delete " + self.RUNTIME_B)
+
+
+class TestCmdTargetsDoNotClaimZeroFreed(unittest.TestCase):
+    """`freed: 0` on a cmd target used to be indistinguishable from "zero was
+    the right answer". Issue #106's real run reported `status: "deleted"`,
+    `freed: 0` for 20.6 GB of advertised runtimes. The engine genuinely
+    cannot measure a cmd target's reclaim, so it now says so additively
+    (`freed_unknown: true`) instead of implying a measurement it never made.
+    `freed` itself stays an int, because CleanItem.freed is a non-optional
+    Int in already-installed copies of the app."""
+
+    def _run(self, target, err=None):
+        with mock.patch.object(cleaner, "delete_target", return_value=(0, err)):
+            with mock.patch.object(cleaner, "write_log"):
+                with mock.patch.object(cleaner, "record_snapshot"):
+                    with mock.patch("sys.stdout", io.StringIO()) as out:
+                        cleaner.run_clean([target], auto_approve=True,
+                                          json_mode=True, explicit=True)
+        return json.loads(out.getvalue())
+
+    def _cmd_target(self):
+        return {"id": "simulator-unused-runtimes", "category": "simulators",
+                "label": "Unused simulator runtimes (1)", "path": None,
+                "glob": None, "skip": [], "safe": False,
+                "cmd": "xcrun simctl runtime delete x",
+                "cmd_runner": "simctl-runtime-delete",
+                "cmd_ids": ["com.apple.CoreSimulator.SimRuntime.iOS-18-1"],
+                "estimate_cmd": None, "estimate_parser": None,
+                "empty_only": False, "precomputed_bytes": 20 * 1024 ** 3}
+
+    def test_cmd_item_declares_its_freed_figure_unmeasured(self):
+        item = self._run(self._cmd_target())["items"][0]
+        self.assertEqual(item["status"], "deleted")
+        self.assertTrue(item["freed_unknown"], "0 must not read as a measured zero")
+        self.assertEqual(item["freed"], 0, "the key itself stays an int")
+
+    def test_cmd_item_never_reports_the_precomputed_size_as_achieved(self):
+        report = self._run(self._cmd_target())
+        self.assertEqual(report["items"][0]["freed"], 0)
+        self.assertEqual(report["freed_bytes"], 0)
+
+    def test_failed_cmd_item_is_error_with_the_partial_count(self):
+        item = self._run(self._cmd_target(),
+                         err="1 of 2 runtimes deleted; still registered: "
+                             "com.apple.CoreSimulator.SimRuntime.iOS-18-1 (exit 1)"
+                         )["items"][0]
+        self.assertEqual(item["status"], "error")
+        self.assertIn("1 of 2", item["error"])
+        self.assertTrue(item["freed_unknown"])
+
+    def test_path_targets_still_report_a_measured_figure(self):
+        t = {"id": "npm-cache", "category": "node", "label": "npm cache",
+             "path": "~/.npm/_cacache", "glob": None, "skip": [], "safe": True,
+             "cmd": None, "estimate_cmd": None, "estimate_parser": None,
+             "empty_only": False, "exists": True, "size": 10}
+        with mock.patch.object(cleaner, "measure_targets", side_effect=lambda ts: ts):
+            report = self._run(t)
+        self.assertNotIn("freed_unknown", report["items"][0],
+                         "a measured target must not carry the flag at all")
+
+    def test_min_free_clean_marks_cmd_items_the_same_way(self):
+        t = dict(self._cmd_target(), safe=True, exists=True, size=1)
+        with mock.patch.object(cleaner, "measure_targets", side_effect=lambda ts: ts):
+            with mock.patch.object(cleaner, "delete_target", return_value=(0, None)):
+                with mock.patch.object(cleaner, "disk_stats",
+                                       return_value={"free_bytes": 1}):
+                    with mock.patch.object(cleaner, "write_log"):
+                        with mock.patch.object(cleaner, "record_snapshot"):
+                            with mock.patch("sys.stdout", io.StringIO()) as out:
+                                cleaner.run_clean_min_free([t], 40, json_mode=True)
+        self.assertTrue(json.loads(out.getvalue())["items"][0]["freed_unknown"])
 
 
 class TestScannerScoping(unittest.TestCase):
