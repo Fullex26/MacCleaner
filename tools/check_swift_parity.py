@@ -10,6 +10,10 @@ against it, and compares semantically (per-target dicts, order-free):
   file is stale: regenerate it, don't hand-edit.
 - scan --all: for every target, (category, label, safe, exists,
   size_bytes) must be identical, including command estimates and simulator sizes.
+- command text: for every target that runs a command, the exact command string
+  must be identical. Read from `clean --dry-run` on the Python side (the only
+  place the engine exposes it) and from `cmd_text` on the Swift side (`cmd`
+  there is a presence flag, not the command).
 
 Exit 0 on parity, 1 with a readable diff otherwise.
 """
@@ -73,7 +77,6 @@ def main():
         sw_scan = run_json([str(MCK), "scan", "--json", "--all"], env)
         def by_id(d): return {t["id"]: t for t in d["targets"]}
         ps, ss = by_id(py_scan), by_id(sw_scan)
-        cmd_ids = {t["id"] for t in sw_scan["targets"] if t.get("cmd")}
         for tid in sorted(set(ps) | set(ss)):
             p, s = ps.get(tid), ss.get(tid)
             if p is None or s is None:
@@ -82,6 +85,34 @@ def main():
             for k in ("category", "label", "safe", "exists", "size_bytes"):
                 if p.get(k) != s.get(k):
                     failures.append(f"scan/{tid}.{k}: py={p.get(k)!r} swift={s.get(k)!r}")
+        # Command TEXT, not merely its presence. The engine exposes a target's
+        # command only through `clean --dry-run` (scan --json omits it), and a dry
+        # run deletes nothing and writes no report.log. Until this existed the
+        # gate compared cmd targets on size alone while printing "fully
+        # compared", so both hand-written simctl strings in SimulatorScanner.swift
+        # kept the suppressed "2>/dev/null ... ; true" form for a release after
+        # the engine dropped it — the very form that made a failed delete
+        # unreportable (issue #106). Built from BOTH engines so a command target
+        # present on only one side is a failure, not a silent omission.
+        dry = run_json([sys.executable, str(gen.ENGINE), "clean", "--dry-run",
+                        "--json", "--targets", ",".join(sorted(ps))], env)
+        py_cmds = {i["id"]: i["cmd"] for i in dry["items"] if i.get("cmd")}
+        # The kit's `cmd` is a presence flag, not the command — reading it as the
+        # text compares a string against `true` and fails everything. The text
+        # rides alongside it as `cmd_text`; a row claiming a command without one
+        # would hide from this check, so that is a failure in its own right.
+        sw_cmds = {t["id"]: t["cmd_text"] for t in sw_scan["targets"]
+                   if t.get("cmd_text")}
+        for t in sw_scan["targets"]:
+            if t.get("cmd") and not t.get("cmd_text"):
+                failures.append(f"cmd/{t['id']}: swift reports a command "
+                                f"but no cmd_text to compare")
+        cmd_ids = set(py_cmds) | set(sw_cmds)
+        for tid in sorted(cmd_ids):
+            if py_cmds.get(tid) != sw_cmds.get(tid):
+                failures.append(f"cmd/{tid}: py={py_cmds.get(tid)!r} "
+                                f"swift={sw_cmds.get(tid)!r}")
+
         # Pin independent known totals too: two engines returning zero is not parity.
         expected = {"docker-prune": 1078984704, "brew-cleanup": 1610612736,
                     "conda-clean": 1075838976, "pnpm-store": 8192,
@@ -162,7 +193,7 @@ def main():
             print(" ", f)
         raise SystemExit(1)
     print(f"parity OK: {len(pt)} table entries, {len(ps)} scanned targets "
-          f"({len(cmd_ids)} cmd targets fully compared)")
+          f"({len(cmd_ids)} command strings compared verbatim)")
 
 if __name__ == "__main__":
     main()
