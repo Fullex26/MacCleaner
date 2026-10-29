@@ -1250,6 +1250,11 @@ def _reclaim_unverified_fields(t):
     itself from simctl's own `sizeBytes` and offered 20.56 GB that four
     measured runs in a row freed nothing of. See issue #112.
 
+    Mark a target here only when there is *evidence* its bytes do not come
+    back, not merely because measuring them is hard -- an unmeasured target
+    belongs in the total, since leaving it out understates what a user can
+    free just as dishonestly as counting it overstates it.
+
     Additive and emitted only when true, like `advisory` and `freed_unknown`,
     so every existing reader keeps decoding unchanged."""
     if not t.get("reclaim_unverified"):
@@ -3210,30 +3215,43 @@ def scan_simulator_targets(config):
                 "id": "simulator-unused-runtimes", "category": "simulators",
                 "label": "Unused simulator runtimes (%d)" % len(ids),
                 "description": "Runtime images with no simulator devices — "
-                               "deregistered via simctl, which is not known to "
-                               "free disk. Xcode → Settings → Platforms "
-                               "removes the image itself.",
+                               "deregistering them is not known to free disk, "
+                               "and can leave the image on disk with no way "
+                               "to remove it.",
                 "path": None, "glob": None, "skip": [], "safe": False,
                 # The size is simctl's own sizeBytes and it is real, but it
-                # is not reclaim, and simctl's registry cannot establish that
-                # it is. On a real machine `runtime list` went from 7 runtimes
-                # / 43.20 GiB to 2 / 11.1 GiB in ten minutes with nothing
-                # deleted and no reboot: images.plist tracks which runtime
-                # images are currently MOUNTED, and entries come and go with
-                # them. So this target's membership and size swing on their
-                # own, and #109's post-delete registry re-read can report a
-                # clean `deleted` purely because the image is unmounted at
-                # that instant. Four runs in report.log: freed 0 every time,
-                # 43.20 GiB of images still on disk after a reboot. The
-                # re-read still does the job it was written for (#106); it
-                # just says nothing about disk space. Issue #112.
+                # is not reclaim. Measured on a real machine: three runtimes
+                # were deregistered -- by this target's own command earlier,
+                # and later by Xcode -> Settings -> Platforms -- and all
+                # 21.26 GiB of their /System/Library/AssetsV2 bundles stayed
+                # on disk both times. report.log has four runs of this target,
+                # freed 0 every one. The runtimes then came back Ready after a
+                # reboot, because the asset was still there to rediscover.
+                #
+                # Worse than not reclaiming: once an asset is unregistered
+                # nothing can remove it. simctl has no identifier for it
+                # (`runtime delete --unusable/--outdated --dry-run` both
+                # answer "No matching images found"), Xcode lists only
+                # registered runtimes, and AssetsV2 is SIP-restricted so rm
+                # fails even as root. So a part-failed delete can put the
+                # space permanently beyond reach.
+                #
+                # The command itself is right -- `runtime delete` removes the
+                # asset by default, `--keep-asset` is the opt-out, and the
+                # .asset dir IS the runtime's storage (`runtime list -v`
+                # Image Path), not a cached copy. Why the removal completes
+                # for some runtimes and not others is NOT established; do not
+                # write a mechanism into this comment without measuring one.
+                # And do not point users at Xcode -> Settings -> Platforms as
+                # the fix: in the same session it freed two runtimes' assets
+                # and left these three. Issue #112.
                 "reclaim_unverified": True,
-                "reclaim_note": "Size comes from simctl, which lists only "
-                                "currently-mounted runtime images, so it is "
-                                "not verified reclaim — measured runs freed "
-                                "nothing. Remove runtimes in Xcode → Settings "
-                                "→ Platforms, which drops the registration "
-                                "and the image together.",
+                "reclaim_note": "Not verified reclaim. On a real Mac both "
+                                "`simctl runtime delete` and Xcode → Settings "
+                                "→ Platforms deregistered these runtimes and "
+                                "left all 21.26 GiB of their images on disk — "
+                                "and once an image is unregistered, no tool "
+                                "can remove it. Expect to free nothing.",
                 # `cmd` describes what runs (and is what --dry-run shows); the
                 # work is done by cmd_runner, one process per identifier, with
                 # a registry re-read afterwards. The old form silenced every

@@ -8183,11 +8183,30 @@ class TestSimulatorRuntimeTargetIsHonest(unittest.TestCase):
         self.assertIn("iOS-18-6", rt["cmd"])            # still says what goes
         self.assertEqual(rt["precomputed_bytes"], 6000000000)   # still sized
 
-    def test_supported_removal_path_is_named(self):
+    def test_text_warns_that_nothing_is_expected_to_be_freed(self):
+        rt = [t for t in self._targets() if t["id"] == "simulator-unused-runtimes"][0]
+        self.assertIn("not known to free disk", rt["description"])
+        self.assertIn("Expect to free nothing", rt["reclaim_note"])
+
+    def test_text_does_not_promise_an_alternative_removal_path(self):
+        # An earlier draft named Xcode -> Settings -> Platforms as the way to
+        # remove registration and image together. Measured: in one session
+        # that UI released two runtimes' assets and left these three in place
+        # (issue #112). There is no removal path to send a user to once an
+        # asset is orphaned, so the text must not invent one.
         rt = [t for t in self._targets() if t["id"] == "simulator-unused-runtimes"][0]
         for text in (rt["description"], rt["reclaim_note"]):
-            self.assertIn("Xcode", text)
-            self.assertIn("Platforms", text)
+            self.assertNotRegex(
+                text,
+                r"(?i)(remove|use|go to|open)[^.]*Xcode[^.]*Platforms",
+            )
+
+    def test_reclaim_note_states_the_stranding_risk(self):
+        # Running this target can be worse than useless: an unregistered asset
+        # is removable by nothing, so the space goes permanently out of reach.
+        rt = [t for t in self._targets() if t["id"] == "simulator-unused-runtimes"][0]
+        self.assertIn("no tool can remove it", rt["reclaim_note"])
+        self.assertIn("no way to remove it", rt["description"])
 
     def test_stale_devices_target_is_not_marked(self):
         # Device data lives under ~/Library/Developer/CoreSimulator/Devices and

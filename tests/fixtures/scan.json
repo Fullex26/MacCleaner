@@ -4,11 +4,11 @@
   "targets": [
     {
       "category": "simulators",
-      "description": "Runtime images with no simulator devices \u2014 deregistered via simctl, which is not known to free disk. Xcode \u2192 Settings \u2192 Platforms removes the image itself.",
+      "description": "Runtime images with no simulator devices \u2014 deregistering them is not known to free disk, and can leave the image on disk with no way to remove it.",
       "exists": true,
       "id": "simulator-unused-runtimes",
       "label": "Unused simulator runtimes (1)",
-      "reclaim_note": "Size comes from simctl, which lists only currently-mounted runtime images, so it is not verified reclaim \u2014 measured runs freed nothing. Remove runtimes in Xcode \u2192 Settings \u2192 Platforms, which drops the registration and the image together.",
+      "reclaim_note": "Not verified reclaim. On a real Mac both `simctl runtime delete` and Xcode \u2192 Settings \u2192 Platforms deregistered these runtimes and left all 21.26 GiB of their images on disk \u2014 and once an image is unregistered, no tool can remove it. Expect to free nothing.",
       "reclaim_unverified": true,
       "safe": false,
       "size_bytes": 8000000000,
