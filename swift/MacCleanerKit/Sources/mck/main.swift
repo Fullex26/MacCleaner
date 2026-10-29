@@ -24,7 +24,11 @@ case "scan":
     let config = Config.load(from: configPath)
     let results = Scanner.scan(config: config)
     var targets: [[String: Any]] = results.map { r -> [String: Any] in
-        [
+        // `cmd` stays the presence flag it has always been; `cmd_text` carries
+        // the command itself so tools/check_swift_parity.py can compare it to
+        // the engine's verbatim. Without it the gate could only ever see
+        // `true`, which is how two stale simctl strings survived issue #106.
+        var row: [String: Any] = [
             "id": r.target.id,
             "category": r.target.category,
             "label": r.target.label,
@@ -34,6 +38,8 @@ case "scan":
             "size_bytes": r.sizeBytes,
             "cmd": r.target.cmd != nil,
         ]
+        if let c = r.target.cmd { row["cmd_text"] = c }
+        return row
     }
     // Dynamic tmp scanner (V3 Stage 2 second half). Mirrors collect_targets:
     // appended only when the category is enabled; always review-only.
@@ -54,12 +60,14 @@ case "scan":
     // emitted with precomputed sizes; nothing here executes their commands.
     if config.enabledCategories.contains("simulators") {
         for t in SimulatorScanner.scan(staleDays: config.simulatorStaleDays) {
-            targets.append([
+            var row: [String: Any] = [
                 "id": t.id, "category": t.category, "label": t.label,
                 "description": t.desc, "safe": false,
                 "exists": true, "size_bytes": t.precomputedBytes ?? 0,
-                "cmd": true,
-            ])
+                "cmd": t.cmd != nil,
+            ]
+            if let c = t.cmd { row["cmd_text"] = c }
+            targets.append(row)
         }
     }
     // Leftovers: multi-path review-only targets, sized like the Python

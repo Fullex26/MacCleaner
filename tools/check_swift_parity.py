@@ -11,8 +11,9 @@ against it, and compares semantically (per-target dicts, order-free):
 - scan --all: for every target, (category, label, safe, exists,
   size_bytes) must be identical, including command estimates and simulator sizes.
 - command text: for every target that runs a command, the exact command string
-  must be identical. Read from `clean --dry-run` on the Python side, which is
-  the only place the engine exposes it.
+  must be identical. Read from `clean --dry-run` on the Python side (the only
+  place the engine exposes it) and from `cmd_text` on the Swift side (`cmd`
+  there is a presence flag, not the command).
 
 Exit 0 on parity, 1 with a readable diff otherwise.
 """
@@ -96,7 +97,16 @@ def main():
         dry = run_json([sys.executable, str(gen.ENGINE), "clean", "--dry-run",
                         "--json", "--targets", ",".join(sorted(ps))], env)
         py_cmds = {i["id"]: i["cmd"] for i in dry["items"] if i.get("cmd")}
-        sw_cmds = {t["id"]: t["cmd"] for t in sw_scan["targets"] if t.get("cmd")}
+        # The kit's `cmd` is a presence flag, not the command — reading it as the
+        # text compares a string against `true` and fails everything. The text
+        # rides alongside it as `cmd_text`; a row claiming a command without one
+        # would hide from this check, so that is a failure in its own right.
+        sw_cmds = {t["id"]: t["cmd_text"] for t in sw_scan["targets"]
+                   if t.get("cmd_text")}
+        for t in sw_scan["targets"]:
+            if t.get("cmd") and not t.get("cmd_text"):
+                failures.append(f"cmd/{t['id']}: swift reports a command "
+                                f"but no cmd_text to compare")
         cmd_ids = set(py_cmds) | set(sw_cmds)
         for tid in sorted(cmd_ids):
             if py_cmds.get(tid) != sw_cmds.get(tid):
