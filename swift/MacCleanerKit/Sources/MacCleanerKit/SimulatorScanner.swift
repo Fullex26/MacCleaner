@@ -86,7 +86,7 @@ public enum SimulatorScanner {
         }
 
         if !stale.isEmpty {
-            let udids = stale.compactMap { $0["udid"] as? String }.joined(separator: " ")
+            let udids = stale.compactMap { $0["udid"] as? String }
             let names = stale.prefix(4).compactMap { $0["name"] as? String ?? "?" }
                 .joined(separator: ", ")
             let more = stale.count <= 4 ? "" : " +\(stale.count - 4) more"
@@ -95,7 +95,12 @@ public enum SimulatorScanner {
                 label: "Stale simulator devices (\(stale.count))",
                 desc: "Not booted in \(Int(staleDays))d: \(names)\(more) — deleted via simctl",
                 safe: false, emptyOnly: false, paths: [], glob: nil,
-                cmd: "xcrun simctl delete \(udids) 2>/dev/null || true",
+                // Mirrors the Python engine exactly: one command per UDID,
+                // ";"-joined so a bad UDID cannot skip the rest. The old
+                // "simctl delete <all udids> 2>/dev/null || true" form threw the
+                // error away AND forced exit 0, which made a failed delete
+                // literally unreportable — see issue #106.
+                cmd: udids.map { "xcrun simctl delete \($0)" }.joined(separator: "; "),
                 precomputedBytes: staleBytes))
         }
 
@@ -125,8 +130,10 @@ public enum SimulatorScanner {
             .sorted { (($0["identifier"] as? String) ?? "") < (($1["identifier"] as? String) ?? "") }
         if !unused.isEmpty {
             let ids = unused.compactMap { $0["identifier"] as? String }
-            let cmd = ids.map { "xcrun simctl runtime delete \($0) 2>/dev/null" }
-                .joined(separator: "; ") + "; true"
+            // Same correction as simulator-stale-devices above: no 2>/dev/null,
+            // no trailing "; true". Both silenced every failure (issue #106).
+            let cmd = ids.map { "xcrun simctl runtime delete \($0)" }
+                .joined(separator: "; ")
             targets.append(Target(
                 id: "simulator-unused-runtimes", category: "simulators",
                 label: "Unused simulator runtimes (\(ids.count))",
