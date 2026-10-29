@@ -61,7 +61,7 @@ struct HistoryCard: View {
                                 Text(item.label).font(.rowLabel)
                                 Text(item.outcomeLabel)
                                     .foregroundStyle(item.status == "error" ? .red : .secondary)
-                                Text("Reported freed: \(ByteCountFormatter.string(fromByteCount: Int64(item.freed), countStyle: .file))")
+                                Text(item.freedDetail)
                                     .font(.metaCaption).foregroundStyle(.secondary)
                                 if let error = item.error {
                                     Text(error).font(.metaCaption).foregroundStyle(.red).textSelection(.enabled)

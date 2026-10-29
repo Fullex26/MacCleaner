@@ -48,6 +48,31 @@ struct CleanItem: Codable, Identifiable {
     let freed: Int
     let status: String
     let error: String?
+    /// Additive and present only when true (the `advisory` idiom): the engine
+    /// could not measure this item's reclaim at all, so `freed` is `0` as a
+    /// placeholder and not as a measurement. Command-based targets — `docker
+    /// system prune`, `brew cleanup`, the simctl targets — are the only ones
+    /// that carry it: the command decides what goes, and for simctl the bytes
+    /// may sit in SIP-protected asset bundles. Optional because older engines
+    /// omit the key entirely, and `freed` stays non-optional because changing
+    /// its type would break every already-installed copy of this app.
+    let freed_unknown: Bool?
+
+    /// Never prints "0 bytes" for an unmeasured item: a figure the engine
+    /// never took must not read as a figure it did.
+    var freedLabel: String {
+        if freed_unknown == true { return "not measurable" }
+        return ByteCountFormatter.string(fromByteCount: Int64(freed), countStyle: .file)
+    }
+
+    /// History's per-item line. Built here, as an explicit `String`, so the
+    /// view passes one value to `Text` instead of a ternary of literals.
+    var freedDetail: String {
+        if freed_unknown == true {
+            return "Freed: not measurable (command-based cleanup)"
+        }
+        return "Reported freed: " + freedLabel
+    }
 
     var outcomeLabel: String {
         switch status {

@@ -1227,15 +1227,45 @@ def _cleanup_termination_signals():
             signal.signal(signum, handler)
 
 
+def _freed_unknown_field(t):
+    """`{"freed_unknown": True}` for a command-based target, else `{}`.
+
+    A cmd target's reclaim genuinely isn't measurable — the command decides
+    what goes, and for simctl the bytes may live in SIP-protected asset
+    bundles this tool can never see. Reporting a bare `freed: 0` made that
+    indistinguishable from a measured zero: issue #106's real run printed
+    `status: "deleted"`, `freed: 0` after advertising 20.6 GB. The flag is
+    additive and emitted only when true, so `freed` stays a plain int for
+    already-installed copies of the app (`CleanItem.freed` is non-optional)
+    while a reader can tell "unmeasured" from "nothing to free"."""
+    return {"freed_unknown": True} if t.get("cmd") else {}
+
+
 def delete_target(t, mode="rm"):
     """Delete a target. Returns (bytes_freed, error_message_or_None)."""
     if t.get("cmd"):
+        runner = t.get("cmd_runner")
+        if runner is not None:
+            # Runner-backed targets do their own work in Python, one process
+            # per identifier, and verify the result afterwards; their `cmd` is
+            # a faithful DESCRIPTION of what runs (shown by --dry-run), not a
+            # string vetted for a shell. Never fall through to the shell here:
+            # an unrecognized runner is an error, not a reason to guess.
+            ids = t.get("cmd_ids") or []
+            try:
+                if runner == "simctl-runtime-delete":
+                    return 0, _simctl_runtime_delete(ids)
+                if runner == "simctl-device-delete":
+                    return 0, _simctl_device_delete(ids)
+                return 0, "unknown command runner: %s" % runner
+            except Exception as e:
+                # One target's runner blowing up must not abort the run, same
+                # contract as the shell path below.
+                return 0, str(e)
         try:
-            # cmd strings are either static literals from get_targets() (need
-            # `|| true` and pipes) or assembled by scanners (scan_simulator_
-            # targets) exclusively from simctl identifiers that passed
-            # _SIMCTL_UDID_RE/_SIMCTL_RUNTIME_ID_RE — never raw user input,
-            # so shell=True is safe here
+            # cmd strings here are static literals from get_targets() (they
+            # need `|| true` and pipes) — never raw user input, so shell=True
+            # is safe. Scanner-assembled commands go through cmd_runner above.
             with _cleanup_termination_signals() as launched:
                 process = subprocess.Popen(t["cmd"], shell=True, stdout=subprocess.DEVNULL,
                                            stderr=subprocess.DEVNULL, start_new_session=True)
@@ -1614,6 +1644,7 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
         total_freed += freed
         status = "error" if err else ("trashed" if mode == "trash" and not t.get("cmd") else "deleted")
         results.append({"id": t["id"], "label": t["label"], "freed": freed, "status": status,
+                        **_freed_unknown_field(t),
                         **({"error": err} if err else {})})
         return freed, err
 
@@ -1730,7 +1761,8 @@ def run_clean_min_free(targets, min_free_gb, mode="rm", json_mode=False, notify=
         total_freed += freed
         status = "error" if err else ("trashed" if mode == "trash" and not t.get("cmd") else "deleted")
         results.append({"id": t["id"], "label": t["label"], "freed": freed,
-                        "status": status, **({"error": err} if err else {})})
+                        "status": status, **_freed_unknown_field(t),
+                        **({"error": err} if err else {})})
         say(f"  ✅ Cleaned: {t['label']} ({fmt_size(freed)})" if not err
             else f"  ⚠️  {t['label']}: {err}")
     free_now = disk_stats()["free_bytes"]
@@ -2869,6 +2901,188 @@ def _simctl_json(args):
         return None
 
 
+def _simctl_runtime_entries(rt):
+    """Normalize every shape `simctl runtime list -j` has shipped into a flat
+    list of runtime dicts: {"runtimes": [...]}, {"runtimes": {uuid: {...}}},
+    a bare top-level [...], and (current Xcode) a bare dict keyed by image
+    UUID with no wrapper key at all."""
+    if isinstance(rt, list):
+        entries = rt
+    elif isinstance(rt, dict) and "runtimes" in rt:
+        entries = rt["runtimes"]
+        if isinstance(entries, dict):
+            entries = list(entries.values())
+    elif isinstance(rt, dict):
+        entries = list(rt.values())
+    else:
+        entries = []
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict)]
+
+
+def _simctl_registered_runtime_ids():
+    """Every runtime identifier simctl still has registered, or None when the
+    question could not be asked at all.
+
+    None vs. an empty set is the whole point (the `_launchd_is_loaded`
+    lesson): once the last runtime is gone, `runtime list -j` answers with an
+    empty collection, and `{}` is falsy — treating that as "could not ask"
+    would turn the one completely successful clean into a permanent "could
+    not verify". Both identifier fields are collected because which one
+    carries the reverse-DNS string moved between Xcode versions, and the
+    delete was issued with whatever the scanner validated."""
+    rt = _simctl_json(["runtime", "list"])
+    if rt is None:
+        return None
+    ids = set()
+    for r in _simctl_runtime_entries(rt):
+        for key in ("identifier", "runtimeIdentifier"):
+            value = r.get(key)
+            if isinstance(value, str) and value:
+                ids.add(value)
+    return ids
+
+
+def _simctl_registered_device_udids():
+    """Every device UDID simctl still has registered, or None when unaskable.
+    A missing/mis-shaped "devices" key is unaskable, not "no devices" —
+    an empty `{"devices": {}}` is the real empty answer."""
+    data = _simctl_json(["list", "devices"])
+    if not isinstance(data, dict):
+        return None
+    devices = data.get("devices")
+    if not isinstance(devices, dict):
+        return None
+    udids = set()
+    for devs in devices.values():
+        if not isinstance(devs, list):
+            continue
+        for d in devs:
+            if isinstance(d, dict) and isinstance(d.get("udid"), str):
+                udids.add(d["udid"])
+    return udids
+
+
+def _simctl_run_owned(argv, timeout_s):
+    """Run one simctl argv in its own process group; returns (rc, stderr).
+
+    No shell, so there is no `2>/dev/null` to swallow simctl's diagnostics
+    and no `; true` to force exit 0. The process group and the file-backed
+    stderr follow the same discipline as `_run_estimate`/`delete_target`:
+    `xcrun` is only a launcher, so killing it alone on timeout would leave
+    simctl mutating storage, and the group is terminated on every exit path,
+    not just the timeout one."""
+    with _cleanup_termination_signals() as launched:
+        with tempfile.TemporaryFile(mode="w+t") as errfile:
+            process = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                       stderr=errfile, start_new_session=True)
+            try:
+                launched()
+                process.wait(timeout=timeout_s)
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            errfile.seek(0)
+            return process.returncode, errfile.read()
+
+
+def _simctl_delete_verified(ids, argv_for, registered, validator, noun):
+    """Delete simulator objects one process per identifier, then verify
+    against simctl's own registry. Returns an error string, or None when
+    every requested identifier is verifiably gone.
+
+    This replaces a "; "-joined shell string in which every command was
+    `2>/dev/null`-silenced and the whole thing ended `; true` (issue #106):
+    the target could not report failure by construction, and reported
+    `status: "deleted"` while 21.26 GB of runtime assets stayed on disk.
+    Iterating in Python keeps the one property that join was there for — a
+    failing identifier must not short-circuit the rest — while restoring the
+    per-identifier exit code and stderr it destroyed.
+
+    simctl's exit codes alone are not trusted: the registry is re-read
+    afterwards and anything still registered is a failure whatever simctl
+    said. An identifier that was never handed to simctl at all (refused by
+    the validator, or left over when the time budget ran out) is a failure
+    too, whether or not the registry mentions it — the engine did less than
+    the target promised. An unanswerable re-read is reported as unverified,
+    never as success. Note that even a verified deregistration does not
+    prove bytes came back — the SIP-protected MobileAsset bundles are
+    outside this tool's reach — which is why cmd targets report
+    `freed_unknown`."""
+    # Normalize to text first: a non-string identifier (malformed JSON, a
+    # hand-built target) must be reportable, and an unhashable one must not
+    # blow up the reasons dict and abort the whole clean run.
+    requested = [i if isinstance(i, str) else repr(i) for i in ids]
+    reasons, unattempted = {}, set()
+    deadline = time.monotonic() + CLEANUP_TIMEOUT_S
+    for i in requested:
+        if not validator.fullmatch(i):
+            # Defence in depth. The scanners validate before building a
+            # target, but nothing should ever hand simctl an unvalidated
+            # string — "all", "--outdated" and "--unusable" are real
+            # `runtime delete` arguments and "all" wipes every image.
+            reasons[i] = "malformed identifier, refused"
+            unattempted.add(i)
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            reasons[i] = "not attempted, %ds budget exhausted" % CLEANUP_TIMEOUT_S
+            unattempted.add(i)
+            continue
+        try:
+            rc, stderr = _simctl_run_owned(argv_for(i), remaining)
+        except subprocess.TimeoutExpired:
+            # It did run, so the registry still decides whether it worked.
+            reasons[i] = "timed out after %ds" % int(remaining)
+            continue
+        except Exception as exc:
+            reasons[i] = "could not run: %s" % exc
+            unattempted.add(i)
+            continue
+        if rc != 0:
+            lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+            reasons[i] = "exit %s%s" % (rc, (": " + lines[0]) if lines else "")
+
+    def detail(names):
+        return ", ".join("%s (%s)" % (i, reasons.get(i, "simctl reported success"))
+                         for i in names)
+
+    still = registered()
+    if still is None:
+        tail = detail([i for i in requested if i in reasons])
+        return ("could not verify: simctl would not report its %s back after "
+                "%d delete attempt(s)%s" % (noun, len(requested),
+                                            "; " + tail if tail else ""))
+    survivors = [i for i in requested if i in still]
+    blocked = [i for i in requested if i in unattempted and i not in still]
+    if not survivors and not blocked:
+        return None
+    clauses = []
+    if survivors:
+        clauses.append("still registered: " + detail(survivors))
+    if blocked:
+        clauses.append("never attempted: " + detail(blocked))
+    failed = len(survivors) + len(blocked)
+    return ("%d of %d %s deleted; %s"
+            % (len(requested) - failed, len(requested), noun, "; ".join(clauses)))
+
+
+def _simctl_runtime_delete(ids):
+    return _simctl_delete_verified(
+        ids, lambda i: ["xcrun", "simctl", "runtime", "delete", i],
+        _simctl_registered_runtime_ids, _SIMCTL_RUNTIME_ID_RE, "runtimes")
+
+
+def _simctl_device_delete(udids):
+    return _simctl_delete_verified(
+        udids, lambda u: ["xcrun", "simctl", "delete", u],
+        _simctl_registered_device_udids, _SIMCTL_UDID_RE, "devices")
+
+
 def _parse_simctl_date(s):
     # "2026-08-09T00:00:00Z" or with offset; simctl emits ISO8601
     try:
@@ -2924,7 +3138,7 @@ def scan_simulator_targets(config):
                     except OSError:
                         pass
     if stale:
-        udids = " ".join(d["udid"] for d in stale)
+        udids = [d["udid"] for d in stale]
         names = ", ".join(d.get("name", "?") for d in stale[:4])
         more = "" if len(stale) <= 4 else " +%d more" % (len(stale) - 4)
         targets.append({
@@ -2933,29 +3147,25 @@ def scan_simulator_targets(config):
             "description": "Not booted in %dd: %s%s — deleted via simctl"
                            % (stale_days, names, more),
             "path": None, "glob": None, "skip": [], "safe": False,
-            "cmd": "xcrun simctl delete %s 2>/dev/null || true" % udids,
+            # `cmd` describes what runs (and is what --dry-run shows); the
+            # work itself is done by cmd_runner, one process per UDID, and
+            # verified against simctl's registry afterwards. See
+            # _simctl_delete_verified for why the old
+            # "2>/dev/null || true" form could never report a failure.
+            "cmd": "; ".join("xcrun simctl delete %s" % u for u in udids),
+            "cmd_runner": "simctl-device-delete", "cmd_ids": udids,
             "estimate_cmd": None, "estimate_parser": None,
             "empty_only": False, "precomputed_bytes": stale_bytes,
         })
     rt = _simctl_json(["runtime", "list"])
     if rt:
         # simctl has shipped at least three runtime-list shapes across
-        # versions: {"runtimes": [...]}, a bare top-level [...], and (the
-        # shape observed from current Xcode) a bare dict keyed by runtime
-        # UUID with no "runtimes" wrapper at all — {uuid: {...}, ...}.
-        if isinstance(rt, list):
-            runtimes = rt
-        elif isinstance(rt, dict) and "runtimes" in rt:
-            runtimes = rt["runtimes"]
-            if isinstance(runtimes, dict):
-                runtimes = list(runtimes.values())
-        elif isinstance(rt, dict):
-            runtimes = list(rt.values())
-        else:
-            runtimes = []
+        # versions; _simctl_runtime_entries normalizes all of them (the
+        # verification re-read after a delete has to understand the same
+        # shapes, which is why it lives in a shared helper).
+        runtimes = _simctl_runtime_entries(rt)
         unused = [r for r in runtimes
-                  if isinstance(r, dict)
-                  and r.get("runtimeIdentifier", r.get("identifier")) not in used_runtimes
+                  if r.get("runtimeIdentifier", r.get("identifier")) not in used_runtimes
                   and r.get("state") == "Ready"
                   and r.get("identifier")
                   and _SIMCTL_RUNTIME_ID_RE.fullmatch(r["identifier"])]
@@ -2967,11 +3177,16 @@ def scan_simulator_targets(config):
                 "label": "Unused simulator runtimes (%d)" % len(ids),
                 "description": "Runtime images with no simulator devices — re-downloadable in Xcode",
                 "path": None, "glob": None, "skip": [], "safe": False,
-                # "; "-joined with per-command suppression (not "&&") so one
-                # failing delete doesn't short-circuit and skip every later
-                # identifier; trailing "; true" keeps the overall exit 0.
-                "cmd": "; ".join("xcrun simctl runtime delete %s 2>/dev/null" % i
-                                 for i in ids) + "; true",
+                # `cmd` describes what runs (and is what --dry-run shows); the
+                # work is done by cmd_runner, one process per identifier, with
+                # a registry re-read afterwards. The old form silenced every
+                # command with 2>/dev/null and ended "; true", which made a
+                # failure literally unreportable — see issue #106 and
+                # _simctl_delete_verified. Iterating keeps the property that
+                # join was chosen for: one bad identifier must not skip the
+                # rest.
+                "cmd": "; ".join("xcrun simctl runtime delete %s" % i for i in ids),
+                "cmd_runner": "simctl-runtime-delete", "cmd_ids": ids,
                 "estimate_cmd": None, "estimate_parser": None,
                 "empty_only": False, "precomputed_bytes": size,
             })

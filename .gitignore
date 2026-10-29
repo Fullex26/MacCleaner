@@ -21,6 +21,14 @@ alerts.json
 .snapshots.log.*.tmp
 .alerts.json.*.tmp
 cron.log
+# The stable sibling .lock files _state_transaction/_config_transaction take.
+# Deliberately never unlinked (replacing the inode would let two processes
+# hold different locks for the same state), so once the engine has been run
+# from a checkout these stay on disk forever.
+report.log.lock
+snapshots.log.lock
+alerts.json.lock
+config.json.lock
 
 # macOS
 .DS_Store

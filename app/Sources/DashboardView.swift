@@ -393,6 +393,15 @@ struct TargetRow: View {
         .animation(Motion.standard, value: cleanedItem?.status)
     }
 
+    /// A command-based target reports `freed_unknown`, so there is no byte
+    /// figure to show — "Done" rather than a "0 bytes" that would read as a
+    /// measurement the engine never made.
+    private func cleanedSummary(_ item: CleanItem) -> String {
+        if item.status == "error" { return "Failed" }
+        if item.freed_unknown == true { return "Done" }
+        return ByteCountFormatter.string(fromByteCount: Int64(item.freed), countStyle: .file)
+    }
+
     @ViewBuilder
     private var statusSlot: some View {
         if target.measurement_error != nil {
@@ -407,7 +416,7 @@ struct TargetRow: View {
             HStack(spacing: 4) {
                 Image(systemName: item.status == "error" ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
                     .foregroundStyle(item.status == "error" ? .red : .green)
-                Text(item.status == "error" ? "Failed" : ByteCountFormatter.string(fromByteCount: Int64(item.freed), countStyle: .file))
+                Text(cleanedSummary(item))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
