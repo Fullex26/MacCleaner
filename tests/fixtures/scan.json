@@ -4,10 +4,12 @@
   "targets": [
     {
       "category": "simulators",
-      "description": "Runtime images with no simulator devices \u2014 re-downloadable in Xcode",
+      "description": "Runtime images with no simulator devices \u2014 deregistered via simctl, which is not known to free disk. Xcode \u2192 Settings \u2192 Platforms removes the image itself.",
       "exists": true,
       "id": "simulator-unused-runtimes",
       "label": "Unused simulator runtimes (1)",
+      "reclaim_note": "Size comes from simctl, which lists only currently-mounted runtime images, so it is not verified reclaim \u2014 measured runs freed nothing. Remove runtimes in Xcode \u2192 Settings \u2192 Platforms, which drops the registration and the image together.",
+      "reclaim_unverified": true,
       "safe": false,
       "size_bytes": 8000000000,
       "size_human": "7.5 GB"
@@ -634,7 +636,7 @@
     }
   ],
   "timestamp": "<TS>",
-  "total_reclaimable_bytes": 8000245760,
-  "total_reclaimable_human": "7.5 GB",
+  "total_reclaimable_bytes": 245760,
+  "total_reclaimable_human": "240.0 KB",
   "version": "2.19.0"
 }

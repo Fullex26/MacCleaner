@@ -1241,6 +1241,25 @@ def _freed_unknown_field(t):
     return {"freed_unknown": True} if t.get("cmd") else {}
 
 
+def _reclaim_unverified_fields(t):
+    """`reclaim_unverified`/`reclaim_note` for a target whose advertised size
+    is not known to come back, else `{}`.
+
+    `freed_unknown` (issue #106) made the *post-clean* report honest. This is
+    the other half: `scan`'s advertised size. `simulator-unused-runtimes` sized
+    itself from simctl's own `sizeBytes` and offered 20.56 GB that four
+    measured runs in a row freed nothing of. See issue #112.
+
+    Additive and emitted only when true, like `advisory` and `freed_unknown`,
+    so every existing reader keeps decoding unchanged."""
+    if not t.get("reclaim_unverified"):
+        return {}
+    out = {"reclaim_unverified": True}
+    if t.get("reclaim_note"):
+        out["reclaim_note"] = t["reclaim_note"]
+    return out
+
+
 def delete_target(t, mode="rm"):
     """Delete a target. Returns (bytes_freed, error_message_or_None)."""
     if t.get("cmd"):
@@ -1527,15 +1546,19 @@ def print_scan(targets, show_all=False):
             size_str = (fmt_size(t["size"]) if t["size"]
                         else "~unknown" if t.get("estimate_cmd")
                         else "cmd-based")
+            if t.get("reclaim_unverified"):
+                size_str += " †"
             safe_str = "✅" if t["safe"] else "⚠️"
             table.add_row(t["category"], t["label"], t["id"], size_str, safe_str)
 
         console.print(table)
         hidden = len(targets) - len(visible)
         hidden_note = f"\n[dim]{hidden} empty/not-installed targets hidden — use --all to show[/dim]" if hidden else ""
+        footnotes = "".join(f"\n[dim]† {t['label']}: {t['reclaim_note']}[/dim]"
+                            for t in visible if t.get("reclaim_note"))
         console.print(Panel(
             f"[bold green]Total reclaimable: {fmt_size(total)}[/bold green]\n"
-            f"[dim]Current disk: {disk_free()}[/dim]{hidden_note}\n\n"
+            f"[dim]Current disk: {disk_free()}[/dim]{hidden_note}{footnotes}\n\n"
             f"[bold]→ Run [cyan]maccleaner clean[/cyan] to start cleaning[/bold]",
             title="Summary"
         ))
@@ -1547,11 +1570,16 @@ def print_scan(targets, show_all=False):
             size_str = (fmt_size(t["size"]) if t["size"]
                         else "~unknown" if t.get("estimate_cmd")
                         else "cmd")
+            if t.get("reclaim_unverified"):
+                size_str += " †"
             safe = "safe" if t["safe"] else "REVIEW"
-            print(f"  [{t['category']:9}] {t['label']:<38} {size_str:>10}  {safe}")
+            print(f"  [{t['category']:9}] {t['label']:<38} {size_str:>12}  {safe}")
         hidden = len(targets) - len(visible)
         if hidden:
             print(f"\n  ({hidden} empty/not-installed targets hidden — use --all to show)")
+        for t in visible:
+            if t.get("reclaim_note"):
+                print(f"\n  † {t['label']}: {t['reclaim_note']}")
         print(f"\n  Total reclaimable: {fmt_size(total)}")
         print(f"\n  → Run 'maccleaner clean' to start cleaning")
         print(f"{'='*72}\n")
@@ -1586,6 +1614,11 @@ def reclaimable_total(targets):
             for p in paths
         ):
             continue  # fully contained in another target -- already counted
+        if t.get("reclaim_unverified"):
+            # Measured not to come back -- see _reclaim_unverified_fields and
+            # issue #112. Still resolved above, so it keeps shadowing anything
+            # nested inside it; it just stops inflating the headline figure.
+            continue
         total += t.get("size") or 0
     return total
 
@@ -1611,6 +1644,7 @@ def scan_json(targets, extra=None):
                 "safe": t["safe"],
                 "exists": t.get("exists", False),
                 **({"measurement_error": t["measurement_error"]} if t.get("measurement_error") else {}),
+                **_reclaim_unverified_fields(t),
             }
             for t in sorted(targets, key=lambda x: x["size"], reverse=True)
         ]
@@ -3175,8 +3209,31 @@ def scan_simulator_targets(config):
             targets.append({
                 "id": "simulator-unused-runtimes", "category": "simulators",
                 "label": "Unused simulator runtimes (%d)" % len(ids),
-                "description": "Runtime images with no simulator devices — re-downloadable in Xcode",
+                "description": "Runtime images with no simulator devices — "
+                               "deregistered via simctl, which is not known to "
+                               "free disk. Xcode → Settings → Platforms "
+                               "removes the image itself.",
                 "path": None, "glob": None, "skip": [], "safe": False,
+                # The size is simctl's own sizeBytes and it is real, but it
+                # is not reclaim, and simctl's registry cannot establish that
+                # it is. On a real machine `runtime list` went from 7 runtimes
+                # / 43.20 GiB to 2 / 11.1 GiB in ten minutes with nothing
+                # deleted and no reboot: images.plist tracks which runtime
+                # images are currently MOUNTED, and entries come and go with
+                # them. So this target's membership and size swing on their
+                # own, and #109's post-delete registry re-read can report a
+                # clean `deleted` purely because the image is unmounted at
+                # that instant. Four runs in report.log: freed 0 every time,
+                # 43.20 GiB of images still on disk after a reboot. The
+                # re-read still does the job it was written for (#106); it
+                # just says nothing about disk space. Issue #112.
+                "reclaim_unverified": True,
+                "reclaim_note": "Size comes from simctl, which lists only "
+                                "currently-mounted runtime images, so it is "
+                                "not verified reclaim — measured runs freed "
+                                "nothing. Remove runtimes in Xcode → Settings "
+                                "→ Platforms, which drops the registration "
+                                "and the image together.",
                 # `cmd` describes what runs (and is what --dry-run shows); the
                 # work is done by cmd_runner, one process per identifier, with
                 # a registry re-read afterwards. The old form silenced every
