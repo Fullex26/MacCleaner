@@ -256,6 +256,16 @@ def base_env(root: Path):
     return {
         "HOME": str(root / "home"),
         "PATH": str(stub),
+        # Apple's framework Python (/usr/bin/python3) cannot write
+        # __pycache__ beside its own stdlib inside Xcode.app, so it falls
+        # back to "$HOME/Library/Caches/com.apple.python/<abs path>.pyc" --
+        # i.e. straight into the sandbox directory `general-caches`
+        # measures. That made scan.json's general-caches size depend on
+        # which interpreter ran the generator: 1.4 MB on a Mac whose
+        # python3 is Xcode's, 76 KB on CI, where python3 writes
+        # __pycache__ beside its sources instead. The fixtures are supposed
+        # to be reproducible from any machine, so write no bytecode at all.
+        "PYTHONDONTWRITEBYTECODE": "1",
         "MACCLEANER_CONFIG": str(root / "state" / "config.json"),
         "MACCLEANER_LOG": str(root / "state" / "report.log"),
         "MACCLEANER_SNAPSHOTS": str(root / "state" / "snapshots.log"),
