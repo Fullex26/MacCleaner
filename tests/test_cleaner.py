@@ -3595,7 +3595,11 @@ class TestCategoryMigration(unittest.TestCase):
         # 1 since 2.15.0 (was 3): tmp targets are review-only, so the age
         # gate only needs to shield an ACTIVE task's workspace.
         self.assertEqual(cfg["tmp_min_age_days"], 1)
-        self.assertEqual(cfg["simulator_stale_days"], 30)
+        # 7 since 2.19.0 (was 30): simulator targets are review-only too, and
+        # on a machine that builds against simulators daily nothing ever
+        # reaches 30 days idle -- 40 GB of device data was invisible to the
+        # scanner because its oldest device was 19 days old.
+        self.assertEqual(cfg["simulator_stale_days"], 7)
 
     def test_fresh_install_disable_survives_reload(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4160,7 +4164,11 @@ SIMCTL_DEVICES = {"devices": {
     "com.apple.CoreSimulator.SimRuntime.iOS-18-1": [
         {"udid": "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC", "name": "old phone",
          "state": "Shutdown",
-         "dataPath": "/dev/null"},  # no lastBootedAt -> falls back to dataPath mtime
+         # no lastBootedAt -> falls back to the DEVICE DIR's mtime. Every
+         # test that reaches this device replaces dataPath with a real
+         # "<dir>/<UDID>/data" tree (see TestSimulatorTargets.setUp), so the
+         # fallback is exercised against pinned mtimes rather than /dev.
+         "dataPath": "/dev/null"},
     ],
 }}
 SIMCTL_RUNTIMES = {"runtimes": [
@@ -4250,14 +4258,27 @@ class TestSimulatorTargets(unittest.TestCase):
     def setUp(self):
         # On this machine (Darwin devfs) /dev/null's mtime always reads back
         # as "now", not a fixed old timestamp -- stat()ing it can't exercise
-        # the dataPath-mtime fallback deterministically. Give device "CCC"
-        # (the one with no lastBootedAt/lastUsedAt) a real file with a
-        # pinned old mtime instead, so the fallback path is actually tested.
+        # the mtime fallback deterministically. Give device "CCC" (the one
+        # with no lastBootedAt/lastUsedAt) a real directory tree with pinned
+        # mtimes instead, so the fallback path is actually tested.
+        #
+        # The shape mirrors a real device bundle, "<Devices>/<UDID>/data",
+        # and the two mtimes are deliberately OPPOSITE: the device dir is
+        # ancient and its data/ subdir is fresh. That is what a live machine
+        # looks like -- something touches every device's data/ (all 22 on the
+        # Mac this was found on read 0.16 days old against true 12-19 day
+        # device dirs) -- so a fallback that stat()s dataPath instead of its
+        # parent reads "fresh" and silently drops every never-booted device.
+        # Keep both utime calls: dropping the fresh data/ one makes this
+        # fixture pass against the bug it exists to catch.
         self.td = tempfile.TemporaryDirectory()
-        self.old_datapath = str(Path(self.td.name) / "old_datapath")
-        Path(self.old_datapath).write_bytes(b"")
+        device_dir = Path(self.td.name) / "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC"
+        device_dir.mkdir()
+        self.old_datapath = str(device_dir / "data")
+        Path(self.old_datapath).mkdir()
         old = time.time() - 400 * 86400
-        os.utime(self.old_datapath, (old, old))
+        os.utime(self.old_datapath, (time.time(), time.time()))
+        os.utime(device_dir, (old, old))
         self.devices = {"devices": {
             k: [dict(d, dataPath=self.old_datapath)
                 if d["udid"].startswith("CCC") else d
@@ -4432,6 +4453,65 @@ class TestSimulatorTargets(unittest.TestCase):
         stale = [t for t in targets if t["id"] == "simulator-stale-devices"]
         self.assertEqual(stale, [],
                          "no timestamp + unreadable dataPath must not count as stale")
+
+    def _never_booted(self, device_age_days, data_age_days):
+        """One never-booted device whose device dir and data/ subdir carry
+        independently pinned ages, in the real "<Devices>/<UDID>/data" shape."""
+        dev = Path(self.td.name) / ("D" * 8 + "-DDDD-DDDD-DDDD-" + "D" * 12)
+        dev.mkdir()
+        data = dev / "data"
+        data.mkdir()
+        now = time.time()
+        os.utime(data, (now - data_age_days * 86400,) * 2)
+        os.utime(dev, (now - device_age_days * 86400,) * 2)   # last: mkdir bumps parent
+        return {"devices": {"com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+            {"udid": "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD", "name": "never booted",
+             "state": "Shutdown", "dataPath": str(data)}]}}
+
+    def test_never_booted_device_ages_by_device_dir_not_data_subdir(self):
+        """An old device whose data/ was touched minutes ago must still be
+        offered. On a live machine something touches every device's data/ --
+        all 22 read 0.16 days old against true 12-19 day device dirs -- so
+        stat()ing dataPath made every never-booted device permanently
+        invisible to the scanner, which is how 40 GB went unoffered."""
+        # 40 days, because _scan() deliberately passes the old 30-day gate --
+        # this test is about WHICH path is stat'ed, not about the gate value
+        # (test_ten_day_device_offered_when_config_omits_the_key covers that).
+        devices = self._never_booted(device_age_days=40, data_age_days=0)
+        stale = [t for t in self._scan(devices=devices)
+                 if t["id"] == "simulator-stale-devices"]
+        self.assertEqual(len(stale), 1,
+                         "40-day-old device dir must be stale even with a fresh data/")
+        self.assertIn("DDDDDDDD", stale[0]["cmd"])
+
+    def test_recent_device_with_ancient_data_subdir_is_not_stale(self):
+        """The inverse, so this can only pass by reading the device dir: a
+        device created today whose data/ somehow carries an ancient mtime
+        must NOT be offered."""
+        devices = self._never_booted(device_age_days=0, data_age_days=400)
+        stale = [t for t in self._scan(devices=devices)
+                 if t["id"] == "simulator-stale-devices"]
+        self.assertEqual(stale, [],
+                         "a device dir touched today must never count as stale")
+
+    def test_default_stale_gate_is_seven_days(self):
+        self.assertEqual(cleaner.DEFAULT_CONFIG["simulator_stale_days"], 7)
+
+    def test_ten_day_device_offered_when_config_omits_the_key(self):
+        """Pins the .get() fallback literal inside scan_simulator_targets, not
+        just DEFAULT_CONFIG -- an old config.json without the key must get the
+        same 7-day default. At the former default of 30 this device, and the
+        40 GB behind it on a real machine, were never offered at all."""
+        devices = self._never_booted(device_age_days=10, data_age_days=0)
+
+        def fake(args):
+            return devices if args[:2] == ["list", "devices"] else SIMCTL_RUNTIMES
+        with mock.patch.object(cleaner, "_simctl_json", side_effect=fake):
+            with mock.patch.object(cleaner, "get_size", return_value=123):
+                targets = cleaner.scan_simulator_targets({})
+        stale = [t for t in targets if t["id"] == "simulator-stale-devices"]
+        self.assertEqual(len(stale), 1, "10-day-idle device must be stale by default")
+        self.assertIn("7d", stale[0]["description"])
 
     def test_measure_honors_precomputed_bytes(self):
         t = {"id": "x", "path": None, "glob": None, "cmd": "true",

@@ -163,15 +163,21 @@ def _write_xcrun_stub(stub: Path, root: Path):
     device with no timestamps whose aged dataPath exercises the mtime
     fallback, and the Xcode-26 UUID-keyed runtime shape with one unused
     runtime. dataPaths point into the sandbox at 4 KiB seeds."""
-    dp1 = root / "simdata" / "dev1"
-    dp2 = root / "simdata" / "dev2"
+    # Real shape: "<Devices>/<UDID>/data", with the age on the DEVICE DIR.
+    # A never-booted device ages by its own directory, not by dataPath --
+    # data/ is touched constantly on a live machine, so a fixture that ages
+    # dataPath instead stops exercising the fallback at all.
+    dev1 = root / "simdata" / "dev1"
+    dev2 = root / "simdata" / "dev2"
+    dp1 = dev1 / "data"
+    dp2 = dev2 / "data"
     for d in (dp1, dp2):
         d.mkdir(parents=True, exist_ok=True)
         (d / "disk.img").write_bytes(b"x" * (2 * BLOCK))
     import time as _t
     old = _t.time() - TMP_AGE * 20
-    for d in (dp1, dp2):
-        os.utime(d, (old, old))
+    for d in (dev1, dev2):
+        os.utime(d, (old, old))     # after the data/ mkdir, which bumps the parent
     devices = {
         "devices": {
             "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [

@@ -204,7 +204,7 @@ DEFAULT_CONFIG = {
     "project_min_age_days": 30,
     "project_git_check": True,
     "tmp_min_age_days": 1,           # /tmp dirs younger than this are never offered
-    "simulator_stale_days": 30,      # simulators not booted for this long count as stale
+    "simulator_stale_days": 7,       # simulators not booted for this long count as stale
     "app_leftover_min_age_days": 7,  # orphaned app data younger than this is never offered
     "notifications": True,           # notify when a scheduled clean finishes
     "low_disk_alerts": True,         # warn when free space drops below the threshold
@@ -3140,8 +3140,9 @@ def scan_simulator_targets(config):
 
     Device timestamp field: older Xcode/simctl emits "lastBootedAt"; newer
     versions renamed it "lastUsedAt" (observed on Xcode's current simctl) —
-    both are checked, falling back to the device's dataPath mtime when
-    neither is present.
+    both are checked, falling back to the mtime of the device's own directory
+    (the parent of dataPath) when neither is present, which is the case for
+    any device that has never been booted.
 
     Every udid/identifier that ends up in a cmd string is validated against
     _SIMCTL_UDID_RE/_SIMCTL_RUNTIME_ID_RE first and silently dropped (not
@@ -3151,7 +3152,7 @@ def scan_simulator_targets(config):
     data = _simctl_json(["list", "devices"])
     if not data:
         return targets
-    stale_days = config.get("simulator_stale_days", 30)
+    stale_days = config.get("simulator_stale_days", 7)
     cutoff = time.time() - stale_days * 86400
     stale, stale_bytes, used_runtimes = [], 0, set()
     for runtime_id, devs in data.get("devices", {}).items():
@@ -3164,9 +3165,21 @@ def scan_simulator_targets(config):
                 continue
             ts = _parse_simctl_date(d.get("lastBootedAt") or d.get("lastUsedAt"))
             if ts is None:
+                # The device DIRECTORY, not its data/ subdirectory. Something
+                # on a live machine touches every device's data/ — all 22 on
+                # the Mac this was found on read 0.16 days old while their own
+                # device dirs still carried true 12-19 day mtimes — so
+                # stat()ing dataPath marks every never-booted device fresh and
+                # excludes it forever. dataPath is "<Devices>/<UDID>/data", so
+                # the device dir is its parent. This is what the 2.5 design
+                # specified ("fall back to the device dir's mtime"); the
+                # original code stat()ed one level too deep.
+                dp = d.get("dataPath")
                 try:
-                    ts = os.stat(d.get("dataPath", "")).st_mtime
+                    ts = os.stat(Path(dp).parent).st_mtime if dp else None
                 except OSError:
+                    ts = None
+                if ts is None:
                     continue
             if ts < cutoff:
                 stale.append(d)

@@ -161,8 +161,8 @@ python3 ~/mac-cleaner/cleaner.py clean --targets npm-cache,pip-cache,xcode-deriv
   "delete_mode": "rm",
   "project_roots": ["~/Documents", "~/Developer", "~/Projects", "~/Code", "~/dev"],
   "project_min_age_days": 30,
-  "tmp_min_age_days": 3,
-  "simulator_stale_days": 30,
+  "tmp_min_age_days": 1,
+  "simulator_stale_days": 7,
   "notifications": true,
   "low_disk_alerts": true,
   "low_disk_threshold_gb": 10
