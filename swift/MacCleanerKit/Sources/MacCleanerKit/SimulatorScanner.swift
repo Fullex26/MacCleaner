@@ -70,11 +70,16 @@ public enum SimulatorScanner {
                 if (d["state"] as? String) == "Booted" { continue }
                 var ts = parseDate(d["lastBootedAt"] as? String ?? d["lastUsedAt"] as? String)
                 if ts == nil, let dp = d["dataPath"] as? String {
+                    // Python: the DEVICE DIR, parent of dataPath. A live
+                    // machine touches every device's data/ subdirectory, so
+                    // stat()ing dataPath marks every never-booted device
+                    // fresh and drops it from the scan forever.
+                    let deviceDir = (dp as NSString).deletingLastPathComponent
                     var st = stat()
-                    if stat(dp, &st) == 0 {
+                    if !deviceDir.isEmpty, stat(deviceDir, &st) == 0 {
                         ts = TimeInterval(st.st_mtimespec.tv_sec)
                     } else {
-                        continue    // Python: unstat-able dataPath -> skip device
+                        continue    // Python: unstat-able device dir -> skip device
                     }
                 }
                 guard let t = ts, t < cutoff else { continue }

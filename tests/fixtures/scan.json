@@ -106,7 +106,7 @@
     },
     {
       "category": "simulators",
-      "description": "Not booted in 30d: Stale One, Mtime Fallback \u2014 deleted via simctl",
+      "description": "Not booted in 7d: Stale One, Mtime Fallback \u2014 deleted via simctl",
       "exists": true,
       "id": "simulator-stale-devices",
       "label": "Stale simulator devices (2)",

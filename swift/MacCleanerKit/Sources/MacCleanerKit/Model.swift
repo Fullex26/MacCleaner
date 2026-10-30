@@ -34,7 +34,7 @@ public struct Config {
     public var enabledCategories: [String]
     public var skipPaths: [String]
     public var tmpMinAgeDays: Double = 1
-    public var simulatorStaleDays: Double = 30
+    public var simulatorStaleDays: Double = 7
     public var appLeftoverMinAgeDays: Double = 7
 
     /// Mirrors load_config()'s merge-with-defaults posture for the two keys
