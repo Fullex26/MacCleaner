@@ -179,13 +179,142 @@ if [ "$SPARKLE_ENABLED" = "1" ]; then
     cp -R "$SPARKLE_CACHE_DIR/Sparkle.framework" "$BUNDLE/Contents/Frameworks/Sparkle.framework"
 fi
 
-# Strip extended attributes (Finder/iCloud detritus breaks codesign), then
-# ad-hoc sign (required on Apple Silicon; replace with a real identity to
-# distribute). --deep re-signs embedded frameworks/XPC services too — local/
-# dev only; release.yml signs Sparkle.framework explicitly, inside-out, with
-# the Developer ID identity before signing the app.
-xattr -cr "$BUNDLE" 2>/dev/null || true
-codesign --force --deep --sign - "$BUNDLE" || echo "→ codesign unavailable — unsigned bundle"
+# --- Strip extended attributes, then ad-hoc sign ------------------------
+# Ad-hoc signing is required on Apple Silicon; replace with a real identity
+# to distribute. --deep re-signs embedded frameworks/XPC services too —
+# local/dev only; release.yml signs Sparkle.framework explicitly, inside-out,
+# with the Developer ID identity before signing the app.
+#
+# WHY THE WORK HAPPENS OUT OF TREE: in an iCloud-synced checkout (this repo
+# lives under ~/Documents, where "Desktop & Documents Folders" sync is on)
+# the File Provider daemon re-stamps com.apple.FinderInfo and
+# com.apple.fileprovider.fpfs#P on the bundle's root directory in the window
+# between `xattr -cr` and `codesign`. codesign then refuses with "resource
+# fork, Finder information, or similar detritus not allowed". The old code
+# was `xattr -cr "$BUNDLE"; codesign ... || echo "codesign unavailable"`,
+# which lost that race while cutting 2.20.0 and still exited 0 with an
+# unsigned bundle. A retry loop would only bet that the daemon eventually
+# loses the race — and a fresh codesign write is itself an event it reacts
+# to. So we take the bundle somewhere the daemon cannot reach: copy it into
+# a scratch dir outside the synced tree, strip + sign + `--deep --strict`
+# verify it there, then move it back and re-verify the seal in place.
+#
+# WHY THE TWO VERIFIES DIFFER: `--deep --strict` runs in the scratch dir,
+# where it is deterministic and meaningful — it proves the signature is
+# complete and detritus-free at the moment of signing. In the checkout it
+# cannot be a gate at all. Measured here: once the bundle is back in the
+# synced tree, the daemon re-stamps com.apple.FinderInfo and
+# com.apple.fileprovider.fpfs#P on every *bundle* directory inside it (the
+# app root, Sparkle.framework, Updater.app), and `--strict` rejects exactly
+# that. `--deep --strict` passes for a few seconds after an `xattr -cr` and
+# fails again within ten. Using it here would re-introduce the same race one
+# step later. Plain `codesign --verify` is unaffected by xattrs and is what
+# actually answers the question the copy back raises — did the seal survive
+# the move — so that is the in-place gate.
+#
+# A corollary worth knowing when verifying by hand: `codesign --verify
+# --deep --strict build/MacCleaner.app` reporting "resource fork, Finder
+# information, or similar detritus not allowed" in this checkout is the
+# daemon, NOT a bad signature. Check `codesign -dv` (expect
+# `Signature=adhoc`) instead. Nothing ships with that detritus: git does not
+# track extended attributes, and release.yml runs `xattr -cr` and signs on a
+# runner with no File Provider at all.
+#
+# WHY A REFUSED codesign IS FATAL: build/MacCleaner.app is a release
+# artifact. docs/RELEASING.md §3 step 4 copies it straight over the
+# committed MacCleaner.app at the repo root, and install.sh falls back to
+# that committed bundle (step 7b) when no fresh build is available — so an
+# unsigned build reaches real users. Set MACCLEANER_ALLOW_UNSIGNED=1 to
+# build anyway (ignored under CI, same reasoning as the Sparkle fetch).
+# codesign being ABSENT is a different case and stays non-fatal: missing
+# tooling is not something this script can fix, and that is the case the old
+# soft notice was actually written for. The two are reported in deliberately
+# different words so neither can be mistaken for the other in a build log.
+# Remove the out-of-tree scratch copy on every exit path, interruption
+# included. Without this an interrupted build strands a full copy of the
+# bundle (~9 MB) in $TMPDIR, which macOS does not clear promptly — measured:
+# the three normal paths leak nothing, a SIGTERM mid-sign leaked one every
+# time. Poor form in any build script, worse in this one, since leftover
+# scratch in the system temp folder is exactly what `doctor` reports on.
+# Also restores the bundle if we were interrupted between moving it aside
+# and copying the signed one back. Idempotent — it unsets its own state, so
+# the EXIT trap following an INT/TERM is a no-op — and always returns 0, so
+# cleanup can never be what fails the build.
+_sign_scratch_cleanup() {
+    if [ -n "${_SIGN_BACKUP:-}" ] && [ -d "${_SIGN_BACKUP}" ] \
+        && [ ! -d "${_SIGN_BUNDLE:-/nonexistent}" ]; then
+        mv "$_SIGN_BACKUP" "$_SIGN_BUNDLE" || true
+    fi
+    if [ -n "${_SIGN_SCRATCH:-}" ]; then
+        rm -rf "$_SIGN_SCRATCH"
+    fi
+    if [ -n "${_SIGN_BACKUP:-}" ]; then
+        rm -rf "$_SIGN_BACKUP"
+    fi
+    unset _SIGN_SCRATCH _SIGN_BACKUP _SIGN_BUNDLE
+    return 0
+}
+
+adhoc_sign_bundle() {
+    local bundle="$1"
+    local scratch="" staged backup
+
+    if ! command -v codesign >/dev/null 2>&1; then
+        echo "⚠️  codesign is NOT INSTALLED — shipping an unsigned bundle" >&2
+        return 0
+    fi
+
+    if scratch="$(mktemp -d "${TMPDIR:-/private/tmp}/maccleaner-sign.XXXXXX" 2>/dev/null)"; then
+        staged="$scratch/${bundle##*/}"
+        backup="$bundle.unsigned.$$"
+        _SIGN_SCRATCH="$scratch"; _SIGN_BACKUP="$backup"; _SIGN_BUNDLE="$bundle"
+        trap _sign_scratch_cleanup EXIT
+        trap '_sign_scratch_cleanup; exit 130' INT
+        trap '_sign_scratch_cleanup; exit 143' TERM
+        # Say where, so codesign's own "replacing existing signature" line
+        # naming a /var/folders path isn't an unexplained surprise in the log.
+        # ${scratch} braced, not bare: a bare $VAR touching the ellipsis has
+        # its name swallow the ellipsis's leading byte under some locales,
+        # expanding to nothing and emitting invalid UTF-8. The "Fetching
+        # Sparkle" message above is braced for the same reason — that exact
+        # mistake broke a release build in CI once already, and
+        # TestShellScriptUnicodeQuoting now fails the suite on any bare form.
+        echo "→ Signing out of tree in ${scratch}…"
+        if cp -R "$bundle" "$staged" \
+            && { xattr -cr "$staged" 2>/dev/null || true; } \
+            && codesign --force --deep --sign - "$staged" \
+            && codesign --verify --deep --strict "$staged" \
+            && rm -rf "$backup" \
+            && mv "$bundle" "$backup" \
+            && cp -R "$staged" "$bundle" \
+            && codesign --verify "$bundle"; then
+            _sign_scratch_cleanup
+            echo "→ Ad-hoc signed (verified in place)"
+            return 0
+        fi
+        # Puts the bundle back if we got as far as moving it aside, so an
+        # opted-out build still has something at $BUNDLE to inspect.
+        _sign_scratch_cleanup
+    fi
+
+    # The opt-out is for a developer's own machine only. Under CI the same
+    # reasoning that makes a failed Sparkle fetch fatal applies here: a
+    # release must never silently ship without a signature.
+    if [ "${MACCLEANER_ALLOW_UNSIGNED:-0}" != "0" ] && [ -z "${CI:-}" ]; then
+        echo "⚠️  codesign REFUSED to sign the bundle — continuing UNSIGNED" >&2
+        echo "    because MACCLEANER_ALLOW_UNSIGNED is set." >&2
+        return 0
+    fi
+    echo "❌ codesign RAN AND REFUSED to sign $bundle." >&2
+    echo "   This is not the same as codesign being unavailable: the tool is" >&2
+    echo "   installed and rejected the bundle, so what is on disk is unsigned." >&2
+    echo "   build/MacCleaner.app is a release artifact (docs/RELEASING.md §3" >&2
+    echo "   step 4 commits it, install.sh falls back to it), so this is fatal." >&2
+    echo "   Set MACCLEANER_ALLOW_UNSIGNED=1 to build an unsigned bundle anyway." >&2
+    return 1
+}
+
+adhoc_sign_bundle "$BUNDLE"
 
 echo "✅ Built: $BUNDLE"
 if [ "$SPARKLE_ENABLED" = "1" ]; then
