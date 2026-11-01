@@ -1,6 +1,6 @@
 # AGENTS.md — MacCleaner machine interface
 
-MacCleaner is a macOS developer storage cleanup tool: it scans 94 known cache/artifact locations across 23 categories (Xcode, Docker, npm, pip, Homebrew, AI model caches, Flutter, PHP, VMs, ...) plus stale per-project build artifacts, stale build litter left under `/private/tmp`, unused iOS simulator devices/runtimes, and orphaned per-app leftovers under `~/Library` from apps you've already uninstalled, reports sizes, and deletes what you select. The engine is a single stdlib-only Python 3 script. Entry point: `python3 cleaner.py` from a repo checkout, or `maccleaner` (shell alias) / `python3 ~/mac-cleaner/cleaner.py` after `install.sh`. Every data command takes `--json`; that JSON interface is the contract this document specifies (the bundled macOS app is just another client of it). Current version: 2.19.0. As of 2.4.0, `install.sh` also wires up zsh/bash shell completions (`completions/_maccleaner`, `completions/maccleaner.bash`) and the CLI tarball ships them too — a human-facing convenience only, it doesn't change any of the JSON below.
+MacCleaner is a macOS developer storage cleanup tool: it scans 94 known cache/artifact locations across 23 categories (Xcode, Docker, npm, pip, Homebrew, AI model caches, Flutter, PHP, VMs, ...) plus stale per-project build artifacts, stale build litter left under `/private/tmp`, unused iOS simulator devices/runtimes, and orphaned per-app leftovers under `~/Library` from apps you've already uninstalled, reports sizes, and deletes what you select. The engine is a single stdlib-only Python 3 script. Entry point: `python3 cleaner.py` from a repo checkout, or `maccleaner` (shell alias) / `python3 ~/mac-cleaner/cleaner.py` after `install.sh`. Every data command takes `--json`; that JSON interface is the contract this document specifies (the bundled macOS app is just another client of it). Current version: 2.20.0. As of 2.4.0, `install.sh` also wires up zsh/bash shell completions (`completions/_maccleaner`, `completions/maccleaner.bash`) and the CLI tarball ships them too — a human-facing convenience only, it doesn't change any of the JSON below.
 
 ## 1. Quick recipes
 
@@ -94,7 +94,7 @@ Abbreviated but field-accurate examples. All JSON is pretty-printed to stdout.
 
 ```json
 {
-  "version": "2.19.0",
+  "version": "2.20.0",
   "timestamp": "2026-07-14T09:12:03.481920",
   "disk": "Used: 380Gi / 460Gi (85%)",
   "disk_stats": {
@@ -148,7 +148,7 @@ Targets are sorted by `size_bytes` descending. Command-based targets (docker/bre
 
 ```json
 {
-  "version": "2.19.0",
+  "version": "2.20.0",
   "timestamp": "2026-07-14T09:14:55.102331",
   "delete_mode": "rm",
   "freed_bytes": 14495514624,
@@ -172,7 +172,7 @@ Targets are sorted by `size_bytes` descending. Command-based targets (docker/bre
 
 ```json
 {
-  "version": "2.19.0",
+  "version": "2.20.0",
   "timestamp": "2026-07-14T09:14:55.102331",
   "dry_run": true,
   "delete_mode": "rm",
@@ -209,7 +209,7 @@ Same envelope shape as `clean --json` (`delete_mode`, `freed_bytes`, `disk_after
 
 ```json
 {
-  "version": "2.19.0",
+  "version": "2.20.0",
   "timestamp": "2026-07-14T09:16:12.000000",
   "roots": ["/Users/you/Documents", "/Users/you/Code"],
   "min_age_days": 30,
@@ -234,7 +234,7 @@ Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets`
 
 ```json
 {
-  "version": "2.19.0",
+  "version": "2.20.0",
   "ok": true,
   "checks": [
     { "name": "Python",       "status": "3.12.4", "ok": true },
@@ -243,7 +243,7 @@ Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets`
     { "name": "Disk",         "status": "34.2 GB free of 460.4 GB (92.6% used)", "ok": true },
     { "name": "Swap",         "status": "swapfiles use 16.0 GB of disk (14.5 GB of that currently paged in, 90.8%) — macOS manages this and reclaims it as memory pressure drops", "ok": false, "advisory": true },
     { "name": "Held-open files", "status": "4.4 GB of deleted files still held open by diskimages-helper (2.9 GB), codex (258.6 MB), Ollama (144.1 MB) +67 more processes — freed once every process holding them exits", "ok": false, "advisory": true },
-    { "name": "Stranded simulator runtimes", "status": "21.3 GB still stored under /System/Library/AssetsV2 for simulator runtimes Xcode no longer lists: iOS 18.6 (22G86, 8.5 GB), iOS 18.1 (22B81, 8.2 GB), watchOS 11.5 (22T572, 4.5 GB). Remove them in Xcode → Settings → Platforms, which is the only thing with the authority — these directories are SIP-restricted, so `sudo rm` fails even as root, and MacCleaner only reports them.", "ok": false, "advisory": true }
+    { "name": "Stranded simulator runtimes", "status": "21.3 GB still stored under /System/Library/AssetsV2 for simulator runtimes Xcode no longer lists: iOS 18.6 (22G86, 8.5 GB), iOS 18.1 (22B81, 8.2 GB), watchOS 11.5 (22T572, 4.5 GB). Nothing can remove these. The directories are SIP-restricted, so `sudo rm` fails even as root, and Xcode's Platforms pane lists only runtimes that are still registered, so an orphaned image is invisible to it too. MacCleaner reports them so the space is at least accounted for.", "ok": false, "advisory": true }
   ]
 }
 ```
@@ -313,7 +313,7 @@ Both 2.8.0 checks use hardcoded thresholds (8 GiB of swapfiles on disk; 500 MB h
 
 ```json
 {
-  "version": "2.19.0",
+  "version": "2.20.0",
   "free_bytes": 8321499136,
   "free_human": "7.8 GB",
   "threshold_bytes": 10737418240,
@@ -344,7 +344,7 @@ Each map level’s root validation and child enumeration have a 600-second deadl
 
 ```json
 {
-  "version": "2.19.0",
+  "version": "2.20.0",
   "root": "/Users/you",
   "total_bytes": 170728030208,
   "total_human": "159.0 GB",
@@ -371,7 +371,7 @@ Differences from every other command here, all deliberate:
 
 ```json
 {
-  "version": "2.19.0",
+  "version": "2.20.0",
   "roots": [
     "/Users/you/Documents", "/Users/you/Downloads", "/Users/you/Desktop",
     "/Users/you/Library", "/Users/you/Applications", "/Applications"
@@ -417,7 +417,7 @@ New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`month
 
 ```json
 {
-  "version": "2.19.0",
+  "version": "2.20.0",
   "schedule": "weekly",
   "agents": [
     { "label": "com.fullex.maccleaner.clean",     "plist_present": true, "loaded": true, "load_state": "loaded" },
@@ -436,7 +436,7 @@ New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`month
 
 **Exit codes**: `status` and `off` always exit `0`, even when nothing is scheduled. `weekly`/`monthly` exit `1` if either agent failed to load with `launchctl` (the plist is still written to disk either way, and the stderr output includes the manual `launchctl bootstrap` command to load it); they exit `0` when both agents loaded. An unrecognized `action` is an argparse usage error, exit `2`, before any of this runs.
 
-`weekly`/`monthly --json` have one more exit path that does **not** follow the common envelope above: if no usable, non-virtualenv `python3` interpreter can be resolved for `ProgramArguments[0]` (see `_agent_python()`), nothing is written — no plist, no `launchctl` call — and the command exits `1` printing only `{"version": "2.19.0", "error": "<message>"}`. This response has no `schedule`, `agents`, or `legacy_cron` keys at all; a strict external decoder expecting the common shape on every `weekly`/`monthly` call should check for `"error"` first.
+`weekly`/`monthly --json` have one more exit path that does **not** follow the common envelope above: if no usable, non-virtualenv `python3` interpreter can be resolved for `ProgramArguments[0]` (see `_agent_python()`), nothing is written — no plist, no `launchctl` call — and the command exits `1` printing only `{"version": "2.20.0", "error": "<message>"}`. This response has no `schedule`, `agents`, or `legacy_cron` keys at all; a strict external decoder expecting the common shape on every `weekly`/`monthly` call should check for `"error"` first.
 
 Honors `MACCLEANER_LAUNCH_AGENTS_DIR` (default `~/Library/LaunchAgents`) for both reading and writing agent plists — see §5.
 
@@ -444,7 +444,7 @@ Honors `MACCLEANER_LAUNCH_AGENTS_DIR` (default `~/Library/LaunchAgents`) for bot
 
 ```json
 {
-  "version": "2.19.0",
+  "version": "2.20.0",
   "categories": [
     {
       "name": "xcode",
@@ -465,7 +465,7 @@ Lists **all** categories and targets regardless of the enabled_categories config
 
 ```json
 {
-  "version": "2.19.0",
+  "version": "2.20.0",
   "runs": [
     {
       "timestamp": "2026-07-13T09:00:04.120394",
@@ -497,7 +497,7 @@ Lists **all** categories and targets regardless of the enabled_categories config
 }
 ```
 
-Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 50 runs. With no history: `{"version": "2.19.0", "runs": [], "disk_history": {...}}` (`disk_history` is present either way).
+Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 50 runs. With no history: `{"version": "2.20.0", "runs": [], "disk_history": {...}}` (`disk_history` is present either way).
 
 `disk_history` is **additive** (new in 2.1.0) and always present, even with no cleanup history. `current` is today's `disk_stats()` snapshot. `snapshots` is the full contents of `snapshots.log` (append-only, capped at the most recent 365 entries; a snapshot recorded on the same calendar day as the previous one replaces it instead of adding a new entry — so a machine scanned any number of times a day, including every few minutes by the menu bar app's auto-refresh, accumulates at most one entry per day, giving 365 entries roughly a year of history). Every `scan` and every real `clean`/`projects --clean` run (not `--dry-run`) records one snapshot. `reclaimable_bytes` and `categories` (a map of category → bytes) are `null` unless the run covers the **full, unscoped target list** — a plain `scan`, or a plain `clean` with no `--category`/`--min-size`/`--targets` (this doesn't depend on `--yes`: an unscoped interactive `clean` counts too). The sums span every measured target regardless of `safe` — review targets (e.g. all of `ai`, and `system`'s `trash`/`ios-backups`) are folded into `categories` too, not excluded; for `clean` the sum is taken after the run, over whatever remains uncleaned (targets not deleted/trashed this pass, including any review target skipped or declined). They're `null` for `scan --category …`, `scan --min-size …`, any `clean` scoped by `--targets`/`--category`/`--min-size`, and *every* `projects --clean` run (project artifacts aren't part of the regular category sweep, and it never records full scope) — in all of those cases only `disk_total_bytes`/`disk_free_bytes` are trustworthy. Use `MACCLEANER_SNAPSHOTS` to point the engine at a different snapshots file (see §5).
 
@@ -575,7 +575,7 @@ Matching is bundle-ID-precise rather than fuzzy, but it still isn't an absolute 
 - **`disk-check`** (new in 2.2.0) never deletes, measures, or scans — it's a single `shutil.disk_usage` call plus, at most, a notification and a write to `alerts.json` (its own throttle-state file, distinct from `report.log`/`snapshots.log`). It always exits 0, whether or not it's below the threshold or a warning was posted.
 - **`schedule`** (new in 2.3.0) never touches anything inside `$HOME`'s data — it only writes/removes launchd plists (under `MACCLEANER_LAUNCH_AGENTS_DIR`, default `~/Library/LaunchAgents`), calls `launchctl`, and edits the crontab to strip a legacy MacCleaner line. It writes nothing to `report.log`, `snapshots.log`, or `alerts.json`. The agents it installs (`clean --yes --notify`, `disk-check`) are themselves bound by every safety guarantee above.
 - **`doctor`'s 2.8.0 system-pressure checks** (`Swap`, `Held-open files`) are strictly **read-only reporting**. `Swap` runs one `sysctl vm.swapusage`; `Held-open files` runs one `lsof -b -nPw +c 0 +L1`. Neither deletes a byte, neither creates a target ID, neither offers or accepts a cleanup action, and MacCleaner will never kill a process, unlink a held-open inode, or touch `/System/Volumes/VM`. They exist purely to explain disk space the tool has deliberately decided not to reclaim — which is also why both are `advisory` and excluded from top-level `ok` (§3).
-- **`doctor`'s `Stranded simulator runtimes` check** is read-only in the same way, and its subject cannot be written to at all: it runs one `xcrun simctl runtime list -j` (60-second timeout, on the calling thread) plus a bounded, stat-only walk of `/System/Library/AssetsV2` — never `du`, never `open()` on anything but each asset's `Info.plist`. The `.asset` directories are SIP `restricted`, so MacCleaner creates no target ID for them, offers no cleanup action, and could not delete them if it tried; only Xcode → Settings → Platforms can.
+- **`doctor`'s `Stranded simulator runtimes` check** is read-only in the same way, and its subject cannot be written to at all: it runs one `xcrun simctl runtime list -j` (60-second timeout, on the calling thread) plus a bounded, stat-only walk of `/System/Library/AssetsV2` — never `du`, never `open()` on anything but each asset's `Info.plist`. The `.asset` directories are SIP `restricted`, so MacCleaner creates no target ID for them, offers no cleanup action, and could not delete them if it tried — and neither can anything else, Xcode → Settings → Platforms included, which lists only runtimes that are still registered.
 - `scan`, `projects` (without `--clean`), `doctor`, `report`, `categories`, `config show|path`, and `storage-insights` never delete anything. `scan` and every real `clean`/`projects --clean` run (not `--dry-run`) also record a disk-usage entry to `snapshots.log`; `clean` and `projects --clean` (but not `--dry-run`) additionally append a run entry to `report.log`. `--dry-run` writes to neither log. `storage-insights` writes to no log at all — no `report.log`, `snapshots.log`, or `alerts.json` entry, ever.
 
 Empty-only targets (`general-caches` and `trash`) refuse symlink roots: cleanup reports an error with zero freed bytes and preserves the link and destination. Dry-run lists no destination children and prints a skip note to stderr in JSON mode. Ordinary non-empty-only symlink targets retain their existing unlink/move behavior.

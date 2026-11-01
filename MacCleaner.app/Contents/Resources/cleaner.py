@@ -143,7 +143,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.19.0"
+VERSION = "2.20.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -204,7 +204,7 @@ DEFAULT_CONFIG = {
     "project_min_age_days": 30,
     "project_git_check": True,
     "tmp_min_age_days": 1,           # /tmp dirs younger than this are never offered
-    "simulator_stale_days": 30,      # simulators not booted for this long count as stale
+    "simulator_stale_days": 7,       # simulators not booted for this long count as stale
     "app_leftover_min_age_days": 7,  # orphaned app data younger than this is never offered
     "notifications": True,           # notify when a scheduled clean finishes
     "low_disk_alerts": True,         # warn when free space drops below the threshold
@@ -1227,15 +1227,69 @@ def _cleanup_termination_signals():
             signal.signal(signum, handler)
 
 
+def _freed_unknown_field(t):
+    """`{"freed_unknown": True}` for a command-based target, else `{}`.
+
+    A cmd target's reclaim genuinely isn't measurable — the command decides
+    what goes, and for simctl the bytes may live in SIP-protected asset
+    bundles this tool can never see. Reporting a bare `freed: 0` made that
+    indistinguishable from a measured zero: issue #106's real run printed
+    `status: "deleted"`, `freed: 0` after advertising 20.6 GB. The flag is
+    additive and emitted only when true, so `freed` stays a plain int for
+    already-installed copies of the app (`CleanItem.freed` is non-optional)
+    while a reader can tell "unmeasured" from "nothing to free"."""
+    return {"freed_unknown": True} if t.get("cmd") else {}
+
+
+def _reclaim_unverified_fields(t):
+    """`reclaim_unverified`/`reclaim_note` for a target whose advertised size
+    is not known to come back, else `{}`.
+
+    `freed_unknown` (issue #106) made the *post-clean* report honest. This is
+    the other half: `scan`'s advertised size. `simulator-unused-runtimes` sized
+    itself from simctl's own `sizeBytes` and offered 20.56 GB that four
+    measured runs in a row freed nothing of. See issue #112.
+
+    Mark a target here only when there is *evidence* its bytes do not come
+    back, not merely because measuring them is hard -- an unmeasured target
+    belongs in the total, since leaving it out understates what a user can
+    free just as dishonestly as counting it overstates it.
+
+    Additive and emitted only when true, like `advisory` and `freed_unknown`,
+    so every existing reader keeps decoding unchanged."""
+    if not t.get("reclaim_unverified"):
+        return {}
+    out = {"reclaim_unverified": True}
+    if t.get("reclaim_note"):
+        out["reclaim_note"] = t["reclaim_note"]
+    return out
+
+
 def delete_target(t, mode="rm"):
     """Delete a target. Returns (bytes_freed, error_message_or_None)."""
     if t.get("cmd"):
+        runner = t.get("cmd_runner")
+        if runner is not None:
+            # Runner-backed targets do their own work in Python, one process
+            # per identifier, and verify the result afterwards; their `cmd` is
+            # a faithful DESCRIPTION of what runs (shown by --dry-run), not a
+            # string vetted for a shell. Never fall through to the shell here:
+            # an unrecognized runner is an error, not a reason to guess.
+            ids = t.get("cmd_ids") or []
+            try:
+                if runner == "simctl-runtime-delete":
+                    return 0, _simctl_runtime_delete(ids)
+                if runner == "simctl-device-delete":
+                    return 0, _simctl_device_delete(ids)
+                return 0, "unknown command runner: %s" % runner
+            except Exception as e:
+                # One target's runner blowing up must not abort the run, same
+                # contract as the shell path below.
+                return 0, str(e)
         try:
-            # cmd strings are either static literals from get_targets() (need
-            # `|| true` and pipes) or assembled by scanners (scan_simulator_
-            # targets) exclusively from simctl identifiers that passed
-            # _SIMCTL_UDID_RE/_SIMCTL_RUNTIME_ID_RE — never raw user input,
-            # so shell=True is safe here
+            # cmd strings here are static literals from get_targets() (they
+            # need `|| true` and pipes) — never raw user input, so shell=True
+            # is safe. Scanner-assembled commands go through cmd_runner above.
             with _cleanup_termination_signals() as launched:
                 process = subprocess.Popen(t["cmd"], shell=True, stdout=subprocess.DEVNULL,
                                            stderr=subprocess.DEVNULL, start_new_session=True)
@@ -1497,15 +1551,19 @@ def print_scan(targets, show_all=False):
             size_str = (fmt_size(t["size"]) if t["size"]
                         else "~unknown" if t.get("estimate_cmd")
                         else "cmd-based")
+            if t.get("reclaim_unverified"):
+                size_str += " †"
             safe_str = "✅" if t["safe"] else "⚠️"
             table.add_row(t["category"], t["label"], t["id"], size_str, safe_str)
 
         console.print(table)
         hidden = len(targets) - len(visible)
         hidden_note = f"\n[dim]{hidden} empty/not-installed targets hidden — use --all to show[/dim]" if hidden else ""
+        footnotes = "".join(f"\n[dim]† {t['label']}: {t['reclaim_note']}[/dim]"
+                            for t in visible if t.get("reclaim_note"))
         console.print(Panel(
             f"[bold green]Total reclaimable: {fmt_size(total)}[/bold green]\n"
-            f"[dim]Current disk: {disk_free()}[/dim]{hidden_note}\n\n"
+            f"[dim]Current disk: {disk_free()}[/dim]{hidden_note}{footnotes}\n\n"
             f"[bold]→ Run [cyan]maccleaner clean[/cyan] to start cleaning[/bold]",
             title="Summary"
         ))
@@ -1517,11 +1575,16 @@ def print_scan(targets, show_all=False):
             size_str = (fmt_size(t["size"]) if t["size"]
                         else "~unknown" if t.get("estimate_cmd")
                         else "cmd")
+            if t.get("reclaim_unverified"):
+                size_str += " †"
             safe = "safe" if t["safe"] else "REVIEW"
-            print(f"  [{t['category']:9}] {t['label']:<38} {size_str:>10}  {safe}")
+            print(f"  [{t['category']:9}] {t['label']:<38} {size_str:>12}  {safe}")
         hidden = len(targets) - len(visible)
         if hidden:
             print(f"\n  ({hidden} empty/not-installed targets hidden — use --all to show)")
+        for t in visible:
+            if t.get("reclaim_note"):
+                print(f"\n  † {t['label']}: {t['reclaim_note']}")
         print(f"\n  Total reclaimable: {fmt_size(total)}")
         print(f"\n  → Run 'maccleaner clean' to start cleaning")
         print(f"{'='*72}\n")
@@ -1556,6 +1619,11 @@ def reclaimable_total(targets):
             for p in paths
         ):
             continue  # fully contained in another target -- already counted
+        if t.get("reclaim_unverified"):
+            # Measured not to come back -- see _reclaim_unverified_fields and
+            # issue #112. Still resolved above, so it keeps shadowing anything
+            # nested inside it; it just stops inflating the headline figure.
+            continue
         total += t.get("size") or 0
     return total
 
@@ -1581,6 +1649,7 @@ def scan_json(targets, extra=None):
                 "safe": t["safe"],
                 "exists": t.get("exists", False),
                 **({"measurement_error": t["measurement_error"]} if t.get("measurement_error") else {}),
+                **_reclaim_unverified_fields(t),
             }
             for t in sorted(targets, key=lambda x: x["size"], reverse=True)
         ]
@@ -1614,6 +1683,7 @@ def run_clean(targets, auto_approve=False, mode="rm", json_mode=False, explicit=
         total_freed += freed
         status = "error" if err else ("trashed" if mode == "trash" and not t.get("cmd") else "deleted")
         results.append({"id": t["id"], "label": t["label"], "freed": freed, "status": status,
+                        **_freed_unknown_field(t),
                         **({"error": err} if err else {})})
         return freed, err
 
@@ -1730,7 +1800,8 @@ def run_clean_min_free(targets, min_free_gb, mode="rm", json_mode=False, notify=
         total_freed += freed
         status = "error" if err else ("trashed" if mode == "trash" and not t.get("cmd") else "deleted")
         results.append({"id": t["id"], "label": t["label"], "freed": freed,
-                        "status": status, **({"error": err} if err else {})})
+                        "status": status, **_freed_unknown_field(t),
+                        **({"error": err} if err else {})})
         say(f"  ✅ Cleaned: {t['label']} ({fmt_size(freed)})" if not err
             else f"  ⚠️  {t['label']}: {err}")
     free_now = disk_stats()["free_bytes"]
@@ -2869,6 +2940,188 @@ def _simctl_json(args):
         return None
 
 
+def _simctl_runtime_entries(rt):
+    """Normalize every shape `simctl runtime list -j` has shipped into a flat
+    list of runtime dicts: {"runtimes": [...]}, {"runtimes": {uuid: {...}}},
+    a bare top-level [...], and (current Xcode) a bare dict keyed by image
+    UUID with no wrapper key at all."""
+    if isinstance(rt, list):
+        entries = rt
+    elif isinstance(rt, dict) and "runtimes" in rt:
+        entries = rt["runtimes"]
+        if isinstance(entries, dict):
+            entries = list(entries.values())
+    elif isinstance(rt, dict):
+        entries = list(rt.values())
+    else:
+        entries = []
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict)]
+
+
+def _simctl_registered_runtime_ids():
+    """Every runtime identifier simctl still has registered, or None when the
+    question could not be asked at all.
+
+    None vs. an empty set is the whole point (the `_launchd_is_loaded`
+    lesson): once the last runtime is gone, `runtime list -j` answers with an
+    empty collection, and `{}` is falsy — treating that as "could not ask"
+    would turn the one completely successful clean into a permanent "could
+    not verify". Both identifier fields are collected because which one
+    carries the reverse-DNS string moved between Xcode versions, and the
+    delete was issued with whatever the scanner validated."""
+    rt = _simctl_json(["runtime", "list"])
+    if rt is None:
+        return None
+    ids = set()
+    for r in _simctl_runtime_entries(rt):
+        for key in ("identifier", "runtimeIdentifier"):
+            value = r.get(key)
+            if isinstance(value, str) and value:
+                ids.add(value)
+    return ids
+
+
+def _simctl_registered_device_udids():
+    """Every device UDID simctl still has registered, or None when unaskable.
+    A missing/mis-shaped "devices" key is unaskable, not "no devices" —
+    an empty `{"devices": {}}` is the real empty answer."""
+    data = _simctl_json(["list", "devices"])
+    if not isinstance(data, dict):
+        return None
+    devices = data.get("devices")
+    if not isinstance(devices, dict):
+        return None
+    udids = set()
+    for devs in devices.values():
+        if not isinstance(devs, list):
+            continue
+        for d in devs:
+            if isinstance(d, dict) and isinstance(d.get("udid"), str):
+                udids.add(d["udid"])
+    return udids
+
+
+def _simctl_run_owned(argv, timeout_s):
+    """Run one simctl argv in its own process group; returns (rc, stderr).
+
+    No shell, so there is no `2>/dev/null` to swallow simctl's diagnostics
+    and no `; true` to force exit 0. The process group and the file-backed
+    stderr follow the same discipline as `_run_estimate`/`delete_target`:
+    `xcrun` is only a launcher, so killing it alone on timeout would leave
+    simctl mutating storage, and the group is terminated on every exit path,
+    not just the timeout one."""
+    with _cleanup_termination_signals() as launched:
+        with tempfile.TemporaryFile(mode="w+t") as errfile:
+            process = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                       stderr=errfile, start_new_session=True)
+            try:
+                launched()
+                process.wait(timeout=timeout_s)
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            errfile.seek(0)
+            return process.returncode, errfile.read()
+
+
+def _simctl_delete_verified(ids, argv_for, registered, validator, noun):
+    """Delete simulator objects one process per identifier, then verify
+    against simctl's own registry. Returns an error string, or None when
+    every requested identifier is verifiably gone.
+
+    This replaces a "; "-joined shell string in which every command was
+    `2>/dev/null`-silenced and the whole thing ended `; true` (issue #106):
+    the target could not report failure by construction, and reported
+    `status: "deleted"` while 21.26 GB of runtime assets stayed on disk.
+    Iterating in Python keeps the one property that join was there for — a
+    failing identifier must not short-circuit the rest — while restoring the
+    per-identifier exit code and stderr it destroyed.
+
+    simctl's exit codes alone are not trusted: the registry is re-read
+    afterwards and anything still registered is a failure whatever simctl
+    said. An identifier that was never handed to simctl at all (refused by
+    the validator, or left over when the time budget ran out) is a failure
+    too, whether or not the registry mentions it — the engine did less than
+    the target promised. An unanswerable re-read is reported as unverified,
+    never as success. Note that even a verified deregistration does not
+    prove bytes came back — the SIP-protected MobileAsset bundles are
+    outside this tool's reach — which is why cmd targets report
+    `freed_unknown`."""
+    # Normalize to text first: a non-string identifier (malformed JSON, a
+    # hand-built target) must be reportable, and an unhashable one must not
+    # blow up the reasons dict and abort the whole clean run.
+    requested = [i if isinstance(i, str) else repr(i) for i in ids]
+    reasons, unattempted = {}, set()
+    deadline = time.monotonic() + CLEANUP_TIMEOUT_S
+    for i in requested:
+        if not validator.fullmatch(i):
+            # Defence in depth. The scanners validate before building a
+            # target, but nothing should ever hand simctl an unvalidated
+            # string — "all", "--outdated" and "--unusable" are real
+            # `runtime delete` arguments and "all" wipes every image.
+            reasons[i] = "malformed identifier, refused"
+            unattempted.add(i)
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            reasons[i] = "not attempted, %ds budget exhausted" % CLEANUP_TIMEOUT_S
+            unattempted.add(i)
+            continue
+        try:
+            rc, stderr = _simctl_run_owned(argv_for(i), remaining)
+        except subprocess.TimeoutExpired:
+            # It did run, so the registry still decides whether it worked.
+            reasons[i] = "timed out after %ds" % int(remaining)
+            continue
+        except Exception as exc:
+            reasons[i] = "could not run: %s" % exc
+            unattempted.add(i)
+            continue
+        if rc != 0:
+            lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+            reasons[i] = "exit %s%s" % (rc, (": " + lines[0]) if lines else "")
+
+    def detail(names):
+        return ", ".join("%s (%s)" % (i, reasons.get(i, "simctl reported success"))
+                         for i in names)
+
+    still = registered()
+    if still is None:
+        tail = detail([i for i in requested if i in reasons])
+        return ("could not verify: simctl would not report its %s back after "
+                "%d delete attempt(s)%s" % (noun, len(requested),
+                                            "; " + tail if tail else ""))
+    survivors = [i for i in requested if i in still]
+    blocked = [i for i in requested if i in unattempted and i not in still]
+    if not survivors and not blocked:
+        return None
+    clauses = []
+    if survivors:
+        clauses.append("still registered: " + detail(survivors))
+    if blocked:
+        clauses.append("never attempted: " + detail(blocked))
+    failed = len(survivors) + len(blocked)
+    return ("%d of %d %s deleted; %s"
+            % (len(requested) - failed, len(requested), noun, "; ".join(clauses)))
+
+
+def _simctl_runtime_delete(ids):
+    return _simctl_delete_verified(
+        ids, lambda i: ["xcrun", "simctl", "runtime", "delete", i],
+        _simctl_registered_runtime_ids, _SIMCTL_RUNTIME_ID_RE, "runtimes")
+
+
+def _simctl_device_delete(udids):
+    return _simctl_delete_verified(
+        udids, lambda u: ["xcrun", "simctl", "delete", u],
+        _simctl_registered_device_udids, _SIMCTL_UDID_RE, "devices")
+
+
 def _parse_simctl_date(s):
     # "2026-08-09T00:00:00Z" or with offset; simctl emits ISO8601
     try:
@@ -2887,8 +3140,9 @@ def scan_simulator_targets(config):
 
     Device timestamp field: older Xcode/simctl emits "lastBootedAt"; newer
     versions renamed it "lastUsedAt" (observed on Xcode's current simctl) —
-    both are checked, falling back to the device's dataPath mtime when
-    neither is present.
+    both are checked, falling back to the mtime of the device's own directory
+    (the parent of dataPath) when neither is present, which is the case for
+    any device that has never been booted.
 
     Every udid/identifier that ends up in a cmd string is validated against
     _SIMCTL_UDID_RE/_SIMCTL_RUNTIME_ID_RE first and silently dropped (not
@@ -2898,7 +3152,7 @@ def scan_simulator_targets(config):
     data = _simctl_json(["list", "devices"])
     if not data:
         return targets
-    stale_days = config.get("simulator_stale_days", 30)
+    stale_days = config.get("simulator_stale_days", 7)
     cutoff = time.time() - stale_days * 86400
     stale, stale_bytes, used_runtimes = [], 0, set()
     for runtime_id, devs in data.get("devices", {}).items():
@@ -2911,9 +3165,21 @@ def scan_simulator_targets(config):
                 continue
             ts = _parse_simctl_date(d.get("lastBootedAt") or d.get("lastUsedAt"))
             if ts is None:
+                # The device DIRECTORY, not its data/ subdirectory. Something
+                # on a live machine touches every device's data/ — all 22 on
+                # the Mac this was found on read 0.16 days old while their own
+                # device dirs still carried true 12-19 day mtimes — so
+                # stat()ing dataPath marks every never-booted device fresh and
+                # excludes it forever. dataPath is "<Devices>/<UDID>/data", so
+                # the device dir is its parent. This is what the 2.5 design
+                # specified ("fall back to the device dir's mtime"); the
+                # original code stat()ed one level too deep.
+                dp = d.get("dataPath")
                 try:
-                    ts = os.stat(d.get("dataPath", "")).st_mtime
+                    ts = os.stat(Path(dp).parent).st_mtime if dp else None
                 except OSError:
+                    ts = None
+                if ts is None:
                     continue
             if ts < cutoff:
                 stale.append(d)
@@ -2924,7 +3190,7 @@ def scan_simulator_targets(config):
                     except OSError:
                         pass
     if stale:
-        udids = " ".join(d["udid"] for d in stale)
+        udids = [d["udid"] for d in stale]
         names = ", ".join(d.get("name", "?") for d in stale[:4])
         more = "" if len(stale) <= 4 else " +%d more" % (len(stale) - 4)
         targets.append({
@@ -2933,29 +3199,25 @@ def scan_simulator_targets(config):
             "description": "Not booted in %dd: %s%s — deleted via simctl"
                            % (stale_days, names, more),
             "path": None, "glob": None, "skip": [], "safe": False,
-            "cmd": "xcrun simctl delete %s 2>/dev/null || true" % udids,
+            # `cmd` describes what runs (and is what --dry-run shows); the
+            # work itself is done by cmd_runner, one process per UDID, and
+            # verified against simctl's registry afterwards. See
+            # _simctl_delete_verified for why the old
+            # "2>/dev/null || true" form could never report a failure.
+            "cmd": "; ".join("xcrun simctl delete %s" % u for u in udids),
+            "cmd_runner": "simctl-device-delete", "cmd_ids": udids,
             "estimate_cmd": None, "estimate_parser": None,
             "empty_only": False, "precomputed_bytes": stale_bytes,
         })
     rt = _simctl_json(["runtime", "list"])
     if rt:
         # simctl has shipped at least three runtime-list shapes across
-        # versions: {"runtimes": [...]}, a bare top-level [...], and (the
-        # shape observed from current Xcode) a bare dict keyed by runtime
-        # UUID with no "runtimes" wrapper at all — {uuid: {...}, ...}.
-        if isinstance(rt, list):
-            runtimes = rt
-        elif isinstance(rt, dict) and "runtimes" in rt:
-            runtimes = rt["runtimes"]
-            if isinstance(runtimes, dict):
-                runtimes = list(runtimes.values())
-        elif isinstance(rt, dict):
-            runtimes = list(rt.values())
-        else:
-            runtimes = []
+        # versions; _simctl_runtime_entries normalizes all of them (the
+        # verification re-read after a delete has to understand the same
+        # shapes, which is why it lives in a shared helper).
+        runtimes = _simctl_runtime_entries(rt)
         unused = [r for r in runtimes
-                  if isinstance(r, dict)
-                  and r.get("runtimeIdentifier", r.get("identifier")) not in used_runtimes
+                  if r.get("runtimeIdentifier", r.get("identifier")) not in used_runtimes
                   and r.get("state") == "Ready"
                   and r.get("identifier")
                   and _SIMCTL_RUNTIME_ID_RE.fullmatch(r["identifier"])]
@@ -2965,13 +3227,54 @@ def scan_simulator_targets(config):
             targets.append({
                 "id": "simulator-unused-runtimes", "category": "simulators",
                 "label": "Unused simulator runtimes (%d)" % len(ids),
-                "description": "Runtime images with no simulator devices — re-downloadable in Xcode",
+                "description": "Runtime images with no simulator devices — "
+                               "deregistering them is not known to free disk, "
+                               "and can leave the image on disk with no way "
+                               "to remove it.",
                 "path": None, "glob": None, "skip": [], "safe": False,
-                # "; "-joined with per-command suppression (not "&&") so one
-                # failing delete doesn't short-circuit and skip every later
-                # identifier; trailing "; true" keeps the overall exit 0.
-                "cmd": "; ".join("xcrun simctl runtime delete %s 2>/dev/null" % i
-                                 for i in ids) + "; true",
+                # The size is simctl's own sizeBytes and it is real, but it
+                # is not reclaim. Measured on a real machine: three runtimes
+                # were deregistered -- by this target's own command earlier,
+                # and later by Xcode -> Settings -> Platforms -- and all
+                # 21.26 GiB of their /System/Library/AssetsV2 bundles stayed
+                # on disk both times. report.log has four runs of this target,
+                # freed 0 every one. The runtimes then came back Ready after a
+                # reboot, because the asset was still there to rediscover.
+                #
+                # Worse than not reclaiming: once an asset is unregistered
+                # nothing can remove it. simctl has no identifier for it
+                # (`runtime delete --unusable/--outdated --dry-run` both
+                # answer "No matching images found"), Xcode lists only
+                # registered runtimes, and AssetsV2 is SIP-restricted so rm
+                # fails even as root. So a part-failed delete can put the
+                # space permanently beyond reach.
+                #
+                # The command itself is right -- `runtime delete` removes the
+                # asset by default, `--keep-asset` is the opt-out, and the
+                # .asset dir IS the runtime's storage (`runtime list -v`
+                # Image Path), not a cached copy. Why the removal completes
+                # for some runtimes and not others is NOT established; do not
+                # write a mechanism into this comment without measuring one.
+                # And do not point users at Xcode -> Settings -> Platforms as
+                # the fix: in the same session it freed two runtimes' assets
+                # and left these three. Issue #112.
+                "reclaim_unverified": True,
+                "reclaim_note": "Not verified reclaim. On a real Mac both "
+                                "`simctl runtime delete` and Xcode → Settings "
+                                "→ Platforms deregistered these runtimes and "
+                                "left all 21.26 GiB of their images on disk — "
+                                "and once an image is unregistered, no tool "
+                                "can remove it. Expect to free nothing.",
+                # `cmd` describes what runs (and is what --dry-run shows); the
+                # work is done by cmd_runner, one process per identifier, with
+                # a registry re-read afterwards. The old form silenced every
+                # command with 2>/dev/null and ended "; true", which made a
+                # failure literally unreportable — see issue #106 and
+                # _simctl_delete_verified. Iterating keeps the property that
+                # join was chosen for: one bad identifier must not skip the
+                # rest.
+                "cmd": "; ".join("xcrun simctl runtime delete %s" % i for i in ids),
+                "cmd_runner": "simctl-runtime-delete", "cmd_ids": ids,
                 "estimate_cmd": None, "estimate_parser": None,
                 "empty_only": False, "precomputed_bytes": size,
             })
@@ -3443,8 +3746,29 @@ DOCKER_RAW_PATHS = [
     HOME / "Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw",
     HOME / "Library/Containers/com.docker.docker/Data/vms/0/Docker.raw",
 ]
+# Simulator runtime MobileAssets. macOS stores each downloaded runtime as a
+# `<sha>.asset` bundle under /System/Library/AssetsV2; when a runtime is
+# deregistered but its asset survives, the bytes become invisible to every
+# tool and removable by none -- simctl has lost the handle (none of
+# --outdated/--unusable/--notUsedSinceDays matches an image it no longer
+# lists) and the directories carry SIP's `restricted` flag, so `rm -rf`
+# fails even as root. 21.26 GB stranded this way on a real machine with
+# nothing anywhere to explain it. Report-only, and more absolutely so than
+# any other advisory: there is no deletion this tool could even attempt.
+SIMULATOR_ASSET_PLATFORMS = {
+    "com_apple_MobileAsset_iOSSimulatorRuntime": "iOS",
+    "com_apple_MobileAsset_watchOSSimulatorRuntime": "watchOS",
+    "com_apple_MobileAsset_tvOSSimulatorRuntime": "tvOS",
+    "com_apple_MobileAsset_xrOSSimulatorRuntime": "visionOS",
+}
+STRANDED_ASSET_CHECK_NAME = "Stranded simulator runtimes"
+# A real runtime asset is multiple GB (8.24/8.50/4.52 GB in the reported
+# case). Below 1 GiB the finding is a partial or abandoned download, too
+# small to be worth reporting as unreclaimable space.
+STRANDED_ASSET_WARN_BYTES = 1024 ** 3
+STRANDED_ASSET_MAX_NAMED = 4
 
-_SWAP_UNITS = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+_SWAP_UNITS ={"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
 
 
 def _parse_swap_usage(output):
@@ -3577,6 +3901,169 @@ def _docker_disk_image():
             pass
         return {"path": str(raw), "bytes": _disk_bytes(st), "running": running}
     return None
+
+
+def _simulator_asset_root():
+    """macOS's MobileAsset store. Read from the environment on every call so
+    tests never have to touch the real /System/Library/AssetsV2."""
+    return Path(os.environ.get("MACCLEANER_ASSETSV2_ROOT", "/System/Library/AssetsV2"))
+
+
+def _asset_dir_of(path):
+    """The `<sha>.asset` directory a path sits inside, or None.
+
+    simctl reports a registered runtime's backing store as a path *inside*
+    the bundle (".../<sha>.asset/AssetData/Restore/x.dmg"), so the bundle has
+    to be recovered from it before it can be compared with one found on
+    disk."""
+    if not isinstance(path, str) or ".asset" not in path:
+        return None
+    head = os.path.normpath(path)
+    while head not in ("/", ""):
+        if head.endswith(".asset"):
+            return head
+        parent = os.path.dirname(head)
+        if parent == head:
+            return None
+        head = parent
+    return None
+
+
+def _registered_simulator_runtimes():
+    """(builds, asset directories) of every runtime simctl still lists, or
+    None when the question could not be answered.
+
+    None is load-bearing. Without simctl's half of the cross-reference an
+    asset cannot be shown to be unreferenced, and reporting "nothing is
+    stranded" would be exactly the false negative this check exists to fix.
+    An answer that parses but yields no build string at all is also None: a
+    machine that holds runtime assets while simctl names no builds is far
+    likelier to be a JSON shape this code does not recognise than a
+    genuinely empty registry, and believing it would report every asset on
+    the disk as stranded."""
+    rows = _simctl_runtime_entries(_simctl_json(["runtime", "list"]))
+    builds, assets = set(), set()
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        build = r.get("build") or r.get("buildversion")
+        if isinstance(build, str) and build.strip():
+            builds.add(build.strip())
+        # The path is a second, independent signal: a bundle a registered
+        # runtime is mounted out of is referenced whatever its Info.plist
+        # says, which keeps a build-string mismatch from being reported as
+        # gigabytes of reclaimable-looking junk.
+        for key in ("path", "parentMountPath", "runtimeBundlePath"):
+            found = _asset_dir_of(r.get(key))
+            if found:
+                assets.add(found)
+    if not builds:
+        return None
+    return builds, assets
+
+
+def _asset_build_and_version(info_plist):
+    """(Build, SimulatorVersion) from an `.asset` bundle's Info.plist, or
+    (None, None) when it cannot be read.
+
+    `Build` sits under `MobileAssetProperties` in every asset observed on a
+    real machine; a top-level `Build` is accepted as a fallback because the
+    bug report quoted `plutil -p | grep Build`, which cannot tell the two
+    apart. Never raises -- a missing, truncated or non-plist file is just an
+    asset whose build is unknown, and an unknown build is never reported
+    stranded."""
+    try:
+        with open(info_plist, "rb") as f:
+            data = plistlib.load(f)
+    except Exception:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    props = data.get("MobileAssetProperties")
+    if not isinstance(props, dict):
+        props = {}
+    def text(key):
+        value = props.get(key, data.get(key))
+        return value.strip() if isinstance(value, str) and value.strip() else None
+    return text("Build"), text("SimulatorVersion")
+
+
+def _stranded_simulator_assets():
+    """Simulator runtime assets no registered runtime claims — report-only.
+
+    Returns {"assets": [...], "total_bytes", "unreadable", "root"}, or None
+    when the store could not be enumerated or simctl could not be asked.
+    None means "unknown", never "nothing stranded": these bytes exist
+    precisely because nothing else on the machine admits to them.
+
+    simctl runs on the caller thread (abandoning a daemon that supervises
+    subprocess.run can orphan its child); only the filesystem walk goes
+    inside the bounded read-only worker. Sizing is stat-only
+    (`_bundle_size`/`_disk_bytes`, allocated blocks), matching
+    scan_storage_insights -- a runtime asset holds a sparse .dmg, so
+    apparent size would overstate it badly.
+
+    Nothing here is a target: rows carry no id, no `safe`, no `cmd`, and are
+    never passed to delete_target. They could not be deleted anyway."""
+    registered = _registered_simulator_runtimes()
+    if registered is None:
+        return None
+    builds, referenced = registered
+    root = _simulator_asset_root()
+    exists = _read_only_scan(root.is_dir, None, "simulator asset store")
+    if exists is None:
+        return None
+    if not exists:
+        return {"assets": [], "total_bytes": 0, "unreadable": 0, "root": str(root)}
+
+    def read():
+        found, unreadable = [], 0
+        for dirname, platform in sorted(SIMULATOR_ASSET_PLATFORMS.items()):
+            try:
+                entries = list(os.scandir(root / dirname))
+            except FileNotFoundError:
+                # That platform was simply never downloaded.
+                continue
+            except OSError:
+                unreadable += 1
+                continue
+            for entry in entries:
+                if not entry.name.endswith(".asset"):
+                    continue
+                try:
+                    if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    unreadable += 1
+                    continue
+                if _is_dataless(st):
+                    # Nothing under AssetsV2 should ever be an evicted iCloud
+                    # folder, but listing one blocks in the kernel, so it is
+                    # counted rather than entered (see _is_dataless).
+                    unreadable += 1
+                    continue
+                build, version = _asset_build_and_version(
+                    Path(entry.path) / "Info.plist")
+                if not build:
+                    unreadable += 1
+                    continue
+                if build in builds or os.path.normpath(entry.path) in referenced:
+                    continue
+                found.append({"platform": platform, "build": build,
+                              "version": version, "path": entry.path,
+                              "bytes": _bundle_size(Path(entry.path))})
+        found.sort(key=lambda a: a["bytes"], reverse=True)
+        return {"assets": found, "unreadable": unreadable,
+                "total_bytes": sum(a["bytes"] for a in found), "root": str(root)}
+
+    return _read_only_scan(read, None, "simulator asset scan")
+
+
+def _stranded_asset_label(asset):
+    version = (" " + asset["version"]) if asset.get("version") else ""
+    return "%s%s (%s, %s)" % (asset["platform"], version, asset["build"],
+                              fmt_size(asset["bytes"]))
 
 
 def _system_temp_usage():
@@ -3813,6 +4300,37 @@ def run_doctor(config, json_mode=False):
               f"to reclaim it, {how} — Docker returns the freed space to the "
               f"disk itself. MacCleaner never touches this image: deleting or "
               f"truncating it would destroy every container, image and volume",
+              ok=False, advisory=True)
+
+    # Stranded simulator runtime assets. Report-only and advisory for the
+    # strongest reason of any check here: the `.asset` directories carry
+    # SIP's `restricted` flag, so there is no deletion this tool -- or any
+    # tool, at any privilege level -- could even attempt, and Xcode's own
+    # Platforms pane cannot see an image it no longer lists either: measured
+    # twice (issue #112), that UI freed two other runtimes' assets in the same
+    # session and left these three. The row's ABSENCE never asserts that
+    # nothing is stranded: _stranded_simulator_assets() returns None when it
+    # could not look, and an unknown is omitted rather than reported clean.
+    stranded = _stranded_simulator_assets()
+    if stranded and stranded["total_bytes"] >= STRANDED_ASSET_WARN_BYTES:
+        rows = stranded["assets"]
+        shown = rows[:STRANDED_ASSET_MAX_NAMED]
+        named = ", ".join(_stranded_asset_label(a) for a in shown)
+        rest = len(rows) - len(shown)
+        if rest > 0:
+            named += f" +{rest} more"
+        partial = ""
+        if stranded["unreadable"]:
+            partial = (f" {stranded['unreadable']} further asset(s) could not be"
+                       f" read, so this total may be incomplete.")
+        check(STRANDED_ASSET_CHECK_NAME,
+              f"{fmt_size(stranded['total_bytes'])} still stored under "
+              f"{stranded['root']} for simulator runtimes Xcode no longer "
+              f"lists: {named}. Nothing can remove these. The directories are "
+              f"SIP-restricted, so `sudo rm` fails even as root, and Xcode's "
+              f"Platforms pane lists only runtimes that are still registered, "
+              f"so an orphaned image is invisible to it too. MacCleaner "
+              f"reports them so the space is at least accounted for.{partial}",
               ok=False, advisory=True)
 
     # Deleted-but-still-open files (2.8.0). Report-only: the space returns by

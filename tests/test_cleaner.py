@@ -6409,8 +6409,9 @@ class TestStrandedSimulatorAssets(unittest.TestCase):
 
     So this is report-only and advisory, like Swap/System temp/Docker, but
     for the strongest reason of the four: there is no code path in this tool
-    -- or any tool -- that could delete these. Only Xcode's own Platforms UI
-    can. The check must therefore NEVER produce a target, and must never
+    -- or any tool -- that could delete these, Xcode's own Platforms UI
+    included, since it lists only runtimes that are still registered. The
+    check must therefore NEVER produce a target, and must never
     claim "nothing is stranded" when it simply could not look."""
 
     PLATFORM_DIR = "com_apple_MobileAsset_iOSSimulatorRuntime"
@@ -6618,10 +6619,20 @@ class TestStrandedSimulatorAssets(unittest.TestCase):
             self.assertIn(build, row["status"])
         self.assertIn("18.1", row["status"])
 
-    def test_doctor_remedy_is_xcode_platforms_and_says_sudo_rm_cannot_work(self):
+    def test_doctor_status_names_no_remedy_and_says_sudo_rm_cannot_work(self):
+        # The first version of this check sent the reader to Xcode -> Settings
+        # -> Platforms, on the assumption that the UI removes registration and
+        # image together. Measured twice on the machine that found these: in
+        # one session that UI released two OTHER runtimes' assets and left
+        # these three in place (issue #112). For an already-orphaned asset
+        # there is no removal path to point anyone at, so the status must say
+        # so rather than send them somewhere that will not work. Same rule the
+        # target's own description/reclaim_note follow.
         _, row = self._row(self._real_case())
-        self.assertIn("Xcode", row["status"])
-        self.assertIn("Platforms", row["status"])
+        self.assertNotRegex(
+            row["status"],
+            r"(?i)(remove|use|go to|open)[^.]*Xcode[^.]*Platforms",
+        )
         self.assertIn("sudo rm", row["status"])
         self.assertIn("SIP", row["status"])
 
@@ -6650,7 +6661,16 @@ class TestStrandedSimulatorAssets(unittest.TestCase):
         d = self._doctor(None)
         self.assertNotIn(cleaner.STRANDED_ASSET_CHECK_NAME,
                          [c["name"] for c in d["checks"]])
-        self.assertTrue(d["ok"], "an unanswerable advisory is not a MacCleaner fault")
+        # An unanswerable advisory is not a MacCleaner fault. Assert that as
+        # "`ok` is the non-advisory aggregate", the same way the sibling test
+        # above does, NOT as `ok is True`: only the five advisory collectors
+        # are mocked here, so every other check still runs against the
+        # developer's real machine. `assertTrue(d["ok"])` therefore failed
+        # during the 2.20.0 bump for an entirely honest reason -- the repo
+        # engine is one version ahead of the installed app until install.sh
+        # is re-run, and Engine/App version is non-advisory.
+        non_advisory = [c for c in d["checks"] if not c.get("advisory")]
+        self.assertEqual(d["ok"], all(c["ok"] for c in non_advisory))
 
     # ── the hard safety line ──────────────────────────────────────────────
     def test_no_target_ever_points_into_the_asset_store(self):
