@@ -230,6 +230,31 @@ fi
 # tooling is not something this script can fix, and that is the case the old
 # soft notice was actually written for. The two are reported in deliberately
 # different words so neither can be mistaken for the other in a build log.
+# Remove the out-of-tree scratch copy on every exit path, interruption
+# included. Without this an interrupted build strands a full copy of the
+# bundle (~9 MB) in $TMPDIR, which macOS does not clear promptly — measured:
+# the three normal paths leak nothing, a SIGTERM mid-sign leaked one every
+# time. Poor form in any build script, worse in this one, since leftover
+# scratch in the system temp folder is exactly what `doctor` reports on.
+# Also restores the bundle if we were interrupted between moving it aside
+# and copying the signed one back. Idempotent — it unsets its own state, so
+# the EXIT trap following an INT/TERM is a no-op — and always returns 0, so
+# cleanup can never be what fails the build.
+_sign_scratch_cleanup() {
+    if [ -n "${_SIGN_BACKUP:-}" ] && [ -d "${_SIGN_BACKUP}" ] \
+        && [ ! -d "${_SIGN_BUNDLE:-/nonexistent}" ]; then
+        mv "$_SIGN_BACKUP" "$_SIGN_BUNDLE" || true
+    fi
+    if [ -n "${_SIGN_SCRATCH:-}" ]; then
+        rm -rf "$_SIGN_SCRATCH"
+    fi
+    if [ -n "${_SIGN_BACKUP:-}" ]; then
+        rm -rf "$_SIGN_BACKUP"
+    fi
+    unset _SIGN_SCRATCH _SIGN_BACKUP _SIGN_BUNDLE
+    return 0
+}
+
 adhoc_sign_bundle() {
     local bundle="$1"
     local scratch="" staged backup
@@ -242,6 +267,10 @@ adhoc_sign_bundle() {
     if scratch="$(mktemp -d "${TMPDIR:-/private/tmp}/maccleaner-sign.XXXXXX" 2>/dev/null)"; then
         staged="$scratch/${bundle##*/}"
         backup="$bundle.unsigned.$$"
+        _SIGN_SCRATCH="$scratch"; _SIGN_BACKUP="$backup"; _SIGN_BUNDLE="$bundle"
+        trap _sign_scratch_cleanup EXIT
+        trap '_sign_scratch_cleanup; exit 130' INT
+        trap '_sign_scratch_cleanup; exit 143' TERM
         # Say where, so codesign's own "replacing existing signature" line
         # naming a /var/folders path isn't an unexplained surprise in the log.
         # ${scratch} braced, not bare: a bare $VAR touching the ellipsis has
@@ -259,16 +288,13 @@ adhoc_sign_bundle() {
             && mv "$bundle" "$backup" \
             && cp -R "$staged" "$bundle" \
             && codesign --verify "$bundle"; then
-            rm -rf "$scratch" "$backup"
+            _sign_scratch_cleanup
             echo "→ Ad-hoc signed (verified in place)"
             return 0
         fi
-        # Put the bundle back if we got as far as moving it aside, so an
+        # Puts the bundle back if we got as far as moving it aside, so an
         # opted-out build still has something at $BUNDLE to inspect.
-        if [ -d "$backup" ] && [ ! -d "$bundle" ]; then
-            mv "$backup" "$bundle" || true
-        fi
-        rm -rf "$scratch" "$backup"
+        _sign_scratch_cleanup
     fi
 
     # The opt-out is for a developer's own machine only. Under CI the same

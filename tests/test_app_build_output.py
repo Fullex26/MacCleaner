@@ -118,7 +118,10 @@ class TestAdhocSigning(unittest.TestCase):
         path.chmod(0o755)
 
     def _sign(self, env=None, path=None):
+        # Slice in the cleanup helper too — adhoc_sign_bundle installs it as
+        # its EXIT/INT/TERM trap and calls it on every return path.
         script = (
+            f'eval "$(sed -n \'/^_sign_scratch_cleanup()/,/^}}/p\' "{REPO}/app/build.sh")"\n'
             f'eval "$(sed -n \'/^adhoc_sign_bundle()/,/^}}/p\' "{REPO}/app/build.sh")"\n'
             'adhoc_sign_bundle "$1"\n')
         full = dict(os.environ)
@@ -232,6 +235,46 @@ if strict and target.startswith({str(self.tmp / 'build')!r}):
             "fixture app")
         self.assertEqual(sorted(p.name for p in self.bundle.parent.iterdir()),
                          ["MacCleaner.app"], "no scratch or backup left behind")
+
+
+    def test_an_interrupted_sign_leaves_no_scratch_copy_behind(self):
+        """The scratch copy is a full bundle (~9 MB on a real build), and
+        macOS does not clear $TMPDIR promptly. Measured before the trap
+        existed: the three normal paths leaked nothing, but a SIGTERM
+        mid-sign leaked one every time. Leftover scratch in the system temp
+        folder is precisely what this project's own `doctor` reports on.
+
+        Signals the process GROUP, which is what a terminal Ctrl-C does.
+        Signalling bash alone would be deferred until the foreground
+        `codesign` returned, so the cleanup would eventually run but only
+        after the stub's sleep — not the path worth pinning."""
+        import glob
+        import signal
+        import time
+        self._stub("codesign", "import time; time.sleep(30)")
+        pattern = os.path.join(os.environ.get("TMPDIR", "/private/tmp"),
+                               "maccleaner-sign.*")
+        before = set(glob.glob(pattern))
+        script = (
+            f'eval "$(sed -n \'/^_sign_scratch_cleanup()/,/^}}/p\' "{REPO}/app/build.sh")"\n'
+            f'eval "$(sed -n \'/^adhoc_sign_bundle()/,/^}}/p\' "{REPO}/app/build.sh")"\n'
+            'adhoc_sign_bundle "$1"\n')
+        env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"])
+        proc = subprocess.Popen(["/bin/bash", "-c", script, "_", str(self.bundle)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                env=env, start_new_session=True)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (set(glob.glob(pattern)) - before):
+            time.sleep(0.1)
+        self.assertTrue(set(glob.glob(pattern)) - before,
+                        "the scratch dir was never created — test is not "
+                        "exercising the interrupt path")
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.wait(timeout=15)
+        leaked = set(glob.glob(pattern)) - before
+        self.assertEqual(leaked, set(), f"interrupted sign leaked: {leaked}")
+        self.assertTrue((self.bundle / "Contents" / "MacOS" / "MacCleaner").is_file(),
+                        "an interrupted sign must leave the bundle in place")
 
 
 class TestShellScriptUnicodeQuoting(unittest.TestCase):
