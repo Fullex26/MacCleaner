@@ -10,11 +10,11 @@
 		</data>
 		<key>Resources/cleaner.py</key>
 		<data>
-		IyFyPZuaXliOvwjhwQdFI2pXx+o=
+		Pmr7d7FOHvE0hjffXH2C9gaJwSY=
 		</data>
 		<key>Resources/mck</key>
 		<data>
-		sIOFmsKIOc7hbxL55xyAxWbts7M=
+		PeiXKJ82KwKhs4jwnKU9qDcGJbo=
 		</data>
 	</dict>
 	<key>files2</key>
@@ -23,10 +23,10 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			00dZi9qkdYS6VCuikqLRPNaKmHY=
+			RsHPcsSp2tqM8CeVizgrrFNK/gk=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"d347598bdaa47584ba542ba292a2d13cd68a9876" or cdhash H"977594440c5581ec7bbb236e3a2b5cf3361e6f17"</string>
+			<string>cdhash H"46c1cf72c4a9dada8cf027958b382bac534afe09" or cdhash H"c5e275ca38aecd7d98b775e024f2be8b90d279ac"</string>
 		</dict>
 		<key>Resources/MacCleaner.icns</key>
 		<dict>
@@ -39,14 +39,14 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			7sAyYVHThhPGQIxYPJFNMQfWz/NxpR9jPUJCSQuaD0w=
+			QfyhN+Mb5BFRCAcILpUdLHsSxeeqrslF3JN8kXJv69w=
 			</data>
 		</dict>
 		<key>Resources/mck</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			8NEkZxR0+r4sUFVBV1RQv9zzZeSrOtNGl1A9I+jgw2g=
+			TmdnWeUq9esJCJzkEG85KHSF2S1uB+6EbMsuZumYF3w=
 			</data>
 		</dict>
 	</dict>

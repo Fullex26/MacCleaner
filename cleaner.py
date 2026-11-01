@@ -143,7 +143,7 @@ SNAPSHOTS_PATH = _resolve_state_path("MACCLEANER_SNAPSHOTS", "snapshots.log")
 ALERTS_PATH = _resolve_state_path("MACCLEANER_ALERTS", "alerts.json")
 CONFIG_PATH = _resolve_config_path()
 SNAPSHOT_CAP = 365
-VERSION = "2.19.0"
+VERSION = "2.20.0"
 
 # ── Default config ─────────────────────────────────────────────────────────────
 ALL_CATEGORIES = [
@@ -3763,8 +3763,8 @@ SIMULATOR_ASSET_PLATFORMS = {
 }
 STRANDED_ASSET_CHECK_NAME = "Stranded simulator runtimes"
 # A real runtime asset is multiple GB (8.24/8.50/4.52 GB in the reported
-# case). Below 1 GiB the finding is a partial or abandoned download, not
-# worth sending anyone into Xcode's Platforms pane for.
+# case). Below 1 GiB the finding is a partial or abandoned download, too
+# small to be worth reporting as unreclaimable space.
 STRANDED_ASSET_WARN_BYTES = 1024 ** 3
 STRANDED_ASSET_MAX_NAMED = 4
 
@@ -4305,8 +4305,10 @@ def run_doctor(config, json_mode=False):
     # Stranded simulator runtime assets. Report-only and advisory for the
     # strongest reason of any check here: the `.asset` directories carry
     # SIP's `restricted` flag, so there is no deletion this tool -- or any
-    # tool, at any privilege level -- could even attempt. Only Xcode's own
-    # Platforms pane has the authority. The row's ABSENCE never asserts that
+    # tool, at any privilege level -- could even attempt, and Xcode's own
+    # Platforms pane cannot see an image it no longer lists either: measured
+    # twice (issue #112), that UI freed two other runtimes' assets in the same
+    # session and left these three. The row's ABSENCE never asserts that
     # nothing is stranded: _stranded_simulator_assets() returns None when it
     # could not look, and an unknown is omitted rather than reported clean.
     stranded = _stranded_simulator_assets()
@@ -4324,10 +4326,11 @@ def run_doctor(config, json_mode=False):
         check(STRANDED_ASSET_CHECK_NAME,
               f"{fmt_size(stranded['total_bytes'])} still stored under "
               f"{stranded['root']} for simulator runtimes Xcode no longer "
-              f"lists: {named}. Remove them in Xcode → Settings → Platforms, "
-              f"which is the only thing with the authority — these directories "
-              f"are SIP-restricted, so `sudo rm` fails even as root, and "
-              f"MacCleaner only reports them.{partial}",
+              f"lists: {named}. Nothing can remove these. The directories are "
+              f"SIP-restricted, so `sudo rm` fails even as root, and Xcode's "
+              f"Platforms pane lists only runtimes that are still registered, "
+              f"so an orphaned image is invisible to it too. MacCleaner "
+              f"reports them so the space is at least accounted for.{partial}",
               ok=False, advisory=True)
 
     # Deleted-but-still-open files (2.8.0). Report-only: the space returns by

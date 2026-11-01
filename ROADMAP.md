@@ -4,7 +4,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ---
 
-## Current State — v2.19.0 ✅
+## Current State — v2.20.0 ✅
 
 - Subcommand CLI — `scan`, `clean`, `projects`, `report`, `doctor`, `config`, `categories` — with every v1 spelling (`--preview`, `--clean --yes`, `--report`, `--json`, `--config-*`) still working, so existing cron jobs, aliases, and the old menu bar app don't break
 - Agent-ready interface — `--json` on every data command, stable kebab-case target IDs (`clean --targets npm-cache,pip-cache`), JSON on stdout / messages on stderr, documented exit codes, `AGENTS.md` contract
@@ -38,6 +38,8 @@ This document tracks planned features and long-term direction. Community input w
 - **v2.18.1 safety fixes** — honest deletion accounting, excluded-descendant protection, stable dynamic IDs, bounded discovery, empty-only symlink refusal, and supervised cleanup process groups. 651 Python tests plus Swift/parity/app probes. Rescan after upgrading to obtain updated lossy dynamic IDs.
 
 - **v2.19.0 cleanup visibility** — unavailable Dashboard measurements, exact cleanup previews with incomplete-result gating, and detailed History outcomes. 654 Python tests plus production-bridge and layout probes; live visual acceptance remains a separate check.
+
+- **v2.20.0 — the simulator half, told honestly** — four findings from one real machine, each of which had been reporting success while doing nothing. The `simulators` scanner could not see 40 GB of device data: its 30-day staleness gate never fires on a Mac that builds against simulators daily (the oldest idle device was 19 days old), and never-booted devices — which have no simctl timestamp and must age by file mtime — were aged by `dataPath`, the `data/` directory *inside* the device bundle, which something on a live machine keeps touching, so all 22 read 0.16 days old and were dropped permanently. The gate is now 7 days and the fallback stats the device's own directory, which is what the 2.5 design specified; 13.2 GB across 9 devices became visible and was reclaimed. Both simulator targets can now report failure: each identifier runs as its own process and simctl's registry is re-read afterwards, so a partial delete says `"2 of 3 runtimes deleted; still registered: …"` instead of the old shell-joined string that silenced stderr and always exited 0. Command targets carry `freed_unknown` rather than an unmeasurable `freed: 0`, and `simulator-unused-runtimes` carries `reclaim_unverified`: deregistering a runtime was measured, twice, to leave all 21.26 GiB of its images on disk, so those bytes are no longer counted as reclaimable. `doctor` reports the images macOS keeps for runtimes Xcode no longer lists — and, after the same measurement, names no remedy for them, because there is none. 713 Python tests plus Swift/parity/app probes.
 
 ---
 
