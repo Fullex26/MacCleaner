@@ -9,6 +9,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+- `app/build.sh` no longer reports success while producing an **unsigned** app bundle. It ended with `codesign … || echo "codesign unavailable — unsigned bundle"`, and `echo` exits 0, so a `codesign` that ran and *refused* was laundered into a clean build. In a checkout under `~/Documents` it refuses routinely: iCloud's File Provider daemon re-stamps `com.apple.FinderInfo` on the bundle's root directory in the window between `xattr -cr` and `codesign`, which codesign rejects as "resource fork, Finder information, or similar detritus not allowed". That happened while cutting 2.20.0 and was caught only because the signature was checked by hand before the bundle was committed — and the committed `MacCleaner.app` is a release artifact that `install.sh` falls back to, so an unsigned one reaches real users. Signing now happens on a copy in a scratch directory outside the synced tree, where no daemon can touch it, and a refusal exits non-zero instead of printing a notice. A `codesign` that is genuinely *absent* is still non-fatal and now says so in unmistakably different words. `MACCLEANER_ALLOW_UNSIGNED=1` forces an unsigned local build through; it is ignored under `CI`.
+
 ---
 
 ## [2.20.0] — 2026-11-01

@@ -151,6 +151,31 @@ the tag points at), and tags are `vX.Y.Z` — a tag containing a hyphen (e.g.
    bash app/build.sh && rm -rf MacCleaner.app && cp -R build/MacCleaner.app MacCleaner.app
    ```
 
+   `app/build.sh` **exits non-zero if `codesign` ran and refused** — it no
+   longer prints a soft notice and exits 0 with an unsigned bundle, which is
+   what happened while cutting 2.20.0 and was caught only by checking the
+   signature by hand. Signing happens in a scratch dir outside this
+   iCloud-synced checkout, because the File Provider daemon re-stamps
+   `com.apple.FinderInfo` on the bundle root between `xattr -cr` and
+   `codesign`. So if this step fails, the bundle really is unsigned; fix it
+   rather than committing. `MACCLEANER_ALLOW_UNSIGNED=1` forces the build
+   through and **must not be used for a release** (it is ignored under `CI`).
+
+   To check the result by hand, use:
+   ```bash
+   codesign -dv build/MacCleaner.app 2>&1 | grep Signature   # expect: Signature=adhoc
+   ```
+   Do **not** judge it by `codesign --verify --deep --strict` in the
+   checkout. That reports "resource fork, Finder information, or similar
+   detritus not allowed" on a perfectly good signature, because the daemon
+   keeps re-stamping `FinderInfo` on every nested bundle directory
+   (`Sparkle.framework`, `Updater.app`); it passes for seconds after an
+   `xattr -cr` and fails again within ten. The signature itself is fine and
+   nothing ships with the detritus — git does not track extended attributes,
+   and the signing stage below runs `xattr -cr` on a runner that has no File
+   Provider. `app/build.sh` does run `--deep --strict`, on the out-of-tree
+   copy, where the answer is deterministic.
+
 5. **Update `CHANGELOG.md`** — move `[Unreleased]` items into a new
    `## [VERSION] — DATE` section; leave `[Unreleased]` empty for what comes
    next.
