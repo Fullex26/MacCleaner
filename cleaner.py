@@ -3361,6 +3361,20 @@ def _app_bundle_version(app_path: Path):
         return None
 
 
+def _version_dotted(v):
+    """A dotted version string as a tuple of ints, or None when it is not
+    purely numeric.
+
+    None means "cannot be ordered", never "equal" or "older": a pre-release
+    build ("2.21.0-rc1") or a hand-edited plist must leave the caller saying
+    it does not know which side is behind, rather than ordering it wrongly
+    and printing a remedy for the wrong half of the install."""
+    parts = str(v).strip().split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
 def _installed_app_bundles():
     """Every MacCleaner.app doctor knows how to find, in the order install.sh
     prefers them: ~/Applications (install.sh's target) then /Applications
@@ -4238,8 +4252,35 @@ def run_doctor(config, json_mode=False):
     if installed_app is not None:
         app_version = _app_bundle_version(installed_app)
         if app_version is not None and app_version != VERSION:
+            # The remedy has to name the half that is actually behind, and
+            # `install.sh` cannot update a cask-owned app at all -- step 7b
+            # skips the app when Homebrew owns it, by design, so the old
+            # unconditional "re-run bash install.sh" was dead advice for
+            # every Homebrew install (now the recommended path): the user
+            # runs it, nothing moves, and this check keeps failing.
+            # `brew upgrade` on its own skips a cask marked `auto_updates`,
+            # hence --greedy. Where Homebrew does NOT own the app,
+            # install.sh is still the whole answer either way: it refreshes
+            # the engine AND rebuilds/copies the bundle.
+            engine_v, app_v = _version_dotted(VERSION), _version_dotted(app_version)
+            stale_app = (engine_v is not None and app_v is not None
+                         and app_v < engine_v)
+            stale_engine = (engine_v is not None and app_v is not None
+                            and engine_v < app_v)
+            if not _brew_owned(installed_app):
+                remedy = "re-run bash install.sh"
+            elif stale_app:
+                remedy = "update the app: brew upgrade --cask --greedy maccleaner"
+            elif stale_engine:
+                remedy = "refresh the engine: re-run bash install.sh"
+            else:
+                # Either side unorderable (a pre-release), or the strings
+                # differ while the numbers do not ("2.20.0" vs "2.20.00").
+                # Name both halves rather than guess which to send them to.
+                remedy = ("re-run bash install.sh for the engine, or "
+                          "brew upgrade --cask --greedy maccleaner for the app")
             check("Engine/App version",
-                  f"engine {VERSION} != app {app_version} — re-run bash install.sh",
+                  f"engine {VERSION} != app {app_version} — {remedy}",
                   ok=False)
 
     for tool in ["brew", "docker", "xcrun", "node", "npm", "pnpm", "yarn", "bun", "deno",

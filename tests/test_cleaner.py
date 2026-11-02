@@ -7875,6 +7875,96 @@ class TestDoctorDuplicateAppCopies(TestDoctorSchedule):
         self.assertIsNone(skew)
 
 
+class TestDoctorSkewRemedy(TestDoctorDuplicateAppCopies):
+    """`Engine/App version` printed one remedy for every mismatch: "re-run
+    bash install.sh". But install.sh refuses to touch a cask-owned app (its
+    step 7b skips the app step when Homebrew owns the bundle, on purpose), so
+    for a Homebrew install -- the recommended path -- doctor's only failing
+    check sent the user to a command that cannot move the app: measured on a
+    real machine at engine 2.20.0 / app 2.19.0, where the fix was
+    `brew upgrade --cask --greedy maccleaner`. The remedy must name the half
+    that is actually behind, and name a tool that can update that half."""
+
+    def _skew_row(self):
+        r = self.run_doctor()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        return next(x for x in data["checks"] if x["name"] == "Engine/App version")
+
+    def _no_caskroom(self):
+        # Explicit, not merely absent: without the override the real machine's
+        # Caskroom is consulted, and a test whose outcome depends on whether
+        # the developer happens to have the cask installed is the machine
+        # coupling this suite keeps re-learning.
+        self.env["MACCLEANER_CASKROOM_DIR"] = str(self.tmp / "absent")
+
+    @staticmethod
+    def _one_major_above(version):
+        major, *rest = cleaner._version_dotted(version)
+        return ".".join(str(x) for x in (major + 1, *rest))
+
+    def test_homebrew_owned_stale_app_names_brew(self):
+        sys_app = self.tmp / "sysapps" / "MacCleaner.app"
+        self._write_bundle(sys_app, "0.0.1")
+        self._caskroom_pointing_at(sys_app)
+        row = self._skew_row()
+        self.assertFalse(row["ok"])
+        # --greedy is load-bearing: the cask sets `auto_updates true`, which
+        # makes a plain `brew upgrade` skip it entirely.
+        self.assertIn("brew upgrade --cask --greedy maccleaner", row["status"])
+        self.assertNotIn("install.sh", row["status"])
+
+    def test_homebrew_owned_stale_engine_still_names_install_sh(self):
+        # The case the check was originally written for: Sparkle moved the app
+        # and left ~/mac-cleaner/cleaner.py behind. brew cannot refresh the
+        # engine, so a cask-owned app must NOT flip this remedy to brew.
+        sys_app = self.tmp / "sysapps" / "MacCleaner.app"
+        self._write_bundle(sys_app, self._one_major_above(cleaner.VERSION))
+        self._caskroom_pointing_at(sys_app)
+        row = self._skew_row()
+        self.assertIn("install.sh", row["status"])
+        self.assertNotIn("brew upgrade", row["status"])
+
+    def test_install_sh_copy_keeps_the_install_sh_remedy(self):
+        # Not cask-owned: install.sh refreshes the engine AND rebuilds the
+        # bundle, so it remains the whole answer whichever side is behind.
+        home_app = self.home / "Applications" / "MacCleaner.app"
+        self._write_bundle(home_app, "0.0.1")
+        self._no_caskroom()
+        row = self._skew_row()
+        self.assertIn("install.sh", row["status"])
+        self.assertNotIn("brew", row["status"])
+
+    def test_unorderable_version_names_both_halves(self):
+        # A pre-release on either side cannot be ordered. Naming both beats
+        # guessing a direction and printing the wrong half's remedy.
+        sys_app = self.tmp / "sysapps" / "MacCleaner.app"
+        self._write_bundle(sys_app, "2.99.0-rc1")
+        self._caskroom_pointing_at(sys_app)
+        row = self._skew_row()
+        self.assertIn("install.sh", row["status"])
+        self.assertIn("brew upgrade --cask --greedy maccleaner", row["status"])
+
+
+class TestVersionDotted(unittest.TestCase):
+    """Ordering versions by string compare puts 2.9.0 after 2.10.0, which
+    would hand the user the wrong half's remedy."""
+
+    def test_orders_numerically_not_lexically(self):
+        self.assertEqual(cleaner._version_dotted("2.20.0"), (2, 20, 0))
+        self.assertLess(cleaner._version_dotted("2.19.0"),
+                        cleaner._version_dotted("2.20.0"))
+        self.assertLess(cleaner._version_dotted("2.9.0"),
+                        cleaner._version_dotted("2.10.0"))
+
+    def test_unorderable_input_is_none_never_a_guess(self):
+        for v in ("2.21.0-rc1", "v2.20.0", "", "latest", "2..0", "2.20.0b"):
+            self.assertIsNone(cleaner._version_dotted(v), v)
+
+    def test_whitespace_is_tolerated(self):
+        self.assertEqual(cleaner._version_dotted(" 2.20.0\n"), (2, 20, 0))
+
+
 class TestCronLogTrim(unittest.TestCase):
     """The hourly diskwatch agent appends to cron.log forever (1,100+ lines
     of 'BELOW threshold' on one real machine). Trim in place, keeping the
