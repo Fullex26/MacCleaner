@@ -269,7 +269,7 @@ if [ -n "$CASK_APP" ]; then
     # the running copy, so the other falls behind silently. The engine and
     # shortcuts above are still refreshed -- Sparkle never touches those.
     echo "→ MacCleaner.app is managed by Homebrew ($CASK_APP) — not installing a second copy"
-    echo "  Update the app with: brew upgrade --cask maccleaner  (or let it auto-update)"
+    echo "  Update the app with: brew upgrade --cask --greedy maccleaner  (or let it auto-update)"
     if [ -d "$APP_DEST" ]; then
         echo "⚠️  A second copy exists at $APP_DEST from an earlier install — remove it to avoid two apps drifting apart"
     fi

@@ -8145,6 +8145,18 @@ class TestCleanupPreviewSheetPresentation(unittest.TestCase):
                          "a one-shot task strands the sheet on its first result")
 
 
+class TestInstallBrewHintIsGreedy(unittest.TestCase):
+    """The cask sets `auto_updates true`, so plain `brew upgrade` skips it.
+    Any upgrade hint install.sh prints must carry --greedy, as doctor's does."""
+
+    def test_every_cask_upgrade_hint_is_greedy(self):
+        text = (Path(__file__).resolve().parent.parent / "install.sh").read_text()
+        hints = re.findall(r"brew upgrade[^\n\"]*maccleaner", text)
+        self.assertTrue(hints, "install.sh should still name an upgrade command")
+        for hint in hints:
+            self.assertIn("--greedy", hint, hint)
+
+
 class TestCronLogTrim(unittest.TestCase):
     """The hourly diskwatch agent appends to cron.log forever (1,100+ lines
     of 'BELOW threshold' on one real machine). Trim in place, keeping the

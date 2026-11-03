@@ -17,6 +17,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Deleting simulator devices now actually gives the space back. `simctl delete` only moves each device into a `Deleting-…` folder in the temp area and leaves macOS to empty it later, which sometimes never happens: on one machine a delete freed 2 GB of an expected 22 GB until those folders were removed by hand. After its own delete, MacCleaner gives macOS up to a minute to finish, then removes only the staging folders that delete created.
 - A simulator that is starting up or shutting down is no longer offered for deletion. Only fully shut-down devices are.
+- `install.sh` no longer tells Homebrew users to run `brew upgrade --cask maccleaner`, which does nothing for this app: the cask is marked `auto_updates`, so plain `brew upgrade` skips it. It now names `brew upgrade --cask --greedy maccleaner`, the same command `doctor` gives.
 - **The app no longer hides warnings from commands that succeeded (R06).** The
   engine reports a degraded-but-usable result on stderr while still exiting 0 —
   "project discovery stopped after 120s; results are partial", a storage walk
