@@ -638,5 +638,5 @@
   "timestamp": "<TS>",
   "total_reclaimable_bytes": 245760,
   "total_reclaimable_human": "240.0 KB",
-  "version": "2.20.0"
+  "version": "2.21.0"
 }
