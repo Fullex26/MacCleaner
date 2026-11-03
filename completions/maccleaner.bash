@@ -247,7 +247,7 @@ categories schedule disk-check storage-insights storage-map install-deps --help 
         disk-check)
                 COMPREPLY=( $(compgen -W "--json --no-post --help" -- "$cur") ) ;;
         storage-map)
-                COMPREPLY=( $(compgen -W "--min-size --depth --json --help" -- "$cur") ) ;;
+                COMPREPLY=( $(compgen -W "--min-size --depth --unshared --json --help" -- "$cur") ) ;;
         schedule)
                 # positional action, plus --json
                 local seen="" j=0

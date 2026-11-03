@@ -2107,6 +2107,173 @@ def _storage_category(path):
     return best[0]
 
 
+# ── Unshared (clone-private) sizing, issue #107 ────────────────────────────────
+# du and st_blocks bill every APFS clone the full size of the blocks it shares,
+# so a tree of clones can measure hundreds of GB that deleting would never free
+# (81 Xcode parallel-test simulator clones: du 307 GB, freed ~0). APFS answers
+# "how many of this file's bytes does nothing else reference" through
+# getattrlist's extended common attribute ATTR_CMNEXT_PRIVATESIZE. Constants
+# are from <sys/attr.h>. 0x10 is ATTR_CMNEXT_LINKID, an inode number that looks
+# like a size: the returned-attrs check exists so that a wrong bit fails as
+# "unavailable" instead of silently reporting an inode as bytes.
+ATTR_BIT_MAP_COUNT = 5
+ATTR_CMN_RETURNED_ATTRS = 0x80000000
+ATTR_CMNEXT_PRIVATESIZE = 0x00000008
+FSOPT_NOFOLLOW = 0x00000001
+FSOPT_ATTR_CMN_EXTENDED = 0x00000020
+UNSHARED_SCAN_BUDGET_S = STORAGE_MAP_SCAN_BUDGET_S
+
+_private_size_fn = None
+
+
+def _load_private_size_fn():
+    """A `path -> int | None` reader of ATTR_CMNEXT_PRIVATESIZE, or None when
+    this platform cannot answer (not macOS, no getattrlist). Built once.
+
+    Per-file getattrlist is stat-like: measured on an evicted iCloud file it
+    returned in <0.15 ms without triggering a download. getattrlistbulk is a
+    directory enumeration and would inherit readdir's hang exposure, so it is
+    deliberately not used."""
+    global _private_size_fn
+    if _private_size_fn is not None:
+        return _private_size_fn or None
+    if sys.platform != "darwin":
+        _private_size_fn = False
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+        getattrlist = libc.getattrlist
+    except (OSError, AttributeError):
+        _private_size_fn = False
+        return None
+
+    class _AttrList(ctypes.Structure):
+        _fields_ = [("bitmapcount", ctypes.c_ushort), ("reserved", ctypes.c_uint16),
+                    ("commonattr", ctypes.c_uint32), ("volattr", ctypes.c_uint32),
+                    ("dirattr", ctypes.c_uint32), ("fileattr", ctypes.c_uint32),
+                    ("forkattr", ctypes.c_uint32)]
+
+    getattrlist.argtypes = [ctypes.c_char_p, ctypes.POINTER(_AttrList), ctypes.c_void_p,
+                            ctypes.c_size_t, ctypes.c_uint]
+    getattrlist.restype = ctypes.c_int
+    request = _AttrList(ATTR_BIT_MAP_COUNT, 0, ATTR_CMN_RETURNED_ATTRS, 0, 0, 0,
+                        ATTR_CMNEXT_PRIVATESIZE)
+
+    def private_size(path):
+        # Layout: u_int32 length, attribute_set_t (5 x u_int32), then the off_t.
+        buf = ctypes.create_string_buffer(64)
+        if getattrlist(os.fsencode(path), ctypes.byref(request), buf, len(buf),
+                       FSOPT_NOFOLLOW | FSOPT_ATTR_CMN_EXTENDED) != 0:
+            return None
+        raw = buf.raw
+        if not int.from_bytes(raw[20:24], "little") & ATTR_CMNEXT_PRIVATESIZE:
+            return None  # no clone accounting on this volume: unknown, never 0
+        return int.from_bytes(raw[24:32], "little", signed=True)
+
+    _private_size_fn = private_size
+    return private_size
+
+
+def _unshared_bytes(root, private_size=None, deadline=None):
+    """Lower bound on the bytes deleting `root` would free, or None if unknown.
+
+    Sums ATTR_CMNEXT_PRIVATESIZE over every regular file beneath `root`. It
+    is a LOWER bound, not an exact figure: blocks shared only among files
+    INSIDE `root` are private to none of them and read 0 here, yet deleting
+    all of them frees those blocks too. That is the safe direction for a
+    cleanup tool (it never over-promises), so callers present it as "at least".
+
+    Same walk contract as _bundle_size: stat-only, never follows symlinks,
+    never lists a dataless (evicted iCloud) folder. Unlike _bundle_size it
+    counts a hard-linked file as 0 (another link may survive outside `root`)
+    and never crosses a mount point, matching du -x.
+    Returns None when the platform cannot answer, when the first file asked
+    about is unanswerable (e.g. a volume without clone accounting), or when
+    `deadline` (a time.monotonic() value) passes mid-walk: unavailable is
+    never reported as 0. A later unanswerable file contributes 0, which keeps
+    the bound true."""
+    if private_size is None:
+        private_size = _load_private_size_fn()
+    if private_size is None:
+        return None
+    root = str(root)
+    try:
+        root_st = os.lstat(root)
+    except OSError:
+        return None
+    if statmod.S_ISLNK(root_st.st_mode):
+        return 0
+    if not statmod.S_ISDIR(root_st.st_mode):
+        if not statmod.S_ISREG(root_st.st_mode) or root_st.st_nlink > 1:
+            return 0
+        return private_size(root)
+    if _is_dataless(root_st):
+        return 0
+    device = root_st.st_dev
+    total, answered, stack = 0, False, [root]
+    while stack:
+        if deadline is not None and time.monotonic() > deadline:
+            return None
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink():
+                    continue
+                st = e.stat(follow_symlinks=False)
+                if e.is_dir(follow_symlinks=False):
+                    if st.st_dev == device and not _is_dataless(st):
+                        stack.append(e.path)
+                    continue
+                # A hard-linked file survives while any other link does, and
+                # that link may live outside `root`: counting it could
+                # over-promise, so it contributes 0 to the lower bound.
+                if not statmod.S_ISREG(st.st_mode) or st.st_nlink > 1:
+                    continue
+            except OSError:
+                continue
+            size = private_size(e.path)
+            if size is None:
+                if not answered:
+                    return None
+                continue
+            answered = True
+            total += max(size, 0)
+    return total
+
+
+def _add_unshared(result):
+    """Annotate one storage-map level in place with lower-bound unshared sizes.
+
+    Each row is measured inside the read-only deadline helper, all rows
+    against one shared deadline. A row that could not be measured has no
+    `unshared_bytes`; the level total is emitted only when every row was and
+    the du measurement itself was complete."""
+    deadline = time.monotonic() + UNSHARED_SCAN_BUDGET_S
+    complete, total = True, 0
+    for child in result.get("children", []):
+        remaining = deadline - time.monotonic()
+        value = None
+        if remaining > 0:
+            value = _read_only_scan(
+                lambda p=child["path"]: _unshared_bytes(p, deadline=deadline),
+                None, "unshared size", remaining)
+        if value is None:
+            complete = False
+            continue
+        child["unshared_bytes"] = value
+        child["unshared_human"] = fmt_size(value)
+        total += value
+    if complete and not result.get("incomplete"):
+        result["unshared_bytes"] = total
+        result["unshared_human"] = fmt_size(total)
+    return result
+
+
 def _du_children(root, stats=None):
     """`du -xkd 1` -- immediate children plus the root's own total, in bytes.
 
@@ -2376,8 +2543,12 @@ def _relative_days(mtime):
     return f"{int(days)} days ago"
 
 
-def show_storage_map(root=None, min_bytes=0, json_mode=False, depth=1):
+def show_storage_map(root=None, min_bytes=0, json_mode=False, depth=1, unshared=False):
     r = scan_storage_map(root, min_bytes=min_bytes, depth=depth)
+    if unshared:
+        # Top level only: nested --depth rows keep du's figure, so the opt-in
+        # cost stays one walk of the requested tree, not depth-many.
+        _add_unshared(r)
     if json_mode:
         print(json.dumps({"version": VERSION, **r}, indent=2))
         return r
@@ -2387,11 +2558,16 @@ def show_storage_map(root=None, min_bytes=0, json_mode=False, depth=1):
     if RICH:
         table = Table(title=f"{r['root']}  —  {r['total_human']}", show_lines=False)
         table.add_column("Size", style="green", justify="right")
+        if unshared:
+            table.add_column("Unshared (at least)", style="green", justify="right")
         table.add_column("Name", style="cyan")
         table.add_column("Kind", style="magenta")
         table.add_column("Category", style="yellow")
         for c in r["children"]:
-            table.add_row(c["size_human"], c["name"], c["kind"], c["category"])
+            cells = [c["size_human"]]
+            if unshared:
+                cells.append(c.get("unshared_human", "unknown"))
+            table.add_row(*cells, c["name"], c["kind"], c["category"])
         console.print(table)
     else:
         print(f"\n{'='*66}")
@@ -2400,8 +2576,16 @@ def show_storage_map(root=None, min_bytes=0, json_mode=False, depth=1):
         for c in r["children"]:
             marker = "/" if c["kind"] == "dir" else ("@" if c["kind"] == "link" else " ")
             name = c["name"] if len(c["name"]) <= 40 else c["name"][:37] + "..."
-            print(f"{c['size_human']:>10}  {name}{marker:<2} [{c['category']}]")
+            extra = ""
+            if unshared:
+                extra = (f"  (>= {c['unshared_human']} unshared)" if "unshared_human" in c
+                         else "  (unshared: unknown)")
+            print(f"{c['size_human']:>10}  {name}{marker:<2} [{c['category']}]{extra}")
         print()
+    if unshared:
+        print("Unshared = bytes no APFS clone elsewhere also references: a lower bound "
+              "on what deleting the row would free. 'unknown' = could not measure.",
+              file=sys.stderr)
     return r
 
 
@@ -5542,6 +5726,8 @@ def build_parser():
                        metavar="MB", help="Hide entries smaller than this")
     p_map.add_argument("--depth", type=int, choices=[1, 2, 3], default=1,
                        help="Levels to include (JSON nests 'children'; bounded on purpose)")
+    p_map.add_argument("--unshared", action="store_true",
+                       help="Also measure clone-private bytes per row (APFS; a lower bound on what deleting frees; slower)")
     p_map.add_argument("--json", action="store_true", help="Machine-readable output")
 
     p_sched = sub.add_parser("schedule",
@@ -5614,7 +5800,7 @@ def main():
     if args.command == "storage-map":
         show_storage_map(args.path,
                          min_bytes=int(args.min_size * 1024 * 1024),
-                         json_mode=args.json, depth=args.depth)
+                         json_mode=args.json, depth=args.depth, unshared=args.unshared)
         return
 
     if args.command == "storage-insights":
