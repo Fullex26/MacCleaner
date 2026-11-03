@@ -4,7 +4,7 @@ This document tracks planned features and long-term direction. Community input w
 
 ---
 
-## Current State — v2.21.0 ✅
+## Current State — v2.21.1 ✅
 
 - Subcommand CLI — `scan`, `clean`, `projects`, `report`, `doctor`, `config`, `categories` — with every v1 spelling (`--preview`, `--clean --yes`, `--report`, `--json`, `--config-*`) still working, so existing cron jobs, aliases, and the old menu bar app don't break
 - Agent-ready interface — `--json` on every data command, stable kebab-case target IDs (`clean --targets npm-cache,pip-cache`), JSON on stdout / messages on stderr, documented exit codes, `AGENTS.md` contract
