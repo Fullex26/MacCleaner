@@ -169,23 +169,67 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            if let n = bridge.soakDivergences {
-                HStack(spacing: 8) {
-                    Image(systemName: n == 0 ? "checkmark.seal" : "exclamationmark.triangle")
-                        .foregroundStyle(n == 0 ? Color.green : .orange)
-                    Text(n == 0 ? "Last comparison: engines agree"
-                                : "Last comparison: \(n) divergence\(n == 1 ? "" : "s")")
-                        .font(.callout)
-                    if n > 0 {
-                        Button("Show Log") {
-                            NSWorkspace.shared.selectFile(CleanerBridge.soakLogPath(),
-                                                          inFileViewerRootedAtPath: "")
-                        }
-                        .buttonStyle(.link)
-                    }
-                }
+            if bridge.v3SoakEnabled {
+                soakStatus
             }
         }
+    }
+
+    /// Every state is spelled out: only a completed comparison may read as
+    /// agreement. A missing helper, missing config or failed run is shown as
+    /// exactly that, never as a stale "engines agree" (R09).
+    @ViewBuilder
+    private var soakStatus: some View {
+        switch bridge.soakState {
+        case .disabled:
+            EmptyView()
+        case .waiting:
+            soakRow("clock", .secondary, "Waiting for the next full scan to compare.")
+        case .unavailable(let reason):
+            soakRow("info.circle", .orange, "Not compared: \(reason)")
+        case .running(let config):
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Comparing engines…").font(.callout)
+            }
+            soakConfig(config)
+        case .failed(let reason, let config):
+            soakRow("xmark.octagon", .red,
+                    "Last comparison failed, so this is not evidence the engines agree. \(reason)")
+            soakConfig(config)
+        case .compared(let n, let config, let at):
+            HStack(spacing: 8) {
+                Image(systemName: n == 0 ? "checkmark.seal" : "exclamationmark.triangle")
+                    .foregroundStyle(n == 0 ? Color.green : .orange)
+                Text(n == 0 ? "Last comparison: engines agree"
+                            : "Last comparison: \(n) divergence\(n == 1 ? "" : "s")")
+                    .font(.callout)
+                Text(at, style: .relative).font(.caption).foregroundStyle(.secondary)
+                if n > 0 {
+                    Button("Show Log") {
+                        NSWorkspace.shared.selectFile(CleanerBridge.soakLogPath(),
+                                                      inFileViewerRootedAtPath: "")
+                    }
+                    .buttonStyle(.link)
+                }
+            }
+            soakConfig(config)
+        }
+    }
+
+    private func soakRow(_ symbol: String, _ tint: Color, _ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: symbol).foregroundStyle(tint)
+            Text(text).font(.callout).lineLimit(3)
+        }
+    }
+
+    private func soakConfig(_ path: String) -> some View {
+        Text("Both engines read \((path as NSString).abbreviatingWithTildeInPath)")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
     }
 
     private var alertsSection: some View {
