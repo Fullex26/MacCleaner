@@ -103,6 +103,9 @@ jobs:
       - name: Scan measurement diagnostics regression
         run: python3 tools/check_scan_measurements.py
 
+      - name: Soak state reporting regression (R09)
+        run: python3 tools/check_soak_states.py
+
       - name: Storage request ordering regression
         run: python3 tools/check_storage_request_order.py
 

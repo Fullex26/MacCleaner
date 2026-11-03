@@ -343,6 +343,21 @@ struct StorageMapReport: Codable {
     }
 }
 
+/// V3 soak status (R09). Only `.compared` is a comparison result.
+enum SoakState: Equatable {
+    case disabled
+    case waiting
+    case unavailable(String)
+    case running(config: String)
+    case failed(String, config: String)
+    case compared(divergences: Int, config: String, at: Date)
+}
+
+enum SoakOutcome: Equatable {
+    case compared(Int)
+    case failed(String)
+}
+
 struct DiskCheckReport: Codable {
     let free_bytes: Int
     let free_human: String
@@ -435,7 +450,19 @@ final class CleanerBridge: ObservableObject {
     /// each full Python scan and log divergence. Python stays the engine of
     /// record; the soak never deletes and never changes behaviour.
     @Published var v3SoakEnabled = true
-    @Published var soakDivergences: Int?
+    /// What the soak last did (R09). Every non-`compared` state is explicitly
+    /// NOT evidence that the engines agree: a missing helper, a missing config
+    /// or a failed run used to leave a stale "engines agree" on screen.
+    @Published var soakState: SoakState = .waiting
+    /// The in-flight comparison, so probes can await it; a newer soak
+    /// supersedes it and the older result is never published.
+    private(set) var soakTask: Task<Void, Never>?
+    private var soakGeneration = UUID()
+    /// Divergences from the last COMPLETED comparison only; nil otherwise.
+    var soakDivergences: Int? {
+        if case let .compared(n, _, _) = soakState { return n }
+        return nil
+    }
     @Published var scheduleStatus: ScheduleStatus?
     @Published var scheduleSupported = true
     /// Set for the whole `setSchedule` round trip (bootout + bootstrap +
@@ -1084,6 +1111,7 @@ final class CleanerBridge: ObservableObject {
             lowDiskThresholdGB = cfg.low_disk_threshold_gb ?? 10
             showInDock = cfg.show_in_dock ?? false
             v3SoakEnabled = cfg.v3_soak ?? true
+            if !v3SoakEnabled { soakState = .disabled }
             applyDockVisibility()
             fullRefreshHours = cfg.full_refresh_hours ?? 6
         } catch {
@@ -1153,6 +1181,7 @@ final class CleanerBridge: ObservableObject {
         do {
             try await runPlain(["config", "set", "v3_soak", on ? "true" : "false"])
             v3SoakEnabled = on
+            soakState = on ? .waiting : .disabled
         } catch {
             statusMessage = "Config change failed: \(error.localizedDescription)"
         }
@@ -1164,35 +1193,72 @@ final class CleanerBridge: ObservableObject {
     /// never delay, fail, or alter the real scan — Python remains the engine
     /// of record throughout the soak period.
     func runSoakIfEnabled(against report: ScanReport?) {
-        guard v3SoakEnabled, let report else { return }
+        let generation = UUID()
+        soakGeneration = generation
+        guard v3SoakEnabled else { soakState = .disabled; return }
+        guard let report else { return }
         let mck = ProcessInfo.processInfo.environment["MACCLEANER_MCK"]
             ?? Bundle.main.path(forResource: "mck", ofType: nil)
-        guard let mck, FileManager.default.isExecutableFile(atPath: mck) else { return }
-        // Only soak against the standard installed config: mck must see the
-        // exact same enabled categories / skip paths or every comparison is
-        // noise. A non-standard layout just skips the soak silently.
-        let configPath = NSHomeDirectory() + "/mac-cleaner/config.json"
-        guard FileManager.default.fileExists(atPath: configPath) else { return }
+        guard let mck, FileManager.default.isExecutableFile(atPath: mck) else {
+            soakState = .unavailable("This build doesn't include the Swift engine (mck).")
+            return
+        }
         let pyTargets = report.targets
-        Task.detached(priority: .utility) { [weak self] in
-            let divergences = Self.soakCompare(mck: mck, configPath: configPath,
-                                               pyTargets: pyTargets)
-            await MainActor.run { [weak self] in
-                self?.soakDivergences = divergences
+        soakTask = Task { [weak self] in
+            guard let self else { return }
+            // mck must read the SAME config the Python engine just used, or
+            // every comparison is noise. Ask the engine of record (same
+            // resolution as the scan) rather than assuming ~/mac-cleaner:
+            // a bundled or overridden engine keeps its config elsewhere.
+            let configPath: String
+            do {
+                let data = try await Task.detached(priority: .utility) {
+                    try Self.runEngine(["config", "path"], timeout: 30)
+                }.value
+                configPath = String(decoding: data, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } catch {
+                self.publishSoak(.unavailable("Couldn't ask the engine which config it used: \(error.localizedDescription)"),
+                                 generation)
+                return
+            }
+            guard !configPath.isEmpty, FileManager.default.fileExists(atPath: configPath) else {
+                self.publishSoak(.unavailable("The engine has no config file yet (\(configPath.isEmpty ? "unknown path" : configPath)), so the Swift engine can't be given the same settings."),
+                                 generation)
+                return
+            }
+            self.publishSoak(.running(config: configPath), generation)
+            let outcome = await Task.detached(priority: .utility) {
+                Self.soakCompare(mck: mck, configPath: configPath, pyTargets: pyTargets)
+            }.value
+            switch outcome {
+            case .compared(let n):
+                self.publishSoak(.compared(divergences: n, config: configPath, at: Date()), generation)
+            case .failed(let reason):
+                self.publishSoak(.failed(reason, config: configPath), generation)
             }
         }
     }
 
+    /// Only the latest soak may publish; an older one finishing late is dropped.
+    private func publishSoak(_ state: SoakState, _ generation: UUID) {
+        guard soakGeneration == generation else { return }
+        soakState = state
+    }
+
     nonisolated static func soakLogPath() -> String {
+        if let override = ProcessInfo.processInfo.environment["MACCLEANER_SOAK_LOG"] {
+            return override
+        }
         let dir = NSHomeDirectory() + "/Library/Application Support/MacCleaner"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         return dir + "/soak.log"
     }
 
-    /// Runs mck, compares, logs, returns the divergence count (nil = soak
-    /// could not run at all, which is not the same as zero divergences).
+    /// Runs mck, compares, logs, returns the divergence count -- or why no
+    /// comparison happened, which is never the same as zero divergences.
     nonisolated static func soakCompare(mck: String, configPath: String,
-                                        pyTargets: [ScanTarget]) -> Int? {
+                                        pyTargets: [ScanTarget]) -> SoakOutcome {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: mck)
         p.arguments = ["scan", "--json", "--all"]
@@ -1202,18 +1268,30 @@ final class CleanerBridge: ObservableObject {
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return nil }
+        do { try p.run() } catch {
+            return .failed("Couldn't start the Swift engine: \(error.localizedDescription)")
+        }
         // mck bounds its own du calls now, but a wedged child must never pin
         // an app thread forever regardless: hard-kill the whole soak run
         // after 10 minutes. The first live soak hung exactly this way.
-        let killer = DispatchWorkItem { if p.isRunning { p.terminate(); kill(p.processIdentifier, SIGKILL) } }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 600, execute: killer)
+        let timedOut = TimedOutFlag()
+        let killer = DispatchWorkItem {
+            if p.isRunning { timedOut.set(); p.terminate(); kill(p.processIdentifier, SIGKILL) }
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + soakTimeout, execute: killer)
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         killer.cancel()
-        guard p.terminationStatus == 0,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let rows = obj["targets"] as? [[String: Any]] else { return nil }
+        if timedOut.value {
+            return .failed("The Swift engine didn't finish within \(Int(soakTimeout)) seconds and was stopped.")
+        }
+        guard p.terminationStatus == 0 else {
+            return .failed("The Swift engine exited with status \(p.terminationStatus).")
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = obj["targets"] as? [[String: Any]] else {
+            return .failed("The Swift engine's output wasn't a scan report.")
+        }
 
         struct SwiftRow { let safe: Bool; let exists: Bool; let size: Int64; let cmd: Bool }
         var swiftById: [String: SwiftRow] = [:]
@@ -1263,7 +1341,12 @@ final class CleanerBridge: ObservableObject {
                 try? blob.write(toFile: soakLogPath(), atomically: true, encoding: .utf8)
             }
         }
-        return lines.count
+        return .compared(lines.count)
+    }
+
+    /// Overridable so a probe can exercise the timeout path quickly.
+    nonisolated static var soakTimeout: TimeInterval {
+        TimeInterval(ProcessInfo.processInfo.environment["MACCLEANER_SOAK_TIMEOUT"] ?? "") ?? 600
     }
 
     func setLowDiskThreshold(_ gb: Double) async {
