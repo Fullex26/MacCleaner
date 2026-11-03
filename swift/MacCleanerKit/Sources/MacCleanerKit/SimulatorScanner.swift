@@ -52,7 +52,8 @@ public enum SimulatorScanner {
             .timeIntervalSince1970
     }
 
-    public static func scan(staleDays: Double, now: TimeInterval = Date().timeIntervalSince1970) -> [Target] {
+    public static func scan(staleDays: Double, autoClean: Bool = false,
+                            now: TimeInterval = Date().timeIntervalSince1970) -> [Target] {
         var targets: [Target] = []
         guard let devData = simctlJSON(["list", "devices"]) as? [String: Any],
               let devMap = devData["devices"] as? [String: [[String: Any]]] else {
@@ -67,7 +68,8 @@ public enum SimulatorScanner {
             for d in devices {
                 guard let udid = d["udid"] as? String, matches(udidShape, udid) else { continue }
                 usedRuntimes.insert(runtimeId)
-                if (d["state"] as? String) == "Booted" { continue }
+                // Python: only a fully shut-down device is a candidate.
+                if (d["state"] as? String) != "Shutdown" { continue }
                 var ts = parseDate(d["lastBootedAt"] as? String ?? d["lastUsedAt"] as? String)
                 if ts == nil, let dp = d["dataPath"] as? String {
                     // Python: the DEVICE DIR, parent of dataPath. A live
@@ -99,7 +101,8 @@ public enum SimulatorScanner {
                 id: "simulator-stale-devices", category: "simulators",
                 label: "Stale simulator devices (\(stale.count))",
                 desc: "Not booted in \(Int(staleDays))d: \(names)\(more) — deleted via simctl",
-                safe: false, emptyOnly: false, paths: [], glob: nil,
+                // Python: review-only unless simulator_auto_clean opts in.
+                safe: autoClean, emptyOnly: false, paths: [], glob: nil,
                 // Mirrors the Python engine exactly: one command per UDID,
                 // ";"-joined so a bad UDID cannot skip the rest. The old
                 // "simctl delete <all udids> 2>/dev/null || true" form threw the

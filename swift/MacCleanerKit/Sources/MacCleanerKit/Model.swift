@@ -35,6 +35,7 @@ public struct Config {
     public var skipPaths: [String]
     public var tmpMinAgeDays: Double = 1
     public var simulatorStaleDays: Double = 7
+    public var simulatorAutoClean: Bool = false
     public var appLeftoverMinAgeDays: Double = 7
 
     /// Mirrors load_config()'s merge-with-defaults posture for the two keys
@@ -52,6 +53,10 @@ public struct Config {
             else if let i = obj["tmp_min_age_days"] as? Int { cfg.tmpMinAgeDays = Double(i) }
             if let d = obj["simulator_stale_days"] as? Double { cfg.simulatorStaleDays = d }
             else if let i = obj["simulator_stale_days"] as? Int { cfg.simulatorStaleDays = Double(i) }
+            // Python tests `is True`: only a real JSON boolean opts in. A bare
+            // `as? Bool` would also accept the number 1 (NSNumber bridges).
+            if let n = obj["simulator_auto_clean"] as? NSNumber,
+               CFGetTypeID(n) == CFBooleanGetTypeID() { cfg.simulatorAutoClean = n.boolValue }
             if let d = obj["app_leftover_min_age_days"] as? Double { cfg.appLeftoverMinAgeDays = d }
             else if let i = obj["app_leftover_min_age_days"] as? Int { cfg.appLeftoverMinAgeDays = Double(i) }
             return cfg
