@@ -213,6 +213,11 @@ class TestRealApfsClones(unittest.TestCase):
         self.td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.td, True)
         if not _clones_supported(self.td):
+            # A silent skip already hid these tests once (#107 review). CI's
+            # macOS runners are APFS, so there a skip can only mean the probe
+            # itself is broken: fail loudly instead.
+            if os.environ.get('CI'):
+                self.fail('cp -c clone probe failed on a macOS CI runner')
             self.skipTest('temporary directory volume does not support clones')
         self.private = cleaner._load_private_size_fn()
         # On APFS the reader must exist and answer; None here means the
