@@ -1,6 +1,6 @@
 cask "maccleaner" do
-  version "2.20.0"
-  sha256 "cbd708a8040594ff74f8b5cc27ef46be70450de4bdcb10e0742ed594db96613b"
+  version "2.21.0"
+  sha256 "0b462f3a420f7bbcf79a29fd1f3d39cd84ca5eaf058ef8a8edee039b4e537993"
 
   url "https://github.com/Fullex26/MacCleaner/releases/download/v#{version}/MacCleaner-v#{version}-macos-universal.zip"
   name "MacCleaner"
