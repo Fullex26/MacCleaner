@@ -9,6 +9,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+---
+
+## [2.21.0] — 2026-11-03
+
 ### Added
 - **An auditable V3 soak record** (R10). Every soak attempt is now recorded in `soak-runs.log` as one JSON line. A record holds the outcome (compared, failed or not run, with the reason), the divergence classes, the number of targets compared, the Python, `mck` and app versions, the config, and an `evidence` flag.
   - Runs made under any developer or test override, or from a non-bundled build, are marked `evidence: false` and excluded, so fixtures can never count as real-machine soak.
