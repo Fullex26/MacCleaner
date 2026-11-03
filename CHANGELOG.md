@@ -9,6 +9,28 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- **The app no longer hides warnings from commands that succeeded (R06).** The
+  engine reports a degraded-but-usable result on stderr while still exiting 0 —
+  "project discovery stopped after 120s; results are partial", a storage walk
+  that hit its time budget, a corrupt `config.json` that fell back to defaults.
+  `CleanerBridge.runEngineOutput` has always captured that text, but the
+  `runEngine` wrapper every caller used returned only stdout, so the warning
+  reached a CLI user's terminal and nothing else. The app showed a confident,
+  quietly incomplete list.
+
+  Warnings now surface as `engineNotices`, keyed by subcommand, and the
+  Dashboard shows the ones from its own `scan` and `clean`. A quiet run clears
+  the notice rather than leaving it stuck; a warning never renders as a
+  failure, and never changes what may be cleaned.
+
+  No engine or JSON-contract change — the text is the engine's existing stderr,
+  carried verbatim. `tools/check_engine_diagnostics.py` drives the real bridge
+  against an engine that warns while exiting 0, and the layout probe gained a
+  Dashboard scenario with two long multi-line notices on top of 40 unavailable
+  rows.
+
 ---
 
 ## [2.21.1] — 2026-11-03

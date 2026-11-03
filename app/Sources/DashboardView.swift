@@ -50,6 +50,7 @@ struct DashboardView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            engineNoticeBanner
             DiskTrendView()
                 .padding(.horizontal)
                 .padding(.bottom, 8)
@@ -60,6 +61,45 @@ struct DashboardView: View {
             content
             Divider()
             footer
+        }
+    }
+
+    /// Warnings the engine wrote to stderr on a call that still exited 0
+    /// (R06) — "project discovery stopped after 120s; results are partial"
+    /// and the like, which until now only a CLI user ever saw.
+    ///
+    /// Scoped to this view's own two calls. A `config` or `schedule` notice
+    /// belongs beside the control that caused it, not on the Dashboard.
+    ///
+    /// Deliberately worded as a report, not a prompt: the text says a result
+    /// was incomplete and never implies more may be cleaned. It also gets no
+    /// action button, because there is nothing here to act on — the remedy
+    /// for a partial scan is to scan again, which the header already offers.
+    ///
+    /// Two lines with the rest on hover, rather than letting stderr size the
+    /// view: a multi-line warning growing this section's *minimum* height is
+    /// exactly what pushes both split-view columns off-screen past the
+    /// window's 480pt floor (see `tools/check_app_layout.sh`).
+    @ViewBuilder
+    private var engineNoticeBanner: some View {
+        let notices = ["scan", "clean"].compactMap { bridge.engineNotices[$0] }
+        if !notices.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(notices) { notice in
+                    Label {
+                        Text("\(notice.command) reported: \(notice.text)")
+                            .lineLimit(2)
+                            .help(notice.text)
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal)
+            .padding(.bottom, 8)
         }
     }
 
