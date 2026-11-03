@@ -108,6 +108,33 @@ struct LayoutProbe {
             failed = true
         }
 
+        // storage-map --unshared (#107): optional lower bounds decode, absent
+        // means unmeasured (never zero), and caption rows keep the height bound.
+        let unsharedJSON = Data(#"{"root":"/fixture","total_bytes":3,"total_human":"3 B","category":"other","unshared_bytes":1,"unshared_human":"1 B","children":[{"path":"/fixture/clones","name":"clones","size_bytes":2147483648,"size_human":"2.0 GB","kind":"dir","category":"developer","unshared_bytes":0,"unshared_human":"0.0 B"},{"path":"/fixture/solo","name":"solo","size_bytes":4096,"size_human":"4.0 KB","kind":"dir","category":"other","unshared_bytes":4096,"unshared_human":"4.0 KB"},{"path":"/fixture/unknown","name":"unknown","size_bytes":4096,"size_human":"4.0 KB","kind":"dir","category":"other"}]}"#.utf8)
+        do {
+            let measured = try JSONDecoder().decode(StorageMapReport.self, from: unsharedJSON)
+            let rows = Dictionary(uniqueKeysWithValues: measured.children.map { ($0.name, $0) })
+            let checks: [(Bool, String)] = [
+                (measured.unshared_human == "1 B", "level unshared total decodes"),
+                (measured.measuredUnshared, "level reports rows were measured"),
+                (rows["clones"]?.unshared_bytes == 0, "zero unshared decodes as a measured 0"),
+                (rows["clones"]?.isMostlyShared == true, "clone-heavy row is flagged as mostly shared"),
+                (rows["solo"]?.isMostlyShared == false, "fully private row is not flagged"),
+                (rows["unknown"]?.unshared_bytes == nil, "absent key stays unmeasured, not 0"),
+                (rows["unknown"]?.isMostlyShared == false, "unmeasured row is never flagged"),
+                (!map.measuredUnshared, "plain map reports nothing measured"),
+            ]
+            for (ok, name) in checks {
+                print("\(ok ? "ok  " : "FAIL") Storage unshared: \(name)")
+                if !ok { failed = true }
+            }
+            bridge.acceptStorageMap(measured)
+            checkStorageHeight("unshared")
+        } catch {
+            print("FAIL Storage unshared fixture: \(error)")
+            failed = true
+        }
+
         bridge.storageMap = nil
         bridge.storageMapError = nil
         for (name, view) in sections {

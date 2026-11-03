@@ -329,6 +329,7 @@ _maccleaner() {
           _arguments -s -S \
             '--min-size[hide entries smaller than this (MB)]:MB:' \
             '--depth[levels to include, 1-3]:depth:(1 2 3)' \
+            '--unshared[also measure clone-private bytes per row (APFS lower bound)]' \
             '--json[machine-readable output]' \
             '(-h --help)'{-h,--help}'[show help]' \
             '1:directory:_files -/' && ret=0

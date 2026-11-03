@@ -305,8 +305,21 @@ struct StorageMapEntry: Codable, Identifiable {
     let size_human: String
     let kind: String      // "dir" | "file" | "link"
     let category: String
+    /// `storage-map --unshared` (#107): a LOWER bound on what deleting this
+    /// row would free — bytes no APFS clone elsewhere also references. Absent
+    /// means not measured (older engine, no flag, unsupported volume, or
+    /// timeout), never zero. `size_bytes` still bills every clone in full.
+    var unshared_bytes: Int? = nil
+    var unshared_human: String? = nil
     var id: String { path }
     var isDirectory: Bool { kind == "dir" }
+
+    /// True when most of this row's billed size is shared with clones that
+    /// deleting it would not free — the case a plain size column misleads on.
+    var isMostlyShared: Bool {
+        guard let unshared = unshared_bytes, size_bytes > 0 else { return false }
+        return unshared * 2 < size_bytes && size_bytes - unshared >= 100 * 1024 * 1024
+    }
 }
 
 struct StorageMapReport: Codable {
@@ -316,6 +329,11 @@ struct StorageMapReport: Codable {
     let category: String
     let children: [StorageMapEntry]
     var incomplete: Bool? = nil
+    /// Level-wide `--unshared` lower bound; only present when every row was measured.
+    var unshared_bytes: Int? = nil
+    var unshared_human: String? = nil
+
+    var measuredUnshared: Bool { children.contains { $0.unshared_bytes != nil } }
 
     var totalLabel: String { incomplete == true ? "Total unavailable" : total_human }
     var measurementWarning: String? {
@@ -932,7 +950,9 @@ final class CleanerBridge: ObservableObject {
     /// Loads one level of the storage browser. `path` nil means the home folder.
     /// Never touches `statusMessage`: this runs concurrently with the Dashboard's
     /// own scan, and a shared banner can't represent two failures at once.
-    func scanStorageMap(_ path: String? = nil) async {
+    /// `unshared` adds the engine's clone-aware lower bound per row (#107):
+    /// on-demand only, since it walks every file and costs ~2.2x `du`.
+    func scanStorageMap(_ path: String? = nil, unshared: Bool = false) async {
         let requestID = UUID()
         storageMapRequestID = requestID
         isScanningStorageMap = true
@@ -941,16 +961,23 @@ final class CleanerBridge: ObservableObject {
         }
         var args = ["storage-map"]
         if let path { args.append(path) }
+        if unshared { args.append("--unshared") }
         args.append("--json")
         do {
-            let report = try await run(StorageMapReport.self, args)
+            // The unshared walk has its own 600 s deadline on top of du's, so
+            // the default backstop would kill a legitimately slow check.
+            let report = try await run(StorageMapReport.self, args,
+                                       timeout: unshared ? 1300 : Self.defaultEngineTimeout)
             guard storageMapRequestID == requestID else { return }
             acceptStorageMap(report)
         } catch {
             guard storageMapRequestID == requestID else { return }
             // Leave any previously loaded level on screen rather than blanking
             // the browser out from under the user.
-            storageMapError = error.localizedDescription
+            let message = error.localizedDescription
+            storageMapError = unshared && message.contains("--unshared")
+                ? "The installed engine can't check shared blocks yet. Update it (re-run install.sh) and try again."
+                : message
         }
     }
 

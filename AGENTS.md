@@ -60,7 +60,7 @@ maccleaner config    show | path | enable CAT | disable CAT | set KEY VALUE
 maccleaner categories [--json]
 maccleaner disk-check [--json]    # cheap; for launchd's hourly diskwatch agent
 maccleaner storage-insights [--json]   # read-only: largest items in Documents, Downloads, Desktop, ~/Library and Applications (never deletes)
-maccleaner storage-map [PATH] [--min-size MB] [--depth 1-3] [--json]   # read-only: browse where disk space goes, anywhere on the disk
+maccleaner storage-map [PATH] [--min-size MB] [--depth 1-3] [--unshared] [--json]   # read-only: browse where disk space goes, anywhere on the disk
 maccleaner schedule  status | weekly | monthly | off | run [--json]   # manage the launchd schedule
 maccleaner install-deps          # pip-installs 'rich' (optional, cosmetic only)
 maccleaner --version
@@ -366,6 +366,11 @@ Differences from every other command here, all deliberate:
 - **Measurement never crosses mount points** (`du -xkd 1`). This matters more than it sounds: without `-x`, `du` descends into any mounted disk image beneath the path and counts that image's contents on top of the image file itself. Measured that way, `/Library/Developer/CoreSimulator` on a real machine reported **106 GB** when it actually held **11 GB**. Any agent reimplementing this measurement must pass `-x`.
 - **`incomplete`** is an optional boolean, emitted only as `true` when disk measurement failed or was partial (including a nested level). Sizes and rows may be partial; a zero total then means unavailable, not an empty folder. Complete measurements omit the key. The app displays unavailable totals explicitly.
 - `--min-size MB` hides entries below the threshold. Exit code is 0 whether or not anything was found.
+- **`--unshared`** (issue #107, opt-in, about 2.2× slower than the default): each top-level row may gain `unshared_bytes`/`unshared_human`, the bytes no APFS clone elsewhere also references. That figure is a **lower bound on what deleting the row would free, never an exact or reclaimable figure**. Blocks shared only among files inside the row read 0 here, and hard-linked files count 0, because another link may survive. `size_bytes` (from `du`) is unchanged and still bills every clone in full. On a clone-heavy tree the two can differ by hundreds of GB.
+  - The key is **omitted** when the row could not be measured: a non-macOS host, a volume without clone accounting, the 600-second deadline, or an unanswerable first file. Absent means unknown, never 0.
+  - The level gains `unshared_bytes`/`unshared_human` only when every row was measured and `incomplete` is not set.
+  - Nested `--depth` rows are never measured.
+  - Without the flag the output is byte-identical to before.
 
 ### `storage-insights --json`
 
