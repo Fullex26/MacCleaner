@@ -149,6 +149,23 @@ maccleaner_cask_app() {
     return 0
 }
 
+# Print "weekly" or "monthly" when a MacCleaner schedule is already installed,
+# nothing otherwise. Asks the engine itself (`schedule status --json`), the same
+# source of truth `doctor` uses, so a re-install never has to guess from files.
+# Any failure (no python3, an engine too old to know `schedule`) prints nothing,
+# which falls back to asking -- never to silently changing a schedule.
+maccleaner_existing_schedule() {
+    local engine="$1"
+    [ -f "$engine" ] || return 0
+    python3 "$engine" schedule status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    s = json.load(sys.stdin).get("schedule")
+except Exception:
+    s = None
+print(s if s in ("weekly", "monthly") else "")' 2>/dev/null || true
+}
+
 SHELL_RC="$HOME/.zshrc"
 migrate_maccleaner_aliases "$SHELL_RC"
 dedupe_maccleaner_shortcuts "$SHELL_RC"
@@ -204,8 +221,18 @@ if [ -d "$COMPLETIONS_DIR" ]; then
     done
 fi
 
-# 6. Schedule (skipped when not running interactively)
-if [ -t 0 ]; then
+# 6. Schedule. A re-install keeps whatever schedule is already set up instead of
+# asking again -- re-running install.sh to update is routine, and asking every
+# time meant knowing to answer "3" to avoid changing it. The existing cadence is
+# re-applied so its launchd agents are rewritten by this version of the engine.
+EXISTING_SCHEDULE="$(maccleaner_existing_schedule "$INSTALL_DIR/cleaner.py")"
+if [ -n "$EXISTING_SCHEDULE" ]; then
+    echo ""
+    echo "📅 Schedule: $EXISTING_SCHEDULE cleanup is already set up — keeping it"
+    bash "$INSTALL_DIR/scheduler.sh" "$EXISTING_SCHEDULE" \
+        || echo "  ⚠️  Could not refresh it — run '$INSTALL_DIR/scheduler.sh $EXISTING_SCHEDULE'"
+    echo "  Change it anytime: $INSTALL_DIR/scheduler.sh weekly|monthly|remove"
+elif [ -t 0 ]; then
     echo ""
     echo "📅 Schedule cleanup?"
     echo "  1) Weekly (every Monday 9am) — recommended"
