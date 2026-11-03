@@ -59,10 +59,11 @@ case "scan":
     // Simulators: cmd targets assembled from simctl's own identifiers,
     // emitted with precomputed sizes; nothing here executes their commands.
     if config.enabledCategories.contains("simulators") {
-        for t in SimulatorScanner.scan(staleDays: config.simulatorStaleDays) {
+        for t in SimulatorScanner.scan(staleDays: config.simulatorStaleDays,
+                                       autoClean: config.simulatorAutoClean) {
             var row: [String: Any] = [
                 "id": t.id, "category": t.category, "label": t.label,
-                "description": t.desc, "safe": false,
+                "description": t.desc, "safe": t.safe,
                 "exists": true, "size_bytes": t.precomputedBytes ?? 0,
                 "cmd": t.cmd != nil,
             ]

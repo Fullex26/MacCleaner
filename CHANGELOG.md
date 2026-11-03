@@ -9,8 +9,14 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- **`simulator_auto_clean`** (off by default): turn it on with `config set simulator_auto_clean true` and the weekly scheduled clean deletes simulator devices that are shut down and unused for `simulator_stale_days` (7 by default), instead of only offering them for review. Simulators pile up fast — a coding agent can leave a fresh 5–9 GB device behind per project — and nothing else ever removes them. Downloaded simulator runtimes are never included: deregistering one can leave its files on disk with no way to remove them.
+
 ### Fixed
 
+- Deleting simulator devices now actually gives the space back. `simctl delete` only moves each device into a `Deleting-…` folder in the temp area and leaves macOS to empty it later, which sometimes never happens: on one machine a delete freed 2 GB of an expected 22 GB until those folders were removed by hand. After its own delete, MacCleaner gives macOS up to a minute to finish, then removes only the staging folders that delete created.
+- A simulator that is starting up or shutting down is no longer offered for deletion. Only fully shut-down devices are.
 - **The app no longer hides warnings from commands that succeeded (R06).** The
   engine reports a degraded-but-usable result on stderr while still exiting 0 —
   "project discovery stopped after 120s; results are partial", a storage walk

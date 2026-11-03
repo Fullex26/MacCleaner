@@ -205,6 +205,7 @@ DEFAULT_CONFIG = {
     "project_git_check": True,
     "tmp_min_age_days": 1,           # /tmp dirs younger than this are never offered
     "simulator_stale_days": 7,       # simulators not booted for this long count as stale
+    "simulator_auto_clean": False,   # let unattended `clean --yes` delete stale, shut-down simulator devices
     "app_leftover_min_age_days": 7,  # orphaned app data younger than this is never offered
     "notifications": True,           # notify when a scheduled clean finishes
     "low_disk_alerts": True,         # warn when free space drops below the threshold
@@ -3301,9 +3302,97 @@ def _simctl_runtime_delete(ids):
 
 
 def _simctl_device_delete(udids):
-    return _simctl_delete_verified(
+    before = _sim_staging_dirs()
+    err = _simctl_delete_verified(
         udids, lambda u: ["xcrun", "simctl", "delete", u],
         _simctl_registered_device_udids, _SIMCTL_UDID_RE, "devices")
+    if before is not None:
+        _reap_sim_staging(before)
+    return err
+
+
+# `simctl delete` does not unlink a device. It renames the device bundle to
+# <per-user temp dir>/Deleting-<UUID> and leaves CoreSimulatorService to reap
+# it later. Measured on one Mac: sometimes within two minutes, once never
+# (56 dirs / 225 GB sat there indefinitely). The staged name is a fresh UUID,
+# not the device's UDID, so the only safe way to know which staged dirs are
+# ours is to diff the directory before and after our own delete.
+_SIM_STAGING_RE = re.compile(
+    r"Deleting-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+    r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\Z")
+SIM_STAGING_GRACE_S = 60   # how long CoreSimulatorService gets to reap first
+SIM_STAGING_POLL_S = 2
+
+
+def _sim_staging_root():
+    """The per-user Darwin temp dir CoreSimulatorService stages into, or None.
+
+    Asked of the OS with getconf rather than read from $TMPDIR: launchd does
+    not set TMPDIR for an agent, and Python's tempfile then falls back to
+    /tmp, which is not where the staged devices are."""
+    override = os.environ.get("MACCLEANER_SIM_STAGING_ROOT")
+    if override:
+        return Path(override)
+    try:
+        r = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True,
+                           text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = r.stdout.strip()
+    return Path(out) if r.returncode == 0 and out.startswith("/") else None
+
+
+def _sim_staging_dirs():
+    """Names of Deleting-<UUID> dirs in the staging root right now, or None
+    when that cannot be determined (unknown root, timed-out listing)."""
+    root = _sim_staging_root()
+    if root is None:
+        return None
+
+    def read():
+        with os.scandir(root) as it:
+            return {e.name for e in it if _SIM_STAGING_RE.fullmatch(e.name)}
+    try:
+        return _read_only_scan(read, None, "simulator staging listing")
+    except OSError:
+        return None
+
+
+def _reap_sim_staging(before):
+    """Finish the reaper's job for staged dirs that appeared during our own
+    delete. Waits SIM_STAGING_GRACE_S for CoreSimulatorService to do it, then
+    removes whatever is left. Never fails the clean: the devices are already
+    verifiably deregistered, so a problem here is a stderr warning only.
+
+    Each path is validated on its own: an exact Deleting-<UUID> name that was
+    absent before the delete, a direct child of the staging root, a real
+    directory (lstat, so never a symlink) owned by this user."""
+    root = _sim_staging_root()
+    if root is None:
+        return
+    deadline = time.monotonic() + SIM_STAGING_GRACE_S
+    while True:
+        now = _sim_staging_dirs()
+        if now is None:
+            return
+        ours = sorted(now - before)
+        if not ours or time.monotonic() >= deadline:
+            break
+        time.sleep(SIM_STAGING_POLL_S)
+    for name in ours:
+        path = root / name
+        try:
+            st = os.lstat(path)
+            if (not statmod.S_ISDIR(st.st_mode) or st.st_uid != os.getuid()
+                    or path.parent.resolve() != root.resolve()):
+                print(f"Warning: left simulator staging dir alone: {path}", file=sys.stderr)
+                continue
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            continue   # the reaper got there first
+        except OSError as exc:
+            print(f"Warning: could not remove simulator staging dir {path}: {exc}",
+                  file=sys.stderr)
 
 
 def _parse_simctl_date(s):
@@ -3345,7 +3434,13 @@ def scan_simulator_targets(config):
             if not udid or not _SIMCTL_UDID_RE.fullmatch(udid):
                 continue
             used_runtimes.add(runtime_id)
-            if d.get("state") == "Booted":
+            # Only a fully shut-down device is a candidate. "Booted" was the
+            # only state excluded before, which left "Booting" and "Shutting
+            # Down" offerable; that mattered little while every simulator
+            # target was review-only, but `simulator_auto_clean` lets an
+            # unattended weekly run take this target, and a device mid-boot
+            # is a device someone is about to use.
+            if d.get("state") != "Shutdown":
                 continue
             ts = _parse_simctl_date(d.get("lastBootedAt") or d.get("lastUsedAt"))
             if ts is None:
@@ -3382,7 +3477,14 @@ def scan_simulator_targets(config):
             "label": "Stale simulator devices (%d)" % len(stale),
             "description": "Not booted in %dd: %s%s — deleted via simctl"
                            % (stale_days, names, more),
-            "path": None, "glob": None, "skip": [], "safe": False,
+            # Review-only unless the user opts in. Device data really is
+            # freed (unlike the runtimes target below), the age gate shields
+            # anything used this week, and booted/booting devices never get
+            # here, so an opt-in is enough to let `clean --yes` take it.
+            # `is True`, not truthiness: a hand-edited "false" string must
+            # never turn on unattended deletion.
+            "path": None, "glob": None, "skip": [],
+            "safe": config.get("simulator_auto_clean") is True,
             # `cmd` describes what runs (and is what --dry-run shows); the
             # work itself is done by cmd_runner, one process per UDID, and
             # verified against simctl's registry afterwards. See

@@ -163,6 +163,7 @@ python3 ~/mac-cleaner/cleaner.py clean --targets npm-cache,pip-cache,xcode-deriv
   "project_min_age_days": 30,
   "tmp_min_age_days": 1,
   "simulator_stale_days": 7,
+  "simulator_auto_clean": false,
   "notifications": true,
   "low_disk_alerts": true,
   "low_disk_threshold_gb": 10

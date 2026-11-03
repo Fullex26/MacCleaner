@@ -4537,6 +4537,154 @@ class TestSimulatorTargets(unittest.TestCase):
         self.assertFalse(any(t.get("id") == "simulator-stale-devices" for t in targets))
 
 
+class TestSimulatorAutoClean(unittest.TestCase):
+    """`simulator_auto_clean` lets the unattended weekly `clean --yes` take
+    stale simulator devices. It only ever flips the devices target's `safe`
+    flag, never the runtimes target's (deregistering a runtime can strand its
+    asset permanently), and only for a real JSON boolean."""
+
+    DEVICES = {"devices": {"com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+        {"udid": "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD", "name": "idle",
+         "state": "Shutdown", "lastBootedAt": "2026-01-01T00:00:00Z",
+         "dataPath": "/dev/null"},
+        {"udid": "EEEEEEEE-EEEE-EEEE-EEEE-EEEEEEEEEEEE", "name": "booting",
+         "state": "Booting", "lastBootedAt": "2026-01-01T00:00:00Z",
+         "dataPath": "/dev/null"},
+        {"udid": "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF", "name": "stopping",
+         "state": "Shutting Down", "lastBootedAt": "2026-01-01T00:00:00Z",
+         "dataPath": "/dev/null"},
+    ]}}
+
+    def _scan(self, config):
+        def fake(args):
+            return self.DEVICES if args[:2] == ["list", "devices"] else SIMCTL_RUNTIMES
+        with mock.patch.object(cleaner, "_simctl_json", side_effect=fake), \
+                mock.patch.object(cleaner, "get_size", return_value=0):
+            return {t["id"]: t for t in cleaner.scan_simulator_targets(
+                dict({"simulator_stale_days": 7}, **config))}
+
+    def test_off_by_default(self):
+        self.assertIs(cleaner.DEFAULT_CONFIG["simulator_auto_clean"], False)
+        self.assertFalse(self._scan({})["simulator-stale-devices"]["safe"])
+
+    def test_opt_in_makes_only_the_devices_target_safe(self):
+        targets = self._scan({"simulator_auto_clean": True})
+        self.assertIs(targets["simulator-stale-devices"]["safe"], True)
+        self.assertIs(targets["simulator-unused-runtimes"]["safe"], False)
+
+    def test_only_a_real_boolean_opts_in(self):
+        for value in ("true", 1, "yes", None):
+            with self.subTest(value=value):
+                self.assertIs(
+                    self._scan({"simulator_auto_clean": value})
+                    ["simulator-stale-devices"]["safe"], False)
+
+    def test_devices_mid_boot_or_mid_shutdown_are_never_offered(self):
+        cmd = self._scan({"simulator_auto_clean": True})["simulator-stale-devices"]["cmd"]
+        self.assertIn("DDDDDDDD", cmd)
+        self.assertNotIn("EEEEEEEE", cmd)
+        self.assertNotIn("FFFFFFFF", cmd)
+
+
+class TestSimulatorStagingReaper(unittest.TestCase):
+    """`simctl delete` renames each device to <temp>/Deleting-<UUID> and
+    leaves the reaping to CoreSimulatorService, which sometimes never does it.
+    After our own delete, the engine removes the staged dirs that appeared
+    during it, and nothing else."""
+
+    UUIDS = ["11111111-2222-3333-4444-555555555555",
+             "66666666-7777-8888-9999-AAAAAAAAAAAA"]
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.root = Path(self.td.name)
+        env = mock.patch.dict(os.environ, {"MACCLEANER_SIM_STAGING_ROOT": self.td.name})
+        env.start()
+        self.addCleanup(env.stop)
+        for name, value in (("SIM_STAGING_GRACE_S", 0), ("SIM_STAGING_POLL_S", 0)):
+            p = mock.patch.object(cleaner, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _staged(self, name):
+        d = self.root / name
+        (d / "data").mkdir(parents=True)
+        (d / "data" / "f").write_bytes(b"x" * 4096)
+        return d
+
+    def _delete(self, during=lambda: None, result=None):
+        def fake_verified(*_args, **_kwargs):
+            during()
+            return result
+        with mock.patch.object(cleaner, "_simctl_delete_verified", side_effect=fake_verified), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            out = cleaner._simctl_device_delete(["DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD"])
+        return out, err.getvalue()
+
+    def test_removes_only_dirs_staged_during_our_delete(self):
+        older = self._staged("Deleting-" + self.UUIDS[0])
+        other = self.root / "unrelated-dir"
+        other.mkdir()
+        out, _ = self._delete(during=lambda: self._staged("Deleting-" + self.UUIDS[1]))
+        self.assertIsNone(out)
+        self.assertFalse((self.root / ("Deleting-" + self.UUIDS[1])).exists())
+        self.assertTrue(older.exists(), "staged before our delete: not ours")
+        self.assertTrue(other.exists())
+
+    def test_a_symlink_with_a_staging_name_is_left_alone(self):
+        victim = Path(self.td.name).parent / ("victim-" + self.UUIDS[0][:8])
+        victim.mkdir()
+        self.addCleanup(shutil.rmtree, victim, True)
+        (victim / "keep").write_bytes(b"k")
+        link = self.root / ("Deleting-" + self.UUIDS[1])
+        _, err = self._delete(during=lambda: link.symlink_to(victim))
+        self.assertTrue((victim / "keep").exists())
+        self.assertTrue(link.is_symlink())
+        self.assertIn("left simulator staging dir alone", err)
+
+    def test_near_miss_names_are_left_alone(self):
+        names = ["Deleting-" + self.UUIDS[1][:-1], "Deleting-" + self.UUIDS[1] + "x",
+                 "deleting-" + self.UUIDS[1]]
+        self._delete(during=lambda: [self._staged(n) for n in names])
+        for n in names:
+            self.assertTrue((self.root / n).exists(), n)
+
+    def test_delete_result_passes_through_untouched(self):
+        out, _ = self._delete(during=lambda: self._staged("Deleting-" + self.UUIDS[1]),
+                              result="1 of 1 devices deleted; still registered: x")
+        self.assertEqual(out, "1 of 1 devices deleted; still registered: x")
+
+    def test_waits_for_the_system_reaper_before_acting(self):
+        staged = []
+
+        def during():
+            staged.append(self._staged("Deleting-" + self.UUIDS[1]))
+        calls = []
+        real = cleaner._sim_staging_dirs
+
+        def listing():
+            calls.append(1)
+            if len(calls) == 3 and staged:
+                shutil.rmtree(staged[0])   # the system reaper gets there first
+            return real()
+        with mock.patch.object(cleaner, "SIM_STAGING_GRACE_S", 30), \
+                mock.patch.object(cleaner, "_sim_staging_dirs", side_effect=listing), \
+                mock.patch.object(cleaner.shutil, "rmtree", wraps=shutil.rmtree) as rm:
+            out, err = self._delete(during=during)
+        self.assertIsNone(out)
+        self.assertEqual(err, "")
+        self.assertEqual(rm.call_count, 1, "only the simulated reaper removed it")
+
+    def test_unknown_staging_root_does_nothing(self):
+        with mock.patch.object(cleaner, "_sim_staging_root", return_value=None):
+            out, _ = self._delete(during=lambda: self._staged("Deleting-" + self.UUIDS[1]))
+        self.assertIsNone(out)
+        self.assertTrue((self.root / ("Deleting-" + self.UUIDS[1])).exists())
+
+
 class TestSimctlDeleteIsVerified(unittest.TestCase):
     """Issue #106: `simulator-unused-runtimes` could not report failure.
 
