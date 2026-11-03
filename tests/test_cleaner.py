@@ -8227,6 +8227,39 @@ class TestInstallScriptHelpers(unittest.TestCase):
                               capture_output=True, text=True,
                               env={**os.environ, **(env or {})}, timeout=30)
 
+    def _existing_schedule(self, calendar=None):
+        agents = self.tmp / "LaunchAgents"
+        agents.mkdir()
+        if calendar is not None:
+            with open(agents / "com.fullex.maccleaner.clean.plist", "wb") as f:
+                plistlib.dump({"Label": "com.fullex.maccleaner.clean",
+                               "StartCalendarInterval": calendar}, f)
+        return self._run_fn("maccleaner_existing_schedule",
+                            [str(REPO / "cleaner.py")],
+                            env={"MACCLEANER_LAUNCH_AGENTS_DIR": str(agents)})
+
+    def test_existing_weekly_schedule_is_detected(self):
+        r = self._existing_schedule({"Weekday": 1, "Hour": 9, "Minute": 0})
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "weekly"), r.stderr)
+
+    def test_existing_monthly_schedule_is_detected(self):
+        r = self._existing_schedule({"Day": 1, "Hour": 9, "Minute": 0})
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "monthly"), r.stderr)
+
+    def test_no_schedule_prints_nothing_so_the_installer_asks(self):
+        r = self._existing_schedule()
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
+
+    def test_unusable_engine_prints_nothing_rather_than_failing(self):
+        r = self._run_fn("maccleaner_existing_schedule", [str(self.tmp / "missing.py")])
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
+
+    def test_install_keeps_an_existing_schedule_before_asking(self):
+        text = (REPO / "install.sh").read_text()
+        keep = text.index('if [ -n "$EXISTING_SCHEDULE" ]; then')
+        ask = text.index('read -p "Choice [1/2/3]: "')
+        self.assertLess(keep, ask, "an existing schedule must be checked before the prompt")
+
     def test_dedupe_removes_repeated_shortcut_lines_keeping_the_first(self):
         rc = self.tmp / ".zshrc"
         rc.write_text(
