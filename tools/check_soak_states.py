@@ -20,7 +20,7 @@ if sys.argv[1:] == ["config", "path"]:
     print((root / "configpath").read_text())
     raise SystemExit(0)
 assert sys.argv[1:] == ["scan", "--json"], sys.argv
-print(json.dumps({"timestamp": "t", "disk": "fixture", "total_reclaimable_bytes": 4096,
+print(json.dumps({"version": "9.9.9", "timestamp": "t", "disk": "fixture", "total_reclaimable_bytes": 4096,
                   "total_reclaimable_human": "4 KB", "targets": [
     {"id": "fixture-cache", "category": "caches", "label": "Fixture", "description": "",
      "size_bytes": 4096, "size_human": "4 KB", "safe": True, "exists": True}]}))
@@ -39,7 +39,7 @@ if mode == "garbage":
 if mode == "hang":
     time.sleep(30)
 safe = mode != "diverge"
-print(json.dumps({"targets": [{"id": "fixture-cache", "safe": safe, "exists": True,
+print(json.dumps({"version": "8.8.8", "targets": [{"id": "fixture-cache", "safe": safe, "exists": True,
                                "size_bytes": 4096, "cmd": False}]}))
 '''
 PROBE = r'''
@@ -114,6 +114,48 @@ struct SoakProbe {
         state = try await soak(bridge, mode: "agree")
         check(state == .disabled, "disabled soak reports disabled and runs nothing")
 
+        // R10: every attempt above is recorded, and none of it counts as
+        // evidence because this probe runs under developer overrides.
+        let runs = env["MACCLEANER_SOAK_RUNS"]!
+        let lines = try String(contentsOfFile: runs, encoding: .utf8)
+            .split(separator: "\n").map { try JSONDecoder().decode(SoakRunRecord.self, from: Data($0.utf8)) }
+        let outcomes = lines.map(\.outcome)
+        check(outcomes.count == 8, "every attempt is recorded, disabled ones are not (\(outcomes.count))")
+        check(outcomes.filter { $0 == "compared" }.count == 3
+              && outcomes.filter { $0 == "failed" }.count == 3
+              && outcomes.filter { $0 == "unavailable" }.count == 2, "outcomes are recorded by kind: \(outcomes)")
+        check(lines.allSatisfy { !$0.evidence }, "probe runs are never marked as evidence")
+        check(lines.first?.python_version == "9.9.9" && lines.first?.mck_version == "8.8.8",
+              "engine versions are recorded")
+        check(lines.contains { $0.classes?["safe_mismatch"] == 1 }, "divergence classes are recorded")
+        let probeSummary = CleanerBridge.summarizeSoakRuns(at: runs)
+        check(probeSummary.excludedNonEvidence == 8 && probeSummary.compared == 0
+              && probeSummary.readinessBlockers.first?.contains("No real-machine") == true,
+              "fixtures are excluded and zero comparisons cannot pass readiness")
+
+        func summary(_ text: String) throws -> SoakSummary {
+            let path = root.appendingPathComponent("summary-\(UUID().uuidString).log").path
+            try text.write(toFile: path, atomically: true, encoding: .utf8)
+            return CleanerBridge.summarizeSoakRuns(at: path)
+        }
+        func rec(_ outcome: String, app: String = "2.20.0", div: Int = 0, evidence: Bool = true) -> String {
+            #"{"schema":1,"ts":"2026-11-0\#(app.last!)T00:00:00Z","outcome":"\#(outcome)","divergences":\#(div),"classes":{"size_divergence":\#(div)},"app_version":"\#(app)","evidence":\#(evidence)}"#
+        }
+        let none = CleanerBridge.summarizeSoakRuns(at: root.appendingPathComponent("absent.log").path)
+        check(none.compared == 0 && !none.readinessBlockers.isEmpty, "no records cannot pass readiness")
+        let clean = try summary([rec("compared", app: "2.20.0"), rec("compared", app: "2.21.0"),
+                                 rec("failed"), rec("compared", evidence: false)].joined(separator: "\n"))
+        check(clean.readinessBlockers.isEmpty && clean.compared == 2 && clean.failed == 1
+              && clean.excludedNonEvidence == 1 && clean.appVersions == ["2.20.0", "2.21.0"],
+              "two clean versions pass the mechanical checks; fixture line excluded")
+        let damaged = try summary([rec("compared", app: "2.20.0"), "{not json", rec("compared", app: "2.21.0")].joined(separator: "\n"))
+        check(damaged.malformedLines == 1 && damaged.readinessBlockers.count == 1, "an unreadable line is reported and blocks")
+        let diverged = try summary([rec("compared", app: "2.20.0", div: 2), rec("compared", app: "2.21.0")].joined(separator: "\n"))
+        check(diverged.divergences == 2 && diverged.classes["size_divergence"] == 2
+              && diverged.readinessBlockers.contains { $0.contains("divergence") }, "divergences block and are classed")
+        let single = try summary(rec("compared"))
+        check(single.readinessBlockers.contains { $0.contains("one app version") }, "one version is not a release cycle")
+
         exit(failed ? 1 : 0)
     }
 }
@@ -138,7 +180,8 @@ def main():
             start_new_session=True,
             env={**os.environ, "MACCLEANER_ENGINE": str(engine), "MACCLEANER_MCK": str(mck),
                  "MC_SOAK_FIXTURES": str(root), "MACCLEANER_SOAK_TIMEOUT": "2",
-                 "MACCLEANER_SOAK_LOG": str(root / "soak.log")})
+                 "MACCLEANER_SOAK_LOG": str(root / "soak.log"),
+                 "MACCLEANER_SOAK_RUNS": str(root / "soak-runs.log")})
         try:
             out, err = process.communicate(timeout=120)
             print(out, end="")

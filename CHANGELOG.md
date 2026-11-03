@@ -10,6 +10,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ## [Unreleased]
 
 ### Added
+- **An auditable V3 soak record** (R10). Every soak attempt is now recorded in `soak-runs.log` as one JSON line. A record holds the outcome (compared, failed or not run, with the reason), the divergence classes, the number of targets compared, the Python, `mck` and app versions, the config, and an `evidence` flag.
+  - Runs made under any developer or test override, or from a non-bundled build, are marked `evidence: false` and excluded, so fixtures can never count as real-machine soak.
+  - Settings summarizes the record for V3 gate A and lists what still blocks it: zero real comparisons, unreadable record lines, divergences to investigate, or a single app version (less than a release cycle). It offers **Export Summary…** and **Show Records**.
+  - Passing these checks is stated as necessary, not sufficient: the gate still needs an owner's review.
 - **The V3 soak now says what it actually did** (R09). Settings shows an explicit state: waiting, comparing, compared (with the time and the config both engines read), not compared (with the reason) or failed (with the reason).
   - Previously a missing `mck`, a missing config or a failed run left the last result on screen, so a stale "engines agree" could survive runs that never happened. A failed run was indistinguishable from one that never ran.
   - `mck` is now given the config the Python engine **actually used**, asked of the engine of record with `config path`, rather than a hardcoded `~/mac-cleaner/config.json`. A bundled or overridden engine keeps its config elsewhere, which made those comparisons compare different settings.

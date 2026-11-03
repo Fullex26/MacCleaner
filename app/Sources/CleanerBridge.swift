@@ -32,6 +32,8 @@ struct DiskStats: Codable {
 }
 
 struct ScanReport: Codable {
+    /// Engine version that produced this report (recorded by the soak, R10).
+    var version: String? = nil
     let timestamp: String
     let disk: String
     let disk_stats: DiskStats?
@@ -354,8 +356,53 @@ enum SoakState: Equatable {
 }
 
 enum SoakOutcome: Equatable {
-    case compared(Int)
+    case compared(SoakComparison)
     case failed(String)
+}
+
+struct SoakComparison: Equatable {
+    let divergences: Int
+    let classes: [String: Int]
+    let targetsCompared: Int
+    let mckVersion: String?
+}
+
+/// One line of soak-runs.log (R10): every ATTEMPT, not just divergences, so
+/// the record shows how often the soak actually ran and why it didn't.
+struct SoakRunRecord: Codable, Equatable {
+    var schema = 1
+    let ts: String
+    let outcome: String          // "compared" | "failed" | "unavailable"
+    var reason: String? = nil
+    var divergences: Int? = nil
+    var classes: [String: Int]? = nil
+    var targets: Int? = nil
+    var python_version: String? = nil
+    var mck_version: String? = nil
+    var app_version: String? = nil
+    var config: String? = nil
+    /// False for anything a developer override or a probe produced: synthetic
+    /// fixtures must never be counted as real-machine soak evidence.
+    let evidence: Bool
+}
+
+/// Gate-A bookkeeping over soak-runs.log. `readinessBlockers` empty means
+/// only that the mechanical checks pass; the gate still needs owner review.
+struct SoakSummary: Codable, Equatable {
+    var attempted = 0
+    var compared = 0
+    var failed = 0
+    var unavailable = 0
+    var excludedNonEvidence = 0
+    var malformedLines = 0
+    var divergences = 0
+    var classes: [String: Int] = [:]
+    var firstCompared: String? = nil
+    var lastCompared: String? = nil
+    var appVersions: [String] = []
+    var pythonVersions: [String] = []
+    var mckVersions: [String] = []
+    var readinessBlockers: [String] = []
 }
 
 struct DiskCheckReport: Codable {
@@ -1199,8 +1246,11 @@ final class CleanerBridge: ObservableObject {
         guard let report else { return }
         let mck = ProcessInfo.processInfo.environment["MACCLEANER_MCK"]
             ?? Bundle.main.path(forResource: "mck", ofType: nil)
+        let pythonVersion = report.version
         guard let mck, FileManager.default.isExecutableFile(atPath: mck) else {
-            soakState = .unavailable("This build doesn't include the Swift engine (mck).")
+            let reason = "This build doesn't include the Swift engine (mck)."
+            Self.recordSoakRun(outcome: "unavailable", reason: reason, pythonVersion: pythonVersion)
+            soakState = .unavailable(reason)
             return
         }
         let pyTargets = report.targets
@@ -1218,13 +1268,15 @@ final class CleanerBridge: ObservableObject {
                 configPath = String(decoding: data, as: UTF8.self)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
             } catch {
-                self.publishSoak(.unavailable("Couldn't ask the engine which config it used: \(error.localizedDescription)"),
-                                 generation)
+                let reason = "Couldn't ask the engine which config it used: \(error.localizedDescription)"
+                Self.recordSoakRun(outcome: "unavailable", reason: reason, pythonVersion: pythonVersion)
+                self.publishSoak(.unavailable(reason), generation)
                 return
             }
             guard !configPath.isEmpty, FileManager.default.fileExists(atPath: configPath) else {
-                self.publishSoak(.unavailable("The engine has no config file yet (\(configPath.isEmpty ? "unknown path" : configPath)), so the Swift engine can't be given the same settings."),
-                                 generation)
+                let reason = "The engine has no config file yet (\(configPath.isEmpty ? "unknown path" : configPath)), so the Swift engine can't be given the same settings."
+                Self.recordSoakRun(outcome: "unavailable", reason: reason, pythonVersion: pythonVersion)
+                self.publishSoak(.unavailable(reason), generation)
                 return
             }
             self.publishSoak(.running(config: configPath), generation)
@@ -1232,9 +1284,14 @@ final class CleanerBridge: ObservableObject {
                 Self.soakCompare(mck: mck, configPath: configPath, pyTargets: pyTargets)
             }.value
             switch outcome {
-            case .compared(let n):
-                self.publishSoak(.compared(divergences: n, config: configPath, at: Date()), generation)
+            case .compared(let c):
+                Self.recordSoakRun(outcome: "compared", divergences: c.divergences, classes: c.classes,
+                                   targets: c.targetsCompared, pythonVersion: pythonVersion,
+                                   mckVersion: c.mckVersion, config: configPath)
+                self.publishSoak(.compared(divergences: c.divergences, config: configPath, at: Date()), generation)
             case .failed(let reason):
+                Self.recordSoakRun(outcome: "failed", reason: reason, pythonVersion: pythonVersion,
+                                   config: configPath)
                 self.publishSoak(.failed(reason, config: configPath), generation)
             }
         }
@@ -1303,7 +1360,9 @@ final class CleanerBridge: ObservableObject {
                                      cmd: r["cmd"] as? Bool ?? false)
         }
         var lines: [String] = []
+        var classes: [String: Int] = [:]
         func log(_ kind: String, _ id: String, _ detail: String) {
+            classes[kind, default: 0] += 1
             lines.append("{\"ts\": \"\(ISO8601DateFormatter().string(from: Date()))\", " +
                          "\"kind\": \"\(kind)\", \"id\": \"\(id)\", \"detail\": \"\(detail)\"}")
         }
@@ -1341,7 +1400,96 @@ final class CleanerBridge: ObservableObject {
                 try? blob.write(toFile: soakLogPath(), atomically: true, encoding: .utf8)
             }
         }
-        return .compared(lines.count)
+        return .compared(SoakComparison(divergences: lines.count, classes: classes,
+                                        targetsCompared: pyIds.count,
+                                        mckVersion: obj["version"] as? String))
+    }
+
+    nonisolated static func soakRunsPath() -> String {
+        if let override = ProcessInfo.processInfo.environment["MACCLEANER_SOAK_RUNS"] {
+            return override
+        }
+        return (soakLogPath() as NSString).deletingLastPathComponent + "/soak-runs.log"
+    }
+
+    /// Any developer override or a non-bundled build means the run is not
+    /// real-machine evidence: the gate must never count a fixture.
+    nonisolated static var soakRunIsEvidence: Bool {
+        let env = ProcessInfo.processInfo.environment
+        let overrides = ["MACCLEANER_ENGINE", "MACCLEANER_MCK", "MACCLEANER_CONFIG",
+                         "MACCLEANER_SOAK_LOG", "MACCLEANER_SOAK_RUNS", "MACCLEANER_SOAK_TIMEOUT"]
+        return !overrides.contains { env[$0] != nil } && appVersion != nil
+    }
+
+    nonisolated static var appVersion: String? {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    }
+
+    nonisolated static func recordSoakRun(outcome: String, reason: String? = nil,
+                                          divergences: Int? = nil, classes: [String: Int]? = nil,
+                                          targets: Int? = nil, pythonVersion: String? = nil,
+                                          mckVersion: String? = nil, config: String? = nil) {
+        let record = SoakRunRecord(ts: ISO8601DateFormatter().string(from: Date()), outcome: outcome,
+                                   reason: reason, divergences: divergences, classes: classes,
+                                   targets: targets, python_version: pythonVersion,
+                                   mck_version: mckVersion, app_version: appVersion,
+                                   config: config, evidence: soakRunIsEvidence)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        guard let data = try? encoder.encode(record) else { return }
+        let path = soakRunsPath()
+        let line = data + Data("\n".utf8)
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile(); h.write(line); try? h.close()
+        } else {
+            try? FileManager.default.createDirectory(
+                atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            try? line.write(to: URL(fileURLWithPath: path), options: .atomic)
+        }
+    }
+
+    /// Reads soak-runs.log into the gate-A summary. Unreadable lines are
+    /// counted and block readiness: a damaged record is not silently ignored.
+    nonisolated static func summarizeSoakRuns(at path: String = soakRunsPath()) -> SoakSummary {
+        var s = SoakSummary()
+        let text = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        var apps = Set<String>(), pys = Set<String>(), mcks = Set<String>()
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let r = try? JSONDecoder().decode(SoakRunRecord.self, from: Data(raw.utf8)),
+                  ["compared", "failed", "unavailable"].contains(r.outcome) else {
+                s.malformedLines += 1
+                continue
+            }
+            guard r.evidence else { s.excludedNonEvidence += 1; continue }
+            s.attempted += 1
+            switch r.outcome {
+            case "compared":
+                s.compared += 1
+                s.divergences += r.divergences ?? 0
+                for (k, v) in r.classes ?? [:] { s.classes[k, default: 0] += v }
+                if s.firstCompared == nil || r.ts < s.firstCompared! { s.firstCompared = r.ts }
+                if s.lastCompared == nil || r.ts > s.lastCompared! { s.lastCompared = r.ts }
+                if let v = r.app_version { apps.insert(v) }
+                if let v = r.python_version { pys.insert(v) }
+                if let v = r.mck_version { mcks.insert(v) }
+            case "failed": s.failed += 1
+            default: s.unavailable += 1
+            }
+        }
+        s.appVersions = apps.sorted(); s.pythonVersions = pys.sorted(); s.mckVersions = mcks.sorted()
+        if s.compared == 0 {
+            s.readinessBlockers.append("No real-machine comparisons recorded yet.")
+        }
+        if s.malformedLines > 0 {
+            s.readinessBlockers.append("\(s.malformedLines) record line\(s.malformedLines == 1 ? " is" : "s are") unreadable.")
+        }
+        if s.divergences > 0 {
+            s.readinessBlockers.append("\(s.divergences) divergence\(s.divergences == 1 ? "" : "s") to investigate (see soak.log).")
+        }
+        if s.compared > 0 && apps.count < 2 {
+            s.readinessBlockers.append("Comparisons cover one app version; gate A needs at least one full release cycle.")
+        }
+        return s
     }
 
     /// Overridable so a probe can exercise the timeout path quickly.

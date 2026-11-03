@@ -99,6 +99,9 @@ Redesigned in v2.6 ("Glass & Sparkle"): sidebar navigation replaces the old tab 
 - **V3 soak status (R09):** `CleanerBridge.soakState` is the single source: `.disabled/.waiting/.unavailable(reason)/.running/.failed(reason)/.compared(n, config, at)`. `soakDivergences` is derived and non-nil **only** for a completed comparison. Never let a missing helper, missing config or failed run read as agreement; that is exactly what the old `Int?` allowed.
   - `mck` gets `MACCLEANER_CONFIG` = the path the engine of record reports via `config path`, never a hardcoded install path. A generation UUID drops late results.
   - `MACCLEANER_SOAK_LOG` and `MACCLEANER_SOAK_TIMEOUT` exist for `tools/check_soak_states.py` and must never point at a user's real log.
+- **Soak evidence (R10):** every attempt appends a `SoakRunRecord` to `soak-runs.log` (`MACCLEANER_SOAK_RUNS` overrides it). `evidence` is false under **any** `MACCLEANER_*` engine/soak override or a non-bundled build. That flag is how fixtures and CI are kept out of gate-A evidence, so never record synthetic runs as evidence.
+  - `summarizeSoakRuns()` counts unreadable lines and lists `readinessBlockers`: none compared, malformed, divergences, or a single app version.
+  - An empty blocker list means only that the mechanical checks pass. The gate still needs an owner's review, and the UI says so.
 - `NotificationManager.swift` — posts native notifications after an in-app clean; is its own `UNUserNotificationCenterDelegate` so banners still show while the app is frontmost (the default suppresses them); degrades silently if the user denies permission
 
 ### Python cleaner.py internals
