@@ -7,11 +7,15 @@ review, and to anyone who clones the repo on another machine. This document
 is the source of truth; the skill should track it, not the other way around.
 
 It covers: the five signing secrets, what ships when they're absent, the
-release steps (including a step the skill currently omits), publishing the
-Homebrew tap once notarization is live, bumping the cask after each release,
-which `brew audit` invocation is the actual correctness gate, and (new in
-v2.6.0) the Sparkle appcast — the sixth secret, the key-correspondence gate,
-the stable feed URL, and the framework signing order.
+release steps (including a step the skill currently omits), the Homebrew tap,
+bumping the cask after each release, which `brew audit` invocation is the
+actual correctness gate, and (new in v2.6.0) the Sparkle appcast — the sixth
+secret, the key-correspondence gate, the stable feed URL, and the framework
+signing order.
+
+**To check a published release, run `python3 tools/verify_release.py`**
+(latest) or `python3 tools/verify_release.py X.Y.Z`. It is read-only and
+replaces the hand checks this document used to list — see §3 step 7.
 
 ## 1. Signing secrets
 
@@ -121,9 +125,10 @@ the tag points at), and tags are `vX.Y.Z` — a tag containing a hyphen (e.g.
      drifts. As of this writing `AGENTS.md` embeds the version in two
      distinct places that must both change:
      - The intro paragraph: `"... Current version: 2.3.0."`
-     - Eleven `"version": "2.3.0"` lines inside the documented JSON response
+     - The `"version": "X.Y.Z"` lines inside the documented JSON response
        examples (`scan`, `clean`, `projects`, `report`, `doctor`,
-       `categories`, `schedule status/weekly/monthly/off`, etc.)
+       `categories`, `schedule status/weekly/monthly/off`, etc.) — thirteen
+       as of 2.21, and the count grows as sections are added
 
      Verify the exact count and locations before editing, since it changes
      release to release as sections are added:
@@ -139,6 +144,12 @@ the tag points at), and tags are `vX.Y.Z` — a tag containing a hyphen (e.g.
      `schedule`, `Schedule paths`, `MACCLEANER_LAUNCH_AGENTS_DIR`) — those
      document *when a feature shipped* and must stay pinned to that
      historical version regardless of what the current release is.
+   - **`tests/fixtures/*.json`** embed `"version"`, so `TestContractFixtures`
+     fails after a bump until they are regenerated with
+     `python3 tools/gen_contract_fixtures.py`. The diff should be version
+     lines only; anything else means the contract moved.
+   - **`ROADMAP.md`'s `## Current State — vX.Y.Z` heading**, pinned to
+     `cleaner.VERSION` by `TestRoadmapCurrency`.
 
 3. **Run the test suite:**
    ```bash
@@ -180,30 +191,84 @@ the tag points at), and tags are `vX.Y.Z` — a tag containing a hyphen (e.g.
    `## [VERSION] — DATE` section; leave `[Unreleased]` empty for what comes
    next.
 
-6. **Commit, tag, push:**
+6. **Commit via a PR, then tag the merge commit.** `main` enforces its CI
+   checks on admins too, so the release commit cannot be pushed to it
+   directly:
    ```bash
-   git add CHANGELOG.md cleaner.py app/Info.plist AGENTS.md MacCleaner.app
+   git checkout -b chore/release-X.Y.Z
+   git add CHANGELOG.md cleaner.py app/Info.plist AGENTS.md ROADMAP.md tests/fixtures MacCleaner.app
    git commit -m "chore: release X.Y.Z"
-   git tag vX.Y.Z
-   git push origin main
-   git push origin vX.Y.Z
+   git push -u origin chore/release-X.Y.Z && gh pr create --fill
+   # after CI is green and the PR is merged:
+   git fetch origin && git tag vX.Y.Z origin/main && git push origin vX.Y.Z
    ```
+   Tag the merge commit on `main`, not the branch commit. Anything merged to
+   `main` between the release PR and the tag ships in the release without a
+   changelog entry — 2.21.1 exists because #120 landed twenty minutes after
+   the 2.21.0 tag and missed it, so check `git log` before tagging.
+
    The tag push triggers `.github/workflows/release.yml`, which re-runs the
    tests, builds the universal app from source, optionally signs/notarizes
-   (§1–2), and attaches `MacCleaner-vX.Y.Z-macos-universal.zip` and
-   `MacCleaner-vX.Y.Z-cli.tar.gz` to the GitHub Release.
+   (§1–2), and attaches `MacCleaner-vX.Y.Z-macos-universal.zip`,
+   `MacCleaner-vX.Y.Z-cli.tar.gz` and `appcast.xml` to the GitHub Release.
 
-## 4. Publishing the Homebrew tap
+7. **Verify what was published,** once the release workflow has finished:
+   ```bash
+   python3 tools/verify_release.py X.Y.Z
+   ```
+   Read-only, stdlib-only, a few seconds. It checks the asset set, the
+   CLI tarball's engine version, the appcast (version, `edSignature`, and an
+   enclosure `length` equal to the real ZIP — Sparkle rejects a mismatch as a
+   corrupt download), the bundle's app and engine versions and embedded
+   Sparkle, the Ed25519 signature against the shipped `SUPublicEDKey`, that
+   key's continuity with the **previous release** (whether installed copies
+   can take this update), `codesign --deep --strict`, the stapled ticket,
+   Gatekeeper's `Notarized Developer ID`, the stable feed, and both casks.
 
-**Not done yet, deliberately.** Homebrew 6 removed `--no-quarantine` and
-never had a `quarantine: false` cask stanza, so an unsigned cask install is
-Gatekeeper-blocked with no supported workaround — publishing a tap before
-releases are notarized would just ship a cask that fails on first launch for
-every user. `Casks/maccleaner.rb` lives in this repo, validated and
-version-controlled, so it's one `cp` away the day a signed/notarized release
-exists (§1–2 above).
+   It reports PASS, FAIL, UNVERIFIED ("could not check from here") or
+   SKIPPED ("does not apply" — channel checks on a release that is no
+   longer the latest). Exit 1 means the release is defective; exit 3 means
+   nothing failed but something could not be checked, which is not a pass.
+   Run before §5 the casks will FAIL; that is expected and is what §5 fixes —
+   run it again afterwards and expect exit 0.
 
-When that day comes:
+   Two traps it exists to avoid. Stock macOS `openssl` is LibreSSL 3.3.6,
+   which cannot verify Ed25519 at all, so the verifier does it in pure
+   Python; a hand check that "works" usually used Homebrew's OpenSSL. And
+   `openssl` reports an *empty* signature file in the same words as a wrong
+   one, which nearly condemned a good 2.21.0 during a hand check.
+
+   Unauthenticated, GitHub's API allows 60 requests an hour — about four
+   runs. The verifier borrows the signed-in `gh` CLI's token (`gh auth
+   token`, read-only) or uses `GH_TOKEN`, and reports an exhausted limit as
+   UNVERIFIED rather than as a missing release.
+
+8. **Rebuild the committed bundle if the release was cut somewhere without
+   a macOS toolchain** (a cloud session cannot run `app/build.sh`), then do
+   §5. Step 4 covers the normal case.
+
+## 4. The Homebrew tap
+
+**Live** at `github.com/Fullex26/homebrew-tap` since releases became
+notarized. `Casks/maccleaner.rb` in this repo is the reviewed copy; the tap's
+copy must match it byte for byte (§5).
+
+The only install command that works under Homebrew 6:
+
+```bash
+brew install --cask Fullex26/tap/maccleaner
+```
+
+The two-step `brew tap Fullex26/tap` + `brew install --cask maccleaner` form
+hard-fails on tap trust under Homebrew 6. Don't recommend it.
+
+### History: why the tap waited for notarization
+
+Homebrew 6 removed `--no-quarantine` and never had a `quarantine: false` cask
+stanza, so an unsigned cask install is Gatekeeper-blocked with no supported
+workaround. Publishing the tap before releases were notarized would have
+shipped a cask that failed on first launch for every user. The original
+setup, kept for reference:
 
 1. Create `github.com/Fullex26/homebrew-tap` (public repo). The
    `homebrew-` prefix is **required** — it's what makes the short form
@@ -262,19 +327,34 @@ tag segment and one for the filename segment, matching what the workflow
 actually publishes (and staying consistent with the already-published
 v2.0.0 asset names).
 
-Then, in the tap's clone:
+Then update `version` and `sha256` in **this repo's** `Casks/maccleaner.rb`,
+in its own PR, and merge it once CI is green. After that, copy the merged
+file verbatim into the tap rather than re-typing the two lines, so the two
+copies cannot drift:
 
-```ruby
-version "X.Y.Z"
-sha256 "<the shasum output above>"
+```bash
+TAP="$(brew --repository)/Library/Taps/fullex26/homebrew-tap"
+git show origin/main:Casks/maccleaner.rb > "$TAP/Casks/maccleaner.rb"
+brew style --cask fullex26/tap/maccleaner
+brew audit --cask --online fullex26/tap/maccleaner   # downloads the asset, so it also checks the hash
+git -C "$TAP" commit -am "maccleaner X.Y.Z" && git -C "$TAP" push
+python3 tools/verify_release.py X.Y.Z                 # both casks should now PASS
 ```
 
-Remove the placeholder comment above `sha256` once a real hash is in place.
-Commit and push to `Fullex26/homebrew-tap`. No CI write-token touches the
-tap — this step runs locally under the maintainer's own credentials.
+No CI write-token touches the tap — this step runs locally under the
+maintainer's own credentials. Note `raw.githubusercontent.com` caches for a
+few minutes, so a verifier run immediately after the push can still see the
+old cask.
 
-`Casks/maccleaner.rb` deliberately does **not** set `auto_updates true` yet,
-even though v2.6.0 wires up Sparkle. Setting it tells Homebrew "this cask's
+**The cask sets `auto_updates true`**, so a plain `brew upgrade` skips it:
+installed copies move through Sparkle, or with
+`brew upgrade --cask --greedy maccleaner`. Any user-facing hint about
+updating a Homebrew install has to name `--greedy`.
+
+### History: why `auto_updates` was added late
+
+The cask did not set `auto_updates true` when v2.6.0 first wired up Sparkle.
+Setting it tells Homebrew "this cask's
 installed copy updates itself, don't bother nagging about version drift" —
 `brew upgrade` (without `--greedy`) then silently skips the cask entirely.
 That's fine once the *previously installed* build actually has Sparkle in
