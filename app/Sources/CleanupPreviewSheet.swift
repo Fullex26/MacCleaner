@@ -70,7 +70,10 @@ struct CleanupPreviewSheet: View {
         }
         .padding(20)
         .frame(width: 620, height: 480)
-        .task { await refresh() }
+        // Keyed on `ids`, not a bare `.task`: a one-shot task that ran
+        // against an id list which then changed would leave the sheet
+        // showing a preview (or an error) for a selection it no longer holds.
+        .task(id: ids) { await refresh() }
     }
 
     private func refresh() async {
