@@ -157,6 +157,19 @@ struct CleanResult: Codable {
     }
 }
 
+/// A warning the engine wrote to stderr on a call that still exited 0: a
+/// partial project walk, a truncated storage scan, a corrupt config that fell
+/// back to defaults. Not part of the JSON contract — it is the engine's
+/// human-readable stderr text, carried verbatim, which is why it has no
+/// machine-readable code to branch on.
+struct EngineNotice: Identifiable {
+    let id = UUID()
+    /// The subcommand that warned, e.g. `scan`, used to label the banner.
+    let command: String
+    let text: String
+    let at = Date()
+}
+
 /// `null` when git status couldn't be determined (not a repo, `git` missing,
 /// any git failure, or `project_git_check` disabled); otherwise the two
 /// signals `projects --json` reports per AGENTS.md §"projects --json".
@@ -592,6 +605,22 @@ final class CleanerBridge: ObservableObject {
     /// clean's spinners/checks can't leak into a later scan's target list.
     @Published var cleaningIDs: Set<String> = []
     @Published var cleanedIDs: Set<String> = []
+    /// Warnings an engine call wrote to stderr while still exiting 0 (R06),
+    /// keyed by subcommand. `runEngineOutput` has always captured stderr, but
+    /// the `runEngine` wrapper discarded it, so until now only
+    /// `previewCleanup` could see one: the CLI user read "project discovery
+    /// stopped after 120s; results are partial" on their terminal while the
+    /// app showed a confident, quietly incomplete list.
+    ///
+    /// Keyed rather than a single slot because these calls overlap — the
+    /// app's startup `scan()` runs concurrently with `storage-insights`, and
+    /// a shared field would let either silently erase the other, the same
+    /// reasoning that gave `storageInsightsError` its own channel.
+    ///
+    /// Diagnostic only. A notice says a result is incomplete; it is never
+    /// evidence that anything more may be cleaned, and it must never render
+    /// as a failure — a clean that warns still succeeded.
+    @Published var engineNotices: [String: EngineNotice] = [:]
 
     private var lightTimer: Timer?
     private var fullTimer: Timer?
@@ -711,16 +740,35 @@ final class CleanerBridge: ObservableObject {
 
     private func run<T: Decodable>(_ type: T.Type, _ args: [String],
                                    timeout: TimeInterval = CleanerBridge.defaultEngineTimeout) async throws -> T {
-        let data = try await Task.detached(priority: .userInitiated) {
-            try Self.runEngine(args, timeout: timeout)
+        let output = try await Task.detached(priority: .userInitiated) {
+            try Self.runEngineOutput(args, timeout: timeout)
         }.value
-        return try JSONDecoder().decode(T.self, from: data)
+        // Decode first: a notice describes a result the caller is about to
+        // use, so recording one for a call whose output turned out to be
+        // undecodable would put an "incomplete" banner next to no result at
+        // all, where the caller's own error belongs.
+        let decoded = try JSONDecoder().decode(T.self, from: output.data)
+        note(output.diagnostics, for: args)
+        return decoded
     }
 
     private func runPlain(_ args: [String]) async throws {
-        _ = try await Task.detached(priority: .userInitiated) {
-            try Self.runEngine(args)
+        let output = try await Task.detached(priority: .userInitiated) {
+            try Self.runEngineOutput(args)
         }.value
+        note(output.diagnostics, for: args)
+    }
+
+    /// Record — or clear — the stderr a successful engine call produced.
+    ///
+    /// Clearing on a quiet run is the half that makes the banner trustworthy:
+    /// a notice that only ever accumulated would keep reporting a partial
+    /// scan long after a complete one replaced it.
+    private func note(_ diagnostics: String, for args: [String]) {
+        guard let key = args.first else { return }
+        engineNotices[key] = diagnostics.isEmpty
+            ? nil
+            : EngineNotice(command: key, text: diagnostics)
     }
 
     // ── Actions ────────────────────────────────────────────────────────────────
