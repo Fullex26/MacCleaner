@@ -50,7 +50,7 @@ struct StorageView: View {
             Button("Cancel", role: .cancel) { pendingTrash = nil }
         } message: {
             if let entry = pendingTrash {
-                Text("\(entry.size_human) · You can put it back from the Trash.")
+                Text(trashMessage(entry))
             }
         }
     }
@@ -121,6 +121,14 @@ struct StorageView: View {
 
                 if let map = bridge.storageMap {
                     Button {
+                        Task { await bridge.scanStorageMap(map.root, unshared: true) }
+                    } label: {
+                        Label("Check shared blocks", systemImage: "square.on.square")
+                    }
+                    .disabled(bridge.isScanningStorageMap)
+                    .help("Measure how much of each row is shared with APFS clones elsewhere. Deleting a row frees at most its unshared part. Slower than a normal scan.")
+
+                    Button {
                         NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: map.root)
                     } label: {
                         Label("Open in Finder", systemImage: "folder")
@@ -136,6 +144,12 @@ struct StorageView: View {
                     .textSelection(.enabled)
                     .lineLimit(1)
                     .truncationMode(.head)
+                if let unshared = map.unshared_human {
+                    Text("Deleting everything here would free at least \(unshared). Sizes still include blocks shared with clones.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
         }
         .padding()
@@ -187,6 +201,14 @@ struct StorageView: View {
         }
     }
 
+
+    /// Never promises the billed size when the engine has shown it's shared.
+    private func trashMessage(_ entry: StorageMapEntry) -> String {
+        guard let unshared = entry.unshared_human, entry.unshared_bytes ?? 0 < entry.size_bytes else {
+            return "\(entry.size_human) · You can put it back from the Trash."
+        }
+        return "\(entry.size_human) on disk, but emptying the Trash would free at least \(unshared): the rest is shared with APFS clones elsewhere. You can put it back from the Trash."
+    }
 
     // MARK: - Navigation
 
@@ -259,9 +281,18 @@ private struct StorageRow: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 82, alignment: .leading)
 
-            Text(entry.size_human)
-                .font(.callout.monospacedDigit())
-                .frame(width: 78, alignment: .trailing)
+            VStack(alignment: .trailing, spacing: 0) {
+                Text(entry.size_human)
+                    .font(.callout.monospacedDigit())
+                if let unshared = entry.unshared_human {
+                    Text("frees ≥ \(unshared)")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(entry.isMostlyShared ? Color.orange : Color.secondary)
+                        .lineLimit(1)
+                        .help("At least this much would be freed by deleting it; the rest of its size is shared with APFS clones elsewhere.")
+                }
+            }
+            .frame(width: 96, alignment: .trailing)
 
             HStack(spacing: 2) {
                 Button(action: onReveal) {
