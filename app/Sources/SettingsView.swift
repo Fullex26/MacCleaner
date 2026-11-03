@@ -1,8 +1,12 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @EnvironmentObject var bridge: CleanerBridge
     @ObservedObject private var updater = UpdaterManager.shared
+    /// Gate-A summary of soak-runs.log (R10); re-read when the soak state moves.
+    @State private var soakSummary = SoakSummary()
 
     var body: some View {
         ScrollView {
@@ -172,6 +176,63 @@ struct SettingsView: View {
             if bridge.v3SoakEnabled {
                 soakStatus
             }
+            soakEvidence
+        }
+        .onAppear { soakSummary = CleanerBridge.summarizeSoakRuns() }
+        .onChange(of: bridge.soakState) { _ in soakSummary = CleanerBridge.summarizeSoakRuns() }
+    }
+
+    /// The record the V3 gate is judged on: real-machine runs only (fixtures
+    /// and developer overrides are excluded), with what still blocks it.
+    private var soakEvidence: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            let s = soakSummary
+            Text("Evidence: \(s.compared) comparison\(s.compared == 1 ? "" : "s") of \(s.attempted) attempt\(s.attempted == 1 ? "" : "s")"
+                 + (s.failed + s.unavailable > 0 ? " · \(s.failed) failed · \(s.unavailable) not run" : "")
+                 + (s.appVersions.isEmpty ? "" : " · app \(s.appVersions.joined(separator: ", "))"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            if s.excludedNonEvidence > 0 {
+                Text("\(s.excludedNonEvidence) developer/test run\(s.excludedNonEvidence == 1 ? "" : "s") excluded from evidence.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(s.readinessBlockers, id: \.self) { blocker in
+                Label(blocker, systemImage: "circle.dashed")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            }
+            if s.readinessBlockers.isEmpty {
+                Label("Mechanical checks pass. Gate A still needs an owner's review of these records.",
+                      systemImage: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                    .lineLimit(2)
+            }
+            HStack(spacing: 12) {
+                Button("Export Summary…") { exportSoakSummary(s) }
+                    .buttonStyle(.link)
+                Button("Show Records") {
+                    NSWorkspace.shared.selectFile(CleanerBridge.soakRunsPath(), inFileViewerRootedAtPath: "")
+                }
+                .buttonStyle(.link)
+                .disabled(!FileManager.default.fileExists(atPath: CleanerBridge.soakRunsPath()))
+            }
+            .font(.caption)
+        }
+    }
+
+    private func exportSoakSummary(_ summary: SoakSummary) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "maccleaner-soak-summary.json"
+        panel.allowedContentTypes = [.json]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(summary) {
+            try? data.write(to: url, options: .atomic)
         }
     }
 
