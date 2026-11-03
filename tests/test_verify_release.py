@@ -175,6 +175,14 @@ class TestAppcast(unittest.TestCase):
         r, _ = vr.check_appcast(appcast(sig=None), V, 3210006)
         self.assertEqual(r.status, FAIL)
 
+    def test_dtd_is_refused_before_parsing(self):
+        evil = ('<?xml version="1.0"?><!DOCTYPE r [<!ENTITY a "aaaa">]>'
+                + appcast()[appcast().index("<rss"):])
+        r, sig = vr.check_appcast(evil, V, 3210006)
+        self.assertEqual(r.status, FAIL)
+        self.assertIn("DTD", r.detail)
+        self.assertIsNone(sig)
+
     def test_unparseable_appcast_fails(self):
         r, _ = vr.check_appcast("<rss><channel>", V, 3210006)
         self.assertEqual(r.status, FAIL)
@@ -279,6 +287,14 @@ class TestKeyContinuity(unittest.TestCase):
     def test_unreadable_previous_key_is_unverified(self):
         self.assertEqual(vr.check_key_continuity("a2V5", None, "2.21.0").status, UNVERIFIED)
 
+    def test_previous_release_without_an_updater_is_skipped(self):
+        # 2.6.0 is the first Sparkle build: 2.5.0's bundle reads fine and simply
+        # has no key. That is "nothing to continue", not "could not tell" —
+        # reporting it as unverified would leave 2.6.0 inconclusive forever.
+        r = vr.check_key_continuity("a2V5", None, "2.5.0", previous_readable=True)
+        self.assertEqual(r.status, SKIPPED)
+        self.assertIn("2.5.0", r.detail)
+
 
 class TestGatekeeperParsing(unittest.TestCase):
     def test_notarized_passes(self):
@@ -294,7 +310,49 @@ class TestGatekeeperParsing(unittest.TestCase):
         self.assertEqual(vr.parse_spctl(3, "x.app: rejected\n").status, FAIL)
 
 
+class TestReleaseLookup(unittest.TestCase):
+    """Only a 404 is evidence a release does not exist.
+
+    Found running the verifier for real: after a few runs GitHub's
+    unauthenticated limit (60/hour) answered 403, and the first version
+    reported "v2.21.1 not found" and DEFECTIVE for a release that was fine."""
+
+    def test_404_means_the_release_is_missing(self):
+        self.assertEqual(vr.check_release_lookup("v9.9.9", 404, "HTTP 404").status, FAIL)
+
+    def test_rate_limit_is_unverified(self):
+        r = vr.check_release_lookup("v2.21.1", 403, "GitHub API rate limit reached")
+        self.assertEqual(r.status, UNVERIFIED)
+        self.assertIn("rate limit", r.detail)
+
+    def test_server_error_is_unverified(self):
+        self.assertEqual(vr.check_release_lookup("v2.21.1", 502, "HTTP 502").status, UNVERIFIED)
+
+    def test_network_failure_is_unverified(self):
+        self.assertEqual(vr.check_release_lookup("v2.21.1", None, "timed out").status, UNVERIFIED)
+
+    def test_rate_limit_message_names_the_remedy(self):
+        msg = vr.describe_http_error(403, {"X-RateLimit-Remaining": "0"}, "https://api.github.com/x")
+        self.assertIn("rate limit", msg)
+        self.assertIn("GH_TOKEN", msg)
+
+    def test_ordinary_403_is_not_called_a_rate_limit(self):
+        msg = vr.describe_http_error(403, {"X-RateLimit-Remaining": "41"}, "https://api.github.com/x")
+        self.assertNotIn("rate limit", msg)
+
+
 class TestReadOnly(unittest.TestCase):
+
+    def test_borrowing_the_gh_token_is_allowed(self):
+        # Read-only, and raises the API limit from 60/hour to 5,000/hour.
+        self.assertTrue(vr.is_readonly(["gh", "auth", "token"]))
+
+    def test_other_gh_auth_commands_are_refused(self):
+        for argv in (["gh", "auth", "logout"], ["gh", "auth", "token", "--with-token"],
+                     ["gh", "auth", "refresh"]):
+            with self.subTest(argv=argv):
+                self.assertFalse(vr.is_readonly(argv))
+
     """The verifier must never publish, edit or delete anything."""
 
     def test_write_commands_are_refused(self):
