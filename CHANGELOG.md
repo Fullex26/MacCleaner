@@ -9,13 +9,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- **`tools/verify_release.py` — a read-only check of a published release (R12).** `python3 tools/verify_release.py [X.Y.Z]` replaces the hand checks a release used to need: the asset set, the CLI tarball's engine version, the appcast (version, signature, and an enclosure length equal to the real ZIP), the app and bundled engine versions, the Ed25519 signature against the key the app ships, that key's continuity with the previous release (whether installed copies can take the update), code signing, the stapled notarization ticket, Gatekeeper, the stable update feed, and both Homebrew casks. Each check is PASS, FAIL, UNVERIFIED ("could not check from here") or SKIPPED ("does not apply"), and exit 1 (defective) is kept separate from exit 3 (inconclusive). Stdlib only, including Ed25519 — stock macOS `openssl` cannot verify it — and every command and request goes through a read-only allowlist. Tried on five real releases, it verifies 2.6.0, 2.21.0 and 2.21.1, and correctly reports 2.4.0 and 2.5.0 as predating the updater. `docs/RELEASING.md` is refreshed to match the current process: release commits go through a PR, the tap is live, the cask sets `auto_updates`, and the fixtures and roadmap heading are part of the version sync.
+
 ---
 
 ## [2.22.0] — 2026-11-03
 
 ### Added
-
-- **`tools/verify_release.py` — a read-only check of a published release (R12).** `python3 tools/verify_release.py [X.Y.Z]` replaces the hand checks a release used to need: the asset set, the CLI tarball's engine version, the appcast (version, signature, and an enclosure length equal to the real ZIP), the app and bundled engine versions, the Ed25519 signature against the key the app ships, that key's continuity with the previous release (whether installed copies can take the update), code signing, the stapled notarization ticket, Gatekeeper, the stable update feed, and both Homebrew casks. Each check is PASS, FAIL, UNVERIFIED ("could not check from here") or SKIPPED ("does not apply"), and exit 1 (defective) is kept separate from exit 3 (inconclusive). Stdlib only, including Ed25519 — stock macOS `openssl` cannot verify it — and every command and request goes through a read-only allowlist. Tried on five real releases, it verifies 2.6.0, 2.21.0 and 2.21.1, and correctly reports 2.4.0 and 2.5.0 as predating the updater. `docs/RELEASING.md` is refreshed to match the current process: release commits go through a PR, the tap is live, the cask sets `auto_updates`, and the fixtures and roadmap heading are part of the version sync.
 
 - **`simulator_auto_clean`** (off by default): turn it on with `config set simulator_auto_clean true` and the weekly scheduled clean deletes simulator devices that are shut down and unused for `simulator_stale_days` (7 by default), instead of only offering them for review. Simulators pile up fast — a coding agent can leave a fresh 5–9 GB device behind per project — and nothing else ever removes them. Downloaded simulator runtimes are never included: deregistering one can leave its files on disk with no way to remove them.
 
