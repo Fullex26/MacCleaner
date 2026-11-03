@@ -7965,6 +7965,38 @@ class TestVersionDotted(unittest.TestCase):
         self.assertEqual(cleaner._version_dotted(" 2.20.0\n"), (2, 20, 0))
 
 
+class TestCleanupPreviewSheetPresentation(unittest.TestCase):
+    """The Dashboard's review sheet opened on "Select at least one target to
+    preview." with ten targets selected; Refresh then worked. The sheet's
+    `ids` was a `let` frozen per presentation, so Refresh could only succeed
+    if the sheet had first been BUILT with a stale empty list and re-rendered
+    with the real one later. It was presented with `.sheet(isPresented:)`
+    beside a separate `pendingIDs` array, both written in one tap, and
+    SwiftUI built the sheet from the flag before the array reached it; the
+    sheet's one-shot `.task` then previewed nothing and never re-ran.
+
+    A SwiftUI presentation race cannot be driven from this suite, so these
+    pin the two structural properties that rule it out. They read the Swift
+    source on purpose and are narrow on purpose: they assert only how this
+    one sheet is presented and when its preview runs."""
+
+    SOURCES = REPO / "app" / "Sources"
+
+    def test_dashboard_presents_the_review_from_a_payload_carrying_the_ids(self):
+        src = (self.SOURCES / "DashboardView.swift").read_text()
+        self.assertIn(".sheet(item: $pendingCleanup)", src)
+        self.assertIn("CleanupPreviewSheet(ids: pending.ids)", src,
+                      "the sheet must read its ids from the item it was presented with")
+        self.assertNotIn("pendingIDs", src,
+                         "a separate ids array beside a presentation flag is the race")
+
+    def test_preview_reruns_when_the_ids_change(self):
+        src = (self.SOURCES / "CleanupPreviewSheet.swift").read_text()
+        self.assertIn(".task(id: ids)", src)
+        self.assertNotIn(".task { await refresh() }", src,
+                         "a one-shot task strands the sheet on its first result")
+
+
 class TestCronLogTrim(unittest.TestCase):
     """The hourly diskwatch agent appends to cron.log forever (1,100+ lines
     of 'BELOW threshold' on one real machine). Trim in place, keeping the

@@ -1,16 +1,31 @@
 import SwiftUI
 import AppKit
 
+/// One cleanup review: the frozen target ids the sheet describes and acts
+/// on. A fresh `id` per tap means re-raising the sheet for the same selection
+/// still builds a new sheet and re-runs its preview.
+struct PendingCleanup: Identifiable {
+    let id = UUID()
+    let ids: [String]
+}
+
 struct DashboardView: View {
     @EnvironmentObject var bridge: CleanerBridge
     @State private var selection = Set<String>()
-    @State private var confirmClean = false
-    /// Snapshot of `selection` taken the moment the confirmation dialog is
-    /// raised (finding B6) — a background refresh can reseed `selection`
-    /// between raising the dialog and the user tapping confirm, so both the
-    /// dialog's own text and the actual destructive action read from this
-    /// frozen copy instead of the live, possibly-changed `selection`.
-    @State private var pendingIDs: [String] = []
+    /// Snapshot of `selection` taken the moment the review sheet is raised
+    /// (finding B6) — a background refresh can reseed `selection` between
+    /// raising the sheet and the user tapping confirm, so the sheet reads
+    /// this frozen copy instead of the live, possibly-changed `selection`.
+    ///
+    /// It is also what presents the sheet, via `.sheet(item:)`. The snapshot
+    /// used to live in a separate `[String]` beside an `isPresented` flag,
+    /// both set in one tap, and SwiftUI could build the sheet from the
+    /// flag's transaction before the array's write reached it: the sheet
+    /// opened on an EMPTY id list, its one-shot `.task` asked the bridge to
+    /// preview nothing, and the user saw "Select at least one target to
+    /// preview." with ten targets selected. With the ids carried by the item
+    /// itself, the sheet cannot exist without them.
+    @State private var pendingCleanup: PendingCleanup?
 
     private var targets: [ScanTarget] {
         bridge.report?.dashboardTargets ?? []
@@ -276,16 +291,16 @@ struct DashboardView: View {
                 // without this snapshot the eventual delete would silently
                 // act on whatever `selection` had become by the time the
                 // user tapped confirm, not the count/bytes they read.
-                pendingIDs = selectableTargets.filter { selection.contains($0.id) }.map(\.id)
-                confirmClean = true
+                pendingCleanup = PendingCleanup(
+                    ids: selectableTargets.filter { selection.contains($0.id) }.map(\.id))
             } label: {
                 Label("Clean Selected", systemImage: "trash")
             }
             .buttonStyle(.borderedProminent)
             .keyboardShortcut(.defaultAction)
             .disabled(selection.isEmpty || bridge.isCleaning || bridge.isScanning)
-            .sheet(isPresented: $confirmClean) {
-                CleanupPreviewSheet(ids: pendingIDs)
+            .sheet(item: $pendingCleanup) { pending in
+                CleanupPreviewSheet(ids: pending.ids)
                     .environmentObject(bridge)
             }
         }
