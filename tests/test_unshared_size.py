@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -77,10 +78,13 @@ class TestUnsharedWalk(unittest.TestCase):
             sub.mkdir()
             (sub / 'inside').write_bytes(b'x')
             real = os.lstat(td)
-            fields = list(real)
-            fields[statmod_dev_index()] = real.st_dev + 1  # root on another device
+            # The root reports another device, so every subdirectory looks
+            # like a mount point. A plain object, not os.stat_result: on macOS
+            # a hand-built stat_result has st_flags=None.
+            fake = SimpleNamespace(st_mode=real.st_mode, st_dev=real.st_dev + 1,
+                                   st_flags=0, st_nlink=real.st_nlink)
             with mock.patch.object(cleaner.os, 'lstat',
-                                   side_effect=lambda p, *a, **k: os.stat_result(fields)
+                                   side_effect=lambda p, *a, **k: fake
                                    if str(p) == td else os.lstat(p, *a, **k)):
                 got = cleaner._unshared_bytes(td, private_size=_by_name({'inside': 50}))
             self.assertEqual(got, 0)
@@ -119,11 +123,6 @@ class TestUnsharedWalk(unittest.TestCase):
             reader = _by_name({'f': 9})
             self.assertEqual(cleaner._unshared_bytes(f, private_size=reader), 9)
             self.assertEqual(cleaner._unshared_bytes(Path(td) / 'l', private_size=reader), 0)
-
-
-def statmod_dev_index():
-    # os.stat_result's sequence form: mode, ino, dev, nlink, uid, gid, size, ...
-    return 2
 
 
 class TestStorageMapUnsharedFlag(unittest.TestCase):
@@ -192,11 +191,18 @@ class TestStorageMapUnsharedFlag(unittest.TestCase):
                     self.assertNotIn('unshared_bytes', nested)
 
 
-def _apfs(path):
-    if sys.platform != 'darwin':
-        return False
-    r = subprocess.run(['stat', '-f', '%T', path], capture_output=True, text=True)
-    return r.stdout.strip() == 'apfs'
+def _clones_supported(directory):
+    # cp -c fails with ENOTSUP on a volume without clonefile; APFS succeeds.
+    # (BSD `stat -f %T` reports the FILE type, not the filesystem -- the first
+    # version of this check used it and silently skipped every test on CI.)
+    probe = os.path.join(directory, '.clone-probe')
+    with open(probe, 'wb') as f:
+        f.write(b'x')
+    r = subprocess.run(['cp', '-c', probe, probe + '-c'], capture_output=True)
+    for p in (probe, probe + '-c'):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(p)
+    return r.returncode == 0
 
 
 @unittest.skipUnless(sys.platform == 'darwin', 'APFS clone accounting is macOS-only')
@@ -206,8 +212,8 @@ class TestRealApfsClones(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.td, True)
-        if not _apfs(self.td):
-            self.skipTest('temporary directory is not on APFS')
+        if not _clones_supported(self.td):
+            self.skipTest('temporary directory volume does not support clones')
         self.private = cleaner._load_private_size_fn()
         # On APFS the reader must exist and answer; None here means the
         # attribute request itself is wrong, which must fail, not skip.
