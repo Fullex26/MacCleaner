@@ -9,6 +9,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+---
+
+## [2.22.0] — 2026-11-03
+
 ### Added
 
 - **`simulator_auto_clean`** (off by default): turn it on with `config set simulator_auto_clean true` and the weekly scheduled clean deletes simulator devices that are shut down and unused for `simulator_stale_days` (7 by default), instead of only offering them for review. Simulators pile up fast — a coding agent can leave a fresh 5–9 GB device behind per project — and nothing else ever removes them. Downloaded simulator runtimes are never included: deregistering one can leave its files on disk with no way to remove them.

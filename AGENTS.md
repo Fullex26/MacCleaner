@@ -1,6 +1,6 @@
 # AGENTS.md — MacCleaner machine interface
 
-MacCleaner is a macOS developer storage cleanup tool: it scans 94 known cache/artifact locations across 23 categories (Xcode, Docker, npm, pip, Homebrew, AI model caches, Flutter, PHP, VMs, ...) plus stale per-project build artifacts, stale build litter left under `/private/tmp`, unused iOS simulator devices/runtimes, and orphaned per-app leftovers under `~/Library` from apps you've already uninstalled, reports sizes, and deletes what you select. The engine is a single stdlib-only Python 3 script. Entry point: `python3 cleaner.py` from a repo checkout, or `maccleaner` (shell alias) / `python3 ~/mac-cleaner/cleaner.py` after `install.sh`. Every data command takes `--json`; that JSON interface is the contract this document specifies (the bundled macOS app is just another client of it). Current version: 2.21.1. As of 2.4.0, `install.sh` also wires up zsh/bash shell completions (`completions/_maccleaner`, `completions/maccleaner.bash`) and the CLI tarball ships them too — a human-facing convenience only, it doesn't change any of the JSON below.
+MacCleaner is a macOS developer storage cleanup tool: it scans 94 known cache/artifact locations across 23 categories (Xcode, Docker, npm, pip, Homebrew, AI model caches, Flutter, PHP, VMs, ...) plus stale per-project build artifacts, stale build litter left under `/private/tmp`, unused iOS simulator devices/runtimes, and orphaned per-app leftovers under `~/Library` from apps you've already uninstalled, reports sizes, and deletes what you select. The engine is a single stdlib-only Python 3 script. Entry point: `python3 cleaner.py` from a repo checkout, or `maccleaner` (shell alias) / `python3 ~/mac-cleaner/cleaner.py` after `install.sh`. Every data command takes `--json`; that JSON interface is the contract this document specifies (the bundled macOS app is just another client of it). Current version: 2.22.0. As of 2.4.0, `install.sh` also wires up zsh/bash shell completions (`completions/_maccleaner`, `completions/maccleaner.bash`) and the CLI tarball ships them too — a human-facing convenience only, it doesn't change any of the JSON below.
 
 ## 1. Quick recipes
 
@@ -94,7 +94,7 @@ Abbreviated but field-accurate examples. All JSON is pretty-printed to stdout.
 
 ```json
 {
-  "version": "2.21.1",
+  "version": "2.22.0",
   "timestamp": "2026-07-14T09:12:03.481920",
   "disk": "Used: 380Gi / 460Gi (85%)",
   "disk_stats": {
@@ -148,7 +148,7 @@ Targets are sorted by `size_bytes` descending. Command-based targets (docker/bre
 
 ```json
 {
-  "version": "2.21.1",
+  "version": "2.22.0",
   "timestamp": "2026-07-14T09:14:55.102331",
   "delete_mode": "rm",
   "freed_bytes": 14495514624,
@@ -172,7 +172,7 @@ Targets are sorted by `size_bytes` descending. Command-based targets (docker/bre
 
 ```json
 {
-  "version": "2.21.1",
+  "version": "2.22.0",
   "timestamp": "2026-07-14T09:14:55.102331",
   "dry_run": true,
   "delete_mode": "rm",
@@ -209,7 +209,7 @@ Same envelope shape as `clean --json` (`delete_mode`, `freed_bytes`, `disk_after
 
 ```json
 {
-  "version": "2.21.1",
+  "version": "2.22.0",
   "timestamp": "2026-07-14T09:16:12.000000",
   "roots": ["/Users/you/Documents", "/Users/you/Code"],
   "min_age_days": 30,
@@ -234,7 +234,7 @@ Sorted by `size_bytes` descending. The `id` is what `projects --clean --targets`
 
 ```json
 {
-  "version": "2.21.1",
+  "version": "2.22.0",
   "ok": true,
   "checks": [
     { "name": "Python",       "status": "3.12.4", "ok": true },
@@ -313,7 +313,7 @@ Both 2.8.0 checks use hardcoded thresholds (8 GiB of swapfiles on disk; 500 MB h
 
 ```json
 {
-  "version": "2.21.1",
+  "version": "2.22.0",
   "free_bytes": 8321499136,
   "free_human": "7.8 GB",
   "threshold_bytes": 10737418240,
@@ -344,7 +344,7 @@ Each map level’s root validation and child enumeration have a 600-second deadl
 
 ```json
 {
-  "version": "2.21.1",
+  "version": "2.22.0",
   "root": "/Users/you",
   "total_bytes": 170728030208,
   "total_human": "159.0 GB",
@@ -376,7 +376,7 @@ Differences from every other command here, all deliberate:
 
 ```json
 {
-  "version": "2.21.1",
+  "version": "2.22.0",
   "roots": [
     "/Users/you/Documents", "/Users/you/Downloads", "/Users/you/Desktop",
     "/Users/you/Library", "/Users/you/Applications", "/Applications"
@@ -422,7 +422,7 @@ New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`month
 
 ```json
 {
-  "version": "2.21.1",
+  "version": "2.22.0",
   "schedule": "weekly",
   "agents": [
     { "label": "com.fullex.maccleaner.clean",     "plist_present": true, "loaded": true, "load_state": "loaded" },
@@ -441,7 +441,7 @@ New in 2.3.0. All four actions share one JSON shape — `status`/`weekly`/`month
 
 **Exit codes**: `status` and `off` always exit `0`, even when nothing is scheduled. `weekly`/`monthly` exit `1` if either agent failed to load with `launchctl` (the plist is still written to disk either way, and the stderr output includes the manual `launchctl bootstrap` command to load it); they exit `0` when both agents loaded. An unrecognized `action` is an argparse usage error, exit `2`, before any of this runs.
 
-`weekly`/`monthly --json` have one more exit path that does **not** follow the common envelope above: if no usable, non-virtualenv `python3` interpreter can be resolved for `ProgramArguments[0]` (see `_agent_python()`), nothing is written — no plist, no `launchctl` call — and the command exits `1` printing only `{"version": "2.21.1", "error": "<message>"}`. This response has no `schedule`, `agents`, or `legacy_cron` keys at all; a strict external decoder expecting the common shape on every `weekly`/`monthly` call should check for `"error"` first.
+`weekly`/`monthly --json` have one more exit path that does **not** follow the common envelope above: if no usable, non-virtualenv `python3` interpreter can be resolved for `ProgramArguments[0]` (see `_agent_python()`), nothing is written — no plist, no `launchctl` call — and the command exits `1` printing only `{"version": "2.22.0", "error": "<message>"}`. This response has no `schedule`, `agents`, or `legacy_cron` keys at all; a strict external decoder expecting the common shape on every `weekly`/`monthly` call should check for `"error"` first.
 
 Honors `MACCLEANER_LAUNCH_AGENTS_DIR` (default `~/Library/LaunchAgents`) for both reading and writing agent plists — see §5.
 
@@ -449,7 +449,7 @@ Honors `MACCLEANER_LAUNCH_AGENTS_DIR` (default `~/Library/LaunchAgents`) for bot
 
 ```json
 {
-  "version": "2.21.1",
+  "version": "2.22.0",
   "categories": [
     {
       "name": "xcode",
@@ -470,7 +470,7 @@ Lists **all** categories and targets regardless of the enabled_categories config
 
 ```json
 {
-  "version": "2.21.1",
+  "version": "2.22.0",
   "runs": [
     {
       "timestamp": "2026-07-13T09:00:04.120394",
@@ -502,7 +502,7 @@ Lists **all** categories and targets regardless of the enabled_categories config
 }
 ```
 
-Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 50 runs. With no history: `{"version": "2.21.1", "runs": [], "disk_history": {...}}` (`disk_history` is present either way).
+Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 50 runs. With no history: `{"version": "2.22.0", "runs": [], "disk_history": {...}}` (`disk_history` is present either way).
 
 `disk_history` is **additive** (new in 2.1.0) and always present, even with no cleanup history. `current` is today's `disk_stats()` snapshot. `snapshots` is the full contents of `snapshots.log` (append-only, capped at the most recent 365 entries; a snapshot recorded on the same calendar day as the previous one replaces it instead of adding a new entry — so a machine scanned any number of times a day, including every few minutes by the menu bar app's auto-refresh, accumulates at most one entry per day, giving 365 entries roughly a year of history). Every `scan` and every real `clean`/`projects --clean` run (not `--dry-run`) records one snapshot. `reclaimable_bytes` and `categories` (a map of category → bytes) are `null` unless the run covers the **full, unscoped target list** — a plain `scan`, or a plain `clean` with no `--category`/`--min-size`/`--targets` (this doesn't depend on `--yes`: an unscoped interactive `clean` counts too). The sums span every measured target regardless of `safe` — review targets (e.g. all of `ai`, and `system`'s `trash`/`ios-backups`) are folded into `categories` too, not excluded; for `clean` the sum is taken after the run, over whatever remains uncleaned (targets not deleted/trashed this pass, including any review target skipped or declined). They're `null` for `scan --category …`, `scan --min-size …`, any `clean` scoped by `--targets`/`--category`/`--min-size`, and *every* `projects --clean` run (project artifacts aren't part of the regular category sweep, and it never records full scope) — in all of those cases only `disk_total_bytes`/`disk_free_bytes` are trustworthy. Use `MACCLEANER_SNAPSHOTS` to point the engine at a different snapshots file (see §5).
 
@@ -558,7 +558,7 @@ Oldest → newest, last N runs (`-n`, default 10). The log file keeps the last 5
 
 **New config keys in 2.5.0** — `tmp_min_age_days` (default `1` since 2.15.0, was `3` — every tmp target is review-only, so the gate only needs to shield an active task's workspace): directories directly under `/private/tmp` younger than this (by mtime) are never offered, regardless of what they contain. `simulator_stale_days` (default `7` since 2.19.0, was `30` — simulator targets are review-only, so like `tmp_min_age_days` the gate only needs to shield devices in active use; at 30 days a machine that builds against simulators daily never produces a stale one at all, and 40 GB of device data stayed invisible to the scanner because its oldest idle device was 19 days old): a simulator device not booted (or, on older `simctl`, not "used") in this many days counts as stale. Both are plain `config set` keys like any other. `config show` also always includes a `known_categories` key — the set of category names this install's `enabled_categories` has already been migrated against. Every `load_config()` call auto-appends any category in `ALL_CATEGORIES` that isn't yet in `known_categories` to `enabled_categories` (so a category added in a new release, like `tmp`/`simulators` in 2.5.0, shows up enabled for existing installs instead of silently staying off), then stamps `known_categories` to the current full list. It's bookkeeping, not a user-facing setting: `config set known_categories ...` is rejected as an unknown key, same as any other name not in `DEFAULT_CONFIG`. If you hand-write or hand-edit a `config.json` (e.g. for a fleet/scripted install), keep its `known_categories` key intact — a config that lacks it gets every category added since 2.4 re-enabled the next time it's loaded, which is the documented upgrade migration working as intended, not a bug.
 
-**New config key (unreleased)** — `simulator_auto_clean` (default `false`): when exactly JSON `true`, the `simulator-stale-devices` target is emitted with `safe: true`, so an unattended `clean --yes` (the weekly launchd run) deletes stale simulator devices without being named. Any other value, including the string `"true"` or the number `1`, leaves it review-only. It never changes `simulator-unused-runtimes`, which stays `safe: false` regardless, because deregistering a runtime can leave its asset on disk with no way to remove it. Set it with `config set simulator_auto_clean true`.
+**New config key in 2.22.0** — `simulator_auto_clean` (default `false`): when exactly JSON `true`, the `simulator-stale-devices` target is emitted with `safe: true`, so an unattended `clean --yes` (the weekly launchd run) deletes stale simulator devices without being named. Any other value, including the string `"true"` or the number `1`, leaves it review-only. It never changes `simulator-unused-runtimes`, which stays `safe: false` regardless, because deregistering a runtime can leave its asset on disk with no way to remove it. Set it with `config set simulator_auto_clean true`.
 
 **New config key in 2.7.0** — `app_leftover_min_age_days` (default `7`): orphaned per-app data under `~/Library` (see the `leftovers` category / §6 below) younger than this (by mtime) is never offered, regardless of which of the five scanned locations it's in. A plain `config set` key like any other; the same `known_categories` auto-enable migration described above covers `leftovers` too.
 
